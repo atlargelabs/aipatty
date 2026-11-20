@@ -2,13 +2,18 @@
 import { randomUUID } from "node:crypto";
 import { on } from "node:events";
 import WebSocket, { type RawData } from "ws";
-import { DEFAULT_URL } from "./config.ts";
+import { DEFAULT_URL, readSettings } from "./config.ts";
 import { failureText, messageText, type ConversationPage, type StreamFrame } from "./protocol.ts";
 
 const root = "/api/conversations/root";
 
 async function request<T>(base: URL, path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(new URL(path, base), options);
+  const response = await fetch(new URL(path, base), options).catch((error: unknown) => {
+    // fetch() says only "fetch failed"; its cause has the reason.
+    const cause = error instanceof Error && error.cause instanceof Error ? error.cause : error;
+    const reason = (cause as NodeJS.ErrnoException).code ?? (cause instanceof Error ? cause.message : String(cause));
+    throw new Error(`Cannot reach the server at ${base.origin} (${reason}). Is it running, and is AIPATTY_URL its address?`);
+  });
   const text = await response.text();
   let value: unknown;
   try {
@@ -84,23 +89,28 @@ async function log(base: URL): Promise<void> {
 
 async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2);
-  const base = new URL(process.env.AIPATTY_URL ?? DEFAULT_URL);
+  const base = new URL(readSettings().URL ?? DEFAULT_URL);
+  const put = (path: string, body: unknown) => request(base, path, {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
   if (base.protocol !== "http:" && base.protocol !== "https:") throw new Error("AIPATTY_URL must be HTTP(S)");
   if (command === "health" && args.length === 0) {
     console.log(JSON.stringify(await request(base, "/health"), null, 2));
   } else if (command === "models" && args.length === 0) {
     console.log(JSON.stringify(await request(base, "/api/models"), null, 2));
   } else if (command === "model" && (args.length === 2 || args.length === 3) && args[0] === "set") {
-    console.log(JSON.stringify(await request(base, "/api/model", {
-      method: "PUT", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ provider: args.length === 3 ? args[1] : undefined, modelId: args.at(-1) }),
-    }), null, 2));
+    const model = { provider: args.length === 3 ? args[1] : undefined, modelId: args.at(-1) };
+    console.log(JSON.stringify(await put("/api/model", model), null, 2));
+  } else if (command === "thinking" && args.length === 2 && args[0] === "set") {
+    console.log(JSON.stringify(await put("/api/thinking", { level: args[1] }), null, 2));
+  } else if (command === "abort" && args.length === 0) {
+    await request(base, `${root}/abort`, { method: "POST" });
   } else if (command === "log" && args.length === 0) {
     await log(base);
   } else if (command === "send" && args.length === 1 && args[0].trim()) {
     await send(base, args[0]);
   } else {
-    throw new Error('Usage: aipatty health | aipatty models | aipatty model set [provider] <modelId> | aipatty send "<text>" | aipatty log');
+    throw new Error('Usage: aipatty health | models | model set [provider] <modelId> | thinking set <level> | send "<text>" | abort | log');
   }
 }
 

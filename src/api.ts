@@ -32,7 +32,11 @@ function errorResponse(error: unknown): { status: number; message: string } {
 }
 
 function trustedName(name: string): string {
-  if (isIP(name) === 6) return new URL(`http://[${name}]`).hostname;
+  if (isIP(name) === 6) {
+    // A Host header cannot carry a zone, so a zoned address could never be matched.
+    if (name.includes("%")) throw new Error(`Expected an IPv6 address without a zone: ${name}`);
+    return new URL(`http://[${name}]`).hostname;
+  }
   if (!name || !/^[a-z0-9.-]+$/i.test(name)) {
     throw new Error(`Expected a trusted hostname or IP address without scheme or port: ${name}`);
   }
@@ -147,6 +151,14 @@ async function handleHttp(agent: AgentHost, health: Health, req: IncomingMessage
     sendJson(res, 200, await agent.modelStatus());
     return;
   }
+  if (pathname === "/api/thinking") {
+    requireMethod(req, res, "PUT");
+    const { level } = await jsonBody(req);
+    if (typeof level !== "string") throw new HttpError(400, "Expected level");
+    await agent.setThinking(level);
+    sendJson(res, 200, await agent.modelStatus());
+    return;
+  }
   const route = /^\/api\/conversations\/([^/]+)(?:\/(messages|abort))?$/.exec(pathname);
   if (!route) throw new HttpError(404, "Not found");
   const [, id, action] = route;
@@ -158,8 +170,7 @@ async function handleHttp(agent: AgentHost, health: Health, req: IncomingMessage
     const submission = await agent.submit(conversation, await messageDraft(req));
     sendJson(res, 202, { submissionId: submission.id });
   } else if (action === "abort") {
-    await agent.assertAvailable();
-    await conversation.abort(ctx);
+    await agent.abort(conversation);
     sendJson(res, 200, { ok: true });
   } else {
     sendJson(res, 200, await conversationPage(conversation, searchParams));
@@ -178,12 +189,19 @@ async function stream(socket: WebSocket, streams: Streams, conversation: Convers
   });
   socket.on("error", () => socket.terminate());
   socket.on("message", () => socket.close(1008, "Stream is read-only"));
-  const send = (value: StreamFrame) => new Promise<void>((resolve, reject) => {
+  // A frame that cannot be written means the client is gone, or was dropped by the heartbeat: end the stream, not fail it.
+  const send = (value: StreamFrame) => new Promise<void>(resolve => {
     if (socket.readyState !== WebSocket.OPEN) {
       resolve();
       return;
     }
-    socket.send(JSON.stringify(value), error => error ? reject(error) : resolve());
+    socket.send(JSON.stringify(value), error => {
+      if (error) {
+        controller.abort();
+        socket.terminate();
+      }
+      resolve();
+    });
   });
 
   try {
@@ -266,7 +284,12 @@ export async function startApi(
   agent: AgentHost, health: Health, host: string, port: number, aliases: readonly string[] = [],
   heartbeatMs = defaultHeartbeatMs,
 ) {
-  const trusted = [host, ...aliases].map(trustedName);
+  // No client addresses a wildcard listener by that address, so it needs the names clients do use.
+  const wildcard = host === "0.0.0.0" || (isIP(host) === 6 && trustedName(host) === "[::]");
+  if (wildcard && !aliases.length) {
+    throw new Error(`Listening on every address (${host}) needs AIPATTY_TRUSTED_HOSTS: the names or addresses clients use to reach this server`);
+  }
+  const trusted = (wildcard ? aliases : [host, ...aliases]).map(trustedName);
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 });
   const streams: Streams = { controllers: new Set(), alive: new WeakSet() };
   const heartbeat = setInterval(() => {

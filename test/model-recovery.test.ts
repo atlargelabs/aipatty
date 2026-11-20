@@ -1,4 +1,4 @@
-import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
+import { BACKGROUND_CONTEXT as ctx, withAbortSignal } from "@earendil-works/chord/context";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { startApi } from "../src/api.ts";
@@ -64,7 +64,7 @@ test("settled frame is delivered while a later submission is still running", asy
   assert.ok((await host.harness.inspect(ctx)).submissions.length > 0, "later submission must still be pending");
 });
 
-test("available existing model ignores invalid new-root default and active switch conflicts", async t => {
+test("a model switch conflicts with active work, which finishes after a restart", async t => {
   const dir = await fixture(t);
   const host = await openHost(fauxConfig(dir));
   const root = (await host.conversation("root"))!;
@@ -72,8 +72,48 @@ test("available existing model ignores invalid new-root default and active switc
   await until(async () => (await host.harness.inspect(ctx)).tasks.length > 0);
   await assert.rejects(host.setModel({ provider: "faux", modelId: "faux-1" }), /active work/);
   await host.harness.close(ctx);
-  const reopened = await openHost({ ...fauxConfig(dir), model: "missing" });
+  const reopened = await openHost(fauxConfig(dir));
   assert.equal((await reopened.modelStatus()).modelStatus, "available");
   await until(async () => (await reopened.harness.inspect(ctx)).submissions.length === 0);
   await reopened.harness.close(ctx);
+});
+
+test("a message sent right behind a recovering model switch, or during an abort, is not stranded", { timeout: 20_000 }, async t => {
+  const dir = await fixture(t);
+  const initial = await openHost(fauxConfig(dir));
+  await initial.submit((await initial.conversation("root"))!, { type: "input", content: "old ".repeat(300) });
+  await until(async () => (await initial.harness.inspect(ctx)).tasks.some(task => task.state.kind === "running"));
+  await initial.harness.close(ctx);
+
+  // The saved faux model is not in the real catalog, so the interrupted run stays paused until a switch aborts it.
+  const blocked = await openHost(readConfig(fixtureEnv(dir, { AIPATTY_FAUX: "0" })));
+  const settles = async (submission: Awaited<ReturnType<typeof blocked.submit>>) =>
+    (await submission.wait(withAbortSignal(AbortSignal.timeout(5_000), ctx))).status;
+  try {
+    const root = (await blocked.conversation("root"))!;
+    const switched = blocked.setModel({ provider: "openai", modelId: "gpt-6.1-sol" });
+    const behind = await blocked.submit(root, { type: "input", content: "new" });
+    await switched;
+    assert.equal(await settles(behind), "unanswered", "no login: the run fails, but it must run");
+  } finally {
+    await blocked.harness.close(ctx);
+  }
+
+  const host = await openHost(fauxConfig(dir));
+  const api = await startApi(host, health, "127.0.0.1", 0);
+  t.after(async () => { await api.close(); await host.harness.close(ctx); });
+  await host.setModel({ provider: "faux", modelId: "faux-1" });
+  const messages = `http://127.0.0.1:${api.port}/api/conversations/root`;
+  const post = (path: string, body: unknown) => fetch(messages + path, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  });
+  for (let round = 0; round < 5; round++) {
+    await post("/messages", { content: "x".repeat(900) });
+    await until(async () => (await host.harness.inspect(ctx)).tasks.some(task => task.state.kind === "running"));
+    const [aborted, sent] = await Promise.all([post("/abort", {}), post("/messages", { content: `after abort ${round}` })]);
+    assert.equal(aborted.status, 200);
+    const { submissionId } = await sent.json() as { submissionId: number };
+    const submission = (await host.harness.submission(submissionId as Parameters<typeof host.harness.submission>[0], ctx))!;
+    assert.notEqual((await submission.wait(withAbortSignal(AbortSignal.timeout(5_000), ctx))).status, undefined);
+  }
 });

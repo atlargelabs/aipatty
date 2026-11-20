@@ -57,7 +57,9 @@ test("missing, malformed and stale catalog snapshots fall back to bundled models
   const config = readConfig(fixtureEnv(dir, { AIPATTY_FAUX: "0" }));
   async function unavailable() {
     const host = await openHost(config);
-    assert.deepEqual(await host.modelStatus(), { modelStatus: "unavailable", model: { provider: "openai", modelId: "gpt-6.2-sol" } });
+    assert.deepEqual(await host.modelStatus(), {
+      modelStatus: "unavailable", model: { provider: "openai", modelId: "gpt-6.2-sol" }, thinking: "high",
+    });
     await host.harness.close(ctx);
   }
   const logged = t.mock.method(console, "error", () => {});
@@ -80,15 +82,11 @@ test("missing, malformed and stale catalog snapshots fall back to bundled models
     },
   }));
   await unavailable();
-  const existing = await openHost({ ...config, provider: "unknown" });
-  assert.equal((await existing.modelStatus()).model?.provider, "openai");
-  await existing.harness.close(ctx);
 });
 
 test("the default model is the openai provider's, taken from the cached catalog", async t => {
   const dir = await fixture(t);
   const config = readConfig(fixtureEnv(dir, { AIPATTY_FAUX: "0" }));
-  assert.deepEqual([config.provider, config.model], ["openai", "gpt-6.2-sol"]);
   const bundled = (await openModels(config)).getModel("openai", "gpt-6.1-sol");
   assert.ok(bundled);
   const host = await openHost(config);

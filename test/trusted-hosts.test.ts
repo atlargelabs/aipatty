@@ -34,3 +34,15 @@ test("HTTP and WS require a configured host and listener port even without an Or
     assert.equal(await probe({ Host: alias, Origin: `http://${base}` }), 403);
   }
 });
+
+test("a wildcard listen address needs trusted hosts, and a zoned IPv6 address is refused by name", async t => {
+  const agent = await openHost(fauxConfig(await fixture(t)));
+  t.after(() => agent.harness.close(ctx));
+  const start = (host: string, aliases: string[] = []) =>
+    startApi(agent, { ok: true, startedAt: "now", version: "test", commit: "test" }, host, 0, aliases);
+  for (const host of ["0.0.0.0", "::", "0:0:0:0:0:0:0:0"]) {
+    await assert.rejects(start(host), /Listening on every address \(.*\) needs AIPATTY_TRUSTED_HOSTS/);
+  }
+  await assert.rejects(start("fe80::1%lo0"), /Expected an IPv6 address without a zone: fe80::1%lo0/);
+  await assert.rejects(start("127.0.0.1", ["fe80::1%lo0"]), /without a zone/);
+});

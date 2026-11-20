@@ -32,8 +32,7 @@ export function fixtureEnv(dir: string, overrides: NodeJS.ProcessEnv = {}): Node
     AIPATTY_FAUX: "1",
     AIPATTY_DATA_DIR: dir,
     AIPATTY_PORT: "0",
-    AIPATTY_AUTH_FILE: join(dir, "auth.json"),
-    AIPATTY_MODELS_STORE: join(dir, "models-store.json"),
+    AIPATTY_PI_DIR: dir,
     ...overrides,
   };
 }

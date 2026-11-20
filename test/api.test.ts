@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { setTimeout as sleep } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
+import WebSocket from "ws";
 import { startApi } from "../src/api.ts";
 import { openHost } from "../src/host.ts";
 import { messageText, streamUpdate, type ConversationPage } from "../src/protocol.ts";
@@ -53,7 +54,9 @@ const idleWith = (count: number) => (state: ConversationPage) => !state.busy && 
 
 test("a message is admitted at once and answered", async t => {
   const { base } = await server(t);
-  assert.deepEqual(await (await fetch(`${base}/health`)).json(), { ...health, modelStatus: "available", model: { provider: "faux", modelId: "faux-1" } });
+  assert.deepEqual(await (await fetch(`${base}/health`)).json(), {
+    ...health, modelStatus: "available", model: { provider: "faux", modelId: "faux-1" }, thinking: "high",
+  });
 
   const response = await post(base, { content: "hello" });
   assert.equal(response.status, 202);
@@ -168,7 +171,6 @@ test("invalid requests and foreign origins are rejected", async t => {
   const foreign = connect(t, base);
   await foreign.opened;
   foreign.ws.terminate();
-  const { default: WebSocket } = await import("ws");
   const rejected = new WebSocket(`${base.replace("http:", "ws:")}/api/conversations/root/stream`, {
     origin: "http://evil.example",
   });
@@ -244,4 +246,27 @@ test("a stream whose client stops answering pings is dropped; a live one stays",
   await once(silent.ws, "close", { signal: AbortSignal.timeout(2_000) });
   await sleep(350);
   assert.equal(live.ws.readyState, live.ws.OPEN);
+});
+
+test("a frame that cannot be written ends the stream without reporting a failure", async t => {
+  const { base } = await server(t);
+  const logged = t.mock.method(console, "error", () => {});
+  // The server's sockets are this class too; the test clients never send.
+  const write = WebSocket.prototype.send as (this: WebSocket, data: string, done: (error?: Error) => void) => void;
+  let failAt = 0, sends = 0;
+  t.mock.method(WebSocket.prototype, "send", function (this: WebSocket, data: string, done: (error?: Error) => void) {
+    if (++sends === failAt) done(new Error("write ECANCELED"));
+    else write.call(this, data, done);
+  });
+  for (const frame of [1, 2]) { // The attachment snapshot, then the first update, sent from the watch listener.
+    [failAt, sends] = [frame, 0];
+    const client = connect(t, base);
+    await client.opened;
+    const closed = once(client.ws, "close", { signal: AbortSignal.timeout(3_000) });
+    if (frame === 2) await post(base, { content: "change" });
+    await closed;
+    assert.equal(client.frames.length, frame - 1);
+  }
+  await until(() => page(base), idleWith(2));
+  assert.deepEqual(logged.mock.calls.map(call => call.arguments.map(String).join(" ")), []);
 });
