@@ -5,6 +5,7 @@ import { isIP } from "node:net";
 import type { Duplex } from "node:stream";
 import WebSocket, { WebSocketServer } from "ws";
 import { HttpError, type AgentHost } from "./host.ts";
+import { pageCss, pageHtml, pageJs } from "./page.ts";
 import { messageText, streamState, streamUpdate, type StreamFrame } from "./protocol.ts";
 
 const maxBody = 64 * 1024;
@@ -134,35 +135,48 @@ async function handleHttp(agent: AgentHost, health: Health, req: IncomingMessage
     sendJson(res, 200, { models: agent.models() });
     return;
   }
-  if (pathname === "/api/model") {
-    requireMethod(req, res, "PUT");
-    const body = await jsonBody(req);
-    const { modelId } = body;
-    if (typeof modelId !== "string" || !modelId.trim()) throw new HttpError(400, "Expected modelId");
-    let provider = body.provider;
-    if (provider === undefined) {
-      const matches = agent.models().filter(model => model.modelId === modelId);
-      if (!matches.length) throw new HttpError(400, "Unknown modelId; list available models with 'aipatty models'");
-      if (matches.length > 1) throw new HttpError(400, "Ambiguous modelId; specify provider");
-      provider = matches[0].provider;
-    }
-    if (typeof provider !== "string" || !provider.trim()) throw new HttpError(400, "Expected provider");
-    await agent.setModel({ provider, modelId });
-    sendJson(res, 200, await agent.modelStatus());
+  if (pathname === "/" || pathname === "/index.html") {
+    requireMethod(req, res, "GET");
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+      "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy": "no-referrer",
+    });
+    res.end(pageHtml);
     return;
   }
-  if (pathname === "/api/thinking") {
-    requireMethod(req, res, "PUT");
-    const { level } = await jsonBody(req);
-    if (typeof level !== "string") throw new HttpError(400, "Expected level");
-    await agent.setThinking(level);
-    sendJson(res, 200, await agent.modelStatus());
+  if (pathname === "/app.js" || pathname === "/app.css") {
+    requireMethod(req, res, "GET");
+    const js = pathname === "/app.js";
+    res.writeHead(200, {
+      "Content-Type": js ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    });
+    res.end(js ? pageJs : pageCss);
     return;
   }
-  const route = /^\/api\/conversations\/([^/]+)(?:\/(messages|abort))?$/.exec(pathname);
+  if (pathname === "/api/branches") {
+    requireMethod(req, res, "GET");
+    sendJson(res, 200, await agent.branches());
+    return;
+  }
+  // The root's model and thinking level, kept from step 1 for the CLI's defaults.
+  if (pathname === "/api/model" || pathname === "/api/thinking") {
+    requireMethod(req, res, "PUT");
+    const root = (await agent.conversation("root"))!;
+    await (pathname === "/api/model" ? setModel(agent, root, req) : setThinking(agent, root, req));
+    sendJson(res, 200, await agent.modelStatus(root));
+    return;
+  }
+  const route = /^\/api\/conversations\/([^/]+)(?:\/(messages|abort|fork|title|model|thinking|search))?$/.exec(pathname);
   if (!route) throw new HttpError(404, "Not found");
   const [, id, action] = route;
-  requireMethod(req, res, action ? "POST" : "GET");
+  const method = !action || action === "search" ? "GET"
+    : action === "title" || action === "model" || action === "thinking" ? "PUT" : "POST";
+  requireMethod(req, res, method);
   const conversation = await agent.conversation(id);
   if (!conversation) throw new HttpError(404, "Conversation not found");
 
@@ -172,9 +186,57 @@ async function handleHttp(agent: AgentHost, health: Health, req: IncomingMessage
   } else if (action === "abort") {
     await agent.abort(conversation);
     sendJson(res, 200, { ok: true });
+  } else if (action === "fork") {
+    const { title, at } = await jsonBody(req);
+    if (typeof title !== "string") throw new HttpError(400, "Expected title");
+    if (at !== undefined && (typeof at !== "number" || !Number.isSafeInteger(at) || at < 1)) {
+      throw new HttpError(400, "at must be an entry ID");
+    }
+    sendJson(res, 201, await agent.fork(conversation, { title, at }));
+  } else if (action === "title") {
+    const { title } = await jsonBody(req);
+    if (typeof title !== "string") throw new HttpError(400, "Expected title");
+    await agent.rename(conversation, title);
+    sendJson(res, 200, await agent.branch(conversation));
+  } else if (action === "model") {
+    await setModel(agent, conversation, req);
+    sendJson(res, 200, await agent.branch(conversation));
+  } else if (action === "thinking") {
+    await setThinking(agent, conversation, req);
+    sendJson(res, 200, await agent.branch(conversation));
+  } else if (action === "search") {
+    const query = searchParams.get("q") ?? "";
+    if (!query.trim() || query.length > 200) throw new HttpError(400, "Expected q of 1 to 200 characters");
+    const limit = positiveInt(searchParams.get("limit"), "limit", maxPage);
+    const before = positiveInt(searchParams.get("before"), "before");
+    sendJson(res, 200, await agent.search(conversation, query, { limit, before }));
   } else {
-    sendJson(res, 200, await conversationPage(conversation, searchParams));
+    const [page, branch, totalCost] = await Promise.all([
+      conversationPage(conversation, searchParams), agent.branch(conversation), agent.totalCost(),
+    ]);
+    sendJson(res, 200, { ...page, branch, totalCost });
   }
+}
+
+async function setModel(agent: AgentHost, conversation: Conversation, req: IncomingMessage): Promise<void> {
+  const body = await jsonBody(req);
+  const { modelId } = body;
+  if (typeof modelId !== "string" || !modelId.trim()) throw new HttpError(400, "Expected modelId");
+  let provider = body.provider;
+  if (provider === undefined) {
+    const matches = agent.models().filter(model => model.modelId === modelId);
+    if (!matches.length) throw new HttpError(400, "Unknown modelId; list available models with 'aipatty models'");
+    if (matches.length > 1) throw new HttpError(400, "Ambiguous modelId; specify provider");
+    provider = matches[0].provider;
+  }
+  if (typeof provider !== "string" || !provider.trim()) throw new HttpError(400, "Expected provider");
+  await agent.setModel({ provider, modelId }, conversation);
+}
+
+async function setThinking(agent: AgentHost, conversation: Conversation, req: IncomingMessage): Promise<void> {
+  const { level } = await jsonBody(req);
+  if (typeof level !== "string") throw new HttpError(400, "Expected level");
+  await agent.setThinking(level, conversation);
 }
 
 async function stream(socket: WebSocket, streams: Streams, conversation: Conversation, submission?: Submission): Promise<void> {
@@ -256,7 +318,8 @@ async function handleUpgrade(
   const id = positiveInt(searchParams.get("submissionId"), "submissionId");
   let submission: Submission | undefined;
   if (id !== undefined) {
-    await agent.assertAvailable();
+    // Waiting resumes scheduling, which would run work blocked on an unavailable model.
+    await agent.assertRunning();
     submission = await agent.harness.submission(id as SubmissionId, ctx);
     const status = await submission?.status(ctx);
     if (!status || status.conversationId !== conversation.id || status.type !== "input") {
