@@ -147,7 +147,7 @@ function renderBranches() {
       meta.append(busy);
     }
     li.append(title, meta);
-    li.addEventListener("click", () => { select(branch.id); $("branches").classList.remove("open"); });
+    li.addEventListener("click", () => { selectBranch(branch.id); $("branches").classList.remove("open"); });
     return li;
   }));
   const branch = current();
@@ -156,14 +156,14 @@ function renderBranches() {
   document.title = branch.title + " · aipatty";
   $("cost").textContent = money(branch.cost) + " / " + money(app.totalCost);
   const ref = branch.model ? branch.model.provider + "/" + branch.model.modelId : "";
-  const select = $("model");
-  if (![...select.options].some(option => option.value === ref)) {
+  const picker = $("model");
+  if (![...picker.options].some(option => option.value === ref)) {
     const option = document.createElement("option");
     option.value = ref;
     option.textContent = (branch.model ? branch.model.modelId : "(none)") + " (unavailable)";
-    select.prepend(option);
+    picker.prepend(option);
   }
-  select.value = ref;
+  picker.value = ref;
   $("thinking").value = branch.thinking;
 }
 
@@ -248,7 +248,7 @@ async function refreshBranches() {
   renderBranches();
 }
 
-async function select(id) {
+async function selectBranch(id) {
   app.branch = id;
   app.entries = [];
   app.before = null;
@@ -264,7 +264,7 @@ async function forkAt(at) {
   if (!title) return;
   const created = await api("/api/conversations/" + app.branch + "/fork", { method: "POST", body: at ? { title, at } : { title } });
   await refreshBranches();
-  await select(created.id);
+  await selectBranch(created.id);
 }
 
 async function loadModels() {
@@ -341,7 +341,7 @@ guard(async () => {
   await loadModels();
   await refreshBranches();
   const wanted = Number(location.hash.slice(1));
-  await select(app.branches.some(branch => branch.id === wanted) ? wanted : app.branches[0].id);
+  await selectBranch(app.branches.some(branch => branch.id === wanted) ? wanted : app.branches[0].id);
   setInterval(() => { refreshBranches().catch(() => {}); }, 10000);
 })();
 `;
