@@ -129,32 +129,59 @@ function messageText(message) {
 
 function current() { return app.branches.find(branch => branch.id === app.branch); }
 
-function renderBranches() {
-  const list = $("branch-list");
-  list.replaceChildren(...app.branches.map(branch => {
+/*
+ * A stream frame arrives about ten times a second while a branch answers. Rendering one must leave the nodes already
+ * on the page in place: a node replaced between a press and its release gets no click, and loses its selection and
+ * scroll position. So the branch list is updated in place, and a frame only adds the transcript's new entries.
+ */
+function setText(node, text) {
+  if (node.textContent !== text) node.textContent = text;
+}
+
+const branchNodes = new Map();
+
+/** The list item of a branch, made once and then kept. */
+function branchNode(id) {
+  let node = branchNodes.get(id);
+  if (!node) {
     const li = document.createElement("li");
-    if (branch.id === app.branch) li.className = "current";
+    li.dataset.branch = id;
     const title = document.createElement("div");
-    title.textContent = branch.title;
     const meta = document.createElement("div");
     meta.className = "meta";
-    const model = branch.model ? branch.model.modelId : "no model";
-    meta.textContent = "#" + branch.id + " · " + model + " · " + money(branch.cost);
-    if (branch.busy) {
-      const busy = document.createElement("span");
-      busy.className = "busy";
-      busy.textContent = " · busy";
-      meta.append(busy);
-    }
+    const info = document.createElement("span");
+    const busy = document.createElement("span");
+    busy.className = "busy";
+    busy.textContent = " · busy";
+    meta.append(info, busy);
     li.append(title, meta);
-    li.addEventListener("click", () => { selectBranch(branch.id); $("branches").classList.remove("open"); });
-    return li;
-  }));
+    node = { li, title, info, busy };
+    branchNodes.set(id, node);
+  }
+  return node;
+}
+
+function renderBranches() {
+  const list = $("branch-list");
+  for (const [id, node] of branchNodes) {
+    if (app.branches.some(branch => branch.id === id)) continue;
+    node.li.remove();
+    branchNodes.delete(id);
+  }
+  app.branches.forEach((branch, index) => {
+    const node = branchNode(branch.id);
+    node.li.classList.toggle("current", branch.id === app.branch);
+    setText(node.title, branch.title);
+    const model = branch.model ? branch.model.modelId : "no model";
+    setText(node.info, "#" + branch.id + " · " + model + " · " + money(branch.cost));
+    node.busy.hidden = !branch.busy;
+    if (list.children[index] !== node.li) list.insertBefore(node.li, list.children[index] || null);
+  });
   const branch = current();
   if (!branch) return;
-  $("title").textContent = branch.title;
+  setText($("title"), branch.title);
   document.title = branch.title + " · aipatty";
-  $("cost").textContent = money(branch.cost) + " / " + money(app.totalCost);
+  setText($("cost"), money(branch.cost) + " / " + money(app.totalCost));
   const ref = branch.model ? branch.model.provider + "/" + branch.model.modelId : "";
   const picker = $("model");
   if (![...picker.options].some(option => option.value === ref)) {
@@ -163,8 +190,8 @@ function renderBranches() {
     option.textContent = (branch.model ? branch.model.modelId : "(none)") + " (unavailable)";
     picker.prepend(option);
   }
-  picker.value = ref;
-  $("thinking").value = branch.thinking;
+  if (picker.value !== ref) picker.value = ref;
+  if ($("thinking").value !== branch.thinking) $("thinking").value = branch.thinking;
 }
 
 function entryNode(entry, message) {
@@ -182,30 +209,54 @@ function entryNode(entry, message) {
   return div;
 }
 
-function renderEntries() {
-  const box = $("transcript");
-  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+function entryNodes(entries) {
   const nodes = [];
-  for (const entry of app.entries) {
+  for (const entry of entries) {
     for (const message of entry.model || []) {
       if (messageText(message)) nodes.push(entryNode(entry, message));
     }
   }
-  $("entries").replaceChildren(...nodes);
-  $("older").hidden = app.before === null;
-  renderLive();
+  return nodes;
+}
+
+/** Change the transcript, and keep it scrolled to the bottom if it was there. */
+function keepAtBottom(change) {
+  const box = $("transcript");
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  change();
   if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+/** Rebuild the transcript from app.entries: for another branch, a new snapshot or an older page. */
+function renderEntries() {
+  keepAtBottom(() => {
+    $("entries").replaceChildren(...entryNodes(app.entries));
+    $("older").hidden = app.before === null;
+    renderLive();
+  });
+}
+
+/** Add the entries of a stream update below the ones shown. */
+function appendEntries(entries) {
+  keepAtBottom(() => {
+    $("entries").append(...entryNodes(entries));
+    renderLive();
+  });
 }
 
 function renderLive() {
   $("abort").disabled = !app.live.run;
   const live = $("live");
   const message = app.live.generation && app.live.generation.message;
-  if (!message || !messageText(message)) { live.replaceChildren(); return; }
-  const div = document.createElement("div");
-  div.className = "entry assistant";
-  div.textContent = messageText(message);
-  live.replaceChildren(div);
+  const text = message ? messageText(message) : "";
+  if (!text) { live.replaceChildren(); return; }
+  let div = live.firstElementChild;
+  if (!div) {
+    div = document.createElement("div");
+    div.className = "entry assistant";
+    live.append(div);
+  }
+  setText(div, text);
 }
 
 function connect(id) {
@@ -233,7 +284,7 @@ function connect(id) {
       branch.cost = frame.usage.cost;
       if (wasBusy && !frame.busy) refreshBranches();
     }
-    renderEntries();
+    if (frame.type === "state") renderEntries(); else appendEntries(frame.appended);
     renderBranches();
   });
   socket.addEventListener("close", () => {
@@ -336,6 +387,12 @@ $("older").addEventListener("click", guard(async () => {
   box.scrollTop += box.scrollHeight - height;
 }));
 $("menu").addEventListener("click", () => $("branches").classList.toggle("open"));
+$("branch-list").addEventListener("click", event => {
+  const li = event.target.closest("li");
+  if (!li) return;
+  selectBranch(Number(li.dataset.branch));
+  $("branches").classList.remove("open");
+});
 
 guard(async () => {
   await loadModels();

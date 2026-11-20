@@ -1,5 +1,8 @@
 import { awaitWithContext, type Context } from "@earendil-works/chord/context";
-import { defineExtension, defineTool, ROOT_CONVERSATION_ID, type Conversation, type EntryId } from "@earendil-works/pi-durable";
+import {
+  defineExtension, defineTool, ROOT_CONVERSATION_ID,
+  type Conversation, type Cursor, type EntryId, type EntryRecord, type Page,
+} from "@earendil-works/pi-durable";
 import { int, obj, opt, str } from "@earendil-works/pi-schema";
 import { thinkingLevels, type BranchInfo } from "./branches.ts";
 import type { AgentHost } from "./host.ts";
@@ -27,10 +30,30 @@ export function branchLine(branch: BranchInfo): string {
 }
 
 /**
- * The tree tools. They take the host lazily: the Harness that runs them must be open before the host exists. Calls
- * that queue on the host's admission line wait with the call's context: an abort holds that line while it waits for
- * this very call to end, and the abort cancels the wait.
+ * Wait for a host call that queues on the admission line. An abort holds that line while it waits for this very tool
+ * call to end, and cancels `context`: that ends the wait here, and the host, given the same context, then drops the
+ * queued call instead of running it after the abort.
  */
+function queued<T>(call: Promise<T>, context: Context): Promise<T> {
+  // awaitWithContext() does not observe the call when the context is already cancelled; its rejection is expected.
+  call.catch(() => {});
+  return awaitWithContext(call, context);
+}
+
+/** The ID of the entry holding the assistant message that made tool call `callId`, searched newest first. */
+async function callEntry(conversation: Conversation, callId: string, context: Context): Promise<EntryId | undefined> {
+  let cursor: Cursor | undefined;
+  do {
+    const page: Page<EntryRecord, Cursor> = await conversation.entries({}, maxReadEntries, cursor, context);
+    const found = page.items.find(entry => entry.model?.some(message => message.role === "assistant"
+      && message.content.some(content => content.type === "toolCall" && content.id === callId)));
+    if (found) return found.id;
+    cursor = page.next;
+  } while (cursor);
+  return undefined;
+}
+
+/** The tree tools. They take the host lazily: the Harness that runs them must be open before the host exists. */
 export function treeExtension(getHost: () => AgentHost) {
   const target = async (id: number | undefined, own: number, context: Context): Promise<Conversation> => {
     const found = await awaitWithContext(getHost().conversation(String(id ?? own)), context);
@@ -91,23 +114,27 @@ export function treeExtension(getHost: () => AgentHost) {
 
   const forkBranch = defineTool({
     name: "fork_branch",
-    description: "Start a new branch, an independent workstream that shares this branch's history up to the fork. "
+    description: "Start a new branch, an independent workstream that shares this branch's history up to this call. "
       + "It gets this branch's model. Optionally send it a first message, which it starts working on at once. "
       + "Nothing reports back here: read it later with read_branch.",
     parameters: obj({
       title: str({ minLength: 1, maxLength: 100, description: "A short title for the branch list" }),
       message: opt(str({ minLength: 1, description: "First message for the new branch" })),
       from: opt(int({ minimum: 1, description: "Branch to fork; default this branch" })),
-      at: opt(int({ minimum: 1, description: "Last entry the fork inherits; default the newest" })),
+      at: opt(int({ minimum: 1, description: "Last entry the fork inherits; default all of them" })),
     }),
     async execute(args, api, context) {
       const host = getHost();
       const from = await target(args.from, api.conversationId, context);
-      const created = await awaitWithContext(host.fork(from, { title: args.title, at: args.at }), context);
+      // This call has no result yet. A fork that inherited the message making it would show the new branch a call
+      // that never completed, which reads as a failed fork: by default this branch is forked just before that message.
+      const before = args.at === undefined && from.id === api.conversationId
+        ? await callEntry(from, api.callId, context) : undefined;
+      const created = await awaitWithContext(host.fork(from, { title: args.title, at: args.at, before }), context);
       let note = "";
       if (args.message !== undefined) {
-        const conversation = (await host.conversation(String(created.id)))!;
-        await awaitWithContext(host.submit(conversation, { type: "input", content: args.message }), context);
+        const conversation = (await awaitWithContext(host.conversation(String(created.id)), context))!;
+        await queued(host.submit(conversation, { type: "input", content: args.message }, context), context);
         note = " It is working on the message.";
       }
       return text(`Created branch ${created.id}, "${created.title}".${note}`);
@@ -139,8 +166,8 @@ export function treeExtension(getHost: () => AgentHost) {
         await conversation.configure({ model, ...(thinkingLevel ? { thinkingLevel } : {}) }, context);
       } else {
         // Another branch goes through the host, which refuses while that branch has active work.
-        await awaitWithContext(host.setModel(model, conversation), context);
-        if (thinkingLevel) await awaitWithContext(host.setThinking(thinkingLevel, conversation), context);
+        await queued(host.setModel(model, conversation, context), context);
+        if (thinkingLevel) await queued(host.setThinking(thinkingLevel, conversation, context), context);
       }
       const name = conversation.id === ROOT_CONVERSATION_ID ? "the main branch" : `branch ${conversation.id}`;
       return text(`Set ${name} to ${model.provider}/${model.modelId}${thinkingLevel ? ` with thinking ${thinkingLevel}` : ""}.`);

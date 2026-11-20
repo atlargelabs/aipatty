@@ -1,4 +1,4 @@
-import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
+import { BACKGROUND_CONTEXT as ctx, withCancel } from "@earendil-works/chord/context";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { test, type TestContext } from "node:test";
@@ -101,6 +101,7 @@ test("each branch keeps its own model and thinking level, and a busy branch refu
   const busy = await call<{ error: string }>(`/api/conversations/${fork.id}/model`, "PUT", { modelId: "faux-1" });
   assert.equal(busy.status, 409);
   assert.match(busy.body.error, /active work/);
+  assert.ok(busy.body.error.includes(`'aipatty abort --branch ${fork.id}'`), busy.body.error);
   // The root is not busy, so its model can still change.
   assert.equal((await call("/api/model", "PUT", { modelId: "faux-1" })).status, 200);
   await call(`/api/conversations/${fork.id}/abort`, "POST");
@@ -148,6 +149,14 @@ test("the model's tree tools list, read, search, fork and set models", { timeout
   assert.ok(created);
   const id = String(created.id);
   await until(async () => (await texts(host, id)).at(-1) === "Faux reply: look into walruses");
+  // The new branch starts before the call that created it: that call has no result yet, and would read as a failed one.
+  const inherited = (await (await host.conversation(id))!.context(ctx)).messages;
+  assert.deepEqual(inherited.flatMap(message => message.role === "assistant"
+    ? message.content.flatMap(content => content.type === "toolCall" ? [content.name] : []) : []), ["list_branches"]);
+  assert.ok(!inherited.some(message => message.role === "toolResult" && message.isError), JSON.stringify(inherited));
+  assert.deepEqual((await texts(host, id)).slice(-3), [
+    'call fork_branch {"title":"Walrus research","message":"look into walruses"}', "look into walruses", "Faux reply: look into walruses",
+  ]);
 
   await say(host, "root", `call read_branch {"branch":${id},"limit":2}`);
   const read = (await texts(host, "root")).at(-1)!;
@@ -164,6 +173,36 @@ test("the model's tree tools list, read, search, fork and set models", { timeout
   assert.equal((await host.modelStatus((await host.conversation(id))!)).thinking, "minimal");
   await say(host, "root", 'call set_model {"modelId":"nope"}');
   assert.match((await texts(host, "root")).at(-1)!, /Unknown model nope/);
+});
+
+test("a call cancelled while it waits behind an abort does nothing when its turn comes", async t => {
+  const { host } = await server(t);
+  const root = (await host.conversation("root"))!;
+  const fork = await host.fork(root, { title: "Fork" });
+  const branch = (await host.conversation(String(fork.id)))!;
+  await host.submit(root, { type: "input", content: "x".repeat(900) });
+  await until(async () => (await host.branch(root)).busy);
+
+  // What an aborted fork_branch or set_model call does: the abort holds the admission line until the turn has ended,
+  // the call queues behind it, and the abort cancels the call's context.
+  const { context, cancel } = withCancel(ctx);
+  const aborting = host.abort(root);
+  const queued = Promise.allSettled([
+    host.submit(branch, { type: "input", content: "too late" }, context),
+    host.setModel({ provider: "faux", modelId: "faux-1" }, branch, context),
+    host.setThinking("low", branch, context),
+  ]);
+  cancel();
+  await aborting;
+  assert.deepEqual((await queued).map(result => result.status), ["rejected", "rejected", "rejected"]);
+  await branch.waitForIdle(ctx);
+  assert.deepEqual(await texts(host, String(fork.id)), [], "the cancelled message never started a turn");
+  assert.equal((await host.modelStatus(branch)).thinking, "high");
+
+  // Without a cancelled context the same calls go through.
+  await host.setThinking("low", branch);
+  assert.equal((await host.modelStatus(branch)).thinking, "low");
+  await say(host, String(fork.id), "in time");
 });
 
 test("the page shows the branch's own cost and the session total", async t => {

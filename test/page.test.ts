@@ -2,12 +2,12 @@ import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { startApi } from "../src/api.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
-import { fauxConfig, fixture, until } from "./helpers.ts";
+import { checkout, fauxConfig, fixture, until } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
 
@@ -27,14 +27,20 @@ function findChrome(): string | undefined {
 const chrome = findChrome();
 
 /** One headless Chrome page driven over the DevTools protocol, without a browser library. */
-async function openBrowser(t: TestContext, dir: string) {
-  const profile = join(dir, "chrome-profile");
+async function openBrowser(t: TestContext) {
+  // Chrome's own directory, removed only after Chrome has exited: it writes to its profile until then.
+  const profile = await mkdtemp(join(checkout, "node_modules", "aipatty-test-chrome-"));
   const child = spawn(chrome!, [
     "--headless=new", "--remote-debugging-port=0", `--user-data-dir=${profile}`,
     "--no-first-run", "--no-default-browser-check", "--disable-extensions", "about:blank",
   ], { stdio: "ignore" });
   const exited = new Promise(resolve => child.once("exit", resolve));
-  t.after(async () => { child.kill("SIGKILL"); await exited; });
+  t.after(async () => {
+    child.kill("SIGKILL");
+    await exited;
+    // Chrome's helper processes can outlive it for a moment.
+    await rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
 
   // Chrome writes the port it chose to this file once DevTools listens.
   const portFile = join(profile, "DevToolsActivePort");
@@ -82,6 +88,9 @@ async function openBrowser(t: TestContext, dir: string) {
     errors,
     evaluate,
     navigate: (url: string) => send("Page.navigate", { url }),
+    /** Press or release the left mouse button at a point of the page, as a person's click does in two steps. */
+    mouse: (type: "mousePressed" | "mouseReleased", x: number, y: number) =>
+      send("Input.dispatchMouseEvent", { type, x, y, button: "left", clickCount: 1 }),
   };
 }
 
@@ -120,7 +129,7 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
   const side = await host.fork((await host.conversation("root"))!, { title: "Side" });
   await say(host, String(side.id), "only on side");
 
-  const browser = await openBrowser(t, dir);
+  const browser = await openBrowser(t);
   await browser.navigate(`${base}/`);
   const main = await waitFor(browser, "the main branch", value => value.messages.length === 2);
   assert.deepEqual(main, { title: "Main", current: "Main", hash: "#1", messages: ["on main", "Faux reply: on main"] });
@@ -143,4 +152,40 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
   await browser.navigate(`${base}/#${side.id}`);
   await waitFor(browser, "the branch named in the fragment", value => value.title === "Side" && value.messages.length === 4);
   assert.deepEqual(browser.errors, []);
+});
+
+test("a click on another branch lands while the current branch is streaming", { skip: chrome ? false : "no Chrome found; set CHROME_PATH", timeout: 30_000 }, async t => {
+  const host = await openHost(fauxConfig(await fixture(t)));
+  const api = await startApi(host, health, "127.0.0.1", 0);
+  t.after(async () => { await api.close(); await host.harness.close(ctx); });
+  const root = (await host.conversation("root"))!;
+  await say(host, "root", "on main");
+  const side = await host.fork(root, { title: "Side" });
+  await say(host, String(side.id), "only on side");
+
+  const browser = await openBrowser(t);
+  await browser.navigate(`http://127.0.0.1:${api.port}/`);
+  await waitFor(browser, "the main branch", value => value.messages.length === 2);
+
+  // A long answer streams for a few seconds, a frame at a time.
+  await host.submit(root, { type: "input", content: "x".repeat(1500) });
+  const streamed = () => browser.evaluate<number>(`document.querySelector("#live .entry")?.textContent.length ?? 0`);
+  await until(streamed, length => length > 0);
+
+  // Press on the other branch, let stream frames arrive, then release: a person's click spans several frames.
+  const point = await browser.evaluate<{ x: number; y: number }>(`(() => {
+    window.kept = document.querySelector("#entries .entry");
+    const box = [...document.querySelectorAll("#branch-list li")]
+      .find(li => li.querySelector("div").textContent === "Side").getBoundingClientRect();
+    return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  })()`);
+  await browser.mouse("mousePressed", point.x, point.y);
+  const pressedAt = await streamed();
+  await until(streamed, length => length > pressedAt + 30);
+  assert.equal(await browser.evaluate("window.kept.isConnected"), true, "a stream frame does not rebuild the transcript");
+  await browser.mouse("mouseReleased", point.x, point.y);
+  const onSide = await waitFor(browser, "the side branch after a click during streaming", value => value.title === "Side");
+  assert.equal(onSide.current, "Side");
+  assert.deepEqual(browser.errors, []);
+  await host.abort(root);
 });

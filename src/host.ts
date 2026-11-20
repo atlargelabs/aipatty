@@ -1,4 +1,4 @@
-import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
+import { BACKGROUND_CONTEXT as ctx, type Context } from "@earendil-works/chord/context";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import {
   createRegistry, Harness, LiveDoc, ROOT_CONVERSATION_ID, UsageDoc,
@@ -41,22 +41,27 @@ export interface AgentHost {
   /** A branch's saved model and thinking level, and whether the local catalog has that model; the root by default. */
   modelStatus(conversation?: Conversation): Promise<ModelStatus>;
   models(): { provider: string; modelId: string; name: string }[];
-  setModel(model: ModelRef, conversation?: Conversation): Promise<void>;
-  setThinking(level: string, conversation?: Conversation): Promise<void>;
+  /**
+   * `setModel`, `setThinking` and `submit` wait their turn on one admission line, behind any abort. Given the caller's
+   * `context`, a call whose context was cancelled while it waited rejects when its turn comes and changes nothing.
+   */
+  setModel(model: ModelRef, conversation?: Conversation, context?: Context): Promise<void>;
+  setThinking(level: string, conversation?: Conversation, context?: Context): Promise<void>;
   /** Every branch, oldest first, and the spend of the whole session. */
   branches(): Promise<{ branches: BranchInfo[]; totalCost: number }>;
   branch(conversation: Conversation): Promise<BranchInfo>;
   /**
-   * Start a branch from `from`'s history through entry `at` (default: its newest), with `from`'s current model and
-   * thinking level. A branch without entries starts an empty one.
+   * Start a branch from `from`'s history through entry `at`, with `from`'s current model and thinking level. Without
+   * `at`, the history through its newest entry, or through the newest one below `before`. No such entry starts an
+   * empty branch.
    */
-  fork(from: Conversation, options: { title: string; at?: number }): Promise<BranchInfo>;
+  fork(from: Conversation, options: { title: string; at?: number; before?: number }): Promise<BranchInfo>;
   rename(conversation: Conversation, title: string): Promise<void>;
   /** Newest matches first; `before` continues below an entry ID, and the result's `before` is where the next page starts. */
   search(conversation: Conversation, query: string, options?: { limit?: number; before?: number }):
     Promise<{ matches: SearchMatch[]; before: number | null }>;
   totalCost(): Promise<number>;
-  submit(conversation: Conversation, draft: InputSubmissionDraft): Promise<Submission>;
+  submit(conversation: Conversation, draft: InputSubmissionDraft, context?: Context): Promise<Submission>;
   /** Withdraw queued inputs and abort the running turn; resolves once the conversation is idle. */
   abort(conversation: Conversation): Promise<void>;
   /** Throw 409 unless scheduling runs: a wait or an abort would resume work blocked on an unavailable model. */
@@ -128,10 +133,14 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
     const recovered: Conversation[] = [];
 
     // Serialize admission, aborts and model changes: no input may slip between the busy check and configure(),
-    // or be admitted while aborted work is still settling, where it would never start.
+    // or be admitted while aborted work is still settling, where it would never start. A call made by a turn that was
+    // aborted while the call waited here is dropped: its `context` is cancelled by the time the abort lets it through.
     let tail = Promise.resolve();
-    function exclusive<T>(fn: () => Promise<T>): Promise<T> {
-      const result = tail.then(fn);
+    function exclusive<T>(fn: () => Promise<T>, context?: Context): Promise<T> {
+      const result = tail.then(() => {
+        context?.abortSignal?.throwIfAborted();
+        return fn();
+      });
       tail = result.then(() => {}, () => {});
       return result;
     }
@@ -199,7 +208,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
         .sort((a, b) => a.provider.localeCompare(b.provider) || a.modelId.localeCompare(b.modelId)),
       assertRunning: () => assertRunning(),
       assertAvailable,
-      async setModel(next, target = root) {
+      async setModel(next, target = root, context) {
         await exclusive(async () => {
           if (!models.getModel(next.provider, next.modelId)) {
             throw new HttpError(400, `Unknown model ${next.provider}/${next.modelId}; list available models with 'aipatty models'`);
@@ -209,7 +218,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
           const pending = inspection.submissions.filter(s => s.conversationId === target.id);
           const recovering = blocked.has(target.id);
           if (!recovering && (tasks.length || pending.length)) {
-            throw new HttpError(409, "Cannot switch model while the conversation has active work. Wait for the turn to finish, or run 'aipatty abort', before switching.");
+            throw new HttpError(409, `Cannot switch model while the conversation has active work. Wait for the turn to finish, or run 'aipatty abort${branchRef(target.id)}', before switching.`);
           }
           if (recovering) {
             // The scheduler is paused. Withdraw queued submissions and mark all the branch's tasks before
@@ -227,14 +236,14 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
           harness.resume();
           // An input admitted while the aborted tasks are still settling would never start.
           for (const done of recovered.splice(0)) await done.waitForIdle(ctx);
-        });
+        }, context);
       },
-      setThinking(level, target = root) {
+      setThinking(level, target = root, context) {
         return exclusive(async () => {
           const thinkingLevel = thinkingLevels.find(value => value === level);
           if (!thinkingLevel) throw new HttpError(400, `Expected a thinking level: ${thinkingLevels.join(", ")}`);
           await target.configure({ thinkingLevel }, ctx);
-        });
+        }, context);
       },
       async branches() {
         const records = [];
@@ -248,7 +257,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
         return { branches, totalCost: await totalCost() };
       },
       branch,
-      async fork(from, { title, at }) {
+      async fork(from, { title, at, before }) {
         const name = validTitle(title);
         if (!name) throw new HttpError(400, "Expected a title of 1 to 100 characters");
         const { model, thinking } = await status(from);
@@ -262,7 +271,8 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
           if (!items.length) throw new HttpError(400, `Entry ${at} is not in branch ${from.id}`);
           point = items[0].id;
         } else {
-          point = (await from.entries({}, 1, undefined, ctx)).items[0]?.id;
+          const query = before === undefined ? {} : { maxEntryId: (before - 1) as EntryId };
+          point = (await from.entries(query, 1, undefined, ctx)).items[0]?.id;
         }
         const created = point === undefined
           ? await harness.createConversation({ ownership: { kind: "ownerless" }, agent, init }, ctx)
@@ -301,13 +311,13 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
         return { matches, before: null };
       },
       totalCost,
-      submit(target, draft) {
+      submit(target, draft, context) {
         return exclusive(async () => {
           await assertAvailable(target);
           const submission = await target.submit(draft, ctx);
           logFailure(submission);
           return submission;
-        });
+        }, context);
       },
       abort(target) {
         return exclusive(async () => {
