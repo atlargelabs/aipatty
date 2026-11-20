@@ -4,7 +4,7 @@ import { createServer, STATUS_CODES, type IncomingMessage, type ServerResponse }
 import { isIP } from "node:net";
 import type { Duplex } from "node:stream";
 import WebSocket, { WebSocketServer } from "ws";
-import { HostError, type AgentHost } from "./host.ts";
+import { HttpError, type AgentHost } from "./host.ts";
 import { messageText, streamState, streamUpdate, type StreamFrame } from "./protocol.ts";
 
 const maxBody = 64 * 1024;
@@ -20,22 +20,13 @@ interface Streams {
   readonly alive: WeakSet<WebSocket>;
 }
 
-class HttpError extends Error {
-  readonly status: number;
-
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
-}
-
 function sendJson(res: ServerResponse, status: number, value: unknown): void {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
   res.end(JSON.stringify(value));
 }
 
 function errorResponse(error: unknown): { status: number; message: string } {
-  if (error instanceof HttpError || error instanceof HostError) return { status: error.status, message: error.message };
+  if (error instanceof HttpError) return { status: error.status, message: error.message };
   console.error("API error:", error);
   return { status: 500, message: "Internal server error" };
 }

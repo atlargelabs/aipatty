@@ -1,5 +1,5 @@
 import type { JsonValue } from "@earendil-works/chord/json";
-import type { Message } from "@earendil-works/pi-ai";
+import { contentText, type Message } from "@earendil-works/pi-ai";
 import type { ConversationView, EntryRecord, LiveState, ModelRef, UsageState } from "@earendil-works/pi-durable";
 
 /** A transcript page, in chronological order, and its conversation's current metadata. */
@@ -54,8 +54,10 @@ export function streamState(view: ConversationView): Extract<StreamFrame, { type
  */
 export function streamUpdate(previous: ConversationView, view: ConversationView): Exclude<StreamFrame, { type: "settled" }> {
   const state = streamState(view);
-  const known = new Map(previous.entries.map(entry => [entry.id, entry]));
   const last = previous.entries.at(-1)?.id ?? 0;
+  // The watch can fold more than a window of commits while the client is busy.
+  if (view.before !== undefined && view.before > last) return state;
+  const known = new Map(previous.entries.map(entry => [entry.id, entry]));
   const appended: EntryRecord[] = [];
   for (const entry of view.entries) {
     if (entry.id > last) appended.push(entry);
@@ -75,6 +77,5 @@ export function applyUpdate(
 
 /** Extract visible text without printing reasoning, tool calls, or images. */
 export function messageText(message: Pick<Message, "content">): string {
-  if (typeof message.content === "string") return message.content;
-  return message.content.map(part => part.type === "text" ? part.text : "").join("");
+  return contentText(message.content, "");
 }

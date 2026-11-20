@@ -6,7 +6,7 @@ import test, { type TestContext } from "node:test";
 import { startApi } from "../src/api.ts";
 import { openHost } from "../src/host.ts";
 import { messageText, streamUpdate, type ConversationPage } from "../src/protocol.ts";
-import { connect, fauxConfig, fixture } from "./helpers.ts";
+import { connect, fauxConfig, fixture, until } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
 
@@ -47,16 +47,6 @@ async function page(base: string): Promise<ConversationPage> {
 /** The visible text of every model message, as `role: text`. */
 function lines(state: ConversationPage): string[] {
   return state.entries.flatMap(entry => (entry.model ?? []).map(message => `${message.role}: ${messageText(message)}`));
-}
-
-async function until<T>(read: () => Promise<T> | T, done: (value: T) => boolean): Promise<T> {
-  const deadline = Date.now() + 10_000;
-  for (;;) {
-    const value = await read();
-    if (done(value)) return value;
-    if (Date.now() > deadline) throw new Error("Timed out waiting for the expected state");
-    await sleep(20);
-  }
 }
 
 const idleWith = (count: number) => (state: ConversationPage) => !state.busy && lines(state).length >= count;
@@ -219,6 +209,20 @@ test("an entry that changes in place, or a window that moved back, resends the w
   assert.deepEqual(streamUpdate(view(), view(one)).type, "update");
   assert.equal(streamUpdate(view(one, two), view(one, entry(2, "edited"), three)).type, "state");
   assert.equal(streamUpdate(view(two, three), view(one, two, three)).type, "state");
+});
+
+test("a folded watch that skipped entries resets the page and its history cursor", () => {
+  const window = (start: number, before?: number) => ({
+    conversation: { id: 1 }, docs: {}, before,
+    entries: Array.from({ length: 50 }, (_, i) => ({ id: start + i })),
+  }) as unknown as Parameters<typeof streamUpdate>[0];
+  const previous = window(1);
+  // Entry IDs can have holes: the predecessor, not the distance between IDs, proves continuity.
+  assert.equal(streamUpdate(previous, window(101, 50)).type, "update");
+  const frame = streamUpdate(previous, window(101, 100));
+  assert.equal(frame.type, "state");
+  assert.equal(frame.before, 101);
+  assert.equal(frame.entries.length, 50);
 });
 
 test("closing mid-answer with a send stream open is not reported as a stream failure", async t => {

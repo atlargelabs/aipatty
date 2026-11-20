@@ -9,13 +9,15 @@ import type { AddressInfo } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
-import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { readConfig } from "../src/config.ts";
 import { openHost } from "../src/host.ts";
-import { checkout, fixture, fixtureEnv } from "./helpers.ts";
+import { checkout, fixture, fixtureEnv, until } from "./helpers.ts";
 
 const exec = promisify(execFile);
+function cliAt(url: string) {
+  return (...args: string[]) => exec(process.execPath, ["src/cli.ts", ...args], { cwd: checkout, env: { AIPATTY_URL: url } });
+}
 
 /** Wait for readiness or early exit, and reap every child even when assertions fail. */
 function launch(t: TestContext, env: NodeJS.ProcessEnv) {
@@ -47,10 +49,7 @@ test("faux has its own default database directory and an explicit override still
 test("CLI recovers a fresh install with no cached default, without a login or model call", { timeout: 10_000 }, async t => {
   const env = fixtureEnv(await fixture(t), { AIPATTY_FAUX: "0", AIPATTY_HOST: "127.0.0.1" });
   const server = launch(t, env);
-  const base = await server.url();
-  const cli = (...args: string[]) => exec(process.execPath, ["src/cli.ts", ...args], {
-    cwd: checkout, env: { ...env, AIPATTY_URL: base },
-  });
+  const cli = cliAt(await server.url());
   const health = JSON.parse((await cli("health")).stdout);
   assert.equal(health.modelStatus, "unavailable");
   assert.equal(health.model.modelId, "gpt-6.2-sol");
@@ -66,9 +65,9 @@ test("CLI recovers a fresh install with no cached default, without a login or mo
   assert.equal((await cli("log")).stdout, "");
 });
 
-test("a failed run, or a failed API key command, tells the client and the server log why", { timeout: 10_000 }, async t => {
+test("a send requires a subscription login, even with an ambient or stored API key", { timeout: 10_000 }, async t => {
   const dir = await fixture(t);
-  const env = fixtureEnv(dir, { AIPATTY_FAUX: "0", AIPATTY_HOST: "127.0.0.1" });
+  const env = fixtureEnv(dir, { AIPATTY_FAUX: "0", AIPATTY_HOST: "127.0.0.1", OPENAI_API_KEY: "ambient-fake" });
   // An available default model with no login. The unreachable address keeps a stray key off the network.
   await writeFile(join(dir, "models-store.json"), JSON.stringify({
     openai: {
@@ -77,15 +76,13 @@ test("a failed run, or a failed API key command, tells the client and the server
     },
   }));
   const server = launch(t, env);
-  const base = await server.url();
-  const send = exec(process.execPath, ["src/cli.ts", "send", "hi"], { cwd: checkout, env: { ...env, AIPATTY_URL: base } });
-  await assert.rejects(send, /Run failed: model_error: Provider is not configured: openai/);
+  const cli = cliAt(await server.url());
+  await assert.rejects(cli("send", "hi"), /Run failed: model_error: Provider is not configured: openai/);
   assert.match(server.stderr(), /Run failed \(submission \d+\): model_error: Provider is not configured: openai/);
 
   await writeFile(join(dir, "auth.json"), JSON.stringify({ openai: { type: "api_key", key: "!exit 3" } }));
-  const again = exec(process.execPath, ["src/cli.ts", "send", "hi"], { cwd: checkout, env: { ...env, AIPATTY_URL: base } });
-  const cause = /model_error: .*API key for openai in .*auth\.json: command failed \(exit 3\)/;
-  await assert.rejects(again, cause);
+  const cause = /model_error: .*API keys are not supported/;
+  await assert.rejects(cli("send", "hi"), cause);
   assert.match(server.stderr(), cause);
 });
 
@@ -97,7 +94,7 @@ test("CLI reports the HTTP status when the reply is not this server's JSON", asy
   await new Promise<void>(resolve => stub.listen(0, "127.0.0.1", resolve));
   t.after(() => { stub.close(); stub.closeAllConnections(); });
   const url = `http://127.0.0.1:${(stub.address() as AddressInfo).port}`;
-  const cli = (...args: string[]) => exec(process.execPath, ["src/cli.ts", ...args], { cwd: checkout, env: { AIPATTY_URL: url } });
+  const cli = cliAt(url);
   await assert.rejects(cli("health"), /aipatty: HTTP 502 Bad Gateway\n/);
   await assert.rejects(cli("models"), /aipatty: Expected JSON from http:\/\/127\.0\.0\.1:\d+\/api\/models\n/);
 });
@@ -115,23 +112,15 @@ test("one owner per directory across ports; SIGKILL releases ownership and inter
   const route = "/api/conversations/root";
   const response = await fetch(`${base}${route}/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content: input }) });
   assert.equal(response.status, 202);
-  const busyBy = Date.now() + 3000;
-  while (!(await (await fetch(base + route)).json() as { busy: boolean }).busy) {
-    assert.ok(Date.now() < busyBy, "expected the turn to start before killing the process");
-    await sleep(10);
-  }
+  await until(async () => (await (await fetch(base + route)).json() as { busy: boolean }).busy);
   owner.child.kill("SIGKILL");
   await owner.exit;
 
   const replacement = launch(t, env);
   const url = await replacement.url();
-  const cli = (...args: string[]) => exec(process.execPath, ["src/cli.ts", ...args], { cwd: checkout, env: { ...env, AIPATTY_URL: url } });
+  const cli = cliAt(url);
   assert.equal(JSON.parse((await cli("models")).stdout).models[0].modelId, "faux-1");
-  const deadline = Date.now() + 9000;
-  while ((await cli("log")).stdout.split("\n").filter(line => line === `assistant: Faux reply: ${input}`).length !== 1) {
-    assert.ok(Date.now() < deadline, "interrupted turn should finish exactly once");
-    await sleep(100);
-  }
+  await until(async () => (await cli("log")).stdout.split("\n").filter(line => line === `assistant: Faux reply: ${input}`).length === 1);
   const result = JSON.parse((await cli("model", "set", "faux-1")).stdout);
   assert.equal(result.modelStatus, "available");
 });

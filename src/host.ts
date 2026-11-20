@@ -7,10 +7,10 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { DEFAULT_THINKING, type Config } from "./config.ts";
 import { ownDataDir } from "./ownership.ts";
-import { openModels, requireModel } from "./models.ts";
+import { openModels } from "./models.ts";
 import { failureText } from "./protocol.ts";
 
-export class HostError extends Error {
+export class HttpError extends Error {
   readonly status: number;
   constructor(status: number, message: string) {
     super(message);
@@ -75,7 +75,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
     const assertAvailable = async () => {
       if (blocked) {
         const { model: saved } = await status();
-        throw new HostError(409, `Model ${saved ? `${saved.provider}/${saved.modelId}` : "(none)"} is unavailable. Run 'aipatty models' then 'aipatty model set <modelId>'.`);
+        throw new HttpError(409, `Model ${saved ? `${saved.provider}/${saved.modelId}` : "(none)"} is unavailable. Run 'aipatty models' then 'aipatty model set <modelId>'.`);
       }
     };
     // Log a failed run once, whether or not a client is streaming it. A closing harness rejects the wait.
@@ -98,17 +98,14 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
       assertAvailable,
       async setModel(next) {
         await exclusive(async () => {
-          try {
-            requireModel(models, next);
-          } catch (error) {
-            if (!(error instanceof Error)) throw error;
-            throw new HostError(400, error.message);
+          if (!models.getModel(next.provider, next.modelId)) {
+            throw new HttpError(400, `Unknown model ${next.provider}/${next.modelId}; list available models with 'aipatty models'`);
           }
           const inspection = await harness.inspect(ctx);
           const tasks = inspection.tasks.filter(t => t.record.conversationId === root.id);
           const pending = inspection.submissions.filter(s => s.conversationId === root.id);
           if (!blocked && (tasks.length || pending.length)) {
-            throw new HostError(409, "Cannot switch model while the conversation has active work. Wait for the turn to finish or abort it before switching.");
+            throw new HttpError(409, "Cannot switch model while the conversation has active work. Wait for the turn to finish or abort it before switching.");
           }
           if (blocked) {
             // The scheduler is paused. Withdraw queued submissions and mark all root tasks before

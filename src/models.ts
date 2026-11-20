@@ -4,15 +4,9 @@ import {
 } from "@earendil-works/pi-ai";
 import { getBuiltinModelDataGeneratedAt } from "@earendil-works/pi-ai/providers/all";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
-import type { ModelRef } from "@earendil-works/pi-durable";
 import { readFile } from "node:fs/promises";
 import type { Config } from "./config.ts";
 import { FileCredentialStore } from "./credentials.ts";
-
-/** The providers aipatty registers, by id. They use the pi CLI's stored sign-in. */
-const providers: Record<string, () => Provider> = {
-  openai: openaiProvider,
-};
 
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -94,14 +88,6 @@ function demoProvider(): Provider {
   };
 }
 
-/** Resolve a configured chat model or name the available alternatives. */
-export function requireModel(models: Models, { provider, modelId }: ModelRef): void {
-  if (!models.getModel(provider, modelId)) {
-    const ids = models.getModels(provider).map(model => model.id).sort();
-    throw new Error(`Model ${provider}/${modelId} not found. Available ids for ${provider}: ${ids.join(", ") || "(none)"}`);
-  }
-}
-
 /** Build the local chat catalog. Startup never refreshes a catalog or token over the network. */
 export async function openModels(config: Config): Promise<Models> {
   if (config.faux) {
@@ -111,9 +97,8 @@ export async function openModels(config: Config): Promise<Models> {
   }
   const models = createModels({ credentials: new FileCredentialStore(config.authFile) });
   const catalog = await readCatalog(config.modelsStore);
-  for (const create of Object.values(providers)) {
-    const base = create();
-    models.setProvider(withOverlay(base, cachedModels(catalog, base)));
-  }
+  const base = openaiProvider();
+  // Don't fall back to OPENAI_API_KEY when the subscription login is missing.
+  models.setProvider({ ...withOverlay(base, cachedModels(catalog, base)), auth: { oauth: base.auth.oauth } });
   return models;
 }

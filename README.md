@@ -20,9 +20,9 @@ npm start                  # uses the pi CLI's ChatGPT subscription login
 AIPATTY_FAUX=1 npm start   # a fake model that echoes, for demos; needs no login
 ```
 
-The server shares the pi CLI's login file and takes the same lock on it, so both can run at once. A stored API key
-may be a literal, an environment template (`$VAR`, `${VAR}`) or a `!command`, as in the pi CLI. The server runs a
-command key in its own shell and keeps the result until it exits, so restart it after rotating such a key.
+The server uses only the pi CLI’s ChatGPT subscription login and takes the same lock when refreshing it.
+If a send reports that OpenAI is not configured, sign in with the pi CLI. Stored API keys and
+`OPENAI_API_KEY` are not used.
 
 ## Configure
 
@@ -73,7 +73,7 @@ node src/cli.ts log             # print the transcript
 - `POST /api/conversations/:id/abort`
 - `WS /api/conversations/:id/stream` sends one `state` frame (the newest 50 entries and the live state), then an
   `update` frame per change: the live state plus any `appended` entries, without the window. It falls back to a full
-  `state` frame if an entry it already sent changes. With `?submissionId=`, it also sends one `settled` frame: the
+  `state` frame if an entry it already sent changes or a slow client misses part of the window. With `?submissionId=`, it also sends one `settled` frame: the
   answer, or the `reason` and `detail` of a failed run. The server pings every 30 s and drops a stream that does
   not answer.
 

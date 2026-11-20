@@ -2,11 +2,22 @@ import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { TestContext } from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 import WebSocket, { type RawData } from "ws";
 import { readConfig } from "../src/config.ts";
 import { applyUpdate, type StreamFrame } from "../src/protocol.ts";
 
 export const checkout = join(import.meta.dirname, "..");
+
+export async function until<T>(read: () => Promise<T> | T, done: (value: T) => boolean = Boolean): Promise<T> {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const value = await read();
+    if (done(value)) return value;
+    if (Date.now() > deadline) throw new Error("Timed out waiting for the expected state");
+    await sleep(20);
+  }
+}
 
 /** Isolated filesystem fixtures within the ignored dependency directory. */
 export async function fixture(t: TestContext): Promise<string> {

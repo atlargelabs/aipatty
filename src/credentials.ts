@@ -4,7 +4,6 @@ import { link, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/
 import { dirname, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import lockfile from "proper-lockfile";
-import { isCommandValue, resolveTemplate, runCommandValue } from "./config-value.ts";
 
 type Data = Record<string, unknown>;
 const staleMs = 30_000;
@@ -39,8 +38,6 @@ async function acquire(path: string, signal: AbortSignal | undefined, onCompromi
 /** The pi CLI's auth.json format and cross-process lock, with atomic writes. */
 export class FileCredentialStore implements CredentialStore {
   private readonly path: string;
-  /** Successful `!command` keys, kept for the life of the process as the CLI does; a failure is retried. */
-  private readonly commands = new Map<string, Promise<string>>();
 
   constructor(path: string) {
     this.path = resolve(path);
@@ -128,31 +125,15 @@ export class FileCredentialStore implements CredentialStore {
     }
   }
 
-  private command(config: string): Promise<string> {
-    let running = this.commands.get(config);
-    if (!running) {
-      running = runCommandValue(config);
-      this.commands.set(config, running);
-      running.catch(() => this.commands.delete(config));
-    }
-    return running;
-  }
-
-  /**
-   * Read one credential; a missing file is not created or locked. An API key stored as a `!command` or an
-   * environment template is resolved as the pi CLI resolves it, after the lock is released.
-   */
+  /** Read the subscription login without creating a missing auth file. */
   async read(providerId: string, options?: AuthOperationOptions): Promise<Credential | undefined> {
-    const stored = await this.locked(false, async data => ({ value: credential(data[providerId]) }), options);
-    if (stored?.type !== "api_key" || !stored.key) return stored;
-    let key: string;
-    try {
-      key = isCommandValue(stored.key) ? await this.command(stored.key) : resolveTemplate(stored.key, stored.env);
-    } catch (error) {
-      throw new Error(`API key for ${providerId} in ${this.path}: ${error instanceof Error ? error.message : error}`);
-    }
-    options?.signal?.throwIfAborted();
-    return { ...stored, key };
+    return this.locked(false, async data => {
+      const value = credential(data[providerId]);
+      if (value?.type === "api_key") {
+        throw new Error("API keys are not supported. Sign in to the ChatGPT subscription with the pi CLI.");
+      }
+      return { value };
+    }, options);
   }
 
   /** List provider IDs and credential types, never secrets. */
@@ -167,7 +148,7 @@ export class FileCredentialStore implements CredentialStore {
     }, options);
   }
 
-  /** Update one provider under the CLI's lock; an undefined replacement is a no-op. `fn` sees the key as stored. */
+  /** Update one provider under the CLI's lock; an undefined replacement is a no-op. */
   async modify(
     providerId: string,
     fn: (current: Credential | undefined) => Promise<Credential | undefined>,

@@ -9,6 +9,16 @@ import { openHost } from "../src/host.ts";
 import { openModels } from "../src/models.ts";
 import { fixture, fixtureEnv } from "./helpers.ts";
 
+test("the OpenAI provider uses the saved subscription credential", async t => {
+  const config = readConfig(fixtureEnv(await fixture(t), { AIPATTY_FAUX: "0" }));
+  await writeFile(config.authFile, JSON.stringify({ openai: {
+    type: "oauth", access: "fake-access", refresh: "fake-refresh", expires: Date.now() + 3_600_000,
+  } }));
+  const auth = await (await openModels(config)).getAuth("openai");
+  assert.equal(auth?.source, "OAuth");
+  assert.equal(auth.auth.apiKey, "fake-access");
+});
+
 test("newer pi CLI catalog entries are overlaid by model type and id, offline and read-only", async t => {
   const dir = await fixture(t);
   const config = readConfig(fixtureEnv(dir, { AIPATTY_FAUX: "0" }));
