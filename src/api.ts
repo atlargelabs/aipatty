@@ -1,9 +1,10 @@
 import { BACKGROUND_CONTEXT as ctx, withAbortSignal } from "@earendil-works/chord/context";
 import type { Conversation, EntryId, InputSubmissionDraft, Submission, SubmissionId } from "@earendil-works/pi-durable";
 import { createServer, STATUS_CODES, type IncomingMessage, type ServerResponse } from "node:http";
+import { isIP } from "node:net";
 import type { Duplex } from "node:stream";
 import WebSocket, { WebSocketServer } from "ws";
-import type { AgentHost } from "./host.ts";
+import { HostError, type AgentHost } from "./host.ts";
 import { messageText, streamState, type StreamFrame } from "./protocol.ts";
 
 const maxBody = 64 * 1024;
@@ -25,24 +26,29 @@ function sendJson(res: ServerResponse, status: number, value: unknown): void {
 }
 
 function errorResponse(error: unknown): { status: number; message: string } {
-  if (error instanceof HttpError) return { status: error.status, message: error.message };
+  if (error instanceof HttpError || error instanceof HostError) return { status: error.status, message: error.message };
   console.error("API error:", error);
   return { status: 500, message: "Internal server error" };
 }
 
-function checkOrigin(req: IncomingMessage): void {
-  if (!req.headersDistinct.origin) return;
-  const host = req.headers.host;
-  const origin = req.headers.origin;
-  if (host && origin && !/[\s/@?#\\]/.test(host) && req.headersDistinct.origin.length === 1) {
-    const expected = URL.parse(`http://${host}`);
-    if (expected && origin === expected.origin) return;
+function trustedName(name: string): string {
+  if (isIP(name) === 6) return new URL(`http://[${name}]`).hostname;
+  if (!name || !/^[a-z0-9.-]+$/i.test(name)) {
+    throw new Error(`Expected a trusted hostname or IP address without scheme or port: ${name}`);
   }
-  throw new HttpError(403, "Origin is not same-origin");
+  return name.toLowerCase();
 }
 
-function requestUrl(req: IncomingMessage): URL {
-  checkOrigin(req);
+function requestUrl(req: IncomingMessage, trusted: readonly string[]): URL {
+  const authority = req.headers.host?.toLowerCase();
+  const port = req.socket.localPort;
+  const name = trusted.find(n => authority === `${n}:${port}` || (port === 80 && authority === n));
+  if (!name || req.headersDistinct.host?.length !== 1) throw new HttpError(403, "Untrusted Host");
+  const origin = `http://${name}${port === 80 ? "" : `:${port}`}`;
+  const origins = req.headersDistinct.origin;
+  if (origins && (origins.length !== 1 || origins[0] !== origin)) {
+    throw new HttpError(403, "Origin is not same-origin");
+  }
   const target = req.url ?? "";
   if (!target.startsWith("/") || target.startsWith("//")) throw new HttpError(400, "Invalid request target");
   return new URL(target, "http://localhost");
@@ -57,7 +63,7 @@ function positiveInt(value: string | null, field: string, max = Number.MAX_SAFE_
   return number;
 }
 
-async function messageDraft(req: IncomingMessage): Promise<InputSubmissionDraft> {
+async function jsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   if (Number(req.headers["content-length"]) > maxBody) throw new HttpError(413, "Request body too large");
   if (req.headers["content-type"]?.split(";")[0].trim().toLowerCase() !== "application/json") {
     throw new HttpError(415, "Expected application/json");
@@ -78,7 +84,11 @@ async function messageDraft(req: IncomingMessage): Promise<InputSubmissionDraft>
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new HttpError(400, "Expected an object");
   }
-  const { content, requestId, whenBusy } = value as Record<string, unknown>;
+  return value as Record<string, unknown>;
+}
+
+async function messageDraft(req: IncomingMessage): Promise<InputSubmissionDraft> {
+  const { content, requestId, whenBusy } = await jsonBody(req);
   if (typeof content !== "string" || !content.trim()) throw new HttpError(400, "Expected non-empty content");
   if (requestId !== undefined && (typeof requestId !== "string" || !requestId.trim() || requestId.length > 256)) {
     throw new HttpError(400, "requestId must be a non-empty string of at most 256 characters");
@@ -108,11 +118,33 @@ function requireMethod(req: IncomingMessage, res: ServerResponse, method: string
   throw new HttpError(405, "Method not allowed");
 }
 
-async function handleHttp(agent: AgentHost, health: Health, req: IncomingMessage, res: ServerResponse) {
-  const { pathname, searchParams } = requestUrl(req);
+async function handleHttp(agent: AgentHost, health: Health, req: IncomingMessage, res: ServerResponse, trusted: readonly string[]) {
+  const { pathname, searchParams } = requestUrl(req, trusted);
   if (pathname === "/health") {
     requireMethod(req, res, "GET");
-    sendJson(res, 200, health);
+    sendJson(res, 200, { ...health, ...await agent.modelStatus() });
+    return;
+  }
+  if (pathname === "/api/models") {
+    requireMethod(req, res, "GET");
+    sendJson(res, 200, { models: agent.models() });
+    return;
+  }
+  if (pathname === "/api/model") {
+    requireMethod(req, res, "PUT");
+    const body = await jsonBody(req);
+    const { modelId } = body;
+    if (typeof modelId !== "string" || !modelId.trim()) throw new HttpError(400, "Expected modelId");
+    let provider = body.provider;
+    if (provider === undefined) {
+      const matches = agent.models().filter(model => model.modelId === modelId);
+      if (!matches.length) throw new HttpError(400, "Unknown modelId; list available models with 'aipatty models'");
+      if (matches.length > 1) throw new HttpError(400, "Ambiguous modelId; specify provider");
+      provider = matches[0].provider;
+    }
+    if (typeof provider !== "string" || !provider.trim()) throw new HttpError(400, "Expected provider");
+    await agent.setModel({ provider, modelId });
+    sendJson(res, 200, await agent.modelStatus());
     return;
   }
   const route = /^\/api\/conversations\/([^/]+)(?:\/(messages|abort))?$/.exec(pathname);
@@ -123,9 +155,10 @@ async function handleHttp(agent: AgentHost, health: Health, req: IncomingMessage
   if (!conversation) throw new HttpError(404, "Conversation not found");
 
   if (action === "messages") {
-    const submission = await conversation.submit(await messageDraft(req), ctx);
+    const submission = await agent.submit(conversation, await messageDraft(req));
     sendJson(res, 202, { submissionId: submission.id });
   } else if (action === "abort") {
+    await agent.assertAvailable();
     await conversation.abort(ctx);
     sendJson(res, 200, { ok: true });
   } else {
@@ -161,7 +194,6 @@ async function stream(socket: WebSocket, conversation: Conversation, submission?
     if (!submission) return;
 
     const result = await submission.wait(context);
-    await conversation.waitForIdle(context);
     if (result.status === "unanswered") {
       await send({ type: "settled", submissionId: result.id, status: "unanswered", reason: result.reason });
     } else if (result.type === "input") {
@@ -181,9 +213,9 @@ async function stream(socket: WebSocket, conversation: Conversation, submission?
 }
 
 async function handleUpgrade(
-  agent: AgentHost, wss: WebSocketServer, req: IncomingMessage, socket: Duplex, head: Buffer,
+  agent: AgentHost, wss: WebSocketServer, req: IncomingMessage, socket: Duplex, head: Buffer, trusted: readonly string[],
 ) {
-  const { pathname, searchParams } = requestUrl(req);
+  const { pathname, searchParams } = requestUrl(req, trusted);
   const route = /^\/api\/conversations\/([^/]+)\/stream$/.exec(pathname);
   if (!route) throw new HttpError(404, "Not found");
   const conversation = await agent.conversation(route[1]);
@@ -192,6 +224,7 @@ async function handleUpgrade(
   const id = positiveInt(searchParams.get("submissionId"), "submissionId");
   let submission: Submission | undefined;
   if (id !== undefined) {
+    await agent.assertAvailable();
     submission = await agent.harness.submission(id as SubmissionId, ctx);
     const status = await submission?.status(ctx);
     if (!status || status.conversationId !== conversation.id || status.type !== "input") {
@@ -212,10 +245,11 @@ export interface Health {
 }
 
 /** Serve the root (or any conversation ID) over HTTP and WebSocket. */
-export async function startApi(agent: AgentHost, health: Health, host: string, port: number) {
+export async function startApi(agent: AgentHost, health: Health, host: string, port: number, aliases: readonly string[] = []) {
+  const trusted = [host, ...aliases].map(trustedName);
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 });
   const server = createServer({ requestTimeout: 30_000, headersTimeout: 10_000 }, (req, res) => {
-    void handleHttp(agent, health, req, res).catch(error => {
+    void handleHttp(agent, health, req, res, trusted).catch(error => {
       if (res.destroyed) return;
       const { status, message } = errorResponse(error);
       if (!req.complete) res.shouldKeepAlive = false;
@@ -227,7 +261,7 @@ export async function startApi(agent: AgentHost, health: Health, host: string, p
     const onError = () => socket.destroy();
     socket.on("error", onError);
     upgrading.add(socket);
-    void handleUpgrade(agent, wss, req, socket, head).catch(error => {
+    void handleUpgrade(agent, wss, req, socket, head, trusted).catch(error => {
       if (socket.destroyed) return;
       const { status, message } = errorResponse(error);
       const body = JSON.stringify({ error: message });

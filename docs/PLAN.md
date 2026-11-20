@@ -94,7 +94,9 @@ without a login. It changes rarely.
 
 ## Build order
 
-1. **Skeleton:** harness, SQLite, the subscription login, one conversation over the API, resume after a kill.
+1. **Skeleton:** harness, single-writer SQLite, the subscription login, one conversation over the API, resume after
+   a kill. The CLI can list models and switch the root model; reads and model selection remain available if its
+   saved model is missing. Switching does not replay interrupted work. Faux mode has its own data directory.
 2. **Tree:** fork, list, read and search, per-branch model, the page, cost.
 3. **Coding:** the `pi` tool, the git and issue prompt, the hooks.
 4. **Upgrade:** supervisor, health check, rollback, tested with a deliberately broken commit.

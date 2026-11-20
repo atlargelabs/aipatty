@@ -62,7 +62,7 @@ const idleWith = (count: number) => (state: ConversationPage) => !state.busy && 
 
 test("a message is admitted at once and answered", async t => {
   const { base } = await server(t);
-  assert.deepEqual(await (await fetch(`${base}/health`)).json(), health);
+  assert.deepEqual(await (await fetch(`${base}/health`)).json(), { ...health, modelStatus: "available", model: { provider: "faux", modelId: "faux-1" } });
 
   const response = await post(base, { content: "hello" });
   assert.equal(response.status, 202);

@@ -31,7 +31,8 @@ async function main(): Promise<void> {
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
   try {
-    const { harness, conversation } = await openHost(config);
+    const agent = await openHost(config);
+    const { harness } = agent;
     const closed = harness.closed.then(end => {
       if (end.kind === "failed") {
         console.error("Harness failed:", end.error);
@@ -39,7 +40,7 @@ async function main(): Promise<void> {
       }
     });
     try {
-      const api = await startApi({ harness, conversation }, health, config.host, config.port);
+      const api = await startApi(agent, health, config.host, config.port, config.trustedHosts);
       console.log(`aipatty listening on ${config.host}:${api.port}`);
       await Promise.race([signal.promise, closed]);
       await api.close();

@@ -78,12 +78,19 @@ async function main(): Promise<void> {
   if (base.protocol !== "http:" && base.protocol !== "https:") throw new Error("AIPATTY_URL must be HTTP(S)");
   if (command === "health" && args.length === 0) {
     console.log(JSON.stringify(await request(base, "/health"), null, 2));
+  } else if (command === "models" && args.length === 0) {
+    console.log(JSON.stringify(await request(base, "/api/models"), null, 2));
+  } else if (command === "model" && (args.length === 2 || args.length === 3) && args[0] === "set") {
+    console.log(JSON.stringify(await request(base, "/api/model", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider: args.length === 3 ? args[1] : undefined, modelId: args.at(-1) }),
+    }), null, 2));
   } else if (command === "log" && args.length === 0) {
     await log(base);
   } else if (command === "send" && args.length === 1 && args[0].trim()) {
     await send(base, args[0]);
   } else {
-    throw new Error('Usage: aipatty health | aipatty send "<text>" | aipatty log');
+    throw new Error('Usage: aipatty health | aipatty models | aipatty model set [provider] <modelId> | aipatty send "<text>" | aipatty log');
   }
 }
 

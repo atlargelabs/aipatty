@@ -45,22 +45,26 @@ test("newer pi CLI catalog entries are overlaid by model type and id, offline an
 test("missing, malformed and stale catalog snapshots fall back to bundled models", async t => {
   const dir = await fixture(t);
   const config = readConfig(fixtureEnv(dir, { AIPATTY_FAUX: "0" }));
-  const missing = /Model openai\/gpt-6\.2-sol not found\. Available ids for openai: .*gpt-6\.1-sol/;
-  await assert.rejects(openHost(config), missing);
-  assert.deepEqual(await readdir(dir), []);
-
+  async function unavailable() {
+    const host = await openHost(config);
+    assert.deepEqual(await host.modelStatus(), { modelStatus: "unavailable", model: { provider: "openai", modelId: "gpt-6.2-sol" } });
+    await host.harness.close(ctx);
+  }
+  await unavailable();
   await writeFile(config.modelsStore, "{");
-  await assert.rejects(openHost(config), missing);
+  await unavailable();
   await writeFile(config.modelsStore, JSON.stringify({ "openai": { models: null, lastModified: Date.now() } }));
-  await assert.rejects(openHost(config), missing);
+  await unavailable();
   await writeFile(config.modelsStore, JSON.stringify({
     "openai": {
       models: [{ ...openaiProvider().getModels()[0], id: "gpt-6.2-sol" }],
       lastModified: (getBuiltinModelDataGeneratedAt() ?? Date.now()) - 1,
     },
   }));
-  await assert.rejects(openHost(config), missing);
-  await assert.rejects(openHost({ ...config, provider: "unknown" }), /Available ids for unknown: \(none\)/);
+  await unavailable();
+  const existing = await openHost({ ...config, provider: "unknown" });
+  assert.equal((await existing.modelStatus()).model?.provider, "openai");
+  await existing.harness.close(ctx);
 });
 
 test("the default model is the openai provider's, taken from the cached catalog", async t => {
@@ -69,7 +73,9 @@ test("the default model is the openai provider's, taken from the cached catalog"
   assert.deepEqual([config.provider, config.model], ["openai", "gpt-6.2-sol"]);
   const bundled = (await openModels(config)).getModel("openai", "gpt-6.1-sol");
   assert.ok(bundled);
-  await assert.rejects(openHost(config), /Model openai\/gpt-6\.2-sol not found/);
+  const host = await openHost(config);
+  assert.equal((await host.modelStatus()).modelStatus, "unavailable");
+  await host.harness.close(ctx);
 
   await writeFile(config.modelsStore, JSON.stringify({
     openai: {

@@ -26,8 +26,9 @@ The server shares the pi CLI's login file and takes the same lock on it, so both
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `AIPATTY_DATA_DIR` | `~/.aipatty/data` | Where `aipatty.sqlite` lives |
+| `AIPATTY_DATA_DIR` | `~/.aipatty/data` (`~/.aipatty/faux` in faux mode) | Where the conversation database and ownership lock live |
 | `AIPATTY_HOST` | `127.0.0.1` | Listen address; the tailnet address on the Mac mini |
+| `AIPATTY_TRUSTED_HOSTS` | unset | Additional trusted hostnames, comma-separated, without scheme or port (e.g. the mini’s Tailscale DNS name) |
 | `AIPATTY_PORT` | `8790` | Listen port |
 | `AIPATTY_PROVIDER` | `openai` | Provider for a new root conversation |
 | `AIPATTY_MODEL` | `gpt-6.2-sol` | Model for a new root conversation |
@@ -38,25 +39,41 @@ The server shares the pi CLI's login file and takes the same lock on it, so both
 | `AIPATTY_URL` | `http://127.0.0.1:8790` | Server address for the CLI client |
 
 `gpt-6.2-sol` is newer than the catalog bundled with pi-ai 1.5.2. It resolves only if the pi CLI has cached a newer
-catalog in `AIPATTY_MODELS_STORE`; run `pi update --models` if startup reports the model as not found.
+catalog in `AIPATTY_MODELS_STORE`. If the saved model (or the default on first launch) is missing, the server
+still serves the transcript and model commands. `/health` returns HTTP 200, `modelStatus: "unavailable"`, and the
+model reference; sends return 409. Availability means present in the local catalog, not that a login or network call succeeded.
+
+To keep interrupted work pending, restore the original model (e.g. `pi update --models`) and restart.
+Alternatively, select an available model. Switching withdraws outstanding work from the blocked turn, including
+queued messages; it does **not** rerun them. Send any message you want to retry explicitly. A switch during an
+actively running turn returns 409: wait for the turn to finish or abort it first.
+
+Only one process can open a data directory, regardless of listen port. The server holds an OS-backed lock in
+a separate `owner.sqlite` file before opening the conversation database. A crash releases the lock; do not delete the file.
 
 ## CLI
 
 ```sh
 node src/cli.ts health          # the running commit, version and start time
+node src/cli.ts models          # list available model IDs and providers
+node src/cli.ts model set <id>  # select a model from that list (optional provider before ID)
 node src/cli.ts send "hello"    # send a message and stream the answer
 node src/cli.ts log             # print the transcript
 ```
 
 ## API
 
-- `GET /health`
+- `GET /health` (includes the saved model and its catalog availability)
+- `GET /api/models`
+- `PUT /api/model` with `{ modelId, provider? }` to switch the root conversation
 - `GET /api/conversations/:id` (`root` is the root conversation; `?limit=` and `?before=` page backwards)
 - `POST /api/conversations/:id/messages` with `{ content, requestId?, whenBusy?: "followUp" | "steer" }`
 - `POST /api/conversations/:id/abort`
 - `WS /api/conversations/:id/stream` sends the current state, then every change
 
-Requests with an `Origin` header from another origin are rejected.
+Both HTTP and WebSocket requests must use the configured listen name/address or an explicitly trusted hostname,
+at the actual listener port. If present, `Origin` must also match that same HTTP origin. Host validation is not
+authentication: bind only to loopback or the private tailnet address.
 
 ## Test
 

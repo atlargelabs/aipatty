@@ -8,6 +8,7 @@ const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max
 export interface Config {
   dataDir: string;
   host: string;
+  trustedHosts: string[];
   port: number;
   provider: string;
   model: string;
@@ -38,8 +39,9 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   const faux = env.AIPATTY_FAUX === "1";
   return {
-    dataDir: absolutePath(env.AIPATTY_DATA_DIR ?? "~/.aipatty/data"),
+    dataDir: absolutePath(env.AIPATTY_DATA_DIR ?? (faux ? "~/.aipatty/faux" : "~/.aipatty/data")),
     host: env.AIPATTY_HOST ?? "127.0.0.1",
+    trustedHosts: (env.AIPATTY_TRUSTED_HOSTS ?? "").split(",").map(s => s.trim()).filter(Boolean),
     port: Number(port),
     provider: faux ? "faux" : (env.AIPATTY_PROVIDER ?? "openai"),
     model: faux ? "faux-1" : (env.AIPATTY_MODEL ?? "gpt-6.2-sol"),
