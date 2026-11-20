@@ -12,7 +12,7 @@ installed and then asked to keep building itself. It is not the finished product
 | Merging | Only Steve merges PRs in `atlargelabs/aipatty`. |
 | Upgrade | Explicit, never automatic. If rollback also fails, Steve uses SSH or remote desktop. |
 | GitHub identity | The `pattycaik` account with write access, behind a ruleset on `main`. Other repos only when Steve directs it. |
-| Coding | Direct tools for inspection and `gh`; anything that ends in a PR goes through the `pi` CLI and a `prmanager` delegate. |
+| Coding | Direct tools for inspection and `gh`; anything that ends in a PR goes through the `pi` CLI and a `prmanager` delegate. Each `pi` run is disposable: its own run directory, with the repos it works on cloned fresh into it, deleted when the run ends. |
 | Tree | Branches are independent workstreams. Steve and aipatty can both fork. All branches stay listed. No automatic report-back. |
 | Models | Default `gpt-6.2-sol` on the OpenAI subscription. Per-branch model, set by Steve or by aipatty. Spark later. Claude through the `pi` CLI only, for now. |
 | Cost | Shown per branch and in total as `$<branch> / $<total>`. No spend limit. |
@@ -28,7 +28,10 @@ One Node process runs a pi-durable `Harness` over SQLite, with a small superviso
   1.5.2 from npm. Bumping them is a normal reviewed PR.
 - **Layout in the `aipatty` user's home:**
   - `deploy/`: the checkout the process runs from, always a commit of `main`.
-  - `work/`: clones where coding happens.
+  - `work/`: the working directory of aipatty's own `read`, `write`, `edit` and `bash`, for inspection and scratch
+    files. Nothing that becomes a PR is done here.
+  - `runs/`: one directory per `pi` run (see [`pi` runs](#pi-runs)), created when the run starts and deleted when it
+    ends.
   - `data/`: the SQLite database, `mcp.json`, MCP sign-ins, logs and the last-known-good commit.
 - **Conversations:** one root plus forks. Each has a title and its own model.
 - **Model catalog:** `gpt-6.2-sol` is not in pi-ai 1.5.2's bundled catalog. The pi CLI gets it from the pi.dev
@@ -42,14 +45,32 @@ One Node process runs a pi-durable `Harness` over SQLite, with a small superviso
 
 | Tool | What it does |
 | --- | --- |
-| `read`, `write`, `edit`, `bash`, `codemode`, `tool_search` | pi-durable built-ins. |
-| `pi` | Runs the `pi` CLI as a subagent. Research mode is read-only (`thinker`, `thinktank`) and returns a report. Code mode uses `prmanager` in a work clone and returns a PR link. Code mode: one per branch, at most 3 at once. Its cost counts toward the branch. |
+| `read`, `write`, `edit`, `bash`, `codemode`, `tool_search` | pi-durable built-ins, added in step 3, working in `work/`. |
+| `pi` | Runs the `pi` CLI as a disposable subagent in its own run directory. Research mode is read-only (`thinker`, `thinktank`) and returns a report. Code mode uses `prmanager` and returns a PR link. Code mode: one per branch, at most 3 at once. Its cost counts toward the branch. |
 | `fork_branch`, `list_branches`, `read_branch`, `set_model` | Tree management, plus paging and text search over any branch. |
 | `upgrade` | Asks the supervisor to deploy the latest `main`. Refuses while any `pi` run is active. |
 | `mcp_status`, `mcp_reload`, `mcp_sign_in` | Server state, re-reading `mcp.json`, and OAuth by link. |
 
 A `pi` subagent reads branches through the `aipatty` CLI client (`aipatty branches list|read|search`). It never sees
 aipatty's MCP tools.
+
+## `pi` runs
+
+Every `pi` call is a fresh, throwaway run. Nothing carries over from one run to the next except what it published
+(issues, PRs, comments) and the result it returned.
+
+1. **Directory:** the tool creates `runs/<run-id>/`, a new empty directory owned by that run alone.
+2. **Repos:** the call names the repos to work on (`owner/name`, optionally a base branch or ref). Each is cloned
+   fresh into the run directory with `pattycaik`'s `gh` login. Code mode needs at least one repo; research mode may
+   have none. Repos outside `atlargelabs/aipatty` only when Steve has directed it in the branch.
+3. **Run:** `pi` starts with the run directory as its working directory, the task, and the mode's delegate profile.
+   It never sees `work/`, `deploy/`, another run's directory, or aipatty's MCP tools.
+4. **Result:** the tool returns the report (research) or the PR link (code), and the run's cost is added to the
+   branch.
+5. **Cleanup:** the run directory is deleted when the run ends, whether it succeeded, failed or was aborted. Its
+   transcript and log are kept in `data/logs/runs/` first.
+6. **Restart:** a run cut off by a restart is not resumed. Its tool call ends `interrupted`, and the directory it left
+   behind is deleted on the next startup.
 
 The system prompt carries the git-hygiene skill and the issue workflow: every change has an issue, a task branch and a
 PR that links the issue.
@@ -80,7 +101,9 @@ without a login. It changes rarely.
 - **`protect-main` ruleset:** no deletion, no force push, PR with one approval required, and only repository admins
   may update `main`, through a PR. Admins can merge a PR without the approval, since an author cannot approve their
   own PR.
-- **Hooks against mistakes:** block pushing to `main`, `gh pr merge`, and writes inside `deploy/`.
+- **Hooks against mistakes:** block pushing to `main`, `gh pr merge`, and writes inside `deploy/`, for aipatty's own
+  `write`, `edit` and `bash` and for `pi` runs.
+- **Disposable runs:** a `pi` run can only damage its own run directory, which is deleted afterwards.
 
 ## Gmail and OAuth
 
@@ -98,7 +121,9 @@ without a login. It changes rarely.
    a kill. The CLI can list models and switch the root model; reads and model selection remain available if its
    saved model is missing. Switching does not replay interrupted work. Faux mode has its own data directory.
 2. **Tree:** fork, list, read and search, per-branch model, the page, cost.
-3. **Coding:** the `pi` tool, the git and issue prompt, the hooks.
+3. **Coding:** the built-in tools (`read`, `write`, `edit`, `bash`, `codemode`, `tool_search`) in `work/`; the `pi`
+   tool with disposable run directories and fresh clones; the git and issue prompt; the hooks. Tested with a fake
+   `pi`.
 4. **Upgrade:** supervisor, health check, rollback, tested with a deliberately broken commit.
 5. **MCP:** config, one extension per server, reload, OAuth, the per-branch switch, then Gmail.
 6. **Install on the mini** and run the acceptance test: from a phone, ask aipatty to open an issue and a PR against
