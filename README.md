@@ -29,7 +29,7 @@ The server shares the pi CLI's login file and takes the same lock on it, so both
 | `AIPATTY_DATA_DIR` | `~/.aipatty/data` | Where `aipatty.sqlite` lives |
 | `AIPATTY_HOST` | `127.0.0.1` | Listen address; the tailnet address on the Mac mini |
 | `AIPATTY_PORT` | `8790` | Listen port |
-| `AIPATTY_PROVIDER` | `openai` | Provider for a new root conversation: `openai` or `openai-codex` |
+| `AIPATTY_PROVIDER` | `openai` | Provider for a new root conversation |
 | `AIPATTY_MODEL` | `gpt-6.2-sol` | Model for a new root conversation |
 | `AIPATTY_THINKING` | `high` | Thinking level |
 | `AIPATTY_AUTH_FILE` | `~/.pi/agent/auth.json` | The pi CLI's login file |

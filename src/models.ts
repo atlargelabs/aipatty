@@ -4,16 +4,14 @@ import {
 } from "@earendil-works/pi-ai";
 import { getBuiltinModelDataGeneratedAt } from "@earendil-works/pi-ai/providers/all";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
-import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import type { ModelRef } from "@earendil-works/pi-durable";
 import { readFile } from "node:fs/promises";
 import type { Config } from "./config.ts";
 import { FileCredentialStore } from "./credentials.ts";
 
-/** The subscription providers aipatty registers; both use the pi CLI's stored sign-in. */
+/** The providers aipatty registers, by id. They use the pi CLI's stored sign-in. */
 const providers: Record<string, () => Provider> = {
   openai: openaiProvider,
-  "openai-codex": openaiCodexProvider,
 };
 
 function record(value: unknown): value is Record<string, unknown> {

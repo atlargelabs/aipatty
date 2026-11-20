@@ -14,9 +14,9 @@ const other = { type: "api_key", key: "fake" };
 test("read/list of an absent auth file neither creates it nor its parent", async t => {
   const dir = await fixture(t);
   const store = new FileCredentialStore(join(dir, "missing", "auth.json"));
-  assert.equal(await store.read("openai-codex"), undefined);
+  assert.equal(await store.read("openai"), undefined);
   assert.deepEqual(await store.list(), []);
-  await store.delete("openai-codex");
+  await store.delete("openai");
   assert.deepEqual(await readdir(dir), []);
 });
 
@@ -27,20 +27,20 @@ test("credentials preserve other providers, serialize updates, and atomically wr
   const first = new FileCredentialStore(path);
   const second = new FileCredentialStore(path);
   const original = await stat(path);
-  await first.modify("openai-codex", async () => oauth);
-  assert.deepEqual(await second.read("openai-codex"), oauth);
+  await first.modify("openai", async () => oauth);
+  assert.deepEqual(await second.read("openai"), oauth);
   assert.notEqual((await stat(path)).ino, original.ino);
   assert.equal((await stat(path)).mode & 0o777, 0o600);
 
-  await Promise.all(Array.from({ length: 8 }, (_, i) => (i % 2 ? first : second).modify("openai-codex", async current => {
+  await Promise.all(Array.from({ length: 8 }, (_, i) => (i % 2 ? first : second).modify("openai", async current => {
     assert.equal(current?.type, "oauth");
     await sleep(5);
     return { ...current, count: Number(current.count ?? 0) + 1 };
   })));
   const stored = JSON.parse(await readFile(path, "utf8"));
-  assert.equal(stored["openai-codex"].count, 8);
+  assert.equal(stored["openai"].count, 8);
   assert.deepEqual(stored.other, other);
-  await first.delete("openai-codex");
+  await first.delete("openai");
   assert.deepEqual(await first.list(), [{ providerId: "other", type: "api_key" }]);
   assert.deepEqual(await readdir(dir), ["auth.json"]);
 });
@@ -71,13 +71,13 @@ test("modify waits for a separate process using the CLI lock, even through an al
   const [ready] = await once(child, "message", { signal: AbortSignal.timeout(2_000) });
   assert.equal(ready, "locked");
   const store = new FileCredentialStore(alias);
-  const cancelled = store.modify("openai-codex", async () => {
+  const cancelled = store.modify("openai", async () => {
     assert.fail("Callback must not run while the child holds the lock");
   }, { signal: AbortSignal.timeout(50) });
   await assert.rejects(cancelled, error => error instanceof Error && ["AbortError", "TimeoutError"].includes(error.name));
 
   let ran = false;
-  const waiting = store.modify("openai-codex", async () => {
+  const waiting = store.modify("openai", async () => {
     ran = true;
     return oauth;
   });
@@ -94,10 +94,10 @@ test("modify initializes a missing auth file securely and rejects malformed file
   const dir = await fixture(t);
   const path = join(dir, "nested", "auth.json");
   const store = new FileCredentialStore(path);
-  await store.modify("openai-codex", async () => oauth);
+  await store.modify("openai", async () => oauth);
   assert.equal((await stat(path)).mode & 0o777, 0o600);
-  assert.deepEqual(await store.read("openai-codex"), oauth);
+  assert.deepEqual(await store.read("openai"), oauth);
   await writeFile(path, "{ broken");
-  await assert.rejects(store.modify("openai-codex", async () => oauth), /Invalid auth.json/);
+  await assert.rejects(store.modify("openai", async () => oauth), /Invalid auth.json/);
   assert.equal(await readFile(path, "utf8"), "{ broken");
 });

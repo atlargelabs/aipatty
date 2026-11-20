@@ -35,8 +35,8 @@ One Node process runs a pi-durable `Harness` over SQLite, with a small superviso
   catalog overlay it caches in `~/.pi/agent/models-store.json`. aipatty must load that overlay (or fetch the catalog
   itself) before the default model resolves.
 - **Model login:** aipatty shares the pi CLI's stored sign-in (`~/.pi/agent/auth.json`) through its own file-backed
-  pi-ai `CredentialStore`, which takes the same lock as the CLI. The default provider is `openai`, the one the CLI
-  uses; `openai-codex` is also registered.
+  pi-ai `CredentialStore`, which takes the same lock as the CLI. The provider is `openai`, the one the CLI
+  uses.
 
 ## Tools the model gets
 
