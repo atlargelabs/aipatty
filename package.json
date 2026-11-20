@@ -1,0 +1,18 @@
+{
+  "name": "aipatty",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=26" },
+  "bin": { "aipatty": "./src/cli.ts" },
+  "scripts": { "start": "node src/main.ts", "check": "tsc --noEmit", "test": "node --test test/*.test.ts" },
+  "dependencies": {
+    "@earendil-works/pi-durable": "1.5.2",
+    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/chord": "1.5.2",
+    "@earendil-works/pi-schema": "1.5.2",
+    "proper-lockfile": "4.1.2",
+    "ws": "8.21.0"
+  },
+  "devDependencies": { "@types/node": "^25.0.0", "@types/proper-lockfile": "^4.1.4", "@types/ws": "^8.18.1", "typescript": "^5.9.3" }
+}
