@@ -128,5 +128,6 @@ npm run check
 npm test
 ```
 
-Tests use temporary files, fake credentials and the fake model. In faux mode, a message of the form
+Tests use temporary files, fake credentials and the fake model. The page test drives headless Chrome over the
+DevTools protocol; it finds Chrome in the usual places or at `CHROME_PATH`, and is skipped when there is none. In faux mode, a message of the form
 `call <tool> <json arguments>` makes the fake model call that tool once, to try the tools by hand.
