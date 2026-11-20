@@ -5,9 +5,10 @@ import {
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import type { Config } from "./config.ts";
+import { DEFAULT_THINKING, type Config } from "./config.ts";
 import { ownDataDir } from "./ownership.ts";
 import { openModels, requireModel } from "./models.ts";
+import { failureText } from "./protocol.ts";
 
 export class HostError extends Error {
   readonly status: number;
@@ -52,7 +53,11 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
     onReport: report => console.error("pi-durable:", report),
   }, ctx);
   try {
-    const root = await harness.root(ctx, { agent: { model, thinkingLevel: config.thinking } });
+    const root = await harness.root(ctx, { agent: { model, thinkingLevel: config.thinking ?? DEFAULT_THINKING } });
+    // root() applies `agent` only when it creates the root; an explicit level also changes an existing one.
+    if (config.thinking && (await root.agent(ctx)).thinkingLevel !== config.thinking) {
+      await root.configure({ thinkingLevel: config.thinking }, ctx);
+    }
     const status: AgentHost["modelStatus"] = async () => {
       const saved = (await root.agent(ctx)).model ?? null;
       const available = saved !== null && models.getModel(saved.provider, saved.modelId);
@@ -72,6 +77,17 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
         const { model: saved } = await status();
         throw new HostError(409, `Model ${saved ? `${saved.provider}/${saved.modelId}` : "(none)"} is unavailable. Run 'aipatty models' then 'aipatty model set <modelId>'.`);
       }
+    };
+    // Log a failed run once, whether or not a client is streaming it. A closing harness rejects the wait.
+    const awaited = new Set<number>();
+    const logFailure = (submission: Submission) => {
+      if (awaited.has(submission.id)) return;
+      awaited.add(submission.id);
+      void submission.wait(ctx).then(result => {
+        if (result.status === "unanswered" && result.reason !== "aborted") {
+          console.error(`Run failed (submission ${result.id}): ${failureText(result.reason, result.detail)}`);
+        }
+      }, () => {}).finally(() => awaited.delete(submission.id));
     };
     return {
       harness,
@@ -110,7 +126,9 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
       submit(conversation, draft) {
         return exclusive(async () => {
           await assertAvailable();
-          return conversation.submit(draft, ctx);
+          const submission = await conversation.submit(draft, ctx);
+          logFailure(submission);
+          return submission;
         });
       },
       async conversation(id) {

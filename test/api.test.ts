@@ -1,18 +1,19 @@
 import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import { setTimeout as sleep } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
 import { startApi } from "../src/api.ts";
 import { openHost } from "../src/host.ts";
-import { messageText, type ConversationPage } from "../src/protocol.ts";
+import { messageText, streamUpdate, type ConversationPage } from "../src/protocol.ts";
 import { connect, fauxConfig, fixture } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
 
 /** Start a faux-model server on a free port over `dir`. */
-async function start(dir: string) {
+async function start(dir: string, heartbeatMs?: number) {
   const host = await openHost(fauxConfig(dir));
-  const api = await startApi(host, health, "127.0.0.1", 0);
+  const api = await startApi(host, health, "127.0.0.1", 0, [], heartbeatMs);
   let closed = false;
   return {
     base: `http://127.0.0.1:${api.port}`,
@@ -25,8 +26,8 @@ async function start(dir: string) {
   };
 }
 
-async function server(t: TestContext, dir?: string) {
-  const running = await start(dir ?? await fixture(t));
+async function server(t: TestContext, dir?: string, heartbeatMs?: number) {
+  const running = await start(dir ?? await fixture(t), heartbeatMs);
   t.after(() => running.close());
   return running;
 }
@@ -87,19 +88,24 @@ test("the stream delivers the answer, and a late joiner gets the current state",
   );
   assert.deepEqual(frame, { type: "settled", submissionId, status: "done", answer: "Faux reply: stream me" });
 
-  const last = await until(
-    () => early.frames.at(-1),
-    candidate => candidate?.type === "state" && idleWith(2)(candidate),
-  );
-  assert.ok(last?.type === "state");
+  const last = await until(() => early.state(), candidate => candidate !== undefined && idleWith(2)(candidate));
+  assert.ok(last);
   assert.equal(lines(last).at(-1), "assistant: Faux reply: stream me");
-  assert.ok(early.frames.length > 2, "expected live updates between the first and last state");
+
+  // Only the first frame carries the window; the rest carry what changed, and fold to the same page.
+  const [first, ...updates] = early.frames;
+  assert.equal(first.type, "state");
+  assert.ok(updates.length > 2, "expected live updates between the first and last state");
+  assert.ok(updates.every(update => update.type === "update" && !("entries" in update)));
+  assert.equal(updates.flatMap(update => update.type === "update" ? update.appended : []).length, last.entries.length);
+  const { live: _live, type: _type, ...folded } = last;
+  assert.deepEqual(folded, await page(base));
 
   const late = connect(t, base);
-  const first = await until(() => late.frames[0], candidate => candidate !== undefined);
-  assert.ok(first?.type === "state");
-  assert.equal(first.busy, false);
-  assert.deepEqual(lines(first), ["user: stream me", "assistant: Faux reply: stream me"]);
+  const joined = await until(() => late.frames[0], candidate => candidate !== undefined);
+  assert.ok(joined?.type === "state");
+  assert.equal(joined.busy, false);
+  assert.deepEqual(lines(joined), ["user: stream me", "assistant: Faux reply: stream me"]);
 });
 
 test("a retried request with the same requestId is not submitted twice", async t => {
@@ -185,4 +191,53 @@ test("invalid requests and foreign origins are rejected", async t => {
   assert.equal(code, 403);
 
   assert.deepEqual(lines(await page(base)), []);
+});
+
+test("a stream longer than its window still sends only what changed", { timeout: 20_000 }, async t => {
+  const { base } = await server(t);
+  const stream = connect(t, base);
+  await stream.opened;
+  const turns = 27; // Two entries a turn: past the 50-entry window, so its oldest entries drop.
+  for (let turn = 0; turn < turns; turn++) await post(base, { content: `turn ${turn}` });
+  const last = await until(() => stream.state(), candidate => candidate !== undefined && idleWith(turns * 2)(candidate));
+  assert.ok(last);
+  assert.ok(stream.frames.slice(1).every(frame => frame.type === "update"));
+  assert.equal(lines(last).length, turns * 2);
+  assert.equal(new Set(last.entries.map(entry => entry.id)).size, last.entries.length);
+  const newest = await page(base);
+  assert.equal(newest.entries.length, 50);
+  assert.deepEqual(last.entries.slice(-50), newest.entries);
+});
+
+test("an entry that changes in place, or a window that moved back, resends the whole snapshot", () => {
+  const entry = (id: number, text = "x") => ({ id, model: [{ role: "user", content: text }] });
+  const view = (...entries: unknown[]) => ({ conversation: { id: 1 }, entries, docs: {} }) as unknown as Parameters<typeof streamUpdate>[0];
+  const [one, two, three] = [entry(1), entry(2), entry(3)];
+  const grown = streamUpdate(view(one, two), view(two, three));
+  assert.ok(grown.type === "update" && !("entries" in grown) && !("before" in grown));
+  assert.deepEqual(grown.appended, [three]);
+  assert.deepEqual(streamUpdate(view(), view(one)).type, "update");
+  assert.equal(streamUpdate(view(one, two), view(one, entry(2, "edited"), three)).type, "state");
+  assert.equal(streamUpdate(view(two, three), view(one, two, three)).type, "state");
+});
+
+test("closing mid-answer with a send stream open is not reported as a stream failure", async t => {
+  const running = await server(t);
+  const { submissionId } = await (await post(running.base, { content: "x".repeat(900) })).json() as { submissionId: number };
+  const stream = connect(t, running.base, `?submissionId=${submissionId}`);
+  await until(() => stream.state(), candidate => candidate?.live.generation !== undefined);
+  const logged = t.mock.method(console, "error", () => {});
+  await running.close();
+  await sleep(50);
+  assert.deepEqual(logged.mock.calls.map(call => String(call.arguments[0])), []);
+});
+
+test("a stream whose client stops answering pings is dropped; a live one stays", async t => {
+  const { base } = await server(t, undefined, 100);
+  const silent = connect(t, base, "", { autoPong: false });
+  const live = connect(t, base);
+  await Promise.all([silent.opened, live.opened]);
+  await once(silent.ws, "close", { signal: AbortSignal.timeout(2_000) });
+  await sleep(350);
+  assert.equal(live.ws.readyState, live.ws.OPEN);
 });

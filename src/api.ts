@@ -5,11 +5,20 @@ import { isIP } from "node:net";
 import type { Duplex } from "node:stream";
 import WebSocket, { WebSocketServer } from "ws";
 import { HostError, type AgentHost } from "./host.ts";
-import { messageText, streamState, type StreamFrame } from "./protocol.ts";
+import { messageText, streamState, streamUpdate, type StreamFrame } from "./protocol.ts";
 
 const maxBody = 64 * 1024;
 const defaultPage = 50;
 const maxPage = 100;
+const defaultHeartbeatMs = 30_000;
+
+/** What the listener keeps about its open streams, so a close or a silent client can end them. */
+interface Streams {
+  /** Aborted before the harness closes, so a shutdown is not reported as a stream failure. */
+  readonly controllers: Set<AbortController>;
+  /** Sockets that answered the last ping, or opened after it. */
+  readonly alive: WeakSet<WebSocket>;
+}
 
 class HttpError extends Error {
   readonly status: number;
@@ -166,10 +175,16 @@ async function handleHttp(agent: AgentHost, health: Health, req: IncomingMessage
   }
 }
 
-async function stream(socket: WebSocket, conversation: Conversation, submission?: Submission): Promise<void> {
+async function stream(socket: WebSocket, streams: Streams, conversation: Conversation, submission?: Submission): Promise<void> {
   const controller = new AbortController();
   const context = withAbortSignal(controller.signal, ctx);
-  socket.on("close", () => controller.abort());
+  streams.controllers.add(controller);
+  streams.alive.add(socket);
+  socket.on("pong", () => streams.alive.add(socket));
+  socket.on("close", () => {
+    streams.controllers.delete(controller);
+    controller.abort();
+  });
   socket.on("error", () => socket.terminate());
   socket.on("message", () => socket.close(1008, "Stream is read-only"));
   const send = (value: StreamFrame) => new Promise<void>((resolve, reject) => {
@@ -183,9 +198,14 @@ async function stream(socket: WebSocket, conversation: Conversation, submission?
   try {
     const watch = await conversation.watch(context, { min: defaultPage, max: defaultPage });
     // Send the attachment value first; the watch folds changes while a client is slow.
-    const initial = send(streamState(watch.value));
+    let sent = watch.value;
+    const initial = send(streamState(sent));
     watch.start(async call => {
-      if (call.kind === "value") await send(streamState(call.value));
+      if (call.kind !== "value") return;
+      // A partial answer changes only the live document; do not serialise the whole window again for it.
+      const frame = streamUpdate(sent, call.value);
+      sent = call.value;
+      await send(frame);
     });
     void watch.closed.then(end => {
       if (!controller.signal.aborted) socket.close(end.kind === "ended" ? 1001 : 1011, "Stream ended");
@@ -195,7 +215,9 @@ async function stream(socket: WebSocket, conversation: Conversation, submission?
 
     const result = await submission.wait(context);
     if (result.status === "unanswered") {
-      await send({ type: "settled", submissionId: result.id, status: "unanswered", reason: result.reason });
+      await send({
+        type: "settled", submissionId: result.id, status: "unanswered", reason: result.reason, detail: result.detail,
+      });
     } else if (result.type === "input") {
       const { items: [entry] } = await conversation.entries(
         { minEntryId: result.answer, maxEntryId: result.answer }, 1, undefined, context,
@@ -213,7 +235,8 @@ async function stream(socket: WebSocket, conversation: Conversation, submission?
 }
 
 async function handleUpgrade(
-  agent: AgentHost, wss: WebSocketServer, req: IncomingMessage, socket: Duplex, head: Buffer, trusted: readonly string[],
+  agent: AgentHost, wss: WebSocketServer, streams: Streams, req: IncomingMessage, socket: Duplex, head: Buffer,
+  trusted: readonly string[],
 ) {
   const { pathname, searchParams } = requestUrl(req, trusted);
   const route = /^\/api\/conversations\/([^/]+)\/stream$/.exec(pathname);
@@ -232,7 +255,7 @@ async function handleUpgrade(
     }
   }
   if (!socket.destroyed) {
-    wss.handleUpgrade(req, socket, head, ws => { void stream(ws, conversation, submission); });
+    wss.handleUpgrade(req, socket, head, ws => { void stream(ws, streams, conversation, submission); });
   }
 }
 
@@ -244,10 +267,23 @@ export interface Health {
   version: string;
 }
 
-/** Serve the root (or any conversation ID) over HTTP and WebSocket. */
-export async function startApi(agent: AgentHost, health: Health, host: string, port: number, aliases: readonly string[] = []) {
+/**
+ * Serve the root (or any conversation ID) over HTTP and WebSocket. Each stream is pinged every `heartbeatMs` and
+ * dropped if it has not answered by the next ping, so a client that vanished without closing does not linger.
+ */
+export async function startApi(
+  agent: AgentHost, health: Health, host: string, port: number, aliases: readonly string[] = [],
+  heartbeatMs = defaultHeartbeatMs,
+) {
   const trusted = [host, ...aliases].map(trustedName);
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 });
+  const streams: Streams = { controllers: new Set(), alive: new WeakSet() };
+  const heartbeat = setInterval(() => {
+    for (const ws of wss.clients) {
+      if (!streams.alive.delete(ws)) ws.terminate();
+      else if (ws.readyState === WebSocket.OPEN) ws.ping();
+    }
+  }, heartbeatMs).unref();
   const server = createServer({ requestTimeout: 30_000, headersTimeout: 10_000 }, (req, res) => {
     void handleHttp(agent, health, req, res, trusted).catch(error => {
       if (res.destroyed) return;
@@ -261,7 +297,7 @@ export async function startApi(agent: AgentHost, health: Health, host: string, p
     const onError = () => socket.destroy();
     socket.on("error", onError);
     upgrading.add(socket);
-    void handleUpgrade(agent, wss, req, socket, head, trusted).catch(error => {
+    void handleUpgrade(agent, wss, streams, req, socket, head, trusted).catch(error => {
       if (socket.destroyed) return;
       const { status, message } = errorResponse(error);
       const body = JSON.stringify({ error: message });
@@ -286,6 +322,9 @@ export async function startApi(agent: AgentHost, health: Health, host: string, p
     port: address.port,
     close() {
       return closing ??= new Promise<void>(resolve => {
+        clearInterval(heartbeat);
+        // Before any socket closes: the harness may close, and reject a stream's wait, ahead of the close events.
+        for (const controller of streams.controllers) controller.abort();
         server.close(() => resolve());
         server.closeAllConnections();
         for (const socket of upgrading) socket.destroy();

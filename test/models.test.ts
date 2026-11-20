@@ -50,9 +50,17 @@ test("missing, malformed and stale catalog snapshots fall back to bundled models
     assert.deepEqual(await host.modelStatus(), { modelStatus: "unavailable", model: { provider: "openai", modelId: "gpt-6.2-sol" } });
     await host.harness.close(ctx);
   }
+  const logged = t.mock.method(console, "error", () => {});
+  const ignored = () => logged.mock.calls.map(call => String(call.arguments[0])).filter(line => line.startsWith("Ignoring model catalog"));
   await unavailable();
+  assert.deepEqual(ignored(), [], "a missing catalog is the normal fresh install");
   await writeFile(config.modelsStore, "{");
   await unavailable();
+  await writeFile(config.modelsStore, "[]");
+  await unavailable();
+  assert.equal(ignored().length, 2);
+  assert.ok(ignored().every(line => line.startsWith(`Ignoring model catalog ${config.modelsStore}: `)), ignored().join("\n"));
+  assert.match(ignored()[1], /expected a JSON object$/);
   await writeFile(config.modelsStore, JSON.stringify({ "openai": { models: null, lastModified: Date.now() } }));
   await unavailable();
   await writeFile(config.modelsStore, JSON.stringify({

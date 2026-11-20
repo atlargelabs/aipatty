@@ -101,3 +101,59 @@ test("modify initializes a missing auth file securely and rejects malformed file
   await assert.rejects(store.modify("openai", async () => oauth), /Invalid auth.json/);
   assert.equal(await readFile(path, "utf8"), "{ broken");
 });
+
+test("an API key stored as an environment template or a command is resolved as the pi CLI resolves it", async t => {
+  const dir = await fixture(t);
+  const path = join(dir, "auth.json");
+  const count = join(dir, "count");
+  const entries = {
+    literal: { type: "api_key", key: "sk-plain" },
+    scoped: { type: "api_key", key: "$AIPATTY_TEST_KEY", env: { AIPATTY_TEST_KEY: "from-credential" } },
+    ambient: { type: "api_key", key: "pre-${AIPATTY_TEST_KEY}-post" },
+    escaped: { type: "api_key", key: "$$5 $!x ${not a name} $" },
+    unset: { type: "api_key", key: "$AIPATTY_TEST_UNSET" },
+    command: { type: "api_key", key: `!echo run >> '${count}'; printf ' from-command\\n'` },
+    failing: { type: "api_key", key: `!echo run >> '${count}.failed'; exit 3` },
+    silent: { type: "api_key", key: "!true" },
+    keyless: { type: "api_key", env: { REGION: "x" } },
+    oauth,
+  };
+  await writeFile(path, JSON.stringify(entries));
+  process.env.AIPATTY_TEST_KEY = "from-process";
+  t.after(() => { delete process.env.AIPATTY_TEST_KEY; });
+  const store = new FileCredentialStore(path);
+  const key = async (providerId: string) => (await store.read(providerId) as { key?: string }).key;
+
+  assert.equal(await key("literal"), "sk-plain");
+  assert.equal(await key("scoped"), "from-credential");
+  assert.equal(await key("ambient"), "pre-from-process-post");
+  assert.equal(await key("escaped"), "$5 !x ${not a name} $");
+  assert.deepEqual(await store.read("keyless"), entries.keyless);
+  assert.deepEqual(await store.read("oauth"), oauth);
+  await assert.rejects(store.read("unset"), /API key for unset in .*auth\.json: environment variable AIPATTY_TEST_UNSET not set/);
+
+  // A successful command runs once per process; a failure is reported without the command text and retried.
+  assert.deepEqual(await Promise.all([key("command"), key("command")]), ["from-command", "from-command"]);
+  assert.equal(await key("command"), "from-command");
+  assert.equal(await readFile(count, "utf8"), "run\n");
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await assert.rejects(store.read("failing"), error => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /API key for failing in .*auth\.json: command failed \(exit 3\)$/);
+      assert.ok(!error.message.includes("echo"));
+      return true;
+    });
+  }
+  assert.equal(await readFile(`${count}.failed`, "utf8"), "run\nrun\n");
+  await assert.rejects(store.read("silent"), /command printed nothing/);
+
+  // A rewrite sees and keeps the stored form, never the resolved secret.
+  await store.modify("command", async current => {
+    assert.deepEqual(current, entries.command);
+    return { ...current, env: { NOTE: "kept" } } as typeof current;
+  });
+  assert.equal(JSON.parse(await readFile(path, "utf8")).command.key, entries.command.key);
+  assert.deepEqual(await store.list(), Object.keys(entries).map(providerId => (
+    { providerId, type: providerId === "oauth" ? "oauth" : "api_key" }
+  )));
+});

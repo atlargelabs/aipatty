@@ -20,7 +20,9 @@ npm start                  # uses the pi CLI's ChatGPT subscription login
 AIPATTY_FAUX=1 npm start   # a fake model that echoes, for demos; needs no login
 ```
 
-The server shares the pi CLI's login file and takes the same lock on it, so both can run at once.
+The server shares the pi CLI's login file and takes the same lock on it, so both can run at once. A stored API key
+may be a literal, an environment template (`$VAR`, `${VAR}`) or a `!command`, as in the pi CLI. The server runs a
+command key in its own shell and keeps the result until it exits, so restart it after rotating such a key.
 
 ## Configure
 
@@ -32,7 +34,7 @@ The server shares the pi CLI's login file and takes the same lock on it, so both
 | `AIPATTY_PORT` | `8790` | Listen port |
 | `AIPATTY_PROVIDER` | `openai` | Provider for a new root conversation |
 | `AIPATTY_MODEL` | `gpt-6.2-sol` | Model for a new root conversation |
-| `AIPATTY_THINKING` | `high` | Thinking level |
+| `AIPATTY_THINKING` | unset | Thinking level, applied at every start when set. Unset keeps the saved level; a new root conversation gets `high` |
 | `AIPATTY_AUTH_FILE` | `~/.pi/agent/auth.json` | The pi CLI's login file |
 | `AIPATTY_MODELS_STORE` | `~/.pi/agent/models-store.json` | The pi CLI's cached model catalog, read-only |
 | `AIPATTY_FAUX` | unset | `1` uses the fake model |
@@ -69,7 +71,11 @@ node src/cli.ts log             # print the transcript
 - `GET /api/conversations/:id` (`root` is the root conversation; `?limit=` and `?before=` page backwards)
 - `POST /api/conversations/:id/messages` with `{ content, requestId?, whenBusy?: "followUp" | "steer" }`
 - `POST /api/conversations/:id/abort`
-- `WS /api/conversations/:id/stream` sends the current state, then every change
+- `WS /api/conversations/:id/stream` sends one `state` frame (the newest 50 entries and the live state), then an
+  `update` frame per change: the live state plus any `appended` entries, without the window. It falls back to a full
+  `state` frame if an entry it already sent changes. With `?submissionId=`, it also sends one `settled` frame: the
+  answer, or the `reason` and `detail` of a failed run. The server pings every 30 s and drops a stream that does
+  not answer.
 
 Both HTTP and WebSocket requests must use the configured listen name/address or an explicitly trusted hostname,
 at the actual listener port. If present, `Origin` must also match that same HTTP origin. Host validation is not

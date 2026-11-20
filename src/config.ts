@@ -12,11 +12,15 @@ export interface Config {
   port: number;
   provider: string;
   model: string;
-  thinking: ModelThinkingLevel;
+  /** Applied to the root conversation at every start when set; a new root otherwise gets `DEFAULT_THINKING`. */
+  thinking: ModelThinkingLevel | undefined;
   authFile: string;
   modelsStore: string;
   faux: boolean;
 }
+
+/** The thinking level of a new root conversation when `AIPATTY_THINKING` is unset. */
+export const DEFAULT_THINKING: ModelThinkingLevel = "high";
 
 /** The default local endpoint shared by the server and CLI. */
 export const DEFAULT_URL = "http://127.0.0.1:8790";
@@ -32,9 +36,9 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (!/^\d+$/.test(port) || Number(port) > 65_535) {
     throw new Error("AIPATTY_PORT must be an integer between 0 and 65535");
   }
-  const thinking: string = env.AIPATTY_THINKING ?? "high";
+  const thinking = env.AIPATTY_THINKING;
   const level = thinkingLevels.find(value => value === thinking);
-  if (!level) {
+  if (thinking !== undefined && !level) {
     throw new Error(`AIPATTY_THINKING must be one of: ${thinkingLevels.join(", ")}`);
   }
   const faux = env.AIPATTY_FAUX === "1";

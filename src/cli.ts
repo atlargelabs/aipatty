@@ -3,14 +3,24 @@ import { randomUUID } from "node:crypto";
 import { on } from "node:events";
 import WebSocket, { type RawData } from "ws";
 import { DEFAULT_URL } from "./config.ts";
-import { messageText, type ConversationPage, type StreamFrame } from "./protocol.ts";
+import { failureText, messageText, type ConversationPage, type StreamFrame } from "./protocol.ts";
 
 const root = "/api/conversations/root";
 
 async function request<T>(base: URL, path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(new URL(path, base), options);
-  const value = await response.json();
-  if (!response.ok) throw new Error(value.error ?? `HTTP ${response.status}`);
+  const text = await response.text();
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    // Not this server's JSON: a proxy's error page, or another service on the port.
+    throw new Error(response.ok ? `Expected JSON from ${response.url}` : `HTTP ${response.status} ${response.statusText}`.trim());
+  }
+  if (!response.ok) {
+    const message = value && typeof value === "object" && "error" in value ? value.error : undefined;
+    throw new Error(typeof message === "string" ? message : `HTTP ${response.status}`);
+  }
   return value as T;
 }
 
@@ -36,11 +46,11 @@ async function send(base: URL, content: string): Promise<void> {
   try {
     for await (const [data] of on(socket, "message", { close: ["close"] }) as AsyncIterable<[RawData]>) {
       const frame = JSON.parse(data.toString()) as StreamFrame;
-      if (frame.type === "state") {
+      if (frame.type === "state" || frame.type === "update") {
         const message = frame.live.generation?.message;
         if (message && frame.live.run?.inputs.some(id => id === submissionId)) print(messageText(message));
       } else if (frame.type === "settled" && frame.submissionId === submissionId) {
-        if (frame.status === "unanswered") throw new Error(`Run failed: ${frame.reason}`);
+        if (frame.status === "unanswered") throw new Error(`Run failed: ${failureText(frame.reason, frame.detail)}`);
         print(frame.answer);
         return;
       }

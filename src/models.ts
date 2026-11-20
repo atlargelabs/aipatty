@@ -35,14 +35,21 @@ function isChatModel(value: unknown, provider: string, apis: ReadonlySet<string>
     });
 }
 
-/** The pi CLI's cached catalog, or an empty one when it is missing or unreadable. The CLI owns the file. */
+/**
+ * The pi CLI's cached catalog, or an empty one when it is missing or unreadable. The CLI owns the file. Only a missing
+ * file is silent: any other failure can leave the default model unavailable, so it is logged.
+ */
 async function readCatalog(path: string): Promise<Record<string, unknown>> {
   try {
     const cache: unknown = JSON.parse((await readFile(path, "utf8")).replace(/^\uFEFF/, ""));
-    return record(cache) ? cache : {};
-  } catch {
-    return {};
+    if (record(cache)) return cache;
+    console.error(`Ignoring model catalog ${path}: expected a JSON object`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error(`Ignoring model catalog ${path}: ${error instanceof Error ? error.message : error}`);
+    }
   }
+  return {};
 }
 
 /** The cached chat models of one provider, if the cache is newer than the bundled catalog. */

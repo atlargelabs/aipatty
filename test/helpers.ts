@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { TestContext } from "node:test";
 import WebSocket, { type RawData } from "ws";
 import { readConfig } from "../src/config.ts";
-import type { StreamFrame } from "../src/protocol.ts";
+import { applyUpdate, type StreamFrame } from "../src/protocol.ts";
 
 export const checkout = join(import.meta.dirname, "..");
 
@@ -32,11 +32,17 @@ export function fauxConfig(dir: string) {
   return readConfig(fixtureEnv(dir));
 }
 
-/** Collect frames starting with the first message, not just after the open event. */
-export function connect(t: TestContext, base: string, suffix = "") {
-  const ws = new WebSocket(base.replace("http:", "ws:") + "/api/conversations/root/stream" + suffix);
+/** Collect frames starting with the first message, not just after the open event, and fold them as a client would. */
+export function connect(t: TestContext, base: string, suffix = "", options?: WebSocket.ClientOptions) {
+  const ws = new WebSocket(base.replace("http:", "ws:") + "/api/conversations/root/stream" + suffix, options);
   t.after(() => ws.terminate());
   const frames: StreamFrame[] = [];
-  ws.on("message", (data: RawData) => frames.push(JSON.parse(data.toString()) as StreamFrame));
-  return { ws, frames, opened: once(ws, "open", { signal: AbortSignal.timeout(3_000) }) };
+  let state: Extract<StreamFrame, { type: "state" }> | undefined;
+  ws.on("message", (data: RawData) => {
+    const frame = JSON.parse(data.toString()) as StreamFrame;
+    frames.push(frame);
+    if (frame.type === "state") state = frame;
+    else if (frame.type === "update" && state) state = applyUpdate(state, frame);
+  });
+  return { ws, frames, state: () => state, opened: once(ws, "open", { signal: AbortSignal.timeout(3_000) }) };
 }

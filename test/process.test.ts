@@ -1,11 +1,18 @@
+import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
+import { getBuiltinModelDataGeneratedAt } from "@earendil-works/pi-ai/providers/all";
+import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
+import { writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { readConfig } from "../src/config.ts";
+import { openHost } from "../src/host.ts";
 import { checkout, fixture, fixtureEnv } from "./helpers.ts";
 
 const exec = promisify(execFile);
@@ -59,6 +66,42 @@ test("CLI recovers a fresh install with no cached default, without a login or mo
   assert.equal((await cli("log")).stdout, "");
 });
 
+test("a failed run, or a failed API key command, tells the client and the server log why", { timeout: 10_000 }, async t => {
+  const dir = await fixture(t);
+  const env = fixtureEnv(dir, { AIPATTY_FAUX: "0", AIPATTY_HOST: "127.0.0.1" });
+  // An available default model with no login. The unreachable address keeps a stray key off the network.
+  await writeFile(join(dir, "models-store.json"), JSON.stringify({
+    openai: {
+      models: [{ ...openaiProvider().getModels()[0], id: "gpt-6.2-sol", baseUrl: "http://127.0.0.1:9" }],
+      lastModified: (getBuiltinModelDataGeneratedAt() ?? Date.now()) + 1_000,
+    },
+  }));
+  const server = launch(t, env);
+  const base = await server.url();
+  const send = exec(process.execPath, ["src/cli.ts", "send", "hi"], { cwd: checkout, env: { ...env, AIPATTY_URL: base } });
+  await assert.rejects(send, /Run failed: model_error: Provider is not configured: openai/);
+  assert.match(server.stderr(), /Run failed \(submission \d+\): model_error: Provider is not configured: openai/);
+
+  await writeFile(join(dir, "auth.json"), JSON.stringify({ openai: { type: "api_key", key: "!exit 3" } }));
+  const again = exec(process.execPath, ["src/cli.ts", "send", "hi"], { cwd: checkout, env: { ...env, AIPATTY_URL: base } });
+  const cause = /model_error: .*API key for openai in .*auth\.json: command failed \(exit 3\)/;
+  await assert.rejects(again, cause);
+  assert.match(server.stderr(), cause);
+});
+
+test("CLI reports the HTTP status when the reply is not this server's JSON", async t => {
+  const stub = createServer((req, res) => {
+    const status = req.url === "/health" ? 502 : 200;
+    res.writeHead(status, { "Content-Type": "text/html" }).end("<!DOCTYPE html><title>proxy</title>");
+  });
+  await new Promise<void>(resolve => stub.listen(0, "127.0.0.1", resolve));
+  t.after(() => { stub.close(); stub.closeAllConnections(); });
+  const url = `http://127.0.0.1:${(stub.address() as AddressInfo).port}`;
+  const cli = (...args: string[]) => exec(process.execPath, ["src/cli.ts", ...args], { cwd: checkout, env: { AIPATTY_URL: url } });
+  await assert.rejects(cli("health"), /aipatty: HTTP 502 Bad Gateway\n/);
+  await assert.rejects(cli("models"), /aipatty: Expected JSON from http:\/\/127\.0\.0\.1:\d+\/api\/models\n/);
+});
+
 test("one owner per directory across ports; SIGKILL releases ownership and interrupted input resumes", { timeout: 20_000 }, async t => {
   const dir = await fixture(t);
   const env = { ...fixtureEnv(dir), AIPATTY_HOST: "127.0.0.1" };
@@ -91,4 +134,21 @@ test("one owner per directory across ports; SIGKILL releases ownership and inter
   }
   const result = JSON.parse((await cli("model", "set", "faux-1")).stdout);
   assert.equal(result.modelStatus, "available");
+});
+
+test("AIPATTY_THINKING changes an existing root when set, and keeps the saved level when unset", async t => {
+  assert.equal(readConfig({}).thinking, undefined);
+  assert.throws(() => readConfig({ AIPATTY_THINKING: "loud" }), /AIPATTY_THINKING must be one of/);
+  const dir = await fixture(t);
+  const level = async (overrides: NodeJS.ProcessEnv = {}) => {
+    const host = await openHost(readConfig(fixtureEnv(dir, overrides)));
+    try {
+      return (await (await host.conversation("root"))!.agent(ctx)).thinkingLevel;
+    } finally {
+      await host.harness.close(ctx);
+    }
+  };
+  assert.equal(await level(), "high");
+  assert.equal(await level({ AIPATTY_THINKING: "low" }), "low");
+  assert.equal(await level(), "low");
 });
