@@ -7,6 +7,7 @@ import { LOOPBACK } from "./config.ts";
 import { HttpError, type AgentHost } from "./host.ts";
 import { pageCss, pageHtml, pageJs } from "./page.ts";
 import { messageText, streamState, streamUpdate, type StreamFrame } from "./protocol.ts";
+import { transcriptPage } from "./transcript.ts";
 
 const maxBody = 64 * 1024;
 const defaultPage = 50;
@@ -107,9 +108,7 @@ async function conversationPage(conversation: Conversation, params: URLSearchPar
   await watch.stop();
   if (before === undefined) return state;
 
-  const { items } = await conversation.entries({ maxEntryId: (before - 1) as EntryId }, limit + 1, undefined, ctx);
-  const entries = items.slice(0, limit).reverse();
-  return { ...state, entries, before: items.length > limit ? entries[0].id : null };
+  return { ...state, ...await transcriptPage(conversation, ctx, limit, before) };
 }
 
 function requireMethod(req: IncomingMessage, res: ServerResponse, method: string): void {
