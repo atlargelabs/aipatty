@@ -8,6 +8,7 @@ let known = {};
 try {
   known = JSON.parse(readFileSync("fake-gh.json", "utf8"));
 } catch {}
+if (known.delayMs) await new Promise(resolve => setTimeout(resolve, known.delayMs));
 const found = known[`${kind} ${number}`];
 if (verb !== "view" || !found) {
   process.stderr.write(`GraphQL: Could not resolve to a ${kind} with the number of ${number}.\n`);

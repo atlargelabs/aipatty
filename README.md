@@ -40,31 +40,38 @@ in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits fo
   `npm run check` and `npm test` before every push; a `crmanager` review of the final commit, repeated until it
   has no P0 or P1 finding; and that only Steve merges.
 - **Result.** The tool returns a status, Pi's summary, the PR and issue, the last review, the cost, and anything
-  the host found wrong. The host does not take Pi's word for it:
-  - The PR is looked up with `gh`. A run that was asked for a PR and has none that GitHub confirms is `failed`.
-  - A result says `reviewed` only when the last finished `crmanager` review covered the PR's head commit, gave
-    the verdict "correct", and had no P0 or P1 finding. Otherwise it says `NOT REVIEWED` and why.
-  - A clean exit is not enough: the event stream must be well-formed and end settled, with a last message that
-    stopped normally.
-  - CI on the PR's head commit is the authoritative check. The tool does not wait for it.
-- **Cost.** Pi's spend and its delegates', each counted once, is charged to the calling branch. It is marked
-  incomplete when the run was cut off before a delegate reported.
-- **Abort and timeout.** Aborting the branch, or the run's time limit (60 minutes unless the call says otherwise),
-  stops Pi and the processes it started, its delegates included. The result reports what the run had done.
+  the host found wrong. The host does not take Pi's word for it. A run that was asked for a PR is `completed`
+  only when all of this holds, and `failed` otherwise:
+  - Pi exited cleanly: the event stream is well-formed and ends settled, with a last message that stopped normally.
+  - `gh` confirms the PR: open, against `main`, with a body that links a confirmed issue.
+  - The last finished `crmanager` review was a `/review pr` of that PR at its head commit, stated the verdict
+    "correct", and had no P0 or P1 finding. Otherwise the result says `NOT REVIEWED` and why.
+
+  CI on the PR's head commit is the authoritative check. The tool does not wait for it.
+- **Cost.** Pi's spend and its delegates' is charged to the calling branch, once. When a run is cut off, the
+  cost includes what its unfinished delegate jobs had recorded, and is marked incomplete.
+- **Abort and timeout.** Aborting the branch, or the run's time limit (60 minutes unless the call says otherwise,
+  counted from the start of the clone), stops Pi and the processes it started, its delegates included. The result
+  reports what the run had done. Once Pi has finished and the host is checking the result, the run ends as it
+  ended.
 - **Cleanup.** Every run's events, error output, prompt and result are kept in `logs/runs/<run-id>/` in the data
   directory, with the logs of its delegate jobs. The workspace and the delegates' clones are deleted. Logs can
   hold private data.
 - **Restart.** A run does not survive the server. On the next start, before any conversation resumes, the server
   stops what is left of the run, cleans up, and reports the call as `interrupted` in its branch, with any PR link
-  the run had printed. It never runs the call again.
+  the run had printed. It never runs the call again. A run that had already settled when the server died keeps
+  its result.
+- **When cleanup fails.** If a run's processes cannot be stopped, its files cannot be removed, or its saved record
+  (`pi-run.json` in the data directory) cannot be read, nothing is deleted and no new run starts until that is
+  resolved and the server restarted. The refusal says what is wrong.
 
 A run needs `git`, `gh` and a GitHub login for the user the server runs as, the Pi sign-in, and the pi-review
 extension: at `git/github.com/earendil-works/pi-review/review.ts` in the Pi directory (where
 `pi install git:github.com/earendil-works/pi-review` puts it), or wherever `delegates.reviewExtension` in the Pi
 directory's `settings.json` says. A run that must end with a PR is refused when the extension is missing.
 
-Processes are found by parent, by process group, and by a marker in their environment. A process that leaves both
-its parent and its group, and hides its environment, is not found.
+A run's processes are found by parent, by the process groups its processes led, and by a marker in their
+environment. A process that leaves both its parent and its group, and hides its environment, is not found.
 
 ## Page
 

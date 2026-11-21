@@ -2,7 +2,7 @@ import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
@@ -10,6 +10,7 @@ import type { Config } from "../src/config.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
 import { openPiRuns, outcomeText, type RunOutcome, type RunRequest } from "../src/pi-run.ts";
 import { readReport, readReview } from "../src/pi-trace.ts";
+import { listProcesses, newOwned, remember, runProcesses, stopRun } from "../src/processes.ts";
 import { messageText } from "../src/protocol.ts";
 import { checkout, fauxConfig, fixture, until } from "./helpers.ts";
 
@@ -59,8 +60,8 @@ const settled: Step = { emit: { type: "agent_settled", aborted: false } };
 const report = (fields: object = {}) => `Done.\n<result>\n${JSON.stringify({ summary: "Added the thing.", issue: issueUrl, pr: prUrl, remaining: [], ...fields })}\n</result>`;
 
 /** A delegate call and its result, as the delegates extension reports them. */
-function delegate(callId: string, job: { id: string; profile: string; task: string; cost: number; sha?: string; summary?: string; success?: boolean; prUrl?: string }): Step[] {
-  const args = { profile: job.profile, name: "job", task: job.task };
+function delegate(callId: string, job: { id: string; profile: string; task: string; cost: number; sha?: string; summary?: string; success?: boolean; prUrl?: string; continue?: string }): Step[] {
+  const args = { profile: job.profile, name: "job", task: job.task, ...(job.continue ? { continue: job.continue } : {}) };
   const result = {
     id: job.id, name: "job", profile: job.profile, model: "openai/gpt-6.2-sol", execution: "stopped", success: job.success ?? true,
     summary: job.summary ?? "", workspace: { kind: "clone", baseSha: job.sha }, verification: { status: "not-run", checks: [] },
@@ -137,9 +138,12 @@ test("the result is confirmed with gh, and delegate spend is charged once", asyn
   await scenario(config, [
     assistant("Working.", 0.5, "toolUse"),
     ...delegate("c1", { id: "job-pr", profile: "prmanager", task: "Implement it.", cost: 2, prUrl }),
-    // The same job reported again, as a continuation's display might: counted once.
-    ...delegate("c2", { id: "job-pr", profile: "prmanager", task: "Implement it.", cost: 2, prUrl }),
+    // The same job continued after a review: a new call, reporting the spend of that call.
+    ...delegate("c2", { id: "job-pr", profile: "prmanager", task: "Fix the finding.", cost: 1, prUrl, continue: "job-pr" }),
     ...review("c3", "job-review"),
+    // Model work a tool of Pi's own did, such as a codemode classifier call.
+    { emit: { type: "tool_execution_start", toolCallId: "c4", toolName: "codemode", args: {} } },
+    { emit: { type: "tool_execution_end", toolCallId: "c4", toolName: "codemode", isError: false, result: { content: [], usage: usage(0.125) } } },
     { emit: { type: "message_update", usage: usage(99), assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x" } } },
     assistant(report({ remaining: ["[P2] A lesser finding."] }), 0.25),
     { emit: { type: "agent_end", messages: [{ role: "assistant", usage: usage(99) }], willRetry: false } },
@@ -153,13 +157,24 @@ test("the result is confirmed with gh, and delegate spend is charged once", asyn
   assert.equal(outcome.summary, "Added the thing.");
   assert.deepEqual(outcome.remaining, ["[P2] A lesser finding."]);
   assert.deepEqual(outcome.problems, []);
-  // Pi's two messages, the prmanager once, and the review: not the streaming update, the repeat, or agent_end's copy.
-  assert.equal(outcome.usage.cost.total, 0.5 + 0.25 + 2 + 0.25);
+  // Pi's two messages, both calls of the prmanager, the review and the tool: not the streaming update, the
+  // tool result's own copy of a delegate's usage, or agent_end's copy of the messages.
+  assert.equal(outcome.usage.cost.total, 0.5 + 0.25 + 2 + 1 + 0.25 + 0.125);
   assert.equal(outcome.usageComplete, true);
+
+  // A delegate call that ended without a result spent something nobody reported.
+  await scenario(config, [
+    { emit: { type: "tool_execution_start", toolCallId: "c1", toolName: "delegate", args: { profile: "worker", name: "job", task: "x" } } },
+    { emit: { type: "tool_execution_end", toolCallId: "c1", toolName: "delegate", isError: true, result: { content: [{ type: "text", text: "launch failed" }] } } },
+    ...review("c2", "job-review-2"), assistant(report()), settled,
+  ]);
+  const unaccounted = await (await openPiRuns(config)).run(request({ callId: "call-2" }));
+  assert.equal(unaccounted.usageComplete, false);
+  assert.match(unaccounted.problems.join("\n"), /1 delegate call\(s\) ended without a result/);
   assert.match(await readFile(join(config.dataDir, "fake-gh-calls.txt"), "utf8"), /^pr view 12 --repo atlargelabs\/aipatty /);
 });
 
-test("a result is not reported as reviewed when the review is missing, has findings, failed, or covers another commit", async t => {
+test("a run is completed and reviewed only when the last finished review covers the PR at its head, clean", async t => {
   const config = await setup(t);
   await github(config, openPr);
   const runs = await openPiRuns(config);
@@ -167,29 +182,45 @@ test("a result is not reported as reviewed when the review is missing, has findi
     await scenario(config, [...steps, assistant(report()), settled]);
     return runs.run(request());
   };
-  const missing = await run([]);
-  assert.equal(missing.review.status, "missing");
-  assert.equal(missing.status, "completed");
+  /** A run whose PR exists but is not reviewed clean is not completed. */
+  const unreviewed = async (steps: Step[], status: string) => {
+    const outcome = await run(steps);
+    assert.equal(outcome.review.status, status, JSON.stringify(outcome.review));
+    assert.equal(outcome.status, "failed");
+    assert.equal(outcome.pr?.confirmed, true);
+    assert.match(outcome.problems.join("\n"), /The PR is not reviewed clean\./);
+    return outcome;
+  };
+  await unreviewed([], "missing");
 
-  const p1 = await run(review("c1", "r1", { summary: "[P1] src/a.ts:3 breaks the build.\nOverall verdict: needs attention" }));
+  const p1 = await unreviewed(review("c1", "r1", { summary: "[P1] src/a.ts:3 breaks the build.\nOverall verdict: needs attention" }), "findings");
   assert.deepEqual(p1.review, { status: "findings", verdict: "needs attention", sha: head, important: 1, lesser: 0 });
-  // A verdict of "correct" beside a P0 is still a finding, and so is a review with no readable verdict.
-  assert.equal((await run(review("c1", "r2", { summary: "[P0] src/a.ts:3 loses data.\nVerdict: correct" }))).review.status, "findings");
-  assert.equal((await run(review("c1", "r3", { summary: "Looks fine to me." }))).review.status, "findings");
+  // A verdict of "correct" beside a P0 is still a finding, and so is a review that states no verdict.
+  await unreviewed(review("c1", "r2", { summary: "[P0] src/a.ts:3 loses data.\nVerdict: correct" }), "findings");
+  await unreviewed(review("c1", "r3", { summary: "Looks fine to me." }), "findings");
+  await unreviewed(review("c1", "r3b", { summary: "I could not determine whether the change is correct." }), "findings");
 
-  const stale = await run(review("c1", "r4", { sha: other }));
+  const stale = await unreviewed(review("c1", "r4", { sha: other }), "stale");
   assert.deepEqual(stale.review, { status: "stale", verdict: "correct", sha: other, important: 0, lesser: 0 });
-  // A branch review before the PR, then nothing after: the last finished review decides.
-  assert.equal((await run([...review("c1", "r5"), ...review("c2", "r6", { sha: other, task: "/review branch main" })])).review.status, "stale");
+  // The right commit under another request is not a review of the PR's diff: one commit of it, another PR, a branch.
+  await unreviewed(review("c1", "r4b", { task: `/review commit ${head}` }), "stale");
+  await unreviewed(review("c1", "r4c", { task: "/review pr 13" }), "stale");
+  await unreviewed(review("c1", "r4d", { task: "/review pr https://github.com/someone/else/pull/12" }), "stale");
+  // A PR review, then a branch review after it: the last finished review decides.
+  await unreviewed([...review("c1", "r5"), ...review("c2", "r6", { task: "/review branch main" })], "stale");
   // A review of uncommitted changes names no reviewed commit.
-  assert.equal((await run(review("c1", "r7", { task: "/review uncommitted" }))).review.status, "stale");
-  // A clean review followed by one that failed to finish still counts the clean one, of the same head.
-  assert.equal((await run([...review("c1", "r8"), ...review("c2", "r9", { success: false, summary: "" })])).review.status, "clean");
+  await unreviewed(review("c1", "r7", { task: "/review uncommitted" }), "stale");
   // Only a failed review: nothing finished.
-  assert.equal((await run(review("c1", "r10", { success: false, summary: "verdict: correct" }))).review.status, "missing");
+  await unreviewed(review("c1", "r10", { success: false, summary: "verdict: correct" }), "missing");
+
+  // A clean review followed by one that failed to finish still counts the clean one, and the PR may be named by URL.
+  const clean = await run([...review("c1", "r8", { task: `/review pr ${prUrl}` }), ...review("c2", "r9", { success: false, summary: "" })]);
+  assert.equal(clean.review.status, "clean");
+  assert.equal(clean.status, "completed", JSON.stringify(clean.problems));
 
   const text = outcomeText(stale);
-  assert.match(text, /Review: NOT REVIEWED: the last review covered a different commit from the PR head/);
+  assert.match(text, /^Pi run \S+: failed/);
+  assert.match(text, /Review: NOT REVIEWED: the last review was not a `\/review pr` of this PR at its head commit/);
   assert.match(text, new RegExp(`PR: ${prUrl} \\(open, head ${head}\\)`));
 });
 
@@ -221,7 +252,15 @@ test("a successful exit or a URL in the model's output is not proof of delivery"
   await github(config, { "pr 12": { state: "MERGED", headRefOid: head, baseRefName: "release", body: "no link" }, "issue 11": { number: 11 } });
   await scenario(config, [...review("c1", "r2"), assistant(report()), settled]);
   const merged = await runs.run(request());
+  assert.equal(merged.status, "failed");
   assert.match(merged.problems.join("\n"), /The PR is merged, not open\.[^]*The PR targets release, not main\.[^]*does not link issue #11/);
+
+  // A reviewed PR with no issue is not the workflow either.
+  await github(config, openPr);
+  await scenario(config, [...review("c1", "r3"), assistant(report({ issue: null })), settled]);
+  const noIssue = await runs.run(request());
+  assert.equal(noIssue.status, "failed");
+  assert.match(noIssue.problems.join("\n"), /No issue was reported for this change/);
 
   // Without a PR requested, nothing is asked of GitHub and nothing is expected.
   await scenario(config, [assistant(report({ pr: null, issue: null })), settled]);
@@ -274,7 +313,10 @@ test("missing sign-in or model, a provider error, and malformed output are failu
   await scenario(config, [assistant(report()), settled]);
   const clone = await runs.run(request({ base: "no-such-branch" }));
   assert.equal(clone.status, "failed");
-  assert.match(clone.problems.join("\n"), /Could not clone atlargelabs\/aipatty at no-such-branch/);
+  assert.match(clone.problems.join("\n"), /Could not clone atlargelabs\/aipatty at no-such-branch: no such branch, tag or commit/);
+  // A file of the tree is not a base, though `git checkout` would take it.
+  const file = await runs.run(request({ base: "README.md" }));
+  assert.match(file.problems.join("\n"), /Could not clone atlargelabs\/aipatty at README\.md: no such branch, tag or commit/);
   assert.deepEqual(await readdir(config.runsDir), []);
 
   // Without the review extension a PR could never be reviewed: refused before anything is cloned or launched.
@@ -313,8 +355,12 @@ test("abort and timeout stop Pi and its delegates' processes, keep the logs, and
     assistant("Working.", 0.5, "toolUse"),
     ...delegate("c1", { id: "job-done", profile: "worker", task: "Do part.", cost: 1 }),
     { emit: { type: "tool_execution_start", toolCallId: "c2", toolName: "delegate", args: { profile: "prmanager", name: "job", task: "Publish." } } },
-    { job: { id: "job-running" } }, { job: { id: "job-nested", session: "another-session", source: join(config.pi.agentDir, "delegates/jobs/job-running/workspace") } },
-    { job: { id: "job-unrelated", session: "someone-else", source: "/elsewhere" } },
+    // What the cut-off call left: a running job and the job it started, each with its own spend so far, and a
+    // finished job whose spend already includes its child's.
+    { job: { id: "job-running", cost: 0.75 } },
+    { job: { id: "job-nested", parentId: "job-running", cost: 0.25, session: "another-session", source: join(config.pi.agentDir, "delegates/jobs/job-running/workspace") } },
+    { job: { id: "job-finished", cost: 0.5, finishedAt: "2026-01-01T00:00:00Z" } }, { job: { id: "job-finished-child", parentId: "job-finished", cost: 0.125 } },
+    { job: { id: "job-unrelated", session: "someone-else", source: "/elsewhere", cost: 64 } },
     { spawn: true }, { spawn: true }, { hang: true },
   ];
   const runs = await openPiRuns(config);
@@ -334,13 +380,21 @@ test("abort and timeout stop Pi and its delegates' processes, keep the logs, and
       assert.ok(!existsSync(join(outcome.logDir, "delegates", id, "workspace")));
     }
     assert.ok(existsSync(join(jobs, "job-unrelated/workspace/src/file.ts")), "another session's clone is not this run's");
-    // What was spent before the stop is charged, and marked incomplete: one delegate never reported.
-    assert.equal(outcome.usage.cost.total, 1.5);
+    // What was spent before the stop is charged: Pi's message, the delegate that reported, and what the jobs of
+    // the cut-off call had recorded. It is marked incomplete.
+    assert.equal(outcome.usage.cost.total, 0.5 + 1 + 0.75 + 0.25 + 0.5);
     assert.equal(outcome.usageComplete, false);
-    assert.match(outcome.problems.join("\n"), /1 delegate call\(s\) never reported/);
+    assert.match(outcome.problems.join("\n"), /1 delegate call\(s\) were cut off before they reported/);
     assert.ok(!existsSync(join(config.dataDir, "pi-run.json")));
     return outcome;
   };
+
+  // A job directory that is a link is never followed, whatever its manifest says.
+  const victim = join(config.dataDir, "victim");
+  await mkdir(join(victim, "workspace"), { recursive: true });
+  await writeFile(join(victim, "job.json"), JSON.stringify({ id: "linked", ownerSession: "fake-session", workspace: { source: "/" } }));
+  await mkdir(jobs, { recursive: true });
+  await symlink(victim, join(jobs, "linked"));
 
   await scenario(config, steps);
   const controller = new AbortController();
@@ -352,10 +406,11 @@ test("abort and timeout stop Pi and its delegates' processes, keep the logs, and
   // A run that ignores SIGTERM is killed, and a timeout reports any PR the run had already published.
   await github(config, openPr);
   await scenario(config, [...delegate("c0", { id: "job-pr", profile: "prmanager", task: "Publish.", cost: 0, prUrl }), ...steps], { ignoreTerm: true });
-  const timedOut = await check(await runs.run(request({ timeoutMs: 1_500 })), "timed_out");
+  const timedOut = await check(await runs.run(request({ timeoutMs: 3_000 })), "timed_out");
   assert.equal(timedOut.pr?.confirmed, true);
   assert.equal(timedOut.review.status, "missing");
   assert.match(timedOut.summary, /stopped after/);
+  assert.ok(existsSync(join(victim, "workspace")) && !existsSync(join(victim, "discarded")), "the linked directory is untouched");
 });
 
 test("after a crash, the next start stops the surviving processes, cleans up, and reports the call interrupted", { timeout: 60_000 }, async t => {
@@ -363,7 +418,7 @@ test("after a crash, the next start stops the surviving processes, cleans up, an
   await scenario(config, [
     assistant("Working.", 0.5, "toolUse"),
     ...delegate("c1", { id: "job-pr", profile: "prmanager", task: "Publish.", cost: 1, prUrl }),
-    { job: { id: "job-running" } }, { spawn: true }, { hang: true },
+    { job: { id: "job-running", cost: 0.5 } }, { spawn: true }, { hang: true },
   ]);
   // A host process that starts the run and is then killed outright.
   const script = `
@@ -375,7 +430,7 @@ test("after a crash, the next start stops the surviving processes, cleans up, an
   t.after(() => { host.kill("SIGKILL"); });
   await until(async () => (await spawned(config)).length === 1, Boolean, 20_000);
   // Long enough for the host to have recorded the detached child.
-  await until(async () => JSON.parse(await readFile(join(config.dataDir, "pi-run.json"), "utf8")).seen.length >= 2);
+  await until(async () => JSON.parse(await readFile(join(config.dataDir, "pi-run.json"), "utf8")).procs.length >= 2);
   host.kill("SIGKILL");
   await exited;
   const [pi] = await launches(config);
@@ -391,7 +446,8 @@ test("after a crash, the next start stops the surviving processes, cleans up, an
   const outcome = await runs.settled(7, "call-crash");
   assert.equal(outcome?.status, "interrupted");
   assert.deepEqual(outcome?.pr, { url: prUrl, number: 12, confirmed: false });
-  assert.equal(outcome?.usage.cost.total, 1.5);
+  // Pi's message, the delegate that reported, and what the running job had recorded.
+  assert.equal(outcome?.usage.cost.total, 0.5 + 1 + 0.5);
   assert.equal(outcome?.usageComplete, false);
   assert.match(outcome!.summary, /is not run again/);
   assert.equal(await runs.settled(7, "another-call"), undefined);
@@ -505,13 +561,112 @@ test("a restart reports the interrupted call in its branch, without running it a
 
 test("reviews and reports are read strictly", () => {
   assert.deepEqual(readReview("Overall verdict: \"correct\" (no blocking issues)"), { verdict: "correct", important: 0, lesser: 0 });
-  assert.deepEqual(readReview("[P2] a\n[P3] b\nVerdict: correct"), { verdict: "correct", important: 0, lesser: 2 });
-  // Both words present: the cautious reading wins.
-  assert.equal(readReview("Mostly correct, but needs attention.").verdict, "needs attention");
-  assert.equal(readReview("The code is incorrect.").verdict, "unknown");
+  assert.deepEqual(readReview("[P2] a\n[P3] b\n**Verdict:** correct"), { verdict: "correct", important: 0, lesser: 2 });
+  assert.equal(readReview("The verdict is correct.").verdict, "correct");
+  assert.equal(readReview("**Verdict: needs attention.**").verdict, "needs attention");
+  // A line naming both is the cautious one, and the last stated verdict is the one that counts.
+  assert.equal(readReview("Verdict: correct, though it needs attention").verdict, "needs attention");
+  assert.equal(readReview("Verdict: correct\nOn reflection.\nVerdict: needs attention").verdict, "needs attention");
+  // Prose that uses the word, or a summary cut off before its verdict, states none.
+  for (const prose of ["Mostly correct.", "The code is incorrect.", "I could not determine whether the change is correct.",
+    "No verdict is possible; correct me if I am wrong.", "[P2] a finding, and then the text was cut"]) {
+    assert.equal(readReview(prose).verdict, "unknown", prose);
+  }
   assert.equal(readReport("no block"), undefined);
   assert.equal(readReport("<result>not json</result>"), undefined);
   assert.equal(readReport('<result>{"pr":"x"}</result>'), undefined);
   assert.deepEqual(readReport('<result>{"summary":"old"}</result> then\n<result>\n```json\n{"summary":"s","pr":" ","issue":null,"remaining":["a",1]}\n```\n</result>'),
     { summary: "s", issue: undefined, pr: undefined, remaining: ["a"] });
+});
+
+test("an outcome settled before the harness committed it survives a restart, and an abort while it settles does not change it", { timeout: 60_000 }, async t => {
+  const config = await setup(t);
+  await github(config, { ...openPr, delayMs: 1_500 });
+  await scenario(config, [...review("c1", "r1"), assistant(report()), settled]);
+  const runs = await openPiRuns(config);
+  const controller = new AbortController();
+  const running = runs.run(request({ conversationId: 5, callId: "call-late" }), controller.signal);
+  // Pi is done and the host is asking GitHub: the run ends as it ended.
+  await until(() => existsSync(join(config.dataDir, "fake-gh-calls.txt")), Boolean, 20_000);
+  controller.abort();
+  const late = runs.settled(5, "call-late");
+  const outcome = await running;
+  assert.equal(outcome.status, "completed", JSON.stringify(outcome.problems));
+  assert.equal(outcome.review.status, "clean");
+  assert.deepEqual(await late, outcome);
+
+  // The process dies before the harness commits the tool result: the next start still has it, by call.
+  const next = await openPiRuns(config);
+  assert.deepEqual(await next.settled(5, "call-late"), outcome);
+  assert.equal(await next.settled(5, "call-other"), undefined);
+});
+
+test("a run record that cannot be used blocks new runs and deletes nothing", async t => {
+  const config = await setup(t);
+  await scenario(config, [assistant(report({ pr: null, issue: null })), settled]);
+  const logged = t.mock.method(console, "error", () => {});
+  const stateFile = join(config.dataDir, "pi-run.json");
+
+  await writeFile(stateFile, "{ not json");
+  await assert.rejects((await openPiRuns(config)).run(request({ pr: false })), /pi-run\.json, cannot be used[^]*No new run starts until it is inspected/);
+  assert.equal(await readFile(stateFile, "utf8"), "{ not json");
+
+  // A record naming a directory that is not the run's own is not followed.
+  const victim = join(config.dataDir, "precious");
+  await mkdir(victim);
+  await writeFile(join(victim, "keep.txt"), "keep");
+  await writeFile(stateFile, JSON.stringify({
+    runId: "20260101T000000-deadbeef", conversationId: 1, callId: "c", pr: false, startedAt: "", workspace: victim,
+    logDir: join(config.dataDir, "logs/runs/20260101T000000-deadbeef"), procs: [], groups: [],
+  }));
+  await assert.rejects((await openPiRuns(config)).run(request({ pr: false })), /does not describe a run of this data directory/);
+  assert.equal(await readFile(join(victim, "keep.txt"), "utf8"), "keep");
+  assert.ok(logged.mock.callCount() >= 2);
+  assert.ok(!existsSync(join(config.pi.agentDir, "fake-launches.jsonl")), "nothing was launched");
+
+  // Removed by hand, the slot opens again.
+  await rm(stateFile);
+  assert.equal((await (await openPiRuns(config)).run(request({ pr: false }))).status, "completed");
+});
+
+test("a run's processes are found by environment marker and by the groups they led, not by their arguments", { timeout: 30_000 }, async t => {
+  const marker = `test-${process.pid}-${Date.now()}`;
+  const idle = "setTimeout(() => {}, 600000)";
+  const started: number[] = [];
+  t.after(() => { for (const pid of started) if (alive(pid)) process.kill(pid, "SIGKILL"); });
+  const start = (args: string[], env: NodeJS.ProcessEnv = {}, detached = false) => {
+    const child = spawn(process.execPath, args, { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "ignore"], detached });
+    started.push(child.pid!);
+    return child;
+  };
+  const marked = start(["-e", idle], { PATTY_RUN_ID: marker });
+  // The marker among the arguments, as a search for it would have.
+  const bystander = start(["-e", idle, `PATTY_RUN_ID=${marker}`]);
+  // A detached leader, as a delegate is, whose child stays in its group after the leader is gone.
+  const leader = start(["-e", `
+    const child = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(idle)}], { stdio: "ignore", env: {} });
+    console.log(child.pid);
+    ${idle}`], {}, true);
+  const orphan = Number(await new Promise<string>(resolve => leader.stdout!.once("data", chunk => resolve(String(chunk)))));
+  started.push(orphan);
+
+  const owned = newOwned();
+  const table = await until(async () => {
+    const procs = await listProcesses();
+    return [marked.pid, bystander.pid, leader.pid, orphan].every(pid => procs.some(proc => proc.pid === pid)) ? procs : undefined;
+  });
+  remember(owned, table!.filter(proc => proc.pid === leader.pid));
+  assert.deepEqual([...owned.groups], [leader.pid]);
+  leader.kill("SIGKILL");
+  await until(() => !alive(leader.pid!));
+
+  const found = (await runProcesses(owned, marker)).map(proc => proc.pid);
+  assert.ok(found.includes(marked.pid!), "found by its environment");
+  assert.ok(found.includes(orphan), "found by the group its dead leader led");
+  assert.ok(!found.includes(bystander.pid!), "the marker in an argument is not ownership");
+  assert.ok(!found.includes(process.pid));
+
+  assert.deepEqual(await stopRun(owned, marker, undefined, 0), []);
+  await until(() => !alive(marked.pid!) && !alive(orphan));
+  assert.ok(alive(bystander.pid!));
 });

@@ -4,6 +4,8 @@ import type { Usage } from "@earendil-works/pi-ai";
 export interface Review {
   /** The first line of the delegate's task, such as `/review pr 12`. */
   request: string;
+  /** The PR the delegate was asked to review, when the request names one of this repository by number or URL. */
+  pr?: number;
   /** Whether the delegate finished; a failed review has no verdict. */
   finished: boolean;
   /** The commit the delegate reviewed, when it reviewed one. */
@@ -13,6 +15,15 @@ export interface Review {
   important: number;
   /** Findings tagged P2 or P3. */
   lesser: number;
+}
+
+/** A delegate job's spend as the extension reports it: token counts and one cost figure. */
+export interface JobUsage {
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  cost?: number;
 }
 
 /** What Pi's last message says it did. Claims, until checked against GitHub. */
@@ -38,7 +49,8 @@ export function emptyUsage(): Usage {
   };
 }
 
-function add(total: Usage, usage: unknown): void {
+/** Add Pi's usage, or a delegate job's, to `total`. */
+export function addUsage(total: Usage, usage: unknown): void {
   if (!record(usage)) return;
   const input = number(usage.input), output = number(usage.output);
   const cacheRead = number(usage.cacheRead), cacheWrite = number(usage.cacheWrite);
@@ -63,13 +75,18 @@ function contentText(content: unknown): string {
   return content.map(part => record(part) && part.type === "text" && typeof part.text === "string" ? part.text : "").join("");
 }
 
-/** Read a review's findings and verdict from the reviewer's text, in the format pi-review asks for. */
+/**
+ * Read a review's findings and verdict from the reviewer's text, in the format pi-review asks for. The verdict is
+ * the last line that states one. Prose that merely uses the word, or a summary cut off before its verdict, is
+ * `unknown`, and a line naming both verdicts is the cautious one.
+ */
 export function readReview(summary: string): Pick<Review, "verdict" | "important" | "lesser"> {
   const important = summary.match(/\[P[01]\]/g)?.length ?? 0;
   const lesser = summary.match(/\[P[23]\]/g)?.length ?? 0;
-  // "needs attention" anywhere wins: a verdict that cannot be read must not pass as clean.
-  const verdict = /needs[ _-]attention/i.test(summary) ? "needs attention"
-    : /\bcorrect\b/i.test(summary) ? "correct" : "unknown";
+  const stated = summary.split(/\r?\n/).findLast(line => /\bverdict\b/i.test(line)) ?? "";
+  const after = stated.slice(stated.search(/\bverdict\b/i));
+  const verdict = /needs[ _-]attention/i.test(after) ? "needs attention"
+    : /^verdict(?:\s+is)?\W{0,12}correct\b/i.test(after) ? "correct" : "unknown";
   return { verdict, important, lesser };
 }
 
@@ -106,8 +123,10 @@ export class RunTrace {
   sessionId: string | undefined;
   /** Pi's own model calls and its delegates', each counted once. */
   readonly usage = emptyUsage();
-  /** Delegate jobs whose results, and so whose spend, were seen. */
+  /** Delegate jobs whose newest result, and so whose spend, was seen. */
   readonly countedJobs = new Set<string>();
+  /** Delegate calls that ended without a result to account for. */
+  unaccountedDelegates = 0;
   readonly reviews: Review[] = [];
   /** PRs a `prmanager` delegate published or `gh pr create` printed, oldest first. */
   readonly prLinks: string[] = [];
@@ -129,9 +148,21 @@ export class RunTrace {
     this.repo = repo;
   }
 
-  /** Delegate or shell calls that started and never reported: their spend, or what they published, is unknown. */
+  /** Delegate calls that started and never reported: their spend is known only from the jobs they left. */
   get unfinishedDelegates(): number {
     return [...this.pending.values()].filter(call => delegateTools.has(call.tool)).length;
+  }
+
+  /** Jobs an unfinished call was continuing: an earlier result of theirs does not cover that work. */
+  get continuing(): Set<string> {
+    const ids = new Set<string>();
+    for (const call of this.pending.values()) {
+      if (!delegateTools.has(call.tool) || !record(call.args)) continue;
+      for (const task of Array.isArray(call.args.tasks) ? call.args.tasks : [call.args]) {
+        if (record(task) && typeof task.continue === "string") ids.add(task.continue);
+      }
+    }
+    return ids;
   }
 
   line(line: string): void {
@@ -160,14 +191,14 @@ export class RunTrace {
       case "message_end": {
         const message = event.message;
         if (!record(message) || message.role !== "assistant") return;
-        add(this.usage, message.usage);
+        addUsage(this.usage, message.usage);
         this.lastText = contentText(message.content);
         this.lastStop = typeof message.stopReason === "string" ? message.stopReason : undefined;
         this.lastError = typeof message.errorMessage === "string" ? message.errorMessage : undefined;
         return;
       }
       case "compaction_end":
-        if (record(event.result)) add(this.usage, event.result.usage);
+        if (record(event.result)) addUsage(this.usage, event.result.usage);
         return;
       case "tool_execution_start":
         if (typeof event.toolCallId === "string" && typeof event.toolName === "string") {
@@ -179,8 +210,13 @@ export class RunTrace {
         const call = this.pending.get(event.toolCallId);
         this.pending.delete(event.toolCallId);
         if (!call || !record(event.result)) return;
-        if (delegateTools.has(call.tool)) this.delegates(call.args, event.result);
-        else if (call.tool === "bash") this.shell(call.args, event.result);
+        if (delegateTools.has(call.tool)) {
+          this.delegates(call.args, event.result);
+        } else {
+          // Model work another tool did itself.
+          addUsage(this.usage, event.result.usage);
+          if (call.tool === "bash") this.shell(call.args, event.result);
+        }
         return;
       }
       case "agent_settled":
@@ -194,25 +230,33 @@ export class RunTrace {
     const reported = record(result.details) ? result.details.delegateResult : undefined;
     const results = Array.isArray(reported) ? reported : [reported];
     const tasks = record(args) && Array.isArray(args.tasks) ? args.tasks : [args];
+    let accounted = 0;
     results.forEach((job, index) => {
-      if (!record(job) || typeof job.id !== "string" || this.countedJobs.has(job.id)) return;
+      if (!record(job) || typeof job.id !== "string") return;
+      accounted++;
+      // Each call reports the work of that call: a continued job reports again under the same ID, with new spend.
       this.countedJobs.add(job.id);
       // A job's usage already includes the delegates it started itself.
-      add(this.usage, job.usage);
+      addUsage(this.usage, job.usage);
       if (record(job.delivery) && typeof job.delivery.prUrl === "string") this.link(job.delivery.prUrl);
       if (job.profile !== "crmanager") return;
       const task = tasks[index];
       const request = record(task) && typeof task.task === "string" ? task.task.trim().split(/\r?\n/)[0] : "";
+      const asked = /^\/review (commit|branch|pr) (\S+)$/.exec(request);
       const finished = job.success === true;
       const sha = record(job.workspace) && typeof job.workspace.baseSha === "string" ? job.workspace.baseSha : undefined;
-      // A review of uncommitted changes names the commit it started from, not what it reviewed.
-      const reviewed = /^\/review (commit|branch|pr) /.test(request) ? sha : undefined;
       const summary = typeof job.summary === "string" ? job.summary : "";
       this.reviews.push({
-        request, finished, sha: reviewed,
+        request, finished,
+        pr: asked?.[1] !== "pr" ? undefined
+          : /^[1-9]\d*$/.test(asked[2]) ? Number(asked[2]) : githubLink(asked[2], this.repo, "pull")?.number,
+        // A review of uncommitted changes names the commit it started from, not what it reviewed.
+        sha: asked ? sha : undefined,
         ...(finished ? readReview(summary) : { verdict: "unknown", important: 0, lesser: 0 }),
       });
     });
+    // A call that ended with no result, or fewer than it was asked for, spent something nobody reported.
+    if (accounted < tasks.length) this.unaccountedDelegates += tasks.length - accounted;
   }
 
   private shell(args: unknown, result: Record<string, unknown>): void {
@@ -229,10 +273,10 @@ export class RunTrace {
   }
 }
 
-/** A PR or issue URL of `repo`, in its canonical form; anything else is undefined. */
-export function githubLink(url: string, repo: string): { kind: "pull" | "issues"; number: number; url: string } | undefined {
+/** A PR or issue URL of `repo`, in its canonical form; anything else, or a link of the other `kind`, is undefined. */
+export function githubLink(url: string, repo: string, kind?: "pull" | "issues"): { kind: "pull" | "issues"; number: number; url: string } | undefined {
   const match = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/(pull|issues)\/([1-9]\d*)(?:[/?#].*)?$/.exec(url.trim());
-  if (!match || match[1].toLowerCase() !== repo.toLowerCase()) return undefined;
-  const kind = match[2] as "pull" | "issues";
-  return { kind, number: Number(match[3]), url: `https://github.com/${repo}/${kind}/${match[3]}` };
+  if (!match || match[1].toLowerCase() !== repo.toLowerCase() || (kind && match[2] !== kind)) return undefined;
+  const found = match[2] as "pull" | "issues";
+  return { kind: found, number: Number(match[3]), url: `https://github.com/${repo}/${found}/${match[3]}` };
 }

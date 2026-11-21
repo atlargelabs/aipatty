@@ -37,6 +37,8 @@ export function piExtension(getRuns: () => PiRuns) {
       thinking: opt(str({ description: "Thinking level: off, minimal, low, medium, high, xhigh or max; default high" })),
       timeoutMinutes: opt(int({ minimum: 1, maximum: maxMinutes, description: `Stop the run after this long; default ${defaultMinutes}` })),
     }),
+    // Not from a codemode script: a run is one call of the model's, whose result and cost the branch records.
+    callers: ["model"],
     // The harness's own bound comes after the tool has clipped the summary and the lists.
     outputLimits: { maxBytes: 24_000, maxLines: 400, retain: "head" },
     async execute(args, api, context) {
@@ -53,14 +55,15 @@ export function piExtension(getRuns: () => PiRuns) {
     },
   });
 
-  // The harness writes the result of a call it ended itself. For `pi`, replace it with what the run did before it was
-  // stopped: its spend, and any PR it had already published.
+  // The harness writes the result of a call it ended itself: aborted, or cut off by a restart. For `pi`, replace it
+  // with the run's own outcome: what it had done when it was stopped, or, when the run had already settled and
+  // only the commit of its result was cut off, the result itself. Either way its spend is charged here, once.
   const ended = new Set(["aborted", "interrupted", "restart_limit"]);
   const afterPi = hook(ToolTask, {
     async afterTool(call, written, api) {
       if (call.name !== "pi" || call.parent || !written.diagnostics?.some(diagnostic => ended.has(diagnostic.code ?? ""))) return undefined;
       const outcome = await getRuns().settled(api.conversationId, call.id);
-      return outcome ? { ...result(outcome), isError: true } : undefined;
+      return outcome ? result(outcome) : undefined;
     },
   });
 
