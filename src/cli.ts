@@ -2,7 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { on } from "node:events";
 import WebSocket, { type RawData } from "ws";
-import { DEFAULT_URL, readSettings } from "./config.ts";
+import { LOOPBACK, readFaux, readPort } from "./config.ts";
 import type { BranchInfo, SearchMatch } from "./branches.ts";
 import { failureText, messageText, type ConversationPage, type StreamFrame } from "./protocol.ts";
 import { branchLine } from "./tools.ts";
@@ -18,7 +18,7 @@ async function request<T>(base: URL, path: string, options?: RequestInit): Promi
     // fetch() says only "fetch failed"; its cause has the reason.
     const cause = error instanceof Error && error.cause instanceof Error ? error.cause : error;
     const reason = (cause as NodeJS.ErrnoException).code ?? (cause instanceof Error ? cause.message : String(cause));
-    throw new Error(`Cannot reach the server at ${base.origin} (${reason}). Is it running, and is AIPATTY_URL its address?`);
+    throw new Error(`Cannot reach the server at ${base.origin} (${reason}). Is it running, and is --port its port?`);
   });
   const text = await response.text();
   let value: unknown;
@@ -42,7 +42,7 @@ async function send(base: URL, content: string, root: string): Promise<void> {
     body: JSON.stringify({ content, requestId: randomUUID() }),
   });
   const url = new URL(`${root}/stream?submissionId=${submissionId}`, base);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.protocol = "ws:";
   const socket = new WebSocket(url);
   let printed = "";
   const print = (text: string) => {
@@ -94,13 +94,14 @@ async function log(base: URL, root: string, limit?: number): Promise<void> {
   }
 }
 
-const usage = `Usage: aipatty [--branch <id>] <command>
+const usage = `Usage: aipatty [--port <n>] [--branch <id>] <command>
   health | models
   model set [provider] <modelId> | thinking set <level>
   send "<text>" | abort | log
   branches [list] | branches read <id> [--limit <n>] | branches search <id> "<text>"
   fork "<title>" [--at <entryId>] | rename "<title>"
---branch selects the branch for model, thinking, send, abort, log, fork and rename; default the root.`;
+--branch selects the branch for model, thinking, send, abort, log, fork and rename; default the root.
+--port is the server's port on this machine; default 8790.`;
 
 /** Remove `--name <value>` from `args`, returning the value. */
 function takeOption(args: string[], name: string): string | undefined {
@@ -117,12 +118,13 @@ async function main(): Promise<void> {
   const branch = takeOption(args, "--branch");
   const limitArg = takeOption(args, "--limit");
   const at = takeOption(args, "--at");
+  const port = readPort(takeOption(args, "--port"), 1);
   const limit = limitArg === undefined ? undefined : Number(limitArg);
   if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) throw new Error("--limit must be a positive integer");
   const [command, ...rest] = args;
   const root = conversationPath(branch);
-  const base = new URL(readSettings().URL ?? DEFAULT_URL);
-  if (base.protocol !== "http:" && base.protocol !== "https:") throw new Error("AIPATTY_URL must be HTTP(S)");
+  readFaux(); // The CLI has no environment settings; this rejects a leftover or misspelt one.
+  const base = new URL(`http://${LOOPBACK}:${port}`);
   const json = (path: string, method: string, body: unknown) => request(base, path, {
     method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   });

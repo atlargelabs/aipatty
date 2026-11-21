@@ -1,9 +1,9 @@
 import { BACKGROUND_CONTEXT as ctx, withAbortSignal } from "@earendil-works/chord/context";
 import type { Conversation, EntryId, InputSubmissionDraft, Submission, SubmissionId } from "@earendil-works/pi-durable";
 import { createServer, STATUS_CODES, type IncomingMessage, type ServerResponse } from "node:http";
-import { isIP } from "node:net";
 import type { Duplex } from "node:stream";
 import WebSocket, { WebSocketServer } from "ws";
+import { LOOPBACK } from "./config.ts";
 import { HttpError, type AgentHost } from "./host.ts";
 import { pageCss, pageHtml, pageJs } from "./page.ts";
 import { messageText, streamState, streamUpdate, type StreamFrame } from "./protocol.ts";
@@ -32,22 +32,17 @@ function errorResponse(error: unknown): { status: number; message: string } {
   return { status: 500, message: "Internal server error" };
 }
 
-function trustedName(name: string): string {
-  if (isIP(name) === 6) {
-    // A Host header cannot carry a zone, so a zoned address could never be matched.
-    if (name.includes("%")) throw new Error(`Expected an IPv6 address without a zone: ${name}`);
-    return new URL(`http://[${name}]`).hostname;
-  }
-  if (!name || !/^[a-z0-9.-]+$/i.test(name)) {
-    throw new Error(`Expected a trusted hostname or IP address without scheme or port: ${name}`);
-  }
-  return name.toLowerCase();
-}
+/** The names a client can use for the loopback listener, on this machine or at the near end of an SSH port forward. */
+const loopbackNames = [LOOPBACK, "localhost"];
 
-function requestUrl(req: IncomingMessage, trusted: readonly string[]): URL {
+/**
+ * The request's URL, once its Host names this listener and its Origin, if any, is the same origin. A page on another
+ * site that points its own name at this address, or sends a cross-site request, fails one of the two.
+ */
+function requestUrl(req: IncomingMessage): URL {
   const authority = req.headers.host?.toLowerCase();
   const port = req.socket.localPort;
-  const name = trusted.find(n => authority === `${n}:${port}` || (port === 80 && authority === n));
+  const name = loopbackNames.find(n => authority === `${n}:${port}` || (port === 80 && authority === n));
   if (!name || req.headersDistinct.host?.length !== 1) throw new HttpError(403, "Untrusted Host");
   const origin = `http://${name}${port === 80 ? "" : `:${port}`}`;
   const origins = req.headersDistinct.origin;
@@ -123,8 +118,8 @@ function requireMethod(req: IncomingMessage, res: ServerResponse, method: string
   throw new HttpError(405, "Method not allowed");
 }
 
-async function handleHttp(agent: AgentHost, health: Health, req: IncomingMessage, res: ServerResponse, trusted: readonly string[]) {
-  const { pathname, searchParams } = requestUrl(req, trusted);
+async function handleHttp(agent: AgentHost, health: Health, req: IncomingMessage, res: ServerResponse) {
+  const { pathname, searchParams } = requestUrl(req);
   if (pathname === "/health") {
     requireMethod(req, res, "GET");
     sendJson(res, 200, { ...health, ...await agent.modelStatus() });
@@ -307,9 +302,8 @@ async function stream(socket: WebSocket, streams: Streams, conversation: Convers
 
 async function handleUpgrade(
   agent: AgentHost, wss: WebSocketServer, streams: Streams, req: IncomingMessage, socket: Duplex, head: Buffer,
-  trusted: readonly string[],
 ) {
-  const { pathname, searchParams } = requestUrl(req, trusted);
+  const { pathname, searchParams } = requestUrl(req);
   const route = /^\/api\/conversations\/([^/]+)\/stream$/.exec(pathname);
   if (!route) throw new HttpError(404, "Not found");
   const conversation = await agent.conversation(route[1]);
@@ -340,19 +334,11 @@ export interface Health {
 }
 
 /**
- * Serve the root (or any conversation ID) over HTTP and WebSocket. Each stream is pinged every `heartbeatMs` and
- * dropped if it has not answered by the next ping, so a client that vanished without closing does not linger.
+ * Serve the root (or any conversation ID) over HTTP and WebSocket, on loopback only. Each stream is pinged every
+ * `heartbeatMs` and dropped if it has not answered by the next ping, so a client that vanished without closing does
+ * not linger.
  */
-export async function startApi(
-  agent: AgentHost, health: Health, host: string, port: number, aliases: readonly string[] = [],
-  heartbeatMs = defaultHeartbeatMs,
-) {
-  // No client addresses a wildcard listener by that address, so it needs the names clients do use.
-  const wildcard = host === "0.0.0.0" || (isIP(host) === 6 && trustedName(host) === "[::]");
-  if (wildcard && !aliases.length) {
-    throw new Error(`Listening on every address (${host}) needs AIPATTY_TRUSTED_HOSTS: the names or addresses clients use to reach this server`);
-  }
-  const trusted = (wildcard ? aliases : [host, ...aliases]).map(trustedName);
+export async function startApi(agent: AgentHost, health: Health, port: number, heartbeatMs = defaultHeartbeatMs) {
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 });
   const streams: Streams = { controllers: new Set(), alive: new WeakSet() };
   const heartbeat = setInterval(() => {
@@ -362,7 +348,7 @@ export async function startApi(
     }
   }, heartbeatMs).unref();
   const server = createServer({ requestTimeout: 30_000, headersTimeout: 10_000 }, (req, res) => {
-    void handleHttp(agent, health, req, res, trusted).catch(error => {
+    void handleHttp(agent, health, req, res).catch(error => {
       if (res.destroyed) return;
       const { status, message } = errorResponse(error);
       if (!req.complete) res.shouldKeepAlive = false;
@@ -374,7 +360,7 @@ export async function startApi(
     const onError = () => socket.destroy();
     socket.on("error", onError);
     upgrading.add(socket);
-    void handleUpgrade(agent, wss, streams, req, socket, head, trusted).catch(error => {
+    void handleUpgrade(agent, wss, streams, req, socket, head).catch(error => {
       if (socket.destroyed) return;
       const { status, message } = errorResponse(error);
       const body = JSON.stringify({ error: message });
@@ -387,7 +373,7 @@ export async function startApi(
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(port, host, () => {
+    server.listen(port, LOOPBACK, () => {
       server.off("error", reject);
       resolve();
     });
@@ -397,6 +383,8 @@ export async function startApi(
   let closing: Promise<void> | undefined;
   return {
     port: address.port,
+    /** Where the listener is bound. */
+    address: { address: address.address, family: address.family, port: address.port },
     close() {
       return closing ??= new Promise<void>(resolve => {
         clearInterval(heartbeat);

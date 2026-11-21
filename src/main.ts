@@ -2,7 +2,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { execFileSync } from "node:child_process";
 import packageJson from "../package.json" with { type: "json" };
 import { startApi } from "./api.ts";
-import { readConfig } from "./config.ts";
+import { LOOPBACK, readConfig } from "./config.ts";
 import { openHost } from "./host.ts";
 
 function runningCommit(): string {
@@ -40,8 +40,8 @@ async function main(): Promise<void> {
       }
     });
     try {
-      const api = await startApi(agent, health, config.host, config.port, config.trustedHosts);
-      console.log(`aipatty listening on ${config.host}:${api.port}`);
+      const api = await startApi(agent, health, config.port);
+      console.log(`aipatty listening on ${LOOPBACK}:${api.port}`);
       await Promise.race([signal.promise, closed]);
       await api.close();
     } finally {

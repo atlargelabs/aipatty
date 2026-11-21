@@ -1,13 +1,10 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-
-const names = ["DATA_DIR", "HOST", "TRUSTED_HOSTS", "PORT", "PI_DIR", "FAUX", "URL"] as const;
+import { parseArgs } from "node:util";
 
 /** Server settings. */
 export interface Config {
   dataDir: string;
-  host: string;
-  trustedHosts: string[];
   port: number;
   /** The pi CLI's login file. */
   authFile: string;
@@ -16,18 +13,34 @@ export interface Config {
   faux: boolean;
 }
 
-/** The default local endpoint shared by the server and CLI. */
-export const DEFAULT_URL = "http://127.0.0.1:8790";
+/** The only address the server listens on. Other machines reach it through an SSH port forward. */
+export const LOOPBACK = "127.0.0.1";
+
+/** The port the server listens on, and the CLI connects to, unless `--port` says otherwise. */
+export const DEFAULT_PORT = 8790;
+
+const serverUsage = "Usage: node src/main.ts [--port <n>] [--data-dir <path>] [--pi-dir <path>]";
 
 /**
- * aipatty's settings from the environment, without the `AIPATTY_` prefix. An empty value is unset. The server and the
- * CLI share the prefix, so each accepts the other's settings; any other name is a mistake, not a setting to ignore.
+ * Whether `AIPATTY_FAUX` asks for the fake model. It is the only environment setting; an empty value is unset. The
+ * server and the CLI both check the prefix, so a leftover or misspelt name is an error, not a setting to ignore.
  */
-export function readSettings(env: NodeJS.ProcessEnv = process.env): Partial<Record<typeof names[number], string>> {
-  const known = names.map(name => `AIPATTY_${name}`);
-  const unknown = Object.keys(env).filter(name => name.startsWith("AIPATTY_") && !known.includes(name));
-  if (unknown.length) throw new Error(`Unknown setting ${unknown.join(", ")}. The settings are: ${known.join(", ")}`);
-  return Object.fromEntries(names.flatMap(name => env[`AIPATTY_${name}`] ? [[name, env[`AIPATTY_${name}`]]] : []));
+export function readFaux(env: NodeJS.ProcessEnv = process.env): boolean {
+  const unknown = Object.keys(env).filter(name => name.startsWith("AIPATTY_") && name !== "AIPATTY_FAUX");
+  if (unknown.length) {
+    throw new Error(`Unknown setting ${unknown.join(", ")}. The only environment setting is AIPATTY_FAUX; `
+      + "the port, data directory and pi directory are command-line options");
+  }
+  return env.AIPATTY_FAUX === "1";
+}
+
+/** Parse a `--port` value. Only the server may take 0, which asks the operating system for a free port. */
+export function readPort(value: string | undefined, min: 0 | 1): number {
+  if (value === undefined) return DEFAULT_PORT;
+  if (!/^\d+$/.test(value) || Number(value) < min || Number(value) > 65_535) {
+    throw new Error(`--port must be an integer between ${min} and 65535`);
+  }
+  return Number(value);
 }
 
 function absolutePath(path: string): string {
@@ -35,20 +48,26 @@ function absolutePath(path: string): string {
   return path.startsWith("~/") ? join(homedir(), path.slice(2)) : resolve(path);
 }
 
-/** Parse the server's settings. */
-export function readConfig(env: NodeJS.ProcessEnv = process.env): Config {
-  const settings = readSettings(env);
-  const port = settings.PORT ?? "8790";
-  if (!/^\d+$/.test(port) || Number(port) > 65_535) {
-    throw new Error("AIPATTY_PORT must be an integer between 0 and 65535");
+/** Parse the server's command-line options and its one environment setting. */
+export function readConfig(args: readonly string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env): Config {
+  const faux = readFaux(env);
+  let values: { port?: string; "data-dir"?: string; "pi-dir"?: string };
+  try {
+    ({ values } = parseArgs({
+      args: [...args],
+      options: { port: { type: "string" }, "data-dir": { type: "string" }, "pi-dir": { type: "string" } },
+      allowPositionals: false,
+    }));
+  } catch (error) {
+    throw new Error(`${error instanceof Error ? error.message : error}\n${serverUsage}`);
   }
-  const faux = settings.FAUX === "1";
-  const piDir = absolutePath(settings.PI_DIR ?? "~/.pi/agent");
+  for (const name of ["data-dir", "pi-dir"] as const) {
+    if (values[name] === "") throw new Error(`--${name} needs a path`);
+  }
+  const piDir = absolutePath(values["pi-dir"] ?? "~/.pi/agent");
   return {
-    dataDir: absolutePath(settings.DATA_DIR ?? (faux ? "~/.aipatty/faux" : "~/.aipatty/data")),
-    host: settings.HOST ?? "127.0.0.1",
-    trustedHosts: (settings.TRUSTED_HOSTS ?? "").split(",").map(s => s.trim()).filter(Boolean),
-    port: Number(port),
+    dataDir: absolutePath(values["data-dir"] ?? (faux ? "~/.aipatty/faux" : "~/.aipatty/data")),
+    port: readPort(values.port, 0),
     authFile: join(piDir, "auth.json"),
     modelsStore: join(piDir, "models-store.json"),
     faux,

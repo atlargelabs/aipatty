@@ -21,7 +21,7 @@ the admission error; the branch remains available.
 
 ## Page
 
-Open `http://<AIPATTY_HOST>:<AIPATTY_PORT>/` for the branch list, transcript, input box, fork (of the whole branch, or
+Open `http://127.0.0.1:8790/` (or the port given with `--port`) for the branch list, transcript, input box, fork (of the whole branch, or
 at a completed exchange with "Fork here"), rename, search, model and thinking pickers, and cost. ⌘/Ctrl+Enter sends.
 
 ## Install
@@ -37,6 +37,7 @@ npm install --ignore-scripts
 ```sh
 npm start                  # uses the pi CLI's ChatGPT subscription login
 AIPATTY_FAUX=1 npm start   # a fake model that echoes, for demos; needs no login
+npm start -- --port 9000   # server options go after the --
 ```
 
 The server uses only the pi CLI’s ChatGPT subscription login and takes the same lock when refreshing it.
@@ -45,23 +46,26 @@ If a send reports that OpenAI is not configured, sign in with the pi CLI. Stored
 
 ## Configure
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `AIPATTY_DATA_DIR` | `~/.aipatty/data` (`~/.aipatty/faux` in faux mode) | Where the conversation database and ownership lock live |
-| `AIPATTY_HOST` | `127.0.0.1` | Listen address; the tailnet address on the Mac mini. A wildcard (`0.0.0.0`, `::`) needs `AIPATTY_TRUSTED_HOSTS` |
-| `AIPATTY_TRUSTED_HOSTS` | unset | Additional trusted hostnames, comma-separated, without scheme or port (e.g. the mini’s Tailscale DNS name) |
-| `AIPATTY_PORT` | `8790` | Listen port |
-| `AIPATTY_PI_DIR` | `~/.pi/agent` | The pi CLI's directory: its login file `auth.json` and its cached model catalog `models-store.json`, which is only read |
-| `AIPATTY_FAUX` | unset | `1` uses the fake model |
-| `AIPATTY_URL` | `http://127.0.0.1:8790` | Server address for the CLI client |
+The server takes three command-line options:
 
-An empty value counts as unset. Any other `AIPATTY_` variable stops the server and the CLI with an error that names it.
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--port <n>` | `8790` | Listen port. `0` asks the operating system for a free one, which the server prints |
+| `--data-dir <path>` | `~/.aipatty/data` (`~/.aipatty/faux` in faux mode) | Where the conversation database and ownership lock live |
+| `--pi-dir <path>` | `~/.pi/agent` | The pi CLI's directory: its login file `auth.json` and its cached model catalog `models-store.json`, which is only read |
+
+and one environment variable, `AIPATTY_FAUX`: `1` uses the fake model. An empty value counts as unset.
+
+An unknown option stops the server. Any other `AIPATTY_` variable stops the server and the CLI with an error that
+names it, so a setting left over from an earlier version is not silently ignored.
+
+The server listens on `127.0.0.1` only; there is no listen address to configure. See [From another machine](#from-another-machine).
 
 A new root conversation starts with the model `gpt-6.2-sol` and the thinking level `high`. Both are saved with the
 conversation; change them with `model set` and `thinking set` (add `--branch <id>` for a branch).
 
 `gpt-6.2-sol` is newer than the catalog bundled with pi-ai 1.5.2. It resolves only if the pi CLI has cached a newer
-catalog in `AIPATTY_PI_DIR`. If the saved model (or the default on first launch) is missing, the server
+catalog in the pi directory. If the saved model (or the default on first launch) is missing, the server
 still serves transcripts, branches and model commands. `/health` returns HTTP 200, `modelStatus: "unavailable"`, and the
 model reference; sends return 409. Availability means present in the local catalog, not that a login or network call succeeded.
 A branch whose model is missing refuses sends; the others keep working. If a branch has *interrupted work* waiting
@@ -96,6 +100,20 @@ node src/cli.ts rename "<title>"                   # retitle the root (or --bran
 `--branch <id>` before or after the command points `model set`, `thinking set`, `send`, `abort`, `log`, `fork` and
 `rename` at a branch instead of the root.
 
+The CLI connects to `127.0.0.1:8790`. `--port <n>` names another port, for a server started with `--port`.
+
+## From another machine
+
+The server has no login and accepts connections from its own machine only. To use the page or the CLI from a laptop,
+forward the port over SSH and open `http://127.0.0.1:8790/` there:
+
+```sh
+ssh -N -L 8790:127.0.0.1:8790 <the machine aipatty runs on>
+```
+
+Use the same port number at both ends: the server answers only to `127.0.0.1` or `localhost` at its own port. SSH is
+the authentication.
+
 ## API
 
 - `GET /` the page (and `/app.js`, `/app.css`)
@@ -120,9 +138,9 @@ node src/cli.ts rename "<title>"                   # retitle the root (or --bran
   answer, or the `reason` and `detail` of a failed run. The server pings every 30 s and drops a stream that does
   not answer.
 
-Both HTTP and WebSocket requests must use the configured listen name/address or an explicitly trusted hostname,
-at the actual listener port. If present, `Origin` must also match that same HTTP origin. Host validation is not
-authentication: bind only to loopback or the private tailnet address.
+Both HTTP and WebSocket requests must name the server as `127.0.0.1` or `localhost`, at the actual listener port. If
+present, `Origin` must also match that same HTTP origin. This stops a web page on another site from driving the
+server through the browser. It is not authentication: any process on the machine can connect.
 
 ## Test
 

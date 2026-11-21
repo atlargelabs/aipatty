@@ -353,7 +353,7 @@ $("composer").addEventListener("submit", guard(async event => {
   if (send.disabled || branch === null || !content.trim()) return;
   send.disabled = true;
   try {
-    // getRandomValues is also available on plain HTTP over the tailnet.
+    // Unlike randomUUID, getRandomValues does not need a secure context.
     const requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
     await api("/api/conversations/" + branch + "/messages", {
       method: "POST", body: { content, requestId, whenBusy: "followUp" },

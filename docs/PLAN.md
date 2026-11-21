@@ -8,7 +8,7 @@ installed and then asked to keep building itself. It is not the finished product
 | Area | Decision |
 | --- | --- |
 | Base | A small host of our own on the `@earendil-works/pi-durable` library. Not p2 or p3; p2's plugins are reference code only. |
-| Remote access | HTTP and WebSocket on the tailnet only, one crude web page, and a CLI client. Used from phone and laptop. No notifications. |
+| Remote access | HTTP and WebSocket on loopback only, one crude web page, and a CLI client. The laptop reaches them through an SSH port forward; the phone's route is not settled (see [Remote access](#remote-access)). No notifications. |
 | Merging | Only Steve merges PRs in `atlargelabs/aipatty`. |
 | Upgrade | Explicit, never automatic. If rollback also fails, Steve uses SSH or remote desktop. |
 | GitHub identity | The `pattycaik` account with write access, behind a ruleset on `main`. Other repos only when Steve directs it. |
@@ -77,11 +77,16 @@ PR that links the issue.
 
 ## Remote access
 
-- **API:** bound to the tailnet address. List branches, send, steer, abort, fork, set the model, stream live output,
-  and `/health` with the running commit.
+- **API:** bound to `127.0.0.1`, with no listen address to configure. List branches, send, steer, abort, fork, set
+  the model, stream live output, and `/health` with the running commit.
 - **Page:** branch list, transcript, input box, fork button, model picker, Gmail switch, and cost.
 - **CLI:** the same API from a terminal.
-- **Auth:** the tailnet. No one else's devices are on it.
+- **Auth:** SSH to the mini. The server has no login of its own and answers only to `127.0.0.1` or `localhost` at
+  its own port, so a web page on another site cannot drive it through a browser.
+- **Laptop:** `ssh -N -L 8790:127.0.0.1:8790 macmini`, then the page or the CLI at `127.0.0.1:8790`.
+- **Phone:** not settled. An SSH app can hold the same forward, but iOS suspends it in the background. The
+  alternative is `tailscale serve` on the mini, which would need an option naming the public origin the server
+  accepts; that option is not built and the route is not tested.
 
 ## Upgrade and rollback
 

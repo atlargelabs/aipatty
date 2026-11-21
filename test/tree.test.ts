@@ -5,17 +5,16 @@ import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { startApi } from "../src/api.ts";
 import type { BranchInfo } from "../src/branches.ts";
-import { readConfig } from "../src/config.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
 import { messageText, type ConversationPage } from "../src/protocol.ts";
-import { checkout, fauxConfig, fixture, fixtureEnv, until } from "./helpers.ts";
+import { checkout, fauxConfig, fixture, realConfig, until } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
 const exec = promisify(execFile);
 
 async function server(t: TestContext, dir?: string) {
   const host = await openHost(fauxConfig(dir ?? await fixture(t)));
-  const api = await startApi(host, health, "127.0.0.1", 0);
+  const api = await startApi(host, health, 0);
   t.after(async () => { await api.close(); await host.harness.close(ctx); });
   const base = `http://127.0.0.1:${api.port}`;
   const call = async <T = unknown>(path: string, method = "GET", body?: unknown): Promise<{ status: number; body: T }> => {
@@ -314,7 +313,7 @@ test("a task-owned conversation is not a branch, and an unknown ID is 404", asyn
 test("CLI lists, reads, searches, forks and renames branches, and sends to one", { timeout: 15_000 }, async t => {
   const dir = await fixture(t);
   const { host, base } = await server(t, dir);
-  const cli = (...args: string[]) => exec(process.execPath, ["src/cli.ts", ...args], { cwd: checkout, env: { AIPATTY_URL: base } });
+  const cli = (...args: string[]) => exec(process.execPath, ["src/cli.ts", "--port", new URL(base).port, ...args], { cwd: checkout, env: {} });
   await say(host, "root", "hello there");
   const forked = JSON.parse((await cli("fork", "From the CLI")).stdout) as BranchInfo;
   assert.equal(forked.title, "From the CLI");
@@ -343,7 +342,7 @@ test("interrupted work on a branch with an unavailable model blocks only until t
   await initial.harness.close(ctx);
 
   // Without faux, the saved faux model is missing from the catalog. The root has no interrupted work.
-  const blocked = await openHost(readConfig(fixtureEnv(dir, { AIPATTY_FAUX: "0" })));
+  const blocked = await openHost(realConfig(dir));
   try {
     const root = (await blocked.conversation("root"))!;
     await assert.rejects(blocked.submit(root, { type: "input", content: "no" }), new RegExp(`Branch ${fork.id} has interrupted work.*model set --branch ${fork.id}`));

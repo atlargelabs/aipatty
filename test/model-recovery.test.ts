@@ -2,10 +2,9 @@ import { BACKGROUND_CONTEXT as ctx, withAbortSignal } from "@earendil-works/chor
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { startApi } from "../src/api.ts";
-import { readConfig } from "../src/config.ts";
 import { openHost } from "../src/host.ts";
 import { messageText } from "../src/protocol.ts";
-import { connect, fixture, fixtureEnv, fauxConfig, until } from "./helpers.ts";
+import { connect, fixture, fauxConfig, realConfig, until } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
 test("unavailable interrupted work is withdrawn on switch and cannot replay after restart or new input", async t => {
@@ -16,9 +15,9 @@ test("unavailable interrupted work is withdrawn on switch and cannot replay afte
   await until(async () => (await initial.harness.inspect(ctx)).tasks.some(task => task.state.kind === "running"));
   await initial.harness.close(ctx);
 
-  const config = readConfig(fixtureEnv(dir, { AIPATTY_FAUX: "0" }));
+  const config = realConfig(dir);
   const blocked = await openHost(config);
-  const api = await startApi(blocked, health, "127.0.0.1", 0);
+  const api = await startApi(blocked, health, 0);
   const base = `http://127.0.0.1:${api.port}`;
   try {
     const status = await (await fetch(`${base}/health`)).json() as { modelStatus: string; model: { modelId: string } };
@@ -51,7 +50,7 @@ test("unavailable interrupted work is withdrawn on switch and cannot replay afte
 test("settled frame is delivered while a later submission is still running", async t => {
   const dir = await fixture(t);
   const host = await openHost(fauxConfig(dir));
-  const api = await startApi(host, health, "127.0.0.1", 0);
+  const api = await startApi(host, health, 0);
   t.after(async () => { await api.close(); await host.harness.close(ctx); });
   const base = `http://127.0.0.1:${api.port}`;
   const post = (content: string) => fetch(`${base}/api/conversations/root/messages`, {
@@ -86,7 +85,7 @@ test("a message sent right behind a recovering model switch, or during an abort,
   await initial.harness.close(ctx);
 
   // The saved faux model is not in the real catalog, so the interrupted run stays paused until a switch aborts it.
-  const blocked = await openHost(readConfig(fixtureEnv(dir, { AIPATTY_FAUX: "0" })));
+  const blocked = await openHost(realConfig(dir));
   const settles = async (submission: Awaited<ReturnType<typeof blocked.submit>>) =>
     (await submission.wait(withAbortSignal(AbortSignal.timeout(5_000), ctx))).status;
   try {
@@ -100,7 +99,7 @@ test("a message sent right behind a recovering model switch, or during an abort,
   }
 
   const host = await openHost(fauxConfig(dir));
-  const api = await startApi(host, health, "127.0.0.1", 0);
+  const api = await startApi(host, health, 0);
   t.after(async () => { await api.close(); await host.harness.close(ctx); });
   await host.setModel({ provider: "faux", modelId: "faux-1" });
   const messages = `http://127.0.0.1:${api.port}/api/conversations/root`;

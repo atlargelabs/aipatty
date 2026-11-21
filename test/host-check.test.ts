@@ -7,9 +7,9 @@ import { startApi } from "../src/api.ts";
 import { openHost } from "../src/host.ts";
 import { fixture, fauxConfig } from "./helpers.ts";
 
-test("HTTP and WS require a configured host and listener port even without an Origin", async t => {
+test("HTTP and WS require a loopback name and the listener port, and a same-origin Origin if there is one", async t => {
   const agent = await openHost(fauxConfig(await fixture(t)));
-  const api = await startApi(agent, { ok: true, startedAt: "now", version: "test", commit: "test" }, "127.0.0.1", 0, ["mini.test"]);
+  const api = await startApi(agent, { ok: true, startedAt: "now", version: "test", commit: "test" }, 0);
   t.after(async () => { await api.close(); await agent.harness.close(ctx); });
   const base = `127.0.0.1:${api.port}`;
   function http(headers: Record<string, string>) {
@@ -26,23 +26,26 @@ test("HTTP and WS require a configured host and listener port even without an Or
     });
   }
   for (const [probe, ok] of [[http, 200], [stream, 101]] as const) {
-    const alias = `mini.test:${api.port}`;
+    const name = `localhost:${api.port}`;
     assert.equal(await probe({ Host: base }), ok);
-    assert.equal(await probe({ Host: alias, Origin: `http://${alias}` }), ok);
+    assert.equal(await probe({ Host: base, Origin: `http://${base}` }), ok);
+    assert.equal(await probe({ Host: name, Origin: `http://${name}` }), ok);
+    assert.equal(await probe({ Host: `LOCALHOST:${api.port}` }), ok);
+    // Another site's name pointed at this address, as in DNS rebinding.
     assert.equal(await probe({ Host: `other.test:${api.port}` }), 403);
-    assert.equal(await probe({ Host: "mini.test:1" }), 403);
-    assert.equal(await probe({ Host: alias, Origin: `http://${base}` }), 403);
+    // The far end of an SSH forward must use the same port number.
+    assert.equal(await probe({ Host: "localhost:1" }), 403);
+    assert.equal(await probe({ Host: "localhost" }), 403);
+    // A cross-site request, and one from another origin on this machine.
+    assert.equal(await probe({ Host: base, Origin: "http://other.test" }), 403);
+    assert.equal(await probe({ Host: name, Origin: `http://${base}` }), 403);
+    assert.equal(await probe({ Host: base, Origin: `https://${base}` }), 403);
   }
 });
 
-test("a wildcard listen address needs trusted hosts, and a zoned IPv6 address is refused by name", async t => {
+test("the server listens on loopback only", async t => {
   const agent = await openHost(fauxConfig(await fixture(t)));
-  t.after(() => agent.harness.close(ctx));
-  const start = (host: string, aliases: string[] = []) =>
-    startApi(agent, { ok: true, startedAt: "now", version: "test", commit: "test" }, host, 0, aliases);
-  for (const host of ["0.0.0.0", "::", "0:0:0:0:0:0:0:0"]) {
-    await assert.rejects(start(host), /Listening on every address \(.*\) needs AIPATTY_TRUSTED_HOSTS/);
-  }
-  await assert.rejects(start("fe80::1%lo0"), /Expected an IPv6 address without a zone: fe80::1%lo0/);
-  await assert.rejects(start("127.0.0.1", ["fe80::1%lo0"]), /without a zone/);
+  const api = await startApi(agent, { ok: true, startedAt: "now", version: "test", commit: "test" }, 0);
+  t.after(async () => { await api.close(); await agent.harness.close(ctx); });
+  assert.deepEqual(api.address, { address: "127.0.0.1", family: "IPv4", port: api.port });
 });

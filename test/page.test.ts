@@ -6,9 +6,8 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { startApi } from "../src/api.ts";
-import { readConfig } from "../src/config.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
-import { checkout, fauxConfig, fixture, fixtureEnv, until } from "./helpers.ts";
+import { checkout, fauxConfig, fixture, realConfig, until } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
 
@@ -122,7 +121,7 @@ async function say(host: AgentHost, id: string, content: string): Promise<void> 
 test("clicking a branch in the page's list switches to it, and back", { skip: chrome ? false : "no Chrome found; set CHROME_PATH", timeout: 30_000 }, async t => {
   const dir = await fixture(t);
   const host = await openHost(fauxConfig(dir));
-  const api = await startApi(host, health, "127.0.0.1", 0);
+  const api = await startApi(host, health, 0);
   t.after(async () => { await api.close(); await host.harness.close(ctx); });
   const base = `http://127.0.0.1:${api.port}`;
 
@@ -155,8 +154,8 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
   assert.deepEqual(browser.errors, []);
 });
 
-test("Send over non-local HTTP admits once, preserves a new draft, and shows a failed run", { skip: !chrome, timeout: 30_000 }, async t => {
-  const host = await openHost(readConfig(fixtureEnv(await fixture(t), { AIPATTY_FAUX: "0" })));
+test("Send by the name localhost admits once, preserves a new draft, and shows a failed run", { skip: !chrome, timeout: 30_000 }, async t => {
+  const host = await openHost(realConfig(await fixture(t)));
   await host.setModel({ provider: "openai", modelId: "gpt-6.1-sol" }); // available model, no login in this fixture
   const gate = Promise.withResolvers<void>();
   const requestIds: (string | undefined)[] = [];
@@ -164,12 +163,11 @@ test("Send over non-local HTTP admits once, preserves a new draft, and shows a f
     requestIds.push(draft.requestId);
     await gate.promise;
     return host.submit(branch, draft, context);
-  } }, health, "127.0.0.1", 0, ["aipatty.test"]);
+  } }, health, 0);
   t.after(async () => { gate.resolve(); await api.close(); await host.harness.close(ctx); });
-  const browser = await openBrowser(t, ["--no-proxy-server", "--host-resolver-rules=MAP aipatty.test 127.0.0.1"]);
-  await browser.navigate(`http://aipatty.test:${api.port}/`);
+  const browser = await openBrowser(t);
+  await browser.navigate(`http://localhost:${api.port}/`);
   await waitFor(browser, "the main branch", state => state.current === "Main");
-  assert.equal(await browser.evaluate("isSecureContext"), false);
   await browser.evaluate(`
     document.querySelector('#input').value = 'first';
     document.querySelector('#composer').requestSubmit();
@@ -190,7 +188,7 @@ test("Send over non-local HTTP admits once, preserves a new draft, and shows a f
 
 test("an older page is requested once and cannot overwrite a different branch", { skip: !chrome, timeout: 30_000 }, async t => {
   const host = await openHost(fauxConfig(await fixture(t)));
-  const api = await startApi(host, health, "127.0.0.1", 0);
+  const api = await startApi(host, health, 0);
   t.after(async () => { await api.close(); await host.harness.close(ctx); });
   const root = (await host.conversation("root"))!;
   const side = await host.fork(root, { title: "Side" });
@@ -229,7 +227,7 @@ test("an older page is requested once and cannot overwrite a different branch", 
 
 test("a click on another branch lands while the current branch is streaming", { skip: chrome ? false : "no Chrome found; set CHROME_PATH", timeout: 30_000 }, async t => {
   const host = await openHost(fauxConfig(await fixture(t)));
-  const api = await startApi(host, health, "127.0.0.1", 0);
+  const api = await startApi(host, health, 0);
   t.after(async () => { await api.close(); await host.harness.close(ctx); });
   const root = (await host.conversation("root"))!;
   await say(host, "root", "on main");
