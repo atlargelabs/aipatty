@@ -88,7 +88,8 @@ export function readReview(summary: string): Pick<Review, "verdict" | "important
   const lesser = summary.match(/\[P[23]\]/g)?.length ?? 0;
   const stated = summary.split(/\r?\n/).findLast(line => /\bverdict\b/i.test(line)) ?? "";
   const declared = /^(?:the\s+)?(?:overall\s+|final\s+)?verdict(?:\s+is)?[\s:*_"'`“”–—-]{0,8}(correct|needs[ _-]attention)\b/i
-    .exec(stated.replace(/^[\s>#*_-]+/, ""));
+    // A quoted line is someone else's verdict.
+    .exec(stated.replace(/^[\s#*_-]+/, ""));
   const verdict = /needs[ _-]attention/i.test(stated) ? "needs attention"
     : declared?.[1].toLowerCase() === "correct" ? "correct" : "unknown";
   return { verdict, important, lesser };

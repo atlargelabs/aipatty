@@ -62,9 +62,11 @@ in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits fo
   stops what is left of the run, cleans up, and reports the call as `interrupted` in its branch, with any PR link
   the run had printed. It never runs the call again. A run that had already settled when the server died keeps
   its result.
-- **When cleanup fails.** If a run's processes cannot be stopped, its files cannot be removed, or its saved record
-  (`pi-run.json` in the data directory) cannot be read, nothing is deleted and no new run starts until that is
-  resolved and the server restarted. The refusal says what is wrong.
+- **When cleanup fails.** If a run's processes cannot be stopped or cannot be told from another's, its files
+  cannot be removed, or its saved record (`pi-run.json` in the data directory) cannot be read, nothing more is
+  deleted and no new run starts until that is resolved and the server restarted. The refusal says what is wrong.
+  Spend that is only found by a later cleanup, after the call's result was already recorded in its branch, is
+  kept in the run's `result.json` and is not added to the branch's cost.
 
 A run needs `git`, `gh` and a GitHub login for the user the server runs as, the Pi sign-in, and the pi-review
 extension: at `git/github.com/earendil-works/pi-review/review.ts` in the Pi directory (where

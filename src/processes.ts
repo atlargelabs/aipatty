@@ -72,9 +72,10 @@ async function markedPids(runId: string, procs: readonly Proc[]): Promise<Set<nu
   // `ps -E` prints the arguments and then the environment. Only the environment counts: a process that merely
   // has the marker among its arguments, such as a search for it, is not the run's. The entries are not delimited,
   // so a value that itself contains the marker with this run's random ID would also match.
+  // A scan that fails as a whole rejects: it must not pass for one that found nothing.
   const [plain, withEnv] = await Promise.all([
     ps(["-A", "-ww", "-o", "pid=,command="]), ps(["-A", "-E", "-ww", "-o", "pid=,command="]),
-  ]).catch(() => ["", ""]);
+  ]);
   const args = commands(plain);
   for (const [pid, full] of commands(withEnv)) {
     const own = args.get(pid);
@@ -89,10 +90,16 @@ async function markedPids(runId: string, procs: readonly Proc[]): Promise<Set<nu
  * the members of the groups its processes led, and everything reached from them as a child or as a member of the
  * same group. Pi and the delegates extension start their children as group leaders, so an orphan whose parent, or
  * whose group leader, died is still found. A process that left both its parent and its group, and hides its
- * environment, is not found. Forgets remembered groups that have no member left. The result is from a process table
- * read last, after the slower environment scan: act on it at once.
+ * environment, is not found.
+ *
+ * `unsure` are members of a remembered, leaderless group that started after the run last saw it: a late child of
+ * the run's, or a stranger in a group whose ID was reused. They are not the run's to kill, and not proof that the
+ * run is gone either.
+ *
+ * Forgets remembered groups that have no member left. The result is from a process table read last, after the
+ * slower environment scan: act on it at once.
  */
-export async function runProcesses(owned: Owned, runId: string): Promise<Proc[]> {
+async function scan(owned: Owned, runId: string): Promise<{ ours: Proc[]; unsure: Proc[] }> {
   const before = new Map((await listProcesses()).map(proc => [proc.pid, proc.start]));
   const marked = await markedPids(runId, [...before].map(([pid, start]) => ({ pid, ppid: 0, pgid: 0, start })));
   const procs = await listProcesses();
@@ -105,17 +112,17 @@ export async function runProcesses(owned: Owned, runId: string): Promise<Proc[]>
   const candidate = (proc: Proc) => proc.pid !== process.pid && proc.pid > 1;
   // Marked, and still the process that was scanned.
   const isMarked = (proc: Proc) => marked.has(proc.pid) && before.get(proc.pid) === proc.start;
-  // A member of a remembered group whose leader is gone, if it had started when the run last saw the group. With a
-  // live leader the group is the run's only through that leader, which is then remembered itself.
-  const inOwnGroup = (proc: Proc) => {
+  // A member of a remembered group whose leader is gone. With a live leader the group is the run's only through
+  // that leader, which is then remembered itself.
+  const leaderless = (proc: Proc) => owned.groups.has(proc.pgid) && !skipGroups.has(proc.pgid) && !byPid.has(proc.pgid);
+  const startedBy = (proc: Proc) => {
     const started = Date.parse(proc.start);
-    return owned.groups.has(proc.pgid) && !skipGroups.has(proc.pgid) && !byPid.has(proc.pgid)
-      && Number.isFinite(started) && started <= owned.asOf;
+    return Number.isFinite(started) && started <= owned.asOf;
   };
   const ours = new Map<number, Proc>();
   for (const proc of procs) {
     if (!candidate(proc)) continue;
-    if (owned.procs.get(proc.pid) === proc.start || isMarked(proc) || inOwnGroup(proc)) ours.set(proc.pid, proc);
+    if (owned.procs.get(proc.pid) === proc.start || isMarked(proc) || (leaderless(proc) && startedBy(proc))) ours.set(proc.pid, proc);
   }
   for (let grew = true; grew;) {
     grew = false;
@@ -128,7 +135,12 @@ export async function runProcesses(owned: Owned, runId: string): Promise<Proc[]>
       }
     }
   }
-  return [...ours.values()];
+  return { ours: [...ours.values()], unsure: procs.filter(proc => candidate(proc) && !ours.has(proc.pid) && leaderless(proc)) };
+}
+
+/** The live processes that belong to a run; see `scan`. Rejects when the process table cannot be read. */
+export async function runProcesses(owned: Owned, runId: string): Promise<Proc[]> {
+  return (await scan(owned, runId)).ours;
 }
 
 /**
@@ -158,7 +170,8 @@ function signal(pid: number, name: NodeJS.Signals): void {
  * Stop a run's processes. `root` gets SIGTERM first, through `term` when the caller still holds the child, and
  * `graceMs` to stop its own children, as Pi and the delegates extension do; whatever is left is killed. Every
  * signal goes to a process found, by ID and start time, in a process table read just before, so a process that
- * took over a dead one's ID is not signalled. Returns the survivors. Rejects when the table cannot be read.
+ * took over a dead one's ID is not signalled. Returns what is left: the survivors, and the processes that could not
+ * be told from the run's, which are not signalled. Rejects when the table cannot be read.
  */
 export async function stopRun(
   owned: Owned, runId: string, root: number | undefined, graceMs: number, term?: () => void,
@@ -178,12 +191,13 @@ export async function stopRun(
     }
   }
   let left: Proc[] = [];
+  let unsure: Proc[] = [];
   for (let attempt = 0; attempt < 20; attempt++) {
-    left = await runProcesses(owned, runId);
+    ({ ours: left, unsure } = await scan(owned, runId));
     if (!left.length) break;
     remember(owned, left);
     for (const proc of left) signal(proc.pid, "SIGKILL");
     await sleep(150);
   }
-  return left;
+  return [...left, ...unsure];
 }

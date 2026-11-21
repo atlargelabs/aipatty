@@ -128,7 +128,7 @@ test("a run launches the pinned CLI with only the pinned delegates extension, in
   for (const rule of [/Only Steve merges|only Steve merges/, /npm run check/, /npm test/, /Closes #N/, /\/review pr <number>/, /crmanager/, /<result>/]) assert.match(rules, rule);
   assert.deepEqual(await readdir(config.runsDir), []);
   assert.ok(existsSync(join(outcome.logDir, "events.jsonl")));
-  assert.deepEqual(JSON.parse(await readFile(join(outcome.logDir, "result.json"), "utf8")).status, "completed");
+  assert.deepEqual(JSON.parse(await readFile(join(outcome.logDir, "result.json"), "utf8")), { outcome, reconciled: true, taskId: 101 });
   assert.ok(!existsSync(join(config.dataDir, "pi-run.json")));
 });
 
@@ -262,6 +262,13 @@ test("a successful exit or a URL in the model's output is not proof of delivery"
   await github(config, { "pr 12": { ...openPr["pr 12"], body: "Closes someone/elsewhere#11", closingIssuesReferences: [foreignIssue] }, "issue 11": { number: 11 } });
   await scenario(config, [...review("c1", "r2b"), assistant(report()), settled]);
   assert.match((await runs.run(request())).problems.join("\n"), /The PR does not link issue #11/);
+  // A link to issue 110 is not a link to issue 11.
+  await github(config, { "pr 12": { ...openPr["pr 12"], body: `See ${issueUrl}0` }, "issue 11": { number: 11 } });
+  await scenario(config, [...review("c1", "r2d"), assistant(report()), settled]);
+  assert.match((await runs.run(request())).problems.join("\n"), /The PR does not link issue #11/);
+  await github(config, { "pr 12": { ...openPr["pr 12"], body: `Fixes ${issueUrl}.` }, "issue 11": { number: 11 } });
+  await scenario(config, [...review("c1", "r2e"), assistant(report()), settled]);
+  assert.equal((await runs.run(request())).status, "completed");
   // GitHub's reading is enough, whatever the body's wording.
   await github(config, { "pr 12": { ...openPr["pr 12"], body: "", closingIssuesReferences: [{ number: 11, repository: { name: "aipatty", owner: { login: "atlargelabs" } } }] }, "issue 11": { number: 11 } });
   await scenario(config, [...review("c1", "r2c"), assistant(report()), settled]);
@@ -584,6 +591,7 @@ test("reviews and reports are read strictly", () => {
   // Prose that uses the word, or a summary cut off before its verdict, states none.
   for (const prose of ["Mostly correct.", "The code is incorrect.", "I could not determine whether the change is correct.",
     'I cannot give this patch the verdict "correct".', "No verdict of correct is warranted.", "Verdict: not correct", "Verdict: incorrect",
+    "> Verdict: correct\nI disagree; the cleanup is still broken.",
     "No verdict is possible; correct me if I am wrong.", "[P2] a finding, and then the text was cut"]) {
     assert.equal(readReview(prose).verdict, "unknown", prose);
   }
@@ -621,6 +629,20 @@ test("an outcome settled before the harness committed it survives a restart, and
   const rebuilt = await (await openPiRuns(config)).settled(105);
   assert.equal(rebuilt?.status, "completed");
   assert.equal(rebuilt?.runId, outcome.runId);
+  // The rebuilt index was saved: another restart still has the outcome.
+  assert.equal((await (await openPiRuns(config)).settled(105))?.runId, outcome.runId);
+
+  // The process died after the run's own copy of the result was written and before the index and the record caught
+  // up: the settled result stands, and is not replaced by an interruption.
+  await rm(join(config.dataDir, "pi-outcomes.json"));
+  await writeFile(join(config.dataDir, "pi-run.json"), JSON.stringify({
+    runId: outcome.runId, conversationId: 5, taskId: 105, pr: true, startedAt: "", procs: [], groups: [], asOf: Date.now(),
+    workspace: join(config.runsDir, outcome.runId), logDir: outcome.logDir,
+  }));
+  const ahead = await openPiRuns(config);
+  assert.equal((await ahead.settled(105))?.status, "completed");
+  assert.ok(!existsSync(join(config.dataDir, "pi-run.json")));
+  assert.equal(ahead.active(), undefined);
 });
 
 test("a cut-off continuation charges the new attempt once, and never the earlier one again", { timeout: 60_000 }, async t => {
@@ -680,7 +702,9 @@ test("a run record that cannot be used blocks new runs and deletes nothing", asy
   assert.ok(!existsSync(join(config.pi.agentDir, "fake-launches.jsonl")), "nothing was launched");
 
   // A record that parses to nothing is still a record.
-  for (const damaged of ["null", "0", '""', "[]"]) {
+  const shaped = { runId: "20260101T000000-deadbeef", conversationId: 1, taskId: 1, pr: false, startedAt: "", asOf: 0, groups: [],
+    workspace: join(config.runsDir, "20260101T000000-deadbeef"), logDir: join(config.dataDir, "logs/runs/20260101T000000-deadbeef") };
+  for (const damaged of ["null", "0", '""', "[]", JSON.stringify({ ...shaped, procs: [null] }), JSON.stringify({ ...shaped, procs: [], groups: ["x"] })]) {
     await writeFile(stateFile, damaged);
     await assert.rejects((await openPiRuns(config)).run(request({ pr: false })), /does not describe a run of this data directory/, damaged);
   }
@@ -746,9 +770,12 @@ test("a run's processes are found by environment marker and by the groups they l
   assert.ok(!found.includes(bystander.pid!), "the marker in an argument is not ownership");
   assert.ok(!found.includes(process.pid));
 
-  // A group whose ID was taken over after the run last saw it is not the run's: its members started later.
+  // A member that started after the run last saw the group may be a late child of the run's, or a stranger in a
+  // group whose ID was reused: it is not killed, and it is not passed over as if the run were gone.
   const stale = newOwned([], [leader.pid!], Date.now() - 3_600_000);
   assert.ok(!(await runProcesses(stale, "another-run")).some(proc => proc.pid === orphan));
+  assert.deepEqual((await stopRun(stale, "another-run", undefined, 0)).map(proc => proc.pid), [orphan]);
+  assert.ok(alive(orphan));
 
   assert.deepEqual(await stopRun(owned, marker, undefined, 0), []);
   await until(() => !alive(marked.pid!) && !alive(orphan));
