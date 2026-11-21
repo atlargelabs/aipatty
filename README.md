@@ -46,7 +46,8 @@ in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits fo
   - `gh` confirms the PR: open, against `main`, and listed by GitHub as closing a confirmed issue of this
     repository.
   - The last finished `crmanager` review was a `/review pr` of that PR, in a clone of this repository, at its
-    head commit; it declared the verdict "correct" and no other; and it had no P0 or P1 finding. Otherwise the
+    head commit and after any change of its base branch; it declared the verdict "correct" and no other; and it
+    had no P0 or P1 finding. Otherwise the
     result says `NOT REVIEWED` and why. The verdict is read from the reviewer's text, which is a model's: it is
     a check on the workflow, and Steve's review before merging is the gate.
 

@@ -214,7 +214,11 @@ function repeated(line: string): boolean {
   return repeats.some(prefix => line.startsWith(prefix));
 }
 
-function reviewOf(trace: RunTrace, pr: RunOutcome["pr"], requested: boolean): RunOutcome["review"] {
+/** How far GitHub's clock and this one's may disagree about which came first, a review or a change of base. */
+const clockSlackMs = 60_000;
+
+/** `baseChangedAt` is when the PR's base branch was last changed, 0 if never. */
+function reviewOf(trace: RunTrace, pr: RunOutcome["pr"], requested: boolean, baseChangedAt = 0): RunOutcome["review"] {
   if (!requested) return { status: "none", important: 0, lesser: 0 };
   const last = trace.reviews.findLast(review => review.finished);
   if (!last) return { status: "missing", important: 0, lesser: 0 };
@@ -223,7 +227,9 @@ function reviewOf(trace: RunTrace, pr: RunOutcome["pr"], requested: boolean): Ru
     : !pr?.confirmed ? "unverified"
     // The same head commit under another request, such as `/review commit`, is not a review of the PR's whole diff,
     // and the same number in a clone of another repository is another PR.
-    : !last.ownRepo || last.pr !== pr.number || sha !== pr.headSha ? "stale" : "clean";
+    : !last.ownRepo || last.pr !== pr.number || sha !== pr.headSha ? "stale"
+    // A PR retargeted after its review has another diff under the same head.
+    : baseChangedAt > 0 && baseChangedAt >= last.at - clockSlackMs ? "stale" : "clean";
   return { status, verdict, sha, important, lesser };
 }
 
@@ -231,7 +237,7 @@ const reviewText: Record<RunOutcome["review"]["status"], string> = {
   clean: "reviewed",
   missing: "NOT REVIEWED: no crmanager review finished",
   findings: "NOT REVIEWED CLEAN: the last review has important findings or states no \"correct\" verdict",
-  stale: "NOT REVIEWED: the last review was not a `/review pr` of this PR, in this repository, at its head commit",
+  stale: "NOT REVIEWED: the last review was not a `/review pr` of this PR, in this repository, at its head commit and current base",
   unverified: "NOT REVIEWED: the PR head could not be confirmed, so the review cannot be matched to it",
   none: "not requested",
 };
@@ -366,7 +372,13 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       try {
         const job = await readJson<JobManifest>(join(dir, "job.json"));
         if (job && typeof job === "object") jobs.set(id, job);
+        // A job the run reported is the run's, with or without a manifest: its logs are kept and its clone goes.
+        else if (trace.countedJobs.has(id)) jobs.set(id, {});
       } catch (error) {
+        if (trace.countedJobs.has(id)) {
+          jobs.set(id, {});
+          continue;
+        }
         // An old job's damage is not this run's problem. One touched since the run began may be this run's: say
         // so, and leave it alone.
         const touched = (await lstat(join(dir, "job.json")).catch(() => undefined))?.mtimeMs ?? Infinity;
@@ -383,7 +395,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         const source = job.workspace?.source;
         const fromRun = typeof source === "string" && (resolve(source) === resolve(saved.workspace) || inside(saved.workspace, source)
           || [...ours].some(parent => inside(join(jobsDir, parent), source)));
-        if ((trace.sessionId !== undefined && job.ownerSession === trace.sessionId) || fromRun) {
+        if ((trace.sessionId !== undefined && job.ownerSession === trace.sessionId) || fromRun || trace.countedJobs.has(id)) {
           ours.add(id);
           grew = true;
         }
@@ -486,15 +498,13 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
   };
 
   /**
-   * Check the PR and issue with GitHub; a URL in the model's output is not proof of either. Whether the delivery
-   * holds: an open PR against `main` whose body links a confirmed issue.
+   * Check the PR and issue with GitHub; a URL in the model's output is not proof of either. Anything short of an
+   * open PR against `main` that closes a confirmed issue is added to the outcome's problems. Returns when the PR's
+   * base branch was last changed, 0 if never.
    */
-  async function confirm(trace: RunTrace, outcome: RunOutcome, reported: { pr?: string; issue?: string }): Promise<boolean> {
-    let delivered = true;
-    const problem = (text: string) => {
-      outcome.problems.push(text);
-      delivered = false;
-    };
+  async function confirm(trace: RunTrace, outcome: RunOutcome, reported: { pr?: string; issue?: string }): Promise<number> {
+    let baseChangedAt = 0;
+    const problem = (text: string) => { outcome.problems.push(text); };
     const prUrl = trace.prLinks.at(-1) ?? reported.pr;
     const prLink = prUrl ? githubLink(prUrl, pi.repo, "pull") : undefined;
     const issueUrl = reported.issue ?? trace.issueLinks.at(-1);
@@ -528,6 +538,18 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         if (issueLink && !closes(pr, issueLink.number)) {
           problem(`GitHub does not list issue #${issueLink.number} as one the PR closes: its body needs a plain \`Closes #${issueLink.number}\`.`);
         }
+        // A review covers the diff against the base the PR had then.
+        try {
+          const events = await gh(["api", `repos/${pi.repo}/issues/${prLink.number}/events?per_page=100`]) as { event?: string; created_at?: string }[];
+          for (const event of Array.isArray(events) ? events : []) {
+            if (event.event !== "base_ref_changed") continue;
+            const at = Date.parse(event.created_at ?? "");
+            baseChangedAt = Math.max(baseChangedAt, Number.isFinite(at) ? at : Infinity);
+          }
+        } catch (error) {
+          baseChangedAt = Infinity;
+          problem(`Whether the PR's base was changed could not be checked with gh: ${clip(message(error), 300)}`);
+        }
       } catch (error) {
         problem(`The PR could not be confirmed with gh: ${clip(message(error), 300)}`);
       }
@@ -545,7 +567,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         problem(`The issue could not be confirmed with gh: ${clip(message(error), 300)}`);
       }
     }
-    return delivered;
+    return baseChangedAt;
   }
 
   /** The part of an outcome that the event stream alone decides. */
@@ -601,12 +623,19 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       // directory is written first, so it can be ahead of the index.
       const settledBefore = (await logged(saved.runId, saved.taskId))?.entry
         ?? (kept.get(key)?.outcome.runId === saved.runId ? kept.get(key) : undefined);
+      const owned = newOwned(saved.procs, saved.groups, saved.asOf);
+      // What the cleanup learns of the run's processes is kept for the next start, should this one not finish.
+      const record = () => writeJson(stateFile, { ...saved, procs: [...owned.procs], groups: [...owned.groups] });
       const trace = new RunTrace(pi.repo);
       const split = lineSplitter((line, whole) => trace.line(line, whole));
       try {
         for await (const chunk of createReadStream(join(saved.logDir, "events.jsonl"))) split.write(chunk as Buffer);
       } catch (error) {
-        if (!isMissing(error)) console.error(`Pi run ${saved.runId}: its events could not be read:`, error);
+        if (!isMissing(error)) {
+          // Part of a transcript is not the run's account: stop the run, and keep its record for another try.
+          await stopRun(owned, saved.runId, saved.pid, graceMs, undefined, record).catch(() => {});
+          throw new Error(`its events could not be read: ${message(error)}`);
+        }
       }
       split.end();
       const outcome = settledBefore?.outcome ?? baseOutcome(saved, trace, "interrupted");
@@ -616,9 +645,6 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         outcome.usageComplete = false;
         unconfirmedLinks(trace, outcome);
       }
-      const owned = newOwned(saved.procs, saved.groups, saved.asOf);
-      // What the cleanup learns of the run's processes is kept for the next start, should this one not finish.
-      const record = () => writeJson(stateFile, { ...saved, procs: [...owned.procs], groups: [...owned.groups] });
       const { clean, reconciled } = await cleanUp(saved, owned, trace, outcome, settledBefore?.reconciled ?? false, { record });
       if (outcome.status === "completed" && outcome.problems.length) outcome.status = "failed";
       await remembered(saved, outcome, reconciled);
@@ -878,8 +904,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         // An abort answers quickly: report what the run printed without asking GitHub.
         unconfirmedLinks(trace, outcome);
       } else if (request.pr) {
-        await confirm(trace, outcome, { pr: report?.pr, issue: report?.issue });
-        outcome.review = reviewOf(trace, outcome.pr, true);
+        const baseChangedAt = await confirm(trace, outcome, { pr: report?.pr, issue: report?.issue });
+        outcome.review = reviewOf(trace, outcome.pr, true, baseChangedAt);
         if (outcome.status === "completed" && outcome.review.status !== "clean") {
           outcome.problems.push(`The PR is not reviewed clean. ${reviewText[outcome.review.status]}.`);
         }
@@ -906,6 +932,11 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     } catch (error) {
       handed = false;
       outcome.problems.push(`The run's record could not be closed: ${clip(message(error), 300)}`);
+    }
+    // The caller sees what happened: a run that leaves the slot shut did not complete.
+    if (!handed && outcome.status === "completed") {
+      outcome.status = "failed";
+      await remembered(saved, outcome, reconciled).catch(() => {});
     }
     if (!handed) {
       stuck = `Pi run ${saved.runId} could not be cleaned up: ${outcome.problems.at(-1)} No new run starts until that is resolved and aipatty restarted.`;

@@ -9,6 +9,12 @@ try {
   known = JSON.parse(readFileSync("fake-gh.json", "utf8"));
 } catch {}
 if (known.delayMs) await new Promise(resolve => setTimeout(resolve, known.delayMs));
+if (kind === "api") {
+  // `api repos/<owner>/<name>/issues/<n>/events`: the PR's timeline events.
+  const issue = /\/issues\/(\d+)\/events/.exec(verb)?.[1];
+  process.stdout.write(JSON.stringify(known[`events ${issue}`] ?? []));
+  process.exit(0);
+}
 // A list of answers is given out in order, the last one repeating.
 let found = known[`${kind} ${number}`];
 if (Array.isArray(found)) {

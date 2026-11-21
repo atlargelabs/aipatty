@@ -10,6 +10,8 @@ export interface Review {
   ownRepo: boolean;
   /** Whether the delegate finished; a failed review has no verdict. */
   finished: boolean;
+  /** When the host saw the review's result, in milliseconds. */
+  at: number;
   /** The commit the delegate reviewed, when it reviewed one. */
   sha?: string;
   verdict: "correct" | "needs attention" | "unknown";
@@ -80,8 +82,8 @@ function contentText(content: unknown): string {
 /**
  * Read a review's findings and verdict from the reviewer's text, in the format pi-review asks for.
  *
- * A finding is a line that opens with its priority tag, after any list, heading or table markup: a tag later in a
- * line, as in "the earlier [P1] is resolved", is a mention. A verdict is declared by a line that opens with it, as
+ * A finding is a line that opens with its priority tag, after any list, heading, emphasis, code or table markup: a
+ * tag later in a line, as in "the earlier [P1] is resolved", is a mention. A verdict is declared by a line that opens with it, as
  * in `**Verdict: correct.**`, or by a `Verdict` heading and the line under it. Its value must be the whole of one
  * of the two verdicts, closed by the end of the line or by punctuation, not a sentence that starts with the word.
  * Quoted lines and fenced examples are not the reviewer's own. Any declared "needs attention" wins; a declaration
@@ -103,7 +105,7 @@ export function readReview(summary: string): Pick<Review, "verdict" | "important
   let important = 0, lesser = 0;
   const values = new Set<string>();
   lines.forEach((line, index) => {
-    const tag = /^[\s#*_|\-\d.)]*\[P([0-3])\]/.exec(line)?.[1];
+    const tag = /^[\s#*_|\-+\d.)`]*\[P([0-3])\]/.exec(line)?.[1];
     if (tag !== undefined) tag < "2" ? important++ : lesser++;
     const text = line.replace(/^[\s#*_-]+/, "");
     const opened = /^(?:the\s+)?(?:overall\s+|final\s+)?verdict\b(?:\s+is\b)?[\s:*_"'`“”–—-]*/i.exec(text);
@@ -309,7 +311,7 @@ export class RunTrace {
       const sha = record(job.workspace) && typeof job.workspace.baseSha === "string" ? job.workspace.baseSha : undefined;
       const summary = typeof job.summary === "string" ? job.summary : "";
       this.reviews.push({
-        request, finished,
+        request, finished, at: Date.now(),
         ownRepo: remoteRepo(record(job.workspace) ? job.workspace.remoteUrl : undefined)?.toLowerCase() === this.repo.toLowerCase(),
         pr: asked?.[1] !== "pr" ? undefined
           : /^[1-9]\d*$/.test(asked[2]) ? Number(asked[2]) : githubLink(asked[2], this.repo, "pull")?.number,

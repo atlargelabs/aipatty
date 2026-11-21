@@ -225,7 +225,14 @@ test("a run is completed and reviewed only when the last finished review covers 
 
   const text = outcomeText(stale);
   assert.match(text, /^Pi run \S+: failed/);
-  assert.match(text, /Review: NOT REVIEWED: the last review was not a `\/review pr` of this PR, in this repository, at its head commit/);
+  assert.match(text, /Review: NOT REVIEWED: the last review was not a `\/review pr` of this PR, in this repository, at its head commit and current base/);
+
+  // A PR retargeted after its review has another diff under the same head; one retargeted before it does not.
+  const retargeted = (created_at: string) => github(config, { ...openPr, "events 12": [{ event: "labeled", created_at }, { event: "base_ref_changed", created_at }] });
+  await retargeted(new Date(Date.now() + 3_600_000).toISOString());
+  await unreviewed(review("c1", "r11"), "stale");
+  await retargeted("2020-01-01T00:00:00Z");
+  assert.equal((await run(review("c1", "r12"))).status, "completed");
   assert.match(text, new RegExp(`PR: ${prUrl} \\(open, head ${head}\\)`));
 });
 
@@ -269,7 +276,7 @@ test("a successful exit or a URL in the model's output is not proof of delivery"
     assert.match(unlinked.problems.join("\n"), /GitHub does not list issue #11 as one the PR closes/);
   }
   // It was asked again before giving up, since GitHub works the links out a moment after the PR is written.
-  assert.equal((await readFile(join(config.dataDir, "fake-gh-calls.txt"), "utf8")).trim().split("\n").slice(-4).filter(call => call.startsWith("pr view 12")).length, 3);
+  assert.equal((await readFile(join(config.dataDir, "fake-gh-calls.txt"), "utf8")).trim().split("\n").slice(-5).filter(call => call.startsWith("pr view 12")).length, 3);
 
   // The link arrives on the second answer: accepted. But the answer that has it stands as a whole: if the head
   // moved meanwhile, the review of the earlier head does not cover it.
@@ -411,6 +418,7 @@ test("abort and timeout stop Pi and its delegates' processes, keep the logs, and
       assert.ok(!existsSync(join(outcome.logDir, "delegates", id, "workspace")));
     }
     assert.ok(existsSync(join(jobs, "job-unrelated/workspace/src/file.ts")), "another session's clone is not this run's");
+    assert.equal(await readFile(join(outcome.logDir, "delegates/job-done/child-1.log"), "utf8"), "reported delegate log");
     // What was spent before the stop is charged: Pi's message, the delegate that reported, and what the jobs of
     // the cut-off call had recorded. It is marked incomplete.
     assert.equal(outcome.usage.cost.total, 0.5 + 1 + 0.75 + 0.25 + 0.5);
@@ -428,6 +436,10 @@ test("abort and timeout stop Pi and its delegates' processes, keep the logs, and
   await mkdir(jobs, { recursive: true });
   await symlink(victim, join(jobs, "linked"));
 
+  // A job the run reported is the run's even with its manifest damaged: its logs are kept and its clone goes.
+  await mkdir(join(jobs, "job-done", "workspace"), { recursive: true });
+  await writeFile(join(jobs, "job-done", "job.json"), "{ damaged");
+  await writeFile(join(jobs, "job-done", "child-1.log"), "reported delegate log");
   // Nor is an old job's damaged manifest this run's problem.
   await mkdir(join(jobs, "ancient"));
   await writeFile(join(jobs, "ancient", "job.json"), "{ damaged");
@@ -601,6 +613,7 @@ test("reviews and reports are read strictly", () => {
   assert.deepEqual(readReview("[P2] a\n[P3] b\n**Verdict:** correct"), { verdict: "correct", important: 0, lesser: 2 });
   // Findings open their line, in a list, a heading or a table. A tag later in a line, in a quote or in an example is a mention.
   assert.deepEqual(readReview("1. **[P1] a**\n- [P0] b\n### [P2] c\n| [P1] | `src/x.ts` | d |\n**Verdict: needs attention.**"), { verdict: "needs attention", important: 3, lesser: 1 });
+  assert.deepEqual(readReview("1. `[P1]` Missed child\n+ [P1] Another\n* _[P3]_ Small\nVerdict: correct"), { verdict: "correct", important: 2, lesser: 1 });
   assert.deepEqual(readReview("The previous [P1] finding is resolved.\n> [P0] old\n```\n[P1] example\n```\nVerdict: correct"), { verdict: "correct", important: 0, lesser: 0 });
   for (const clean of ["The verdict is correct.", "## Final verdict — `correct`", "- **Overall verdict:** \"correct\" (no blocking issues)",
     "**Verdict: correct.** Nothing blocks.", "Verdict: correct", "## Verdict\n\n**correct**: no blocking issues.\n\n## Callouts", "### Verdict\n\nCorrect.",
