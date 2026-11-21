@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 /** Server settings. */
@@ -11,7 +12,36 @@ export interface Config {
   /** The pi CLI's cached model catalog. */
   modelsStore: string;
   faux: boolean;
+  /** The working directory of the model's own `read`, `write`, `edit` and `bash`. */
+  workDir: string;
+  /** Where each `pi` run gets its disposable workspace. */
+  runsDir: string;
+  pi: PiConfig;
 }
+
+/** What a `pi` run launches and where it publishes. Everything is an absolute path into this release, or a fixed name. */
+export interface PiConfig {
+  /** The Node binary that runs this server. */
+  node: string;
+  /** The pinned Pi CLI of this release. */
+  cli: string;
+  /** The pinned delegates extension of this release, the only extension a run loads. */
+  extension: string;
+  /** The Pi agent directory the CLI shares with the server: sign-in, model cache, delegates settings and jobs. */
+  agentDir: string;
+  /** The only repository a run may work on, and the URL it is cloned from with the service account's access. */
+  repo: string;
+  repoUrl: string;
+  git: string;
+  gh: string;
+  /** How often a run's process tree is recorded; the tests shorten it. */
+  pollMs?: number;
+  /** How long to wait before asking GitHub again for a PR's linked issues; the tests shorten it. */
+  retryMs?: number;
+}
+
+/** The checkout this server runs from. */
+const release = fileURLToPath(new URL("../", import.meta.url));
 
 /** The only address the server listens on. Other machines reach it through an SSH port forward. */
 export const LOOPBACK = "127.0.0.1";
@@ -19,7 +49,7 @@ export const LOOPBACK = "127.0.0.1";
 /** The port the server listens on, and the CLI connects to, unless `--port` says otherwise. */
 export const DEFAULT_PORT = 8790;
 
-const serverUsage = "Usage: node src/main.ts [--port <n>] [--data-dir <path>] [--pi-dir <path>]";
+const serverUsage = "Usage: node src/main.ts [--port <n>] [--data-dir <path>] [--pi-dir <path>] [--work-dir <path>] [--runs-dir <path>]";
 
 /**
  * Whether `AIPATTY_FAUX` asks for the fake model. It is the only environment setting; an empty value is unset. The
@@ -51,17 +81,20 @@ function absolutePath(path: string): string {
 /** Parse the server's command-line options and its one environment setting. */
 export function readConfig(args: readonly string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env): Config {
   const faux = readFaux(env);
-  let values: { port?: string; "data-dir"?: string; "pi-dir"?: string };
+  let values: { port?: string; "data-dir"?: string; "pi-dir"?: string; "work-dir"?: string; "runs-dir"?: string };
   try {
     ({ values } = parseArgs({
       args: [...args],
-      options: { port: { type: "string" }, "data-dir": { type: "string" }, "pi-dir": { type: "string" } },
+      options: {
+        port: { type: "string" }, "data-dir": { type: "string" }, "pi-dir": { type: "string" },
+        "work-dir": { type: "string" }, "runs-dir": { type: "string" },
+      },
       allowPositionals: false,
     }));
   } catch (error) {
     throw new Error(`${error instanceof Error ? error.message : error}\n${serverUsage}`);
   }
-  for (const name of ["data-dir", "pi-dir"] as const) {
+  for (const name of ["data-dir", "pi-dir", "work-dir", "runs-dir"] as const) {
     if (values[name] === "") throw new Error(`--${name} needs a path`);
   }
   const piDir = absolutePath(values["pi-dir"] ?? "~/.pi/agent");
@@ -71,5 +104,17 @@ export function readConfig(args: readonly string[] = process.argv.slice(2), env:
     authFile: join(piDir, "auth.json"),
     modelsStore: join(piDir, "models-store.json"),
     faux,
+    workDir: absolutePath(values["work-dir"] ?? "~/.aipatty/work"),
+    runsDir: absolutePath(values["runs-dir"] ?? "~/.aipatty/runs"),
+    pi: {
+      node: process.execPath,
+      cli: join(release, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"),
+      extension: join(release, "node_modules/pi-delegates/src/index.ts"),
+      agentDir: piDir,
+      repo: "atlargelabs/aipatty",
+      repoUrl: "git@github.com:atlargelabs/aipatty.git",
+      git: "git",
+      gh: "gh",
+    },
   };
 }

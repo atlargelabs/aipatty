@@ -1,4 +1,3 @@
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { execFileSync } from "node:child_process";
 import packageJson from "../package.json" with { type: "json" };
 import { startApi } from "./api.ts";
@@ -45,7 +44,7 @@ async function main(): Promise<void> {
       await Promise.race([signal.promise, closed]);
       await api.close();
     } finally {
-      await harness.close(BACKGROUND_CONTEXT);
+      await agent.close();
       await closed;
     }
   } finally {

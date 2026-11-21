@@ -5,13 +5,20 @@ import {
   type Conversation, type ConversationId, type EntryId, type InputSubmissionDraft, type ModelRef, type Submission,
   type ConversationRecord, type Cursor, type EntryRecord, type Page, type Tx, type UsageState,
 } from "@earendil-works/pi-durable";
+import { CodemodeSandbox } from "@earendil-works/pi-codemode";
+import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
+import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
+import { createToolSearchExtension } from "@earendil-works/pi-durable/tool-search";
+import { createCodingTools } from "@earendil-works/pi-durable/tools";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { BranchDoc, ROOT_TITLE, thinkingLevels, validTitle, type BranchInfo, type SearchMatch } from "./branches.ts";
 import type { Config } from "./config.ts";
 import { ownDataDir } from "./ownership.ts";
 import { openModels } from "./models.ts";
+import { openPiRuns, type PiRuns } from "./pi-run.ts";
+import { piExtension } from "./pi-tool.ts";
 import { failureText, messageText, usageCost } from "./protocol.ts";
 import { treeExtension } from "./tools.ts";
 
@@ -36,6 +43,10 @@ export interface ModelStatus {
 
 export interface AgentHost {
   harness: Harness;
+  /** The `pi` run slot. */
+  runs: PiRuns;
+  /** Stop the active `pi` run, leaving its result to the next start, then close the harness. */
+  close(): Promise<void>;
   /** `root` or a branch's numeric ID; task-owned conversations are not branches. */
   conversation(id: string): Promise<Conversation | undefined>;
   /** A branch's saved model and thinking level, and whether the local catalog has that model; the root by default. */
@@ -129,8 +140,17 @@ async function forkPoint(from: Conversation, at: number | undefined, before: num
 
 async function openOwnedHost(config: Config): Promise<AgentHost> {
   const models = await openModels(config);
+  // Before any conversation resumes: stop and clean up a run the previous process left behind.
+  const runs = await openPiRuns(config);
+  await mkdir(config.workDir, { recursive: true, mode: 0o700 });
   const storage = await openNodeSqliteStorage(join(config.dataDir, "aipatty.sqlite"));
   const registry = createRegistry();
+  const sandbox = new CodemodeSandbox({ memoryLimitBytes: 256 * 1024 * 1024 });
+  // The model's own tools work in `work/`, for inspection and scratch files. Work meant for a PR goes through `pi`.
+  registry.install(createCodingTools());
+  registry.install(createCodemodeExtension({ sandbox }));
+  registry.install(createToolSearchExtension());
+  registry.install(piExtension(() => runs));
   // The tools need the host, which needs the open Harness: they reach it through this binding.
   let host: AgentHost | undefined;
   registry.install(treeExtension(() => {
@@ -140,6 +160,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
   const harness = await Harness.open(storage, {
     models,
     registry,
+    env: () => new NodeExecutionEnv({ cwd: config.workDir }),
     settings: { afterFailedRun: "withdraw" },
     onReport: report => console.error("pi-durable:", report),
   }, ctx);
@@ -239,8 +260,15 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
     };
     const totalCost = async () => usageCost(await harness.usage(ctx));
 
+    void harness.closed.then(() => sandbox.close()).catch(() => {});
     host = {
       harness,
+      runs,
+      async close() {
+        // First, so the run is left for the next start to report, not settled as an abort.
+        await runs.close();
+        await harness.close(ctx);
+      },
       modelStatus: status,
       models: () => models.getModels()
         .map(m => ({ provider: m.provider, modelId: m.id, name: m.name }))
@@ -364,6 +392,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
     return host;
   } catch (error) {
     await harness.close(ctx);
+    await sandbox.close();
     throw error;
   }
 }

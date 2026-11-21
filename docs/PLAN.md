@@ -27,8 +27,7 @@ One Node process runs a pi-durable `Harness` over SQLite, with a small superviso
 
 - **Stack:** TypeScript on Node 26. The Pi packages (`pi-durable`, `pi-ai`, `pi-codemode`, `chord`, `pi-schema`, and
   the `pi-coding-agent` CLI) are pinned at exactly 1.6.0 from npm, all at the same version so the host and the CLI share
-  one `pi-ai`. The host is on 1.5.2 today; the bump to 1.6.0 is the first PR of build step 2. Later bumps are normal
-  reviewed PRs.
+  one `pi-ai`. Later bumps are normal reviewed PRs.
 - **Layout in the `aipatty` user's home:**
   - `deploy/`: release checkouts of committed `main`, with dependencies installed separately for each release. Keep
     the active and last-known-good releases available for rollback.
@@ -61,9 +60,10 @@ Pi runs use two extensions, and only these two:
 - **`pi-review`** (`github.com/earendil-works/pi-review`): the `/review` command. The run does not load it.
   `delegates` loads it inside a `crmanager` job and runs `/review` there without its interactive UI.
 
-Neither is published on npm. Install both as git dependencies pinned to a full commit SHA, so the lockfile fixes
-them and a rollback of aipatty rolls them back too. Use the copies in the running release by absolute path.
-Do not use `pi install` or `pi update`, which would put a moving copy in the agent directory.
+Neither is published on npm. `delegates` is a git dependency pinned to a full commit SHA, so the lockfile fixes
+it and a rollback of aipatty rolls it back too; the run loads the copy in the running release by absolute path.
+`pi-review` is to be pinned the same way. For now it is the copy `pi install` puts in the agent directory, which
+`delegates` finds by itself and which is not tied to a release.
 
 `delegates` reads its settings from the service account's `settings.json` in the Pi agent directory, not from the
 checkout:
@@ -71,8 +71,9 @@ checkout:
 - **Publication:** `atlargelabs/aipatty` as the one authorized repository, with base branch `main`.
 - **Models:** none set. The extension's defaults are on the `openai` provider: `openai/gpt-6.2-sol` for every
   profile except `crmanager`, which reviews with `openai/gpt-6.2-astra`.
-- **Review extension:** `delegates.reviewExtension` names the pinned `review.ts` by absolute path. Without it
-  `delegates` looks for a `pi install` copy in the agent directory, which the plan does not create.
+- **Review extension:** unset for now, so `delegates` uses the `pi install` copy at
+  `git/github.com/earendil-works/pi-review/review.ts` in the agent directory. Once `pi-review` is pinned,
+  `delegates.reviewExtension` names the pinned `review.ts` by absolute path.
 - **Checks:** `npm ci --ignore-scripts` as setup, and `npm run check` and `npm test` as required checks. A
   `prmanager` refuses to submit with no checks configured, and the copy in the repo's `.pi/settings.json` is not
   read because checkout settings stay untrusted.
@@ -80,9 +81,9 @@ checkout:
 `delegates` keeps its jobs, logs, and `prmanager` and `crmanager` clones in `delegates/jobs/` under the agent
 directory, outside `runs/`.
 
-**Not settled:** the settings file is shared by every release, but the pinned `review.ts` sits at a different
-absolute path in each one. `reviewExtension` needs either a stable path to the active release or an update on each
-deploy and rollback.
+**Not settled:** how to pin `pi-review`. The settings file is shared by every release, but a pinned `review.ts`
+sits at a different absolute path in each one. `reviewExtension` needs either a stable path to the active release
+or an update on each deploy and rollback.
 
 ## Tools the model gets
 
@@ -200,18 +201,17 @@ at boot without a login. It is not replaced by the normal aipatty upgrade.
 
 1. **Done: skeleton and tree.** Durable SQLite conversations, restart/resume, subscription login, loopback API,
    CLI and web page, per-branch models and cost, and `/health` reporting the commit.
-2. **Get the Pi tool right.** First add [CI](#guard-rails) and bump the Pi packages to 1.6.0, adding the
-   [pinned Pi CLI](#pi-installation) and its two [pinned extensions](#pi-extensions). Register pi-durable's coding
-   tools, codemode and tool-search extensions with `work/` as their directory. Then ship the
-   [run contract](#pi-runs) and the git/issue workflow. With a fake CLI, test a second run being refused, missing
-   auth or model, malformed output, false success, abort, child cleanup, and restart. Also test that the launch
-   loads only the pinned `delegates` extension, that delegate usage is charged once, that delegate clones are
-   removed, and that a result is not reported as reviewed when its review is missing, has important findings, or
-   covers a different SHA from the PR head. The real CLI, with both extensions and the review loop, is first
-   exercised in step 3.
+2. **Done: the Pi tool.** [CI](#guard-rails), the Pi packages at 1.6.0 with the [pinned Pi CLI](#pi-installation)
+   and the pinned `delegates` [extension](#pi-extensions), pi-durable's coding tools, codemode and tool search in
+   `work/`, and the [run contract](#pi-runs) with the git/issue workflow. Tested with a fake CLI: a second run
+   refused, missing auth or model, malformed output, false success, abort, child cleanup, restart, the launch
+   loading only the pinned extension, delegate usage charged once, delegate clones removed, and a result not
+   reported as reviewed when its review is missing, has important findings, or covers a different SHA from the PR
+   head. The real CLI, with both extensions and the review loop, is first exercised in step 3.
 3. **Install on the mini and prove the loop by hand.** From the laptop over SSH, ask aipatty for a small change to
    itself. It opens an issue and a checked PR that a `crmanager` has reviewed. Steve merges and deploys it by
    hand; verify the new SHA and keep talking in the original conversation. At this point aipatty can help build the supervisor.
+   The steps are in [INSTALL.md](INSTALL.md).
 4. **Automate explicit upgrade and rollback.** Install the supervisor and replace the manual deploy with the
    `upgrade` tool. Repeat the end-to-end test and verify the originating branch reports the new SHA.
    Test a release that fails readiness and confirm the old release and conversation come back with the failure
