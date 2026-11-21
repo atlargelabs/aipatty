@@ -78,30 +78,42 @@ function contentText(content: unknown): string {
 }
 
 /**
- * Read a review's findings and verdict from the reviewer's text, in the format pi-review asks for. A verdict is
- * declared by a line that opens with it, as in `**Verdict: correct.**`, or by a `Verdict` heading and the line
- * under it. The value must be exactly one of the two verdicts, not a sentence that starts with the word. Quoted
- * lines and fenced examples are not the reviewer's own. Any declared "needs attention" wins; a declaration that
- * cannot be read, or none at all, is `unknown`.
+ * Read a review's findings and verdict from the reviewer's text, in the format pi-review asks for.
+ *
+ * A finding is a line that opens with its priority tag, after any list, heading or table markup: a tag later in a
+ * line, as in "the earlier [P1] is resolved", is a mention. A verdict is declared by a line that opens with it, as
+ * in `**Verdict: correct.**`, or by a `Verdict` heading and the line under it. Its value must be the whole of one
+ * of the two verdicts, closed by the end of the line or by punctuation, not a sentence that starts with the word.
+ * Quoted lines and fenced examples are not the reviewer's own. Any declared "needs attention" wins; a declaration
+ * that cannot be read, or none at all, is `unknown`.
  */
 export function readReview(summary: string): Pick<Review, "verdict" | "important" | "lesser"> {
-  const important = summary.match(/\[P[01]\]/g)?.length ?? 0;
-  const lesser = summary.match(/\[P[23]\]/g)?.length ?? 0;
   const lines: string[] = [];
-  let fenced = false;
+  let fence: string | undefined;
   for (const line of summary.split(/\r?\n/)) {
-    if (/^\s*(```|~~~)/.test(line)) fenced = !fenced;
-    else if (!fenced && !/^\s*>/.test(line)) lines.push(line.replace(/^[\s#*_-]+/, ""));
+    const mark = /^\s*(`{3,}|~{3,})/.exec(line)?.[1];
+    if (fence === undefined) {
+      if (mark) fence = mark;
+      else if (!/^\s*>/.test(line)) lines.push(line);
+    } else if (mark && mark[0] === fence[0] && mark.length >= fence.length && line.trim() === mark) {
+      // Only a fence of the opener's kind, at least as long, closes it.
+      fence = undefined;
+    }
   }
+  let important = 0, lesser = 0;
   const values = new Set<string>();
   lines.forEach((line, index) => {
-    const opened = /^(?:the\s+)?(?:overall\s+|final\s+)?verdict\b(?:\s+is\b)?[\s:*_"'`“”–—-]*/i.exec(line);
+    const tag = /^[\s#*_|\-\d.)]*\[P([0-3])\]/.exec(line)?.[1];
+    if (tag !== undefined) tag < "2" ? important++ : lesser++;
+    const text = line.replace(/^[\s#*_-]+/, "");
+    const opened = /^(?:the\s+)?(?:overall\s+|final\s+)?verdict\b(?:\s+is\b)?[\s:*_"'`“”–—-]*/i.exec(text);
     if (!opened) return;
     // A heading of its own is declared by the next line that has text.
-    const rest = line.slice(opened[0].length) || (lines.slice(index + 1).find(next => next.trim()) ?? "").replace(/^[\s:*_"'`“”–—-]+/, "");
+    const rest = text.slice(opened[0].length)
+      || (lines.slice(index + 1).find(next => next.trim()) ?? "").replace(/^[\s:*_"'`“”–—-]+/, "");
     // "needs attention" anywhere in the declaration is that; "correct" must be the whole value.
     values.add(/needs[ _-]attention/i.test(rest) ? "needs attention"
-      : /^correct(?=\s*$|\s*[^\w\s])/i.test(rest) ? "correct" : "unknown");
+      : /^correct[*_"'`”]*(?:\s*$|\s*[.,;:(–—])/i.test(rest) ? "correct" : "unknown");
   });
   const verdict = values.has("needs attention") ? "needs attention"
     : values.has("unknown") || !values.has("correct") ? "unknown" : "correct";

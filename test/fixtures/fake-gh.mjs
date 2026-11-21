@@ -9,7 +9,12 @@ try {
   known = JSON.parse(readFileSync("fake-gh.json", "utf8"));
 } catch {}
 if (known.delayMs) await new Promise(resolve => setTimeout(resolve, known.delayMs));
-const found = known[`${kind} ${number}`];
+// A list of answers is given out in order, the last one repeating.
+let found = known[`${kind} ${number}`];
+if (Array.isArray(found)) {
+  const asked = readFileSync("fake-gh-calls.txt", "utf8").split("\n").filter(call => call.startsWith(`${kind} view ${number} `)).length;
+  found = found[Math.min(asked, found.length) - 1];
+}
 if (verb !== "view" || !found) {
   process.stderr.write(`GraphQL: Could not resolve to a ${kind} with the number of ${number}.\n`);
   process.exit(1);

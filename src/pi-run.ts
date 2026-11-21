@@ -344,7 +344,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
   const remembered = async (saved: SavedRun, outcome: RunOutcome, reconciled: boolean) => {
     kept.set(String(saved.taskId), { outcome, reconciled });
     for (const key of [...kept.keys()].slice(0, Math.max(0, kept.size - outcomesKept))) kept.delete(key);
-    await writeJson(join(saved.logDir, "result.json"), { outcome, reconciled, taskId: saved.taskId }).catch(() => {});
+    // The run's own copy first, and the index only after it: recovery prefers the copy, as the newer of the two.
+    await writeJson(join(saved.logDir, "result.json"), { outcome, reconciled, taskId: saved.taskId });
     await writeIndex();
   };
 
@@ -491,16 +492,15 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     };
     const prUrl = trace.prLinks.at(-1) ?? reported.pr;
     const prLink = prUrl ? githubLink(prUrl, pi.repo, "pull") : undefined;
+    const issueUrl = reported.issue ?? trace.issueLinks.at(-1);
+    const issueLink = issueUrl ? githubLink(issueUrl, pi.repo, "issues") : undefined;
     type PrView = {
       state?: string; headRefOid?: string; baseRefName?: string;
       closingIssuesReferences?: { number?: number; repository?: { name?: string; owner?: { login?: string } } }[];
     };
-    const view = async (number: number) => await gh(["pr", "view", String(number), "--repo", pi.repo, "--json", "number,url,state,headRefOid,baseRefName,closingIssuesReferences"]) as PrView;
-    /** The issues of this repository that GitHub says the PR closes: its own reading of the body, not ours. */
-    const closes = (pr: PrView) => (pr.closingIssuesReferences ?? [])
-      .filter(issue => `${issue.repository?.owner?.login}/${issue.repository?.name}`.toLowerCase() === pi.repo.toLowerCase())
-      .map(issue => issue.number);
-    let pr: PrView | undefined;
+    /** Whether GitHub lists the issue among those the PR closes: its own reading of the body, not ours. */
+    const closes = (pr: PrView, issue: number) => (pr.closingIssuesReferences ?? []).some(reference => reference.number === issue
+      && `${reference.repository?.owner?.login}/${reference.repository?.name}`.toLowerCase() === pi.repo.toLowerCase());
     if (!prUrl) {
       problem("No PR was found, though one was requested.");
     } else if (!prLink) {
@@ -508,18 +508,25 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     } else {
       outcome.pr = { url: prLink.url, number: prLink.number, confirmed: false };
       try {
-        pr = await view(prLink.number);
+        // Everything is judged from one answer. GitHub works the issue links out shortly after the PR is written,
+        // so an answer without the link is asked for again, and the last one stands as a whole.
+        let pr: PrView = {};
+        for (let attempt = 0; attempt < 3; attempt++) {
+          if (attempt) await sleep(pi.retryMs ?? 3_000);
+          pr = await gh(["pr", "view", String(prLink.number), "--repo", pi.repo, "--json", "number,url,state,headRefOid,baseRefName,closingIssuesReferences"]) as PrView;
+          if (!issueLink || closes(pr, issueLink.number)) break;
+        }
         if (typeof pr.headRefOid !== "string" || !/^[0-9a-f]{40}$/.test(pr.headRefOid)) throw new Error("no head commit in gh's answer");
         outcome.pr = { ...outcome.pr, headSha: pr.headRefOid, state: pr.state ?? "UNKNOWN", confirmed: true };
         if (pr.state !== "OPEN") problem(`The PR is ${pr.state?.toLowerCase()}, not open.`);
         if (pr.baseRefName !== "main") problem(`The PR targets ${pr.baseRefName}, not main.`);
+        if (issueLink && !closes(pr, issueLink.number)) {
+          problem(`GitHub does not list issue #${issueLink.number} as one the PR closes: its body needs a plain \`Closes #${issueLink.number}\`.`);
+        }
       } catch (error) {
-        pr = undefined;
         problem(`The PR could not be confirmed with gh: ${clip(message(error), 300)}`);
       }
     }
-    const issueUrl = reported.issue ?? trace.issueLinks.at(-1);
-    const issueLink = issueUrl ? githubLink(issueUrl, pi.repo, "issues") : undefined;
     if (!issueUrl) {
       problem("No issue was reported for this change.");
     } else if (!issueLink) {
@@ -529,16 +536,6 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       try {
         await gh(["issue", "view", String(issueLink.number), "--repo", pi.repo, "--json", "number,state"]);
         outcome.issue.confirmed = true;
-        if (pr && prLink) {
-          // GitHub works the links out shortly after the PR is written.
-          for (let attempt = 0; attempt < 2 && !closes(pr).includes(issueLink.number); attempt++) {
-            await sleep(pi.retryMs ?? 3_000);
-            pr = await view(prLink.number);
-          }
-          if (!closes(pr).includes(issueLink.number)) {
-            problem(`GitHub does not list issue #${issueLink.number} as one the PR closes: its body needs a plain \`Closes #${issueLink.number}\`.`);
-          }
-        }
       } catch (error) {
         problem(`The issue could not be confirmed with gh: ${clip(message(error), 300)}`);
       }

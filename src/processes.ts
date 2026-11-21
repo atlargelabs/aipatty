@@ -17,7 +17,7 @@ export interface Proc {
 export const RUN_MARKER = "PATTY_RUN_ID";
 
 /**
- * What a run remembers of its processes: each one's ID and start time, the process groups its own processes led,
+ * What a run remembers of its processes: each one's ID and start time, the process groups its processes were in,
  * and when it last saw them (`asOf`, in milliseconds). A group outlives its leader while any member lives. Once it
  * is empty its ID can name a new group, so a leaderless group's members count as the run's only if they had
  * started by `asOf`.
@@ -37,12 +37,16 @@ async function ps(args: string[]): Promise<string> {
   return (await exec("ps", args, { maxBuffer: 64 * 1024 * 1024, env: { ...process.env, LC_ALL: "C" } })).stdout;
 }
 
+/** This process's own group, once the process table has been read: never a run's. */
+let hostGroup: number | undefined;
+
 export async function listProcesses(): Promise<Proc[]> {
   const procs: Proc[] = [];
   for (const line of (await ps(["-A", "-o", "pid=,ppid=,pgid=,lstart="])).split("\n")) {
     const row = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s*$/.exec(line);
     if (row) procs.push({ pid: Number(row[1]), ppid: Number(row[2]), pgid: Number(row[3]), start: row[4] });
   }
+  hostGroup = procs.find(proc => proc.pid === process.pid)?.pgid ?? hostGroup;
   return procs;
 }
 
@@ -144,7 +148,7 @@ export async function runProcesses(owned: Owned, runId: string): Promise<Proc[]>
 }
 
 /**
- * Add a run's processes, and the groups they lead, to what it remembers. `seenAt` is when they were seen while the
+ * Add a run's processes, and the groups they are in, to what it remembers. `seenAt` is when they were seen while the
  * run was being watched; a recovery, which may come long after, leaves `asOf` alone. Returns whether a process or
  * group was new.
  */
@@ -152,7 +156,9 @@ export function remember(owned: Owned, procs: readonly Proc[], seenAt?: number):
   const before = owned.procs.size + owned.groups.size;
   for (const proc of procs) {
     owned.procs.set(proc.pid, proc.start);
-    if (proc.pgid === proc.pid) owned.groups.add(proc.pgid);
+    // The group of a process of the run is the run's, whether or not its leader was ever seen: the run's
+    // processes are started in groups of their own, apart from this process's.
+    if (proc.pgid > 1 && proc.pgid !== hostGroup) owned.groups.add(proc.pgid);
   }
   if (seenAt !== undefined) owned.asOf = Math.max(owned.asOf, seenAt);
   return owned.procs.size + owned.groups.size !== before;

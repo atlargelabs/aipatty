@@ -271,6 +271,21 @@ test("a successful exit or a URL in the model's output is not proof of delivery"
   // It was asked again before giving up, since GitHub works the links out a moment after the PR is written.
   assert.equal((await readFile(join(config.dataDir, "fake-gh-calls.txt"), "utf8")).trim().split("\n").slice(-4).filter(call => call.startsWith("pr view 12")).length, 3);
 
+  // The link arrives on the second answer: accepted. But the answer that has it stands as a whole: if the head
+  // moved meanwhile, the review of the earlier head does not cover it.
+  const late = (pr: object) => [{ ...openPr["pr 12"], closingIssuesReferences: [] }, { ...openPr["pr 12"], ...pr }];
+  await rm(join(config.dataDir, "fake-gh-calls.txt"));
+  await github(config, { "pr 12": late({}), "issue 11": { number: 11 } });
+  await scenario(config, [...review("c1", "r2e"), assistant(report()), settled]);
+  assert.equal((await runs.run(request())).status, "completed");
+  await rm(join(config.dataDir, "fake-gh-calls.txt"));
+  await github(config, { "pr 12": late({ headRefOid: other }), "issue 11": { number: 11 } });
+  await scenario(config, [...review("c1", "r2f"), assistant(report()), settled]);
+  const moved = await runs.run(request());
+  assert.equal(moved.status, "failed");
+  assert.equal(moved.pr?.headSha, other);
+  assert.equal(moved.review.status, "stale");
+
   // A reviewed PR with no issue is not the workflow either.
   await github(config, openPr);
   await scenario(config, [...review("c1", "r3"), assistant(report({ issue: null })), settled]);
@@ -584,6 +599,9 @@ test("a restart reports the interrupted call in its branch, without running it a
 test("reviews and reports are read strictly", () => {
   assert.deepEqual(readReview("Overall verdict: \"correct\" (no blocking issues)"), { verdict: "correct", important: 0, lesser: 0 });
   assert.deepEqual(readReview("[P2] a\n[P3] b\n**Verdict:** correct"), { verdict: "correct", important: 0, lesser: 2 });
+  // Findings open their line, in a list, a heading or a table. A tag later in a line, in a quote or in an example is a mention.
+  assert.deepEqual(readReview("1. **[P1] a**\n- [P0] b\n### [P2] c\n| [P1] | `src/x.ts` | d |\n**Verdict: needs attention.**"), { verdict: "needs attention", important: 3, lesser: 1 });
+  assert.deepEqual(readReview("The previous [P1] finding is resolved.\n> [P0] old\n```\n[P1] example\n```\nVerdict: correct"), { verdict: "correct", important: 0, lesser: 0 });
   for (const clean of ["The verdict is correct.", "## Final verdict — `correct`", "- **Overall verdict:** \"correct\" (no blocking issues)",
     "**Verdict: correct.** Nothing blocks.", "Verdict: correct", "## Verdict\n\n**correct**: no blocking issues.\n\n## Callouts", "### Verdict\n\nCorrect.",
     "> Verdict: needs attention\n\nThat earlier review is resolved.\n\nVerdict: correct"]) {
@@ -599,15 +617,18 @@ test("reviews and reports are read strictly", () => {
   for (const prose of ["Mostly correct.", "The code is incorrect.", "I could not determine whether the change is correct.",
     'I cannot give this patch the verdict "correct".', "No verdict of correct is warranted.", "Verdict: not correct", "Verdict: incorrect",
     "Verdict: correct the cleanup first", "Verdict: correctness is unclear",
-    "## Verdict\n\nCorrect the cleanup before merging.", "## Verdict\n\nThe change is not correct.", "## Verdict",
+    "## Verdict\n\nCorrect the cleanup before merging.", "## Verdict\n\nCorrect `cleanUp` before merging.", "Verdict: correct `x` first",
+    "## Verdict\n\nThe change is not correct.", "## Verdict",
     "> Verdict: correct\nI disagree; the cleanup is still broken.",
     "The review should end like this:\n```\nVerdict: correct\n```\nbut I am not there yet.",
     "Verdict: correct\n\n## Verdict\n\nUnclear.",
     "No verdict is possible; correct me if I am wrong.", "[P2] a finding, and then the text was cut"]) {
     assert.equal(readReview(prose).verdict, "unknown", prose);
   }
-  // A fenced example does not override the reviewer's own declaration.
+  // A fenced example does not override the reviewer's own declaration, nor does a fence shown inside one.
   assert.equal(readReview("Verdict: needs attention\n\n~~~\nVerdict: correct\n~~~").verdict, "needs attention");
+  assert.equal(readReview("~~~markdown\n```\nVerdict: correct\n~~~\nVerdict: needs attention").verdict, "needs attention");
+  assert.equal(readReview("````\n```\nVerdict: correct\n```\n````\nVerdict: needs attention").verdict, "needs attention");
   assert.equal(readReport("no block"), undefined);
   assert.equal(readReport("<result>not json</result>"), undefined);
   assert.equal(readReport('<result>{"pr":"x"}</result>'), undefined);
@@ -772,8 +793,10 @@ test("a run's processes are found by environment marker and by the groups they l
     const procs = await listProcesses();
     return [marked.pid, bystander.pid, leader.pid, orphan].every(pid => procs.some(proc => proc.pid === pid)) ? procs : undefined;
   });
-  remember(owned, table!.filter(proc => proc.pid === leader.pid), Date.now());
+  // The group is remembered from any of its members, so it need not be the leader that was seen.
+  remember(owned, table!.filter(proc => proc.pid === orphan), Date.now());
   assert.deepEqual([...owned.groups], [leader.pid]);
+  owned.procs.clear();
   leader.kill("SIGKILL");
   await until(() => !alive(leader.pid!));
 
