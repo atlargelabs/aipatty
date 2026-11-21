@@ -886,18 +886,24 @@ test("a run's processes are found by environment marker and by the groups they l
     assert.ok(!("asOf" in saved));
   }
 
-  const withClock = async <T>(first: number, later: number, run: () => Promise<T>): Promise<T> => {
+  const withClock = async <T>(first: number, later: number, run: (reads: () => number) => Promise<T>): Promise<T> => {
     let readings = 0;
     const clock = t.mock.method(Date, "now", () => readings++ === 0 ? first : later);
     try {
-      return await run();
+      return await run(() => readings);
     } finally {
       clock.mock.restore();
     }
   };
   const cutoff = Date.now() + 1_000;
   const catchingUp = newOwned([], [[leader.pid!, cutoff]]);
-  assert.equal(await withClock(cutoff - 1, cutoff + 1, () => trackRunProcesses(catchingUp, "another-run")), true);
+  let savedCutoff = false;
+  assert.equal(await withClock(cutoff - 1, cutoff + 1, reads => trackRunProcesses(catchingUp, "another-run", async () => {
+    assert.equal(reads(), 1, "persist before waiting for the process snapshot");
+    assert.equal(catchingUp.groups.get(leader.pid!), null);
+    savedCutoff = true;
+  })), true);
+  assert.ok(savedCutoff);
   assert.equal(catchingUp.groups.get(leader.pid!), null, "a future cutoff at poll entry stays invalid after the scan");
   assert.equal(catchingUp.procs.size, 0, "the cutoff did not confer ownership");
 
@@ -939,6 +945,17 @@ test("a run's processes are found by environment marker and by the groups they l
   }), []);
   assert.deepEqual(records[0], { groups: [fresh.pid], alive: true });
   assert.deepEqual(records.at(-1)?.groups, [], "the forgotten group is also persisted");
+
+  const detached = start(["-e", idle], {}, true);
+  const detachedProc = await until(async () => (await listProcesses()).find(proc => proc.pid === detached.pid));
+  const known = newOwned([[detached.pid!, detachedProc!.start]]);
+  let writes = 0;
+  await assert.rejects(stopRun(known, "no-such-run", undefined, 0, undefined, async () => {
+    writes++;
+    throw new Error("test write failure");
+  }), /the process record could not be saved: test write failure/);
+  assert.ok(writes > 1, "retry the failed record");
+  assert.ok(!alive(detached.pid!), "record failure still allows confirmed processes to be stopped");
 
   assert.deepEqual(await stopRun(owned, marker, undefined, 0), []);
   await until(() => !alive(marked.pid!) && !alive(orphan));

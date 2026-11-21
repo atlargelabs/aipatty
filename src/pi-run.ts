@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import type { Config } from "./config.ts";
 import { instructions, taskPrompt } from "./pi-prompt.ts";
 import { addUsage, githubLink, readReport, RunTrace, usageKey, type JobUsage, type Review } from "./pi-trace.ts";
-import { listProcesses, newOwned, remember, RUN_MARKER, stopRun, trackRunProcesses, type Owned, type Proc } from "./processes.ts";
+import { invalidateFutureCutoffs, listProcesses, newOwned, remember, RUN_MARKER, stopRun, trackRunProcesses, type Owned, type Proc } from "./processes.ts";
 
 const exec = promisify(execFile);
 
@@ -671,8 +671,13 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       } catch (error) {
         if (!isMissing(error)) {
           // Part of a transcript is not the run's account: stop the run, and keep its record for another try.
-          await stop().catch(() => {});
-          throw new Error(`its events could not be read: ${message(error)}`);
+          const reason = `its events could not be read: ${message(error)}`;
+          try {
+            await stop();
+          } catch (stopError) {
+            throw new Error(`${reason}; stopping it also failed: ${message(stopError)}`);
+          }
+          throw new Error(reason);
         }
       }
       split.end();
@@ -743,17 +748,23 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     const adopt = async (pid: number | undefined) => {
       if (pid === undefined) return;
       const seenAt = Date.now();
+      if (invalidateFutureCutoffs(run.owned, seenAt)) await save();
       const own = (await listProcesses().catch(() => [])).find(proc => proc.pid === pid);
-      if (own) remember(run.owned, [own], seenAt);
+      const scannedAt = Date.now();
+      invalidateFutureCutoffs(run.owned, scannedAt);
+      if (own) remember(run.owned, [own], seenAt <= scannedAt ? seenAt : undefined);
       await save();
     };
     /** The children this host started itself and still holds: stopped through their handles when all else fails. */
     const held = new Set<ChildProcess>();
     const stop = async (grace = graceMs) => {
-      await saving.catch(() => {});
       if (!recordEstablished) return []; // Nothing could have been launched.
+      const left = await stopRun(run.owned, saved.runId, saved.pid, grace, term, write);
+      // A previous poll may have failed to write even if the stop scans found no changes. Try again before
+      // letting cleanup delete anything, without making termination of verified processes depend on the write.
+      await saving.catch(() => {});
       if (recordDirty) await write();
-      return stopRun(run.owned, saved.runId, saved.pid, grace, term, write);
+      return left;
     };
     let stopping = Promise.resolve();
     run.kill = () => {
@@ -908,7 +919,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         // Remember the processes the run starts while their parents still live: a delegate leads its own group.
         let polling: Promise<void> | undefined;
         const poll = setInterval(() => {
-          polling ??= trackRunProcesses(run.owned, saved.runId, () => { recordDirty = true; })
+          polling ??= trackRunProcesses(run.owned, saved.runId, save)
             .catch(() => false).then(async changed => {
               if (changed || recordDirty) await save();
             }).finally(() => { polling = undefined; });
