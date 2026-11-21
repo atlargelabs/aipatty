@@ -7,10 +7,13 @@
   "bin": { "aipatty": "./src/cli.ts" },
   "scripts": { "start": "node src/main.ts", "check": "tsc --noEmit", "test": "node --test test/*.test.ts" },
   "dependencies": {
-    "@earendil-works/pi-durable": "1.5.2",
-    "@earendil-works/pi-ai": "1.5.2",
-    "@earendil-works/chord": "1.5.2",
-    "@earendil-works/pi-schema": "1.5.2",
+    "@earendil-works/chord": "1.6.0",
+    "@earendil-works/pi-ai": "1.6.0",
+    "@earendil-works/pi-codemode": "1.6.0",
+    "@earendil-works/pi-coding-agent": "1.6.0",
+    "@earendil-works/pi-durable": "1.6.0",
+    "@earendil-works/pi-schema": "1.6.0",
+    "pi-delegates": "git+https://github.com/stephenchestnut/delegates.git#a66e6d83dcc0cf534802a59f76aa03d088446efd",
     "proper-lockfile": "4.1.2",
     "ws": "8.21.0"
   },

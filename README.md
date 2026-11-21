@@ -64,8 +64,8 @@ The server listens on `127.0.0.1` only; there is no listen address to configure.
 A new root conversation starts with the model `gpt-6.2-sol` and the thinking level `high`. Both are saved with the
 conversation; change them with `model set` and `thinking set` (add `--branch <id>` for a branch).
 
-`gpt-6.2-sol` is newer than the catalog bundled with pi-ai 1.5.2. It resolves only if the pi CLI has cached a newer
-catalog in the pi directory. If the saved model (or the default on first launch) is missing, the server
+`gpt-6.2-sol` is in the catalog bundled with pi-ai 1.6.0. A model newer than that catalog resolves only if the pi
+CLI has cached a newer catalog in the pi directory. If a branch's saved model is missing from both, the server
 still serves transcripts, branches and model commands. `/health` returns HTTP 200, `modelStatus: "unavailable"`, and the
 model reference; sends return 409. Availability means present in the local catalog, not that a login or network call succeeded.
 A branch whose model is missing refuses sends; the others keep working. If a branch has *interrupted work* waiting
