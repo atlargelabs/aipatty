@@ -896,6 +896,11 @@ test("a run's processes are found by environment marker and by the groups they l
     }
   };
   const cutoff = Date.now() + 1_000;
+  const catchingUp = newOwned([], [[leader.pid!, cutoff]]);
+  assert.equal(await withClock(cutoff - 1, cutoff + 1, () => trackRunProcesses(catchingUp, "another-run")), true);
+  assert.equal(catchingUp.groups.get(leader.pid!), null, "a future cutoff at poll entry stays invalid after the scan");
+  assert.equal(catchingUp.procs.size, 0, "the cutoff did not confer ownership");
+
   const futureRecord = JSON.stringify({ ...record, procs: [], groups: [[leader.pid, cutoff]] });
   const eventsFile = join(logDir, "events.jsonl");
   // Recovery takes another clock reading when replaying the tool start. The bad timestamp must stay invalid

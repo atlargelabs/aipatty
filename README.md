@@ -82,6 +82,7 @@ A run's processes are found by parent, by the process groups its processes led, 
 environment. If a group has lost its leader, membership alone counts only for processes old enough to have
 been there when the run last saw an owned member of that same group. Process IDs and groups in older recovery
 records with only a run-wide timestamp can block cleanup, but require independent evidence before signalling.
+Finish any pending Pi run recovery before downgrading: older versions cannot read the new recovery record.
 A process that leaves both its parent and its group, and hides its environment, is not found. No process is
 signalled unless a process table read just before shows it, by ID and start time, to be the run's.
 

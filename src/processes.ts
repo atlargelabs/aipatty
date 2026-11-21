@@ -97,7 +97,25 @@ interface ProcessScan {
   ours: Proc[];
   unsure: Proc[];
   groupsChanged: boolean;
+  beganAt: number;
   scannedAt: number;
+}
+
+function invalidateFutureCutoffs(owned: Owned, at: number): boolean {
+  let changed = false;
+  for (const [pgid, seenAt] of owned.groups) {
+    if (seenAt !== null && seenAt > at) {
+      owned.groups.set(pgid, null);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+async function processSnapshot(runId: string) {
+  const before = new Map((await listProcesses()).map(proc => [proc.pid, proc.start]));
+  const marked = await markedPids(runId, [...before].map(([pid, start]) => ({ pid, ppid: 0, pgid: 0, start })));
+  return { before, marked, procs: await listProcesses() };
 }
 
 /**
@@ -114,20 +132,21 @@ interface ProcessScan {
  * Forgets empty groups and cutoffs invalidated by a clock rollback. The result is from a process table read last,
  * after the slower environment scan: act on it at once.
  */
-async function scan(owned: Owned, runId: string): Promise<ProcessScan> {
-  const before = new Map((await listProcesses()).map(proc => [proc.pid, proc.start]));
-  const marked = await markedPids(runId, [...before].map(([pid, start]) => ({ pid, ppid: 0, pgid: 0, start })));
-  const procs = await listProcesses();
+async function scan(owned: Owned, runId: string, retainOnFailure?: () => unknown): Promise<ProcessScan> {
+  const beganAt = Date.now();
+  // Check before awaiting ps: the clock could catch up before this or a concurrent scan classifies the group.
+  const invalidatedAtEntry = invalidateFutureCutoffs(owned, beganAt);
+  const { before, marked, procs } = await processSnapshot(runId).catch(async error => {
+    if (invalidatedAtEntry) await retainOnFailure?.();
+    throw error;
+  });
+  const scannedAt = Date.now();
+  let groupsChanged = invalidateFutureCutoffs(owned, scannedAt) || invalidatedAtEntry;
   const byPid = new Map(procs.map(proc => [proc.pid, proc]));
   const liveGroups = new Set(procs.map(proc => proc.pgid));
-  const scannedAt = Date.now();
-  let groupsChanged = false;
-  for (const [pgid, seenAt] of owned.groups) {
+  for (const pgid of owned.groups.keys()) {
     if (!liveGroups.has(pgid)) {
       owned.groups.delete(pgid);
-      groupsChanged = true;
-    } else if (seenAt !== null && seenAt > scannedAt) {
-      owned.groups.set(pgid, null);
       groupsChanged = true;
     }
   }
@@ -163,7 +182,7 @@ async function scan(owned: Owned, runId: string): Promise<ProcessScan> {
   }
   const unsure = procs.filter(proc => candidate(proc) && !ours.has(proc.pid)
     && (owned.unverifiedProcs.get(proc.pid) === proc.start || leaderless(proc)));
-  return { ours: [...ours.values()], unsure, groupsChanged, scannedAt };
+  return { ours: [...ours.values()], unsure, groupsChanged, beganAt, scannedAt };
 }
 
 /** The live processes that belong to a run; see `scan`. Rejects when the process table cannot be read. */
@@ -172,10 +191,9 @@ export async function runProcesses(owned: Owned, runId: string): Promise<Proc[]>
 }
 
 /** Poll a live run, returning whether its recovery record needs updating. */
-export async function trackRunProcesses(owned: Owned, runId: string): Promise<boolean> {
-  const seenAt = Date.now();
-  const { ours, groupsChanged, scannedAt } = await scan(owned, runId);
-  const learned = remember(owned, ours, seenAt <= scannedAt ? seenAt : undefined);
+export async function trackRunProcesses(owned: Owned, runId: string, retainOnFailure?: () => void): Promise<boolean> {
+  const { ours, groupsChanged, beganAt, scannedAt } = await scan(owned, runId, retainOnFailure);
+  const learned = remember(owned, ours, beganAt <= scannedAt ? beganAt : undefined);
   return learned || groupsChanged;
 }
 
@@ -233,7 +251,7 @@ export async function stopRun(
     const starts = new Map((await listProcesses()).map(proc => [proc.pid, proc.start]));
     return ours.filter(proc => starts.get(proc.pid) === proc.start);
   };
-  const tree = await recordScan(await scan(owned, runId));
+  const tree = await recordScan(await scan(owned, runId, record));
   const rootStart = root === undefined ? undefined : owned.procs.get(root);
   if (root !== undefined && rootStart !== undefined && tree.some(proc => proc.pid === root && proc.start === rootStart)) {
     // Through the live child handle when there is one, which cannot reach a process that reused the ID.
@@ -248,7 +266,7 @@ export async function stopRun(
   let left: Proc[] = [];
   let unsure: Proc[] = [];
   for (let attempt = 0; attempt < 20; attempt++) {
-    const scanned = await scan(owned, runId);
+    const scanned = await scan(owned, runId, record);
     ({ ours: left, unsure } = scanned);
     const targets = await recordScan(scanned);
     if (!left.length) break;

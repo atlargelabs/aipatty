@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import type { Config } from "./config.ts";
 import { instructions, taskPrompt } from "./pi-prompt.ts";
 import { addUsage, githubLink, readReport, RunTrace, usageKey, type JobUsage, type Review } from "./pi-trace.ts";
-import { listProcesses, newOwned, remember, RUN_MARKER, stopRun, trackRunProcesses, type Owned } from "./processes.ts";
+import { listProcesses, newOwned, remember, RUN_MARKER, stopRun, trackRunProcesses, type Owned, type Proc } from "./processes.ts";
 
 const exec = promisify(execFile);
 
@@ -473,11 +473,10 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
    * spend; when this call added it, the outcome was saved with it before anything was deleted.
    */
   async function cleanUp(
-    saved: SavedRun, owned: Owned, trace: RunTrace, outcome: RunOutcome, reconciled: boolean,
-    options: { term?: () => void; record: () => Promise<unknown> },
+    saved: SavedRun, trace: RunTrace, outcome: RunOutcome, reconciled: boolean, stop: () => Promise<Proc[]>,
   ): Promise<{ clean: boolean; reconciled: boolean }> {
     try {
-      const left = await stopRun(owned, saved.runId, saved.pid, graceMs, options.term, options.record);
+      const left = await stop();
       if (left.length) {
         // Its jobs may still be spending: their spend is added by the cleanup that finds them stopped.
         outcome.problems.push(`${left.length} process(es) could not be stopped, or could not be told from the run's (${left.map(proc => proc.pid).join(", ")}); its workspace was left in ${saved.workspace}.`);
@@ -664,6 +663,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       const owned = newOwned(saved.procs, saved.groups, saved.unverifiedProcs);
       // What the cleanup learns of the run's processes is kept for the next start, should this one not finish.
       const record = () => writeJson(stateFile, { ...saved, procs: [...owned.procs], groups: [...owned.groups] });
+      const stop = () => stopRun(owned, saved.runId, saved.pid, graceMs, undefined, record);
       const trace = new RunTrace(pi.repo);
       const split = lineSplitter((line, whole) => trace.line(line, whole));
       try {
@@ -671,7 +671,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       } catch (error) {
         if (!isMissing(error)) {
           // Part of a transcript is not the run's account: stop the run, and keep its record for another try.
-          await stopRun(owned, saved.runId, saved.pid, graceMs, undefined, record).catch(() => {});
+          await stop().catch(() => {});
           throw new Error(`its events could not be read: ${message(error)}`);
         }
       }
@@ -683,7 +683,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         outcome.usageComplete = false;
         unconfirmedLinks(trace, outcome);
       }
-      const { clean, reconciled } = await cleanUp(saved, owned, trace, outcome, settledBefore?.reconciled ?? false, { record });
+      const { clean, reconciled } = await cleanUp(saved, trace, outcome, settledBefore?.reconciled ?? false, stop);
       if (outcome.status === "completed" && outcome.problems.length) outcome.status = "failed";
       await remembered(saved, outcome, reconciled);
       let handed = clean;
@@ -724,10 +724,19 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
 
     // One writer at a time, and none once the run's record is handed over.
     let recording = true;
+    let recordEstablished = false;
+    let recordDirty = false;
     let saving: Promise<unknown> = Promise.resolve();
     const write = () => saving = saving.catch(() => {}).then(async () => {
       if (!recording) return;
-      await writeJson(stateFile, { ...saved, procs: [...run.owned.procs], groups: [...run.owned.groups] });
+      recordDirty = false;
+      try {
+        await writeJson(stateFile, { ...saved, procs: [...run.owned.procs], groups: [...run.owned.groups] });
+        recordEstablished = true;
+      } catch (error) {
+        recordDirty = true;
+        throw error;
+      }
     });
     const save = () => write().catch(error => console.error(`Pi run ${saved.runId}: could not save its record:`, error));
     /** Remember a process this host started for the run, before waiting on it. */
@@ -740,14 +749,20 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     };
     /** The children this host started itself and still holds: stopped through their handles when all else fails. */
     const held = new Set<ChildProcess>();
+    const stop = async (grace = graceMs) => {
+      await saving.catch(() => {});
+      if (!recordEstablished) return []; // Nothing could have been launched.
+      if (recordDirty) await write();
+      return stopRun(run.owned, saved.runId, saved.pid, grace, term, write);
+    };
     let stopping = Promise.resolve();
     run.kill = () => {
       stopping = stopping.then(async () => {
         try {
-          await stopRun(run.owned, saved.runId, saved.pid, graceMs, term, save);
+          await stop();
         } catch (error) {
-          // The process table could not be read. Kill what this host started, by handle and so by group: each
-          // leads its own. What they started is left to the cleanup, which keeps the slot closed if it cannot look.
+          // The scan or record write failed. Stop what this host started directly, by handle and so by group:
+          // each leads its own. What they started is left to the cleanup, which keeps the slot closed if it fails.
           console.error(`Pi run ${saved.runId}: could not stop its processes by scanning:`, error);
           for (const child of held) {
             if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) continue;
@@ -893,9 +908,10 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         // Remember the processes the run starts while their parents still live: a delegate leads its own group.
         let polling: Promise<void> | undefined;
         const poll = setInterval(() => {
-          polling ??= trackRunProcesses(run.owned, saved.runId).then(async changed => {
-            if (changed) await save();
-          }).catch(() => {}).finally(() => { polling = undefined; });
+          polling ??= trackRunProcesses(run.owned, saved.runId, () => { recordDirty = true; })
+            .catch(() => false).then(async changed => {
+              if (changed || recordDirty) await save();
+            }).finally(() => { polling = undefined; });
         }, pollMs);
         code = await exited;
         clearInterval(poll);
@@ -916,7 +932,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
 
     // A stopped host leaves the workspace, the saved run and the result to the next start.
     if (run.stop === "shutdown") {
-      await stopRun(run.owned, saved.runId, saved.pid, 0, term, save).catch(() => {});
+      await stop(0).catch(() => {});
       await save();
       return undefined;
     }
@@ -964,7 +980,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     }
     if (trace.unfinishedDelegates) outcome.problems.push(`${trace.unfinishedDelegates} delegate call(s) were cut off before they reported; the cost includes what their jobs had recorded.`);
     if (trace.unaccountedDelegates) outcome.problems.push(`${trace.unaccountedDelegates} delegate call(s) ended without a result; their spend is not included.`);
-    const { clean, reconciled } = await cleanUp(saved, run.owned, trace, outcome, false, { term, record: save });
+    const { clean, reconciled } = await cleanUp(saved, trace, outcome, false, stop);
     // `completed` only when everything the host checked holds.
     if (outcome.status === "completed" && outcome.problems.length) outcome.status = "failed";
     outcome.problems = outcome.problems.slice(0, maxItems);
