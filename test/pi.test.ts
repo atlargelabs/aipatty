@@ -583,6 +583,9 @@ test("reviews and reports are read strictly", () => {
   assert.deepEqual(readReview("[P2] a\n[P3] b\n**Verdict:** correct"), { verdict: "correct", important: 0, lesser: 2 });
   assert.equal(readReview("The verdict is correct.").verdict, "correct");
   assert.equal(readReview("## Final verdict — `correct`").verdict, "correct");
+  assert.equal(readReview("## Verdict\n\n**correct**: no blocking issues.\n\n## Callouts").verdict, "correct");
+  assert.equal(readReview("## Verdict\n\nneeds attention").verdict, "needs attention");
+  assert.equal(readReview("## Verdict\n\nThe change is not correct.").verdict, "unknown");
   assert.equal(readReview("- **Overall verdict:** \"correct\" (no blocking issues)").verdict, "correct");
   assert.equal(readReview("**Verdict: needs attention.**").verdict, "needs attention");
   // A line naming both is the cautious one, and the last stated verdict is the one that counts.

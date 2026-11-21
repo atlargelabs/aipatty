@@ -86,7 +86,13 @@ function contentText(content: unknown): string {
 export function readReview(summary: string): Pick<Review, "verdict" | "important" | "lesser"> {
   const important = summary.match(/\[P[01]\]/g)?.length ?? 0;
   const lesser = summary.match(/\[P[23]\]/g)?.length ?? 0;
-  const stated = summary.split(/\r?\n/).findLast(line => /\bverdict\b/i.test(line)) ?? "";
+  const lines = summary.split(/\r?\n/);
+  const at = lines.findLastIndex(line => /\bverdict\b/i.test(line));
+  let stated = lines[at] ?? "";
+  // A heading of its own, such as `## Verdict`, is declared by the next line that has text.
+  if (/^[\s#*_-]*(?:overall\s+|final\s+)?verdict[\s:*_-]*$/i.test(stated)) {
+    stated = `Verdict: ${lines.slice(at + 1).find(line => line.trim()) ?? ""}`;
+  }
   const declared = /^(?:the\s+)?(?:overall\s+|final\s+)?verdict(?:\s+is)?[\s:*_"'`“”–—-]{0,8}(correct|needs[ _-]attention)\b/i
     // A quoted line is someone else's verdict.
     .exec(stated.replace(/^[\s#*_-]+/, ""));
