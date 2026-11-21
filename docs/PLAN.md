@@ -13,9 +13,9 @@ conversation. The conversation host, branch tree, CLI, web page, and commit-repo
 | Merging | Only Steve merges PRs in `atlargelabs/aipatty`. |
 | Upgrade | Explicit, never automatic. If rollback also fails, Steve uses SSH or remote desktop. |
 | GitHub identity | The `pattycaik` account with write access, behind a ruleset on `main`. Other repos only when Steve directs it. |
-| Coding | Aipatty hands bounded tasks to its own pinned Pi CLI in disposable workspaces. Pi inspects and ships a PR directly, without `delegates`. Defer general-purpose host coding tools until a task needs them. |
+| Coding | Aipatty has pi-durable's built-in tools for inspection, scratch work and `gh`. Work intended for a PR goes to its own pinned Pi CLI in a disposable workspace, with the `delegates` and `pi-review` extensions installed. Pi can write the change directly or through a delegate. Every PR is reviewed by a `crmanager` delegate, and Pi keeps fixing until no important finding remains. |
 | Tree | Branches are independent workstreams. Steve and aipatty can both fork. All branches stay listed. No automatic report-back. |
-| Models | Default `gpt-6.2-sol` on the OpenAI subscription. Per-branch model, set by Steve or by aipatty. Spark later. Claude through the `pi` CLI only, for now. |
+| Models | Default `openai/gpt-6.2-sol`, on the `openai` provider with the OpenAI subscription, for aipatty's conversations and for Pi runs. Per-branch model, set by Steve or by aipatty. Spark later. Claude through the `pi` CLI only, for now. |
 | Cost | Shown per branch and in total as `$<branch> / $<total>`. No spend limit. |
 | macOS account | A standard user `aipatty`; Steve keeps administrator access. |
 | Guard rails | No approval prompts. The `protect-main` ruleset with required CI is the enforcement. No hooks for now. |
@@ -25,13 +25,15 @@ conversation. The conversation host, branch tree, CLI, web page, and commit-repo
 
 One Node process runs a pi-durable `Harness` over SQLite, with a small supervisor beside it.
 
-- **Stack:** TypeScript on Node 26. The Pi packages (`pi-durable`, `pi-ai`, `chord`, `pi-schema`, and the
-  `pi-coding-agent` CLI) are pinned at exactly 1.6.0 from npm, all at the same version so the host and the CLI share
+- **Stack:** TypeScript on Node 26. The Pi packages (`pi-durable`, `pi-ai`, `pi-codemode`, `chord`, `pi-schema`, and
+  the `pi-coding-agent` CLI) are pinned at exactly 1.6.0 from npm, all at the same version so the host and the CLI share
   one `pi-ai`. The host is on 1.5.2 today; the bump to 1.6.0 is the first PR of build step 2. Later bumps are normal
   reviewed PRs.
 - **Layout in the `aipatty` user's home:**
   - `deploy/`: release checkouts of committed `main`, with dependencies installed separately for each release. Keep
     the active and last-known-good releases available for rollback.
+  - `work/`: the working directory of aipatty's own `read`, `write`, `edit` and `bash`, for inspection and scratch
+    files. Nothing that becomes a PR is done here.
   - `runs/`: disposable workspaces for [`pi` runs](#pi-runs).
   - `data/`: the SQLite database, logs, upgrade state, and later MCP configuration and sign-ins.
 - **Conversations:** one root plus forks. Each has a title and its own model.
@@ -50,11 +52,44 @@ model catalog cache (`models-store.json`, which supplies models newer than the b
 login with the pinned CLI; neither process uses Steve's personal Pi install, settings, or credential files. When
 bumping Pi, verify that the active and rollback releases can both use the shared sign-in and model cache.
 
+### Pi extensions
+
+Pi runs use two extensions, and only these two:
+
+- **`delegates`** (`github.com/stephenchestnut/delegates`): the `delegate` and `delegate_parallel` tools, with the
+  `thinker`, `thinktank`, `worker`, `prmanager` and `crmanager` profiles. The run loads it with `-e`.
+- **`pi-review`** (`github.com/earendil-works/pi-review`): the `/review` command. The run does not load it.
+  `delegates` loads it inside a `crmanager` job and runs `/review` there without its interactive UI.
+
+Neither is published on npm. Install both as git dependencies pinned to a full commit SHA, so the lockfile fixes
+them and a rollback of aipatty rolls them back too. Use the copies in the running release by absolute path.
+Do not use `pi install` or `pi update`, which would put a moving copy in the agent directory.
+
+`delegates` reads its settings from the service account's `settings.json` in the Pi agent directory, not from the
+checkout:
+
+- **Publication:** `atlargelabs/aipatty` as the one authorized repository, with base branch `main`.
+- **Models:** none set. The extension's defaults are on the `openai` provider: `openai/gpt-6.2-sol` for every
+  profile except `crmanager`, which reviews with `openai/gpt-6.2-astra`.
+- **Review extension:** `delegates.reviewExtension` names the pinned `review.ts` by absolute path. Without it
+  `delegates` looks for a `pi install` copy in the agent directory, which the plan does not create.
+- **Checks:** `npm ci --ignore-scripts` as setup, and `npm run check` and `npm test` as required checks. A
+  `prmanager` refuses to submit with no checks configured, and the copy in the repo's `.pi/settings.json` is not
+  read because checkout settings stay untrusted.
+
+`delegates` keeps its jobs, logs, and `prmanager` and `crmanager` clones in `delegates/jobs/` under the agent
+directory, outside `runs/`.
+
+**Not settled:** the settings file is shared by every release, but the pinned `review.ts` sits at a different
+absolute path in each one. `reviewExtension` needs either a stable path to the active release or an update on each
+deploy and rollback.
+
 ## Tools the model gets
 
 | Tool | What it does |
 | --- | --- |
-| `pi` | Runs one Pi session on a bounded coding task in a fresh clone and returns the result to the calling branch. One run at a time across all branches. |
+| `read`, `write`, `edit`, `bash`, `codemode`, `tool_search` | pi-durable built-ins, working in `work/`. |
+| `pi` | Runs one Pi session on a bounded coding task in a fresh clone and returns the result to the calling branch. One run at a time across all branches. Inside the run Pi may delegate the work, and always delegates the review. |
 | `upgrade` | Asks the supervisor to deploy the latest `main`, when Steve asks for it. Refuses while a `pi` run is active. |
 | `fork_branch`, `list_branches`, `read_branch`, `set_model` | Tree management, plus paging and text search over any branch. |
 | `mcp_status`, `mcp_reload`, `mcp_sign_in` | Later: server state, re-reading `mcp.json`, and OAuth by link. |
@@ -71,23 +106,35 @@ the tool result, and operator logs remain available.
    outcome, and base, then create `runs/<run-id>/`. `atlargelabs/aipatty` is the only allowed repo for now. Clone it
    with the service account's GitHub access and record the resolved base SHA.
 2. **Launch:** use the pinned CLI in one-shot JSON mode (`--mode json --no-session`). Collect structured events and
-   stderr separately. Disable automatic loading of checkout settings and executable resources, extensions, and MCP.
+   stderr separately. Use `openai/gpt-6.2-sol` unless the call names another model. Disable automatic loading of
+   checkout settings and executable resources, extensions, and MCP, then load the pinned
+   [`delegates` extension](#pi-extensions) explicitly. Aipatty can ask Pi to delegate particular work or leave
+   that to Pi; the tool does not map a task to a profile.
    Give Pi the git-hygiene skill and issue workflow: every change has an issue, a task branch, and a PR linking the
-   issue, and Pi runs `npm run check` and `npm test` before it pushes. Only Steve merges.
-3. **Result:** return a typed outcome with the run ID, summary, and, when a PR was requested, the issue and PR
-   links. Confirm with `gh` that the PR exists and report its head SHA. A successful process exit or a URL in model
-   output is not proof of delivery. [CI](#guard-rails) on that head SHA is the authoritative check; the tool does
-   not wait for it. Charge the usage Pi reports to the calling branch once, and mark it incomplete when it cannot be
-   recovered. Bound the runtime and tool-result size.
-4. **Abort and cleanup:** on abort or timeout, stop Pi and its child processes before releasing the run slot. On
-   exit, retain the transcript and diagnostics in `data/logs/runs/` and delete the disposable workspace. Treat logs
-   as private service data.
-5. **Restart:** after taking the data-directory lock and before resuming conversations, stop any surviving processes
+   issue, and Pi runs `npm run check` and `npm test` before it pushes. Pi passes the same rules to any writable
+   delegate. Only Steve merges.
+3. **Review:** when the change is committed, Pi delegates a review to a `crmanager`: `/review branch main` before
+   a PR exists, `/review pr <number>` after. A `crmanager` is read-only, runs no tests and returns findings only.
+   Important findings are those tagged P0 or P1, and any that give the verdict "needs attention". Pi fixes them,
+   or continues the `prmanager` job that opened the PR, reruns the checks, and starts a fresh `crmanager` on the
+   new commit. It repeats until a review of the final commit reports no important finding. Lesser findings go in
+   the result without blocking it. If the runtime bound ends the loop first, the result says so and lists what
+   remains.
+4. **Result:** return a typed outcome with the run ID, summary, the last review's verdict and reviewed SHA, and,
+   when a PR was requested, the issue and PR links. Confirm with `gh` that the PR exists and report its head SHA.
+   A successful process exit or a URL in model output is not proof of delivery. [CI](#guard-rails) on that head SHA is the authoritative check; the tool does
+   not wait for it. This holds whether Pi or a `prmanager` opened the PR. Charge the usage Pi reports, including
+   its delegates' usage, to the calling branch once, and mark it incomplete when it cannot be recovered. Bound the
+   runtime and tool-result size.
+5. **Abort and cleanup:** on abort or timeout, stop Pi and its child processes, delegates included, before
+   releasing the run slot. On exit, retain the transcript and diagnostics in `data/logs/runs/`, including the logs
+   of the run's delegate jobs. Then delete the disposable workspace and the clones those jobs left under the agent
+   directory, which `delegates` does not remove itself. Treat logs as private service data.
+6. **Restart:** after taking the data-directory lock and before resuming conversations, stop any surviving processes
    owned by interrupted runs and finish cleanup. Report the call as `interrupted`, with any known PR link. Never
    rerun a call or repeat publication automatically.
 
-Deferred until something needs them: a read-only research mode, concurrent runs, repos other than aipatty, and the
-`delegates` extension.
+Deferred until something needs them: a read-only research mode, concurrent runs, and repos other than aipatty.
 
 ## Remote access
 
@@ -133,9 +180,11 @@ at boot without a login. It is not replaced by the normal aipatty upgrade.
   every PR and every push to `main`. A PR can change the workflow itself, so Steve reviews workflow changes before
   merging.
 - **No hooks for now:** the ruleset already stops `pattycaik` pushing to or merging into `main`. Add hooks against
-  mistakes only if a real one shows up.
+  mistakes only if a real one shows up. Aipatty's own `write`, `edit` and `bash` start in `work/` but are not
+  confined to it: they have the service user's permissions, including write access to `deploy/` and `data/`.
 - **Disposable runs:** fresh workspaces keep one run's checkout out of the next. Working directories are not
-  OS isolation; Pi still has the service user's permissions. Deleting a workspace does not undo publication.
+  OS isolation; Pi and its delegates still have the service user's permissions. Deleting a workspace does not undo
+  publication.
 
 ## Gmail and OAuth
 
@@ -152,24 +201,31 @@ at boot without a login. It is not replaced by the normal aipatty upgrade.
 1. **Done: skeleton and tree.** Durable SQLite conversations, restart/resume, subscription login, loopback API,
    CLI and web page, per-branch models and cost, and `/health` reporting the commit.
 2. **Get the Pi tool right.** First add [CI](#guard-rails) and bump the Pi packages to 1.6.0, adding the
-   [pinned Pi CLI](#pi-installation). Then ship the [run contract](#pi-runs) and the git/issue workflow. With a fake
-   CLI, test a second run being refused, missing auth or model, malformed output, false success, abort, child
-   cleanup, and restart. The real CLI is first exercised in step 3.
+   [pinned Pi CLI](#pi-installation) and its two [pinned extensions](#pi-extensions). Register pi-durable's coding
+   tools, codemode and tool-search extensions with `work/` as their directory. Then ship the
+   [run contract](#pi-runs) and the git/issue workflow. With a fake CLI, test a second run being refused, missing
+   auth or model, malformed output, false success, abort, child cleanup, and restart. Also test that the launch
+   loads only the pinned `delegates` extension, that delegate usage is charged once, that delegate clones are
+   removed, and that a result is not reported as reviewed when its review is missing, has important findings, or
+   covers a different SHA from the PR head. The real CLI, with both extensions and the review loop, is first
+   exercised in step 3.
 3. **Install on the mini and prove the loop by hand.** From the laptop over SSH, ask aipatty for a small change to
-   itself. It opens an issue and a checked PR. Steve merges and deploys it by hand; verify the new SHA and keep
-   talking in the original conversation. At this point aipatty can help build the supervisor.
+   itself. It opens an issue and a checked PR that a `crmanager` has reviewed. Steve merges and deploys it by
+   hand; verify the new SHA and keep talking in the original conversation. At this point aipatty can help build the supervisor.
 4. **Automate explicit upgrade and rollback.** Install the supervisor and replace the manual deploy with the
    `upgrade` tool. Repeat the end-to-end test and verify the originating branch reports the new SHA.
    Test a release that fails readiness and confirm the old release and conversation come back with the failure
    reported. This is the self-upgrade milestone.
-5. **After self-upgrade:** phone access, MCP configuration and OAuth, the per-branch switch, and Gmail. Add direct
-   host coding tools, research mode, concurrent runs, delegates, hooks, or more repos only when needed.
+5. **After self-upgrade:** phone access, MCP configuration and OAuth, the per-branch switch, and Gmail. Add research
+   mode, concurrent runs, hooks, or more repos only when needed.
 
 ## Setup only Steve can do
 
 - Create the `aipatty` user on the mini and install Node 26.3 or newer, Git, and `gh`. Set up the service account's
-  model sign-in with the release's Pi CLI and configure `pattycaik`'s SSH key and `gh` login. Confirm `main` protection,
-  with the CI check required, before enabling PR publication. No global Pi install or copy of Steve's dotfiles is needed.
+  model sign-in with the release's Pi CLI and configure `pattycaik`'s SSH key and `gh` login. Write the
+  [`delegates` settings](#pi-extensions) into the service account's Pi agent directory. Confirm `main` protection,
+  with the CI check required, before enabling PR publication. No global Pi install or copy of Steve's dotfiles is
+  needed.
 - Fix SSH from the laptop to `macmini` (host key verification fails), and later install the launchd supervisor.
 - For Gmail later, create the Google Cloud project and OAuth client.
 
