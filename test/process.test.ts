@@ -2,6 +2,7 @@ import { getBuiltinModelDataGeneratedAt } from "@earendil-works/pi-ai/providers/
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -141,10 +142,23 @@ test("one owner per directory across ports; SIGKILL releases ownership and inter
 });
 
 test("settings: three server options, and AIPATTY_FAUX as the only environment setting", () => {
-  assert.deepEqual(readConfig([], {}), {
+  const { pi, ...settings } = readConfig([], {});
+  assert.deepEqual(settings, {
     dataDir: join(homedir(), ".aipatty/data"), port: 8790, faux: false,
     authFile: join(homedir(), ".pi/agent/auth.json"), modelsStore: join(homedir(), ".pi/agent/models-store.json"),
+    workDir: join(homedir(), ".aipatty/work"), runsDir: join(homedir(), ".aipatty/runs"),
   });
+  // A run launches this release's own pinned CLI and extension by absolute path, never one found on PATH.
+  assert.deepEqual(pi, {
+    node: process.execPath,
+    cli: join(checkout, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"),
+    extension: join(checkout, "node_modules/pi-delegates/src/index.ts"),
+    agentDir: join(homedir(), ".pi/agent"),
+    repo: "atlargelabs/aipatty", repoUrl: "git@github.com:atlargelabs/aipatty.git", git: "git", gh: "gh",
+  });
+  assert.ok(existsSync(pi.cli) && existsSync(pi.extension), "the pinned CLI and extension are installed");
+  const dirs = readConfig(["--pi-dir", "~/elsewhere", "--work-dir", "~/w", "--runs-dir=/tmp/r"], {});
+  assert.deepEqual([dirs.pi.agentDir, dirs.workDir, dirs.runsDir], [join(homedir(), "elsewhere"), join(homedir(), "w"), "/tmp/r"]);
   const { authFile, modelsStore, port } = readConfig(["--pi-dir", "~/elsewhere", "--port=0"], {});
   assert.deepEqual([authFile, modelsStore, port], [join(homedir(), "elsewhere/auth.json"), join(homedir(), "elsewhere/models-store.json"), 0]);
   for (const bad of ["65536", "-1", "8790.5", "http", ""]) {
