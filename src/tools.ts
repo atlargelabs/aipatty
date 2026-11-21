@@ -130,14 +130,20 @@ export function treeExtension(getHost: () => AgentHost) {
       // that never completed, which reads as a failed fork: by default this branch is forked just before that message.
       const before = args.at === undefined && from.id === api.conversationId
         ? await callEntry(from, api.callId, context) : undefined;
-      const created = await awaitWithContext(host.fork(from, { title: args.title, at: args.at, before }), context);
-      let note = "";
-      if (args.message !== undefined) {
-        const conversation = (await awaitWithContext(host.conversation(String(created.id)), context))!;
-        await queued(host.submit(conversation, { type: "input", content: args.message }, context), context);
-        note = " It is working on the message.";
+      if (args.at === undefined && from.id === api.conversationId && before === undefined) {
+        throw new Error("Cannot find this tool call's entry; refusing an unsafe self-fork.");
       }
-      return text(`Created branch ${created.id}, "${created.title}".${note}`);
+      const created = await host.fork(from, { title: args.title, at: args.at, before }, context);
+      const summary = `Created branch ${created.id}, "${created.title}".`;
+      if (args.message === undefined) return text(summary);
+      try {
+        const conversation = (await host.conversation(String(created.id)))!;
+        await queued(host.submit(conversation, { type: "input", content: args.message }, context), context);
+      } catch (error) {
+        context.abortSignal?.throwIfAborted();
+        throw new Error(`${summary} First message admission failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+      }
+      return text(`${summary} It is working on the message.`);
     },
   });
 
@@ -166,8 +172,7 @@ export function treeExtension(getHost: () => AgentHost) {
         await conversation.configure({ model, ...(thinkingLevel ? { thinkingLevel } : {}) }, context);
       } else {
         // Another branch goes through the host, which refuses while that branch has active work.
-        await queued(host.setModel(model, conversation, context), context);
-        if (thinkingLevel) await queued(host.setThinking(thinkingLevel, conversation, context), context);
+        await queued(host.setModel({ ...model, thinkingLevel }, conversation, context), context);
       }
       const name = conversation.id === ROOT_CONVERSATION_ID ? "the main branch" : `branch ${conversation.id}`;
       return text(`Set ${name} to ${model.provider}/${model.modelId}${thinkingLevel ? ` with thinking ${thinkingLevel}` : ""}.`);

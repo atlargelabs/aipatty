@@ -14,12 +14,15 @@ thinking level, and its own cost; the page and the CLI show it as `$<branch> / $
 
 The model gets four tools for the tree: `list_branches`, `read_branch` (paging and case-insensitive text search over
 any branch), `fork_branch` (optionally with a first message the new branch starts on), and `set_model`. A branch it
-forks gets the model it has; its `set_model` on another branch is refused while that branch is busy.
+forks gets the model it has; its `set_model` on another branch is refused while that branch is busy. Forks at an
+incomplete tool exchange are rejected: fork before the call or after its last result. A tool's default self-fork
+ends before its own call. If the optional first message cannot be admitted, the tool reports the created branch ID and
+the admission error; the branch remains available.
 
 ## Page
 
 Open `http://<AIPATTY_HOST>:<AIPATTY_PORT>/` for the branch list, transcript, input box, fork (of the whole branch, or
-at any message with "Fork here"), rename, search, model and thinking pickers, and cost. ⌘/Ctrl+Enter sends.
+at a completed exchange with "Fork here"), rename, search, model and thinking pickers, and cost. ⌘/Ctrl+Enter sends.
 
 ## Install
 

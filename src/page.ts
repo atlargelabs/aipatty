@@ -35,6 +35,7 @@ export const pageHtml = `<!doctype html>
       <button id="older" type="button" hidden>Load older</button>
       <div id="entries"></div>
       <div id="live"></div>
+      <div id="run-failure" class="entry" role="status" hidden></div>
     </section>
     <form id="composer">
       <textarea id="input" rows="3" placeholder="Message" required></textarea>
@@ -75,6 +76,7 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .entry .fork-here { float: right; font-size: .75rem; }
 .entry.inherited { opacity: .7; }
 #live .entry { border-style: dashed; }
+#run-failure { background: #fff4e5; color: #8a4b00; }
 #composer { display: flex; gap: .5rem; padding: .6rem .8rem; border-top: 1px solid #ddd; background: #fff; }
 #composer textarea { flex: 1; font: inherit; padding: .4rem; resize: vertical; }
 #actions { display: flex; flex-direction: column; gap: .4rem; }
@@ -227,8 +229,11 @@ function keepAtBottom(change) {
   if (atBottom) box.scrollTop = box.scrollHeight;
 }
 
-/** Rebuild the transcript from app.entries: for another branch, a new snapshot or an older page. */
+// A branch switch or replacement snapshot supersedes any pending load for the old transcript.
+let transcriptRevision = 0;
 function renderEntries() {
+  transcriptRevision++;
+  $("older").disabled = false;
   keepAtBottom(() => {
     $("entries").replaceChildren(...entryNodes(app.entries));
     $("older").hidden = app.before === null;
@@ -246,6 +251,9 @@ function appendEntries(entries) {
 
 function renderLive() {
   $("abort").disabled = !app.live.run;
+  const failure = app.live.runFailure;
+  setText($("run-failure"), failure ? "Run failed: " + failure.reason + (failure.detail ? ": " + failure.detail : "") : "");
+  $("run-failure").hidden = !failure;
   const live = $("live");
   const message = app.live.generation && app.live.generation.message;
   const text = message ? messageText(message) : "";
@@ -334,14 +342,26 @@ async function loadModels() {
   }));
 }
 
+let draftRevision = 0;
+$("input").addEventListener("input", () => { draftRevision++; });
 $("composer").addEventListener("submit", guard(async event => {
   event.preventDefault();
+  const send = $("send");
+  const branch = app.branch;
+  const revision = draftRevision;
   const content = $("input").value;
-  if (!content.trim()) return;
-  await api("/api/conversations/" + app.branch + "/messages", {
-    method: "POST", body: { content, requestId: crypto.randomUUID(), whenBusy: "followUp" },
-  });
-  $("input").value = "";
+  if (send.disabled || branch === null || !content.trim()) return;
+  send.disabled = true;
+  try {
+    // getRandomValues is also available on plain HTTP over the tailnet.
+    const requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
+    await api("/api/conversations/" + branch + "/messages", {
+      method: "POST", body: { content, requestId, whenBusy: "followUp" },
+    });
+    if (branch === app.branch && revision === draftRevision) $("input").value = "";
+  } finally {
+    send.disabled = false;
+  }
 }));
 $("input").addEventListener("keydown", event => {
   if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) $("composer").requestSubmit();
@@ -377,14 +397,22 @@ $("thinking").addEventListener("change", guard(async event => {
   }
 }));
 $("older").addEventListener("click", guard(async () => {
-  if (app.before === null) return;
-  const page = await api("/api/conversations/" + app.branch + "?before=" + app.before);
-  app.entries = page.entries.concat(app.entries);
-  app.before = page.before;
-  const box = $("transcript");
-  const height = box.scrollHeight;
-  renderEntries();
-  box.scrollTop += box.scrollHeight - height;
+  const button = $("older");
+  if (button.disabled || app.before === null) return;
+  const revision = transcriptRevision;
+  button.disabled = true;
+  try {
+    const page = await api("/api/conversations/" + app.branch + "?before=" + app.before);
+    if (revision !== transcriptRevision) return;
+    app.entries = page.entries.concat(app.entries);
+    app.before = page.before;
+    const box = $("transcript");
+    const height = box.scrollHeight;
+    renderEntries();
+    box.scrollTop += box.scrollHeight - height;
+  } finally {
+    if (revision === transcriptRevision) button.disabled = false;
+  }
 }));
 $("menu").addEventListener("click", () => $("branches").classList.toggle("open"));
 $("branch-list").addEventListener("click", event => {

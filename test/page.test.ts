@@ -6,8 +6,9 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { startApi } from "../src/api.ts";
+import { readConfig } from "../src/config.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
-import { checkout, fauxConfig, fixture, until } from "./helpers.ts";
+import { checkout, fauxConfig, fixture, fixtureEnv, until } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
 
@@ -27,12 +28,12 @@ function findChrome(): string | undefined {
 const chrome = findChrome();
 
 /** One headless Chrome page driven over the DevTools protocol, without a browser library. */
-async function openBrowser(t: TestContext) {
+async function openBrowser(t: TestContext, flags: string[] = []) {
   // Chrome's own directory, removed only after Chrome has exited: it writes to its profile until then.
   const profile = await mkdtemp(join(checkout, "node_modules", "aipatty-test-chrome-"));
   const child = spawn(chrome!, [
     "--headless=new", "--remote-debugging-port=0", `--user-data-dir=${profile}`,
-    "--no-first-run", "--no-default-browser-check", "--disable-extensions", "about:blank",
+    "--no-first-run", "--no-default-browser-check", "--disable-extensions", ...flags, "about:blank",
   ], { stdio: "ignore" });
   const exited = new Promise(resolve => child.once("exit", resolve));
   t.after(async () => {
@@ -151,6 +152,78 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
   await browser.navigate("about:blank");
   await browser.navigate(`${base}/#${side.id}`);
   await waitFor(browser, "the branch named in the fragment", value => value.title === "Side" && value.messages.length === 4);
+  assert.deepEqual(browser.errors, []);
+});
+
+test("Send over non-local HTTP admits once, preserves a new draft, and shows a failed run", { skip: !chrome, timeout: 30_000 }, async t => {
+  const host = await openHost(readConfig(fixtureEnv(await fixture(t), { AIPATTY_FAUX: "0" })));
+  await host.setModel({ provider: "openai", modelId: "gpt-6.1-sol" }); // available model, no login in this fixture
+  const gate = Promise.withResolvers<void>();
+  const requestIds: (string | undefined)[] = [];
+  const api = await startApi({ ...host, async submit(branch, draft, context) {
+    requestIds.push(draft.requestId);
+    await gate.promise;
+    return host.submit(branch, draft, context);
+  } }, health, "127.0.0.1", 0, ["aipatty.test"]);
+  t.after(async () => { gate.resolve(); await api.close(); await host.harness.close(ctx); });
+  const browser = await openBrowser(t, ["--no-proxy-server", "--host-resolver-rules=MAP aipatty.test 127.0.0.1"]);
+  await browser.navigate(`http://aipatty.test:${api.port}/`);
+  await waitFor(browser, "the main branch", state => state.current === "Main");
+  assert.equal(await browser.evaluate("isSecureContext"), false);
+  await browser.evaluate(`
+    document.querySelector('#input').value = 'first';
+    document.querySelector('#composer').requestSubmit();
+    document.querySelector('#composer').requestSubmit();
+    document.querySelector('#input').value = 'new draft';
+    document.querySelector('#input').dispatchEvent(new Event('input'));
+  `);
+  await until(() => requestIds.length > 0);
+  assert.equal(await browser.evaluate("document.querySelector('#send').disabled"), true);
+  gate.resolve();
+  await until(() => browser.evaluate("!document.querySelector('#send').disabled && !document.querySelector('#run-failure').hidden"));
+  assert.match(await browser.evaluate<string>("document.querySelector('#run-failure').textContent"), /model_error: Provider is not configured: openai/);
+  assert.equal(requestIds.length, 1);
+  assert.ok(requestIds[0]);
+  assert.equal(await browser.evaluate("document.querySelector('#input').value"), "new draft");
+  assert.deepEqual(browser.errors, []);
+});
+
+test("an older page is requested once and cannot overwrite a different branch", { skip: !chrome, timeout: 30_000 }, async t => {
+  const host = await openHost(fauxConfig(await fixture(t)));
+  const api = await startApi(host, health, "127.0.0.1", 0);
+  t.after(async () => { await api.close(); await host.harness.close(ctx); });
+  const root = (await host.conversation("root"))!;
+  const side = await host.fork(root, { title: "Side" });
+  await say(host, String(side.id), "only on side");
+  await root.commit(async tx => {
+    for (let i = 0; i < 51; i++) await tx.appendEntry(root.id, {
+      kind: "test", model: [{ role: "user", content: `main ${i}`, timestamp: i }],
+    });
+  }, ctx);
+  const browser = await openBrowser(t);
+  await browser.navigate(`http://127.0.0.1:${api.port}/`);
+  await waitFor(browser, "50 newest entries", state => state.messages.length === 50);
+  // Hold the already-read HTTP page until after the other branch's WebSocket snapshot arrives.
+  await browser.evaluate(`
+    window.olderRequests = 0;
+    const originalFetch = window.fetch;
+    window.fetch = async (...args) => {
+      if (!String(args[0]).includes('?before=')) return originalFetch(...args);
+      window.olderRequests++;
+      const page = await (await originalFetch(...args)).json();
+      await new Promise(resolve => { window.releasePage = resolve; });
+      return { ok: true, json: async () => page };
+    };
+    document.querySelector('#older').click(); document.querySelector('#older').click();
+  `);
+  await until(() => browser.evaluate("typeof window.releasePage === 'function'"));
+  assert.equal(await browser.evaluate("window.olderRequests"), 1);
+  await browser.evaluate(`document.querySelector('li[data-branch="${side.id}"]').click()`);
+  await waitFor(browser, "the side branch", state => state.current === "Side" && state.messages.length === 2);
+  await browser.evaluate("window.releasePage(); new Promise(resolve => setTimeout(resolve, 0))");
+  const state = await browser.evaluate<Shown>(shown);
+  assert.deepEqual(state.messages, ["only on side", "Faux reply: only on side"]);
+  assert.equal(await browser.evaluate("document.querySelector('#older').hidden"), true);
   assert.deepEqual(browser.errors, []);
 });
 

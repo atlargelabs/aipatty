@@ -45,7 +45,7 @@ export interface AgentHost {
    * `setModel`, `setThinking` and `submit` wait their turn on one admission line, behind any abort. Given the caller's
    * `context`, a call whose context was cancelled while it waited rejects when its turn comes and changes nothing.
    */
-  setModel(model: ModelRef, conversation?: Conversation, context?: Context): Promise<void>;
+  setModel(model: ModelRef & { thinkingLevel?: ModelThinkingLevel }, conversation?: Conversation, context?: Context): Promise<void>;
   setThinking(level: string, conversation?: Conversation, context?: Context): Promise<void>;
   /** Every branch, oldest first, and the spend of the whole session. */
   branches(): Promise<{ branches: BranchInfo[]; totalCost: number }>;
@@ -55,7 +55,7 @@ export interface AgentHost {
    * `at`, the history through its newest entry, or through the newest one below `before`. No such entry starts an
    * empty branch.
    */
-  fork(from: Conversation, options: { title: string; at?: number; before?: number }): Promise<BranchInfo>;
+  fork(from: Conversation, options: { title: string; at?: number; before?: number }, context?: Context): Promise<BranchInfo>;
   rename(conversation: Conversation, title: string): Promise<void>;
   /** Newest matches first; `before` continues below an entry ID, and the result's `before` is where the next page starts. */
   search(conversation: Conversation, query: string, options?: { limit?: number; before?: number }):
@@ -88,6 +88,45 @@ function branchRef(id: number): string {
   return id === ROOT_CONVERSATION_ID ? "" : ` --branch ${id}`;
 }
 
+/** Select an immutable fork point and check that its last assistant tool exchange has every result. */
+async function forkPoint(from: Conversation, at: number | undefined, before: number | undefined, context: Context): Promise<EntryId | undefined> {
+  const last = at ?? (before === undefined ? undefined : before - 1);
+  const query = last === undefined ? {} : { maxEntryId: last as EntryId };
+  const results = new Set<string>();
+  let cursor: Cursor | undefined;
+  let point: EntryId | undefined;
+  do {
+    context.abortSignal?.throwIfAborted();
+    const page: Page<EntryRecord, Cursor> = await from.entries(query, 50, cursor, context);
+    if (cursor === undefined) {
+      point = page.items[0]?.id;
+      if (at !== undefined && point !== at) throw new HttpError(400, `Entry ${at} is not in branch ${from.id}`);
+      if (point === undefined) return undefined;
+    }
+    let groups = page.items.map(entry => entry.model ?? []);
+    cursor = page.next;
+    if (page.items.some(entry => entry.head !== undefined || entry.edits?.length)) {
+      // A reset, compaction or edit changes which messages contribute. Ask Durable for the active history *before*
+      // it synthesizes missing tool results. Ordinary histories only scan back to the most recent assistant.
+      groups = (await from.context(context, { at: point })).contributions.toReversed();
+      results.clear();
+      cursor = undefined;
+    }
+    for (const group of groups) {
+      for (let i = group.length - 1; i >= 0; i--) {
+        const message = group[i];
+        if (message.role === "toolResult") results.add(message.toolCallId);
+        if (message.role !== "assistant" || ["aborted", "deferred", "error"].includes(message.stopReason)) continue;
+        if (message.content.some(part => part.type === "toolCall" && !results.has(part.id))) {
+          throw new HttpError(400, `Cannot fork at entry ${point}: tool exchange is incomplete; choose an earlier entry or wait for all tool results.`);
+        }
+        return point;
+      }
+    }
+  } while (cursor);
+  return point;
+}
+
 async function openOwnedHost(config: Config): Promise<AgentHost> {
   const models = await openModels(config);
   const storage = await openNodeSqliteStorage(join(config.dataDir, "aipatty.sqlite"));
@@ -107,8 +146,8 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
   try {
     const root = await harness.root(ctx, { agent: config.faux ? { ...newRoot, model: fauxModel } : newRoot });
     const available = (model: ModelRef | null | undefined) => !!model && !!models.getModel(model.provider, model.modelId);
-    const status = async (conversation: Conversation = root): Promise<ModelStatus> => {
-      const agent = await conversation.agent(ctx);
+    const status = async (conversation: Conversation = root, context = ctx): Promise<ModelStatus> => {
+      const agent = await conversation.agent(context);
       const saved = agent.model ?? null;
       return { modelStatus: available(saved) ? "available" : "unavailable", model: saved, thinking: agent.thinkingLevel };
     };
@@ -208,7 +247,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
         .sort((a, b) => a.provider.localeCompare(b.provider) || a.modelId.localeCompare(b.modelId)),
       assertRunning: () => assertRunning(),
       assertAvailable,
-      async setModel(next, target = root, context) {
+      async setModel({ thinkingLevel, ...next }, target = root, context) {
         await exclusive(async () => {
           if (!models.getModel(next.provider, next.modelId)) {
             throw new HttpError(400, `Unknown model ${next.provider}/${next.modelId}; list available models with 'aipatty models'`);
@@ -228,7 +267,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
             }
             for (const task of tasks) await harness.abortTask(task.record.id, ctx);
           }
-          await target.configure({ model: next }, ctx);
+          await target.configure({ model: next, thinkingLevel }, ctx);
           if (!recovering) return;
           blocked.delete(target.id);
           recovered.push(target);
@@ -257,26 +296,21 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
         return { branches, totalCost: await totalCost() };
       },
       branch,
-      async fork(from, { title, at, before }) {
+      async fork(from, { title, at, before }, context = ctx) {
+        context.abortSignal?.throwIfAborted();
         const name = validTitle(title);
         if (!name) throw new HttpError(400, "Expected a title of 1 to 100 characters");
-        const { model, thinking } = await status(from);
+        const { model, thinking } = await status(from, context);
         const agent = { thinkingLevel: thinking, ...(model ? { model } : {}) };
         const init = async (tx: Tx, id: ConversationId) => {
           (await tx.doc(BranchDoc, id)).title = name;
+          context.abortSignal?.throwIfAborted();
         };
-        let point: EntryId | undefined;
-        if (at !== undefined) {
-          const { items } = await from.entries({ minEntryId: at as EntryId, maxEntryId: at as EntryId }, 1, undefined, ctx);
-          if (!items.length) throw new HttpError(400, `Entry ${at} is not in branch ${from.id}`);
-          point = items[0].id;
-        } else {
-          const query = before === undefined ? {} : { maxEntryId: (before - 1) as EntryId };
-          point = (await from.entries(query, 1, undefined, ctx)).items[0]?.id;
-        }
+        const point = await forkPoint(from, at, before, context);
+        context.abortSignal?.throwIfAborted();
         const created = point === undefined
-          ? await harness.createConversation({ ownership: { kind: "ownerless" }, agent, init }, ctx)
-          : await from.fork(point, { ownership: { kind: "ownerless" }, agent, init }, ctx);
+          ? await harness.createConversation({ ownership: { kind: "ownerless" }, agent, init }, context)
+          : await from.fork(point, { ownership: { kind: "ownerless" }, agent, init }, context);
         return branch(created);
       },
       async rename(target, title) {

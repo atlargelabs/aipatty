@@ -78,6 +78,38 @@ test("a fork shares history to the fork point, then diverges, and every branch s
   assert.equal((await call("/api/conversations/999/fork", "POST", { title: "x" })).status, 404);
 });
 
+test("fork points reject incomplete multi-call exchanges, including the latest entry", async t => {
+  const { host, call } = await server(t);
+  await say(host, "root", 'call list_branches {}');
+  const root = (await host.conversation("root"))!;
+  const history = (await root.entries({}, 100, undefined, ctx)).items;
+  const assistant = history.flatMap(entry => entry.model ?? []).find(message => message.role === "assistant"
+    && message.content.some(part => part.type === "toolCall"));
+  const result = history.flatMap(entry => entry.model ?? []).find(message => message.role === "toolResult");
+  assert.ok(assistant?.role === "assistant" && result?.role === "toolResult");
+  const first = assistant.content.find(part => part.type === "toolCall")!;
+  assert.ok(first.type === "toolCall");
+  const callEntry = await root.commit(tx => tx.appendEntry(root.id, {
+    kind: "test", model: [{ ...assistant, content: [first, { ...first, id: "second" }] }],
+  }), ctx);
+  const partial = await root.commit(tx => tx.appendEntry(root.id, {
+    kind: "test", model: [result],
+  }), ctx);
+  for (const at of [callEntry.id, partial.id, undefined]) {
+    const response = await call<{ error: string }>("/api/conversations/root/fork", "POST", { title: "unsafe", at });
+    assert.equal(response.status, 400);
+    assert.match(response.body.error, /tool exchange is incomplete/);
+  }
+  const complete = await root.commit(tx => tx.appendEntry(root.id, {
+    kind: "test", model: [{ ...result, toolCallId: "second" }],
+  }), ctx);
+  assert.equal((await call("/api/conversations/root/fork", "POST", { title: "safe", at: complete.id })).status, 201);
+  await root.commit(tx => tx.appendEntry(root.id, { kind: "test", edits: [{ target: complete.id, action: "omit" }] }), ctx);
+  assert.equal((await call("/api/conversations/root/fork", "POST", { title: "result omitted" })).status, 400);
+  await root.commit(tx => tx.appendEntry(root.id, { kind: "test", head: "self" }), ctx);
+  assert.equal((await call("/api/conversations/root/fork", "POST", { title: "after reset" })).status, 201);
+});
+
 test("forking a branch with no messages yet starts an empty branch", async t => {
   const { call } = await server(t);
   const created = await call<BranchInfo>("/api/conversations/root/fork", "POST", { title: "Fresh" });
@@ -175,6 +207,21 @@ test("the model's tree tools list, read, search, fork and set models", { timeout
   assert.match((await texts(host, "root")).at(-1)!, /Unknown model nope/);
 });
 
+test("fork_branch reports the committed branch ID when first message admission fails", async t => {
+  const { host } = await server(t);
+  const source = await host.fork((await host.conversation("root"))!, { title: "Offline" });
+  const offline = (await host.conversation(String(source.id)))!;
+  await offline.configure({ model: { provider: "missing", modelId: "offline" } }, ctx);
+  await say(host, "root", `call fork_branch ${JSON.stringify({ from: source.id, title: "Child", message: "start" })}`);
+  const { branches } = await host.branches();
+  assert.equal(branches.length, 3);
+  const child = branches.find(branch => branch.title === "Child")!;
+  const reply = (await texts(host, "root")).at(-1)!;
+  assert.ok(reply.includes(`Created branch ${child.id}, "Child". First message admission failed:`), reply);
+  assert.match(reply, /missing\/offline.*unavailable/);
+  assert.deepEqual(await texts(host, String(child.id)), []);
+});
+
 test("a call cancelled while it waits behind an abort does nothing when its turn comes", async t => {
   const { host } = await server(t);
   const root = (await host.conversation("root"))!;
@@ -203,6 +250,31 @@ test("a call cancelled while it waits behind an abort does nothing when its turn
   await host.setThinking("low", branch);
   assert.equal((await host.modelStatus(branch)).thinking, "low");
   await say(host, String(fork.id), "in time");
+});
+
+test("fork cancellation during point lookup prevents creation", async t => {
+  const { host } = await server(t);
+  await say(host, "root", "hello");
+  const root = (await host.conversation("root"))!;
+  const { context, cancel } = withCancel(ctx);
+  const entries = root.entries.bind(root);
+  t.mock.method(root, "entries", async (...args: Parameters<typeof entries>) => {
+    const page = await entries(...args);
+    cancel();
+    return page;
+  });
+  await assert.rejects(host.fork(root, { title: "cancelled lookup" }, context), { name: "AbortError" });
+  assert.ok(!(await host.branches()).branches.some(item => item.title === "cancelled lookup"));
+});
+
+test("model and thinking change in one configure operation", async t => {
+  const { host } = await server(t);
+  const root = (await host.conversation("root"))!;
+  const configure = t.mock.method(root, "configure");
+  await host.setModel({ provider: "faux", modelId: "faux-1", thinkingLevel: "low" }, root, ctx);
+  assert.deepEqual(configure.mock.calls.map(call => call.arguments[0]), [{
+    model: { provider: "faux", modelId: "faux-1" }, thinkingLevel: "low",
+  }]);
 });
 
 test("the page shows the branch's own cost and the session total", async t => {
