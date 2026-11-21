@@ -45,12 +45,18 @@ test("faux has its own default database directory and an explicit override still
   assert.equal(readConfig(["--data-dir", "~/demo"], { AIPATTY_FAUX: "1" }).dataDir, join(homedir(), "demo"));
 });
 
-test("CLI recovers a fresh install with no cached default, without a login or model call", { timeout: 10_000 }, async t => {
-  const server = launch(t, await fixture(t), {});
+test("CLI recovers a saved model the catalog lacks, without a login or model call", { timeout: 15_000 }, async t => {
+  // The fake model is saved with the root, and the real catalog does not have it.
+  const dir = await fixture(t);
+  const seed = launch(t, dir);
+  await seed.url();
+  seed.child.kill("SIGTERM");
+  await seed.exit;
+  const server = launch(t, dir, {});
   const cli = cliAt(await server.url());
   const health = JSON.parse((await cli("health")).stdout);
   assert.equal(health.modelStatus, "unavailable");
-  assert.equal(health.model.modelId, "gpt-6.2-sol");
+  assert.equal(health.model.modelId, "faux-1");
   assert.equal((await cli("log")).stdout, "");
   await assert.rejects(cli("send", "not admitted"), /aipatty model set/);
   await assert.rejects(cli("model", "set", "not-in-catalog"), /Unknown modelId/);

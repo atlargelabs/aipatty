@@ -23,7 +23,7 @@ test("newer pi CLI catalog entries are overlaid by model type and id, offline an
   const config = realConfig(dir);
   const bundled = openaiProvider().getModels().find(model => model.id === "gpt-6.1-sol");
   assert.ok(bundled);
-  const added = { ...bundled, id: "gpt-6.2-sol", name: "GPT-6.2 Sol" };
+  const added = { ...bundled, id: "gpt-9-unreleased", name: "GPT-9 Unreleased" };
   const override = { ...bundled, name: "Updated Sol" };
   const snapshot = JSON.stringify({
     "openai": {
@@ -35,7 +35,7 @@ test("newer pi CLI catalog entries are overlaid by model type and id, offline an
   });
   await writeFile(config.modelsStore, snapshot);
   const models = await openModels(config);
-  assert.deepEqual(models.getModel("openai", "gpt-6.2-sol"), added);
+  assert.deepEqual(models.getModel("openai", "gpt-9-unreleased"), added);
   assert.deepEqual(models.getModel("openai", bundled.id), override);
   assert.ok(models.getModel("openai", "gpt-6.1-terra"));
   assert.equal(models.getModel("openai", "malformed"), undefined);
@@ -51,51 +51,54 @@ test("newer pi CLI catalog entries are overlaid by model type and id, offline an
   assert.ok(!(await readdir(dir)).includes("auth.json"));
 });
 
+/** A model ID no bundled catalog has, so only a cached catalog can supply it. */
+const unreleased = "gpt-9-unreleased";
+
 test("missing, malformed and stale catalog snapshots fall back to bundled models", async t => {
   const dir = await fixture(t);
   const config = realConfig(dir);
-  async function unavailable() {
-    const host = await openHost(config);
-    assert.deepEqual(await host.modelStatus(), {
-      modelStatus: "unavailable", model: { provider: "openai", modelId: "gpt-6.2-sol" }, thinking: "high",
-    });
-    await host.harness.close(ctx);
+  async function bundledOnly() {
+    const models = await openModels(config);
+    assert.equal(models.getModel("openai", unreleased), undefined);
+    assert.ok(models.getModel("openai", "gpt-6.2-sol"), "the default model is bundled");
   }
   const logged = t.mock.method(console, "error", () => {});
   const ignored = () => logged.mock.calls.map(call => String(call.arguments[0])).filter(line => line.startsWith("Ignoring model catalog"));
-  await unavailable();
+  await bundledOnly();
   assert.deepEqual(ignored(), [], "a missing catalog is the normal fresh install");
   await writeFile(config.modelsStore, "{");
-  await unavailable();
+  await bundledOnly();
   await writeFile(config.modelsStore, "[]");
-  await unavailable();
+  await bundledOnly();
   assert.equal(ignored().length, 2);
   assert.ok(ignored().every(line => line.startsWith(`Ignoring model catalog ${config.modelsStore}: `)), ignored().join("\n"));
   assert.match(ignored()[1], /expected a JSON object$/);
   await writeFile(config.modelsStore, JSON.stringify({ "openai": { models: null, lastModified: Date.now() } }));
-  await unavailable();
+  await bundledOnly();
   await writeFile(config.modelsStore, JSON.stringify({
     "openai": {
-      models: [{ ...openaiProvider().getModels()[0], id: "gpt-6.2-sol" }],
+      models: [{ ...openaiProvider().getModels()[0], id: unreleased }],
       lastModified: (getBuiltinModelDataGeneratedAt() ?? Date.now()) - 1,
     },
   }));
-  await unavailable();
+  await bundledOnly();
 });
 
-test("the default model is the openai provider's, taken from the cached catalog", async t => {
+test("a fresh install starts on the bundled default, and a newer cached catalog adds only this provider's chat models", async t => {
   const dir = await fixture(t);
   const config = realConfig(dir);
   const bundled = (await openModels(config)).getModel("openai", "gpt-6.1-sol");
   assert.ok(bundled);
   const host = await openHost(config);
-  assert.equal((await host.modelStatus()).modelStatus, "unavailable");
+  assert.deepEqual(await host.modelStatus(), {
+    modelStatus: "available", model: { provider: "openai", modelId: "gpt-6.2-sol" }, thinking: "high",
+  });
   await host.harness.close(ctx);
 
   await writeFile(config.modelsStore, JSON.stringify({
     openai: {
       models: [
-        { ...bundled, id: "gpt-6.2-sol" },
+        { ...bundled, id: unreleased },
         { ...bundled, id: "other-api", api: "not-served-by-this-provider" },
         { ...bundled, id: "classifier", type: "classifier" },
       ],
@@ -103,7 +106,7 @@ test("the default model is the openai provider's, taken from the cached catalog"
     },
   }));
   const models = await openModels(config);
-  assert.equal(models.getModel("openai", "gpt-6.2-sol")?.api, bundled.api);
+  assert.equal(models.getModel("openai", unreleased)?.api, bundled.api);
   assert.equal(models.getModel("openai", "other-api"), undefined);
   assert.equal(models.getModel("openai", "classifier"), undefined);
 });
