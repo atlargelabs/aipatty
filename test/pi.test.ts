@@ -2,7 +2,7 @@ import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
@@ -39,7 +39,7 @@ async function setup(t: TestContext): Promise<Config> {
     ...config,
     pi: {
       ...config.pi, cli: join(checkout, "test/fixtures/fake-pi.mjs"), extension: join(dir, "pinned-delegates/index.ts"),
-      repoUrl: origin, gh: join(checkout, "test/fixtures/fake-gh.mjs"), pollMs: 50,
+      repoUrl: origin, gh: join(checkout, "test/fixtures/fake-gh.mjs"), pollMs: 50, retryMs: 10,
     },
   };
 }
@@ -48,7 +48,9 @@ type Step = Record<string, unknown>;
 const scenario = (config: Config, steps: Step[], extra: object = {}) =>
   writeFile(join(config.pi.agentDir, "fake-scenario.json"), JSON.stringify({ steps, ...extra }));
 const github = (config: Config, known: object) => writeFile(join(config.dataDir, "fake-gh.json"), JSON.stringify(known));
-const openPr = { "pr 12": { state: "OPEN", headRefOid: head, baseRefName: "main", body: "Closes #11" }, "issue 11": { number: 11, state: "OPEN" } };
+/** What GitHub says a PR closes. */
+const closing = (number: number, owner = "atlargelabs", name = "aipatty") => [{ number, repository: { name, owner: { login: owner } } }];
+const openPr = { "pr 12": { state: "OPEN", headRefOid: head, baseRefName: "main", closingIssuesReferences: closing(11) }, "issue 11": { number: 11, state: "OPEN" } };
 
 function usage(cost: number) {
   return { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost } };
@@ -125,7 +127,7 @@ test("a run launches the pinned CLI with only the pinned delegates extension, in
   assert.match(launch.prompt, /Add the thing\.\nSecond line\./);
   assert.match(launch.prompt, /checked out here at `main` \([0-9a-f]{40}\)/);
   const rules = await readFile(argv[argv.indexOf("--append-system-prompt") + 1], "utf8");
-  for (const rule of [/Only Steve merges|only Steve merges/, /npm run check/, /npm test/, /Closes #N/, /\/review pr <number>/, /crmanager/, /<result>/]) assert.match(rules, rule);
+  for (const rule of [/only Steve merges/, /npm run check/, /npm test/, /`Closes #N`, as plain text/, /\/review pr <number>/, /crmanager/, /<result>/, /do not look for or report the cost/]) assert.match(rules, rule);
   assert.deepEqual(await readdir(config.runsDir), []);
   assert.ok(existsSync(join(outcome.logDir, "events.jsonl")));
   assert.deepEqual(JSON.parse(await readFile(join(outcome.logDir, "result.json"), "utf8")), { outcome, reconciled: true, taskId: 101 });
@@ -171,7 +173,7 @@ test("the result is confirmed with gh, and delegate spend is charged once", asyn
   const unaccounted = await (await openPiRuns(config)).run(request({ taskId: 102 }));
   assert.equal(unaccounted.usageComplete, false);
   assert.match(unaccounted.problems.join("\n"), /1 delegate call\(s\) ended without a result/);
-  assert.match(await readFile(join(config.dataDir, "fake-gh-calls.txt"), "utf8"), /^pr view 12 --repo atlargelabs\/aipatty /);
+  assert.match(await readFile(join(config.dataDir, "fake-gh-calls.txt"), "utf8"), /^pr view 12 --repo atlargelabs\/aipatty --json \S*closingIssuesReferences/);
 });
 
 test("a run is completed and reviewed only when the last finished review covers the PR at its head, clean", async t => {
@@ -251,28 +253,23 @@ test("a successful exit or a URL in the model's output is not proof of delivery"
   assert.equal(claimed.status, "failed");
   assert.match(claimed.problems.join("\n"), /No PR was found, though one was requested/);
 
-  // A merged or closed PR, one against another base, and one that does not link its issue, are reported.
-  await github(config, { "pr 12": { state: "MERGED", headRefOid: head, baseRefName: "release", body: "no link" }, "issue 11": { number: 11 } });
+  // A merged or closed PR, one against another base, and one GitHub does not list as closing its issue, are reported.
+  await github(config, { "pr 12": { state: "MERGED", headRefOid: head, baseRefName: "release", closingIssuesReferences: [] }, "issue 11": { number: 11 } });
   await scenario(config, [...review("c1", "r2"), assistant(report()), settled]);
   const merged = await runs.run(request());
   assert.equal(merged.status, "failed");
-  assert.match(merged.problems.join("\n"), /The PR is merged, not open\.[^]*The PR targets release, not main\.[^]*The PR does not link issue #11/);
-  // Another repository's issue 11 is not this one, in the body or in GitHub's own reading of it.
-  const foreignIssue = { number: 11, repository: { name: "elsewhere", owner: { login: "someone" } } };
-  await github(config, { "pr 12": { ...openPr["pr 12"], body: "Closes someone/elsewhere#11", closingIssuesReferences: [foreignIssue] }, "issue 11": { number: 11 } });
-  await scenario(config, [...review("c1", "r2b"), assistant(report()), settled]);
-  assert.match((await runs.run(request())).problems.join("\n"), /The PR does not link issue #11/);
-  // A link to issue 110 is not a link to issue 11.
-  await github(config, { "pr 12": { ...openPr["pr 12"], body: `See ${issueUrl}0` }, "issue 11": { number: 11 } });
-  await scenario(config, [...review("c1", "r2d"), assistant(report()), settled]);
-  assert.match((await runs.run(request())).problems.join("\n"), /The PR does not link issue #11/);
-  await github(config, { "pr 12": { ...openPr["pr 12"], body: `Fixes ${issueUrl}.` }, "issue 11": { number: 11 } });
-  await scenario(config, [...review("c1", "r2e"), assistant(report()), settled]);
-  assert.equal((await runs.run(request())).status, "completed");
-  // GitHub's reading is enough, whatever the body's wording.
-  await github(config, { "pr 12": { ...openPr["pr 12"], body: "", closingIssuesReferences: [{ number: 11, repository: { name: "aipatty", owner: { login: "atlargelabs" } } }] }, "issue 11": { number: 11 } });
-  await scenario(config, [...review("c1", "r2c"), assistant(report()), settled]);
-  assert.equal((await runs.run(request())).status, "completed");
+  assert.match(merged.problems.join("\n"), /The PR is merged, not open\.[^]*The PR targets release, not main\.[^]*GitHub does not list issue #11 as one the PR closes/);
+  // Only GitHub's own reading of the body counts: not text in it that merely looks like a link, another
+  // repository's issue 11, or issue 110.
+  for (const [id, references] of [["r2b", closing(11, "someone", "elsewhere")], ["r2c", closing(110)], ["r2d", undefined]] as const) {
+    await github(config, { "pr 12": { ...openPr["pr 12"], body: "<!-- Closes #11 -->", closingIssuesReferences: references }, "issue 11": { number: 11 } });
+    await scenario(config, [...review("c1", id), assistant(report()), settled]);
+    const unlinked = await runs.run(request());
+    assert.equal(unlinked.status, "failed", id);
+    assert.match(unlinked.problems.join("\n"), /GitHub does not list issue #11 as one the PR closes/);
+  }
+  // It was asked again before giving up, since GitHub works the links out a moment after the PR is written.
+  assert.equal((await readFile(join(config.dataDir, "fake-gh-calls.txt"), "utf8")).trim().split("\n").slice(-4).filter(call => call.startsWith("pr view 12")).length, 3);
 
   // A reviewed PR with no issue is not the workflow either.
   await github(config, openPr);
@@ -404,6 +401,7 @@ test("abort and timeout stop Pi and its delegates' processes, keep the logs, and
     assert.equal(outcome.usage.cost.total, 0.5 + 1 + 0.75 + 0.25 + 0.5);
     assert.equal(outcome.usageComplete, false);
     assert.match(outcome.problems.join("\n"), /1 delegate call\(s\) were cut off before they reported/);
+    assert.doesNotMatch(outcome.problems.join("\n"), /manifest/);
     assert.ok(!existsSync(join(config.dataDir, "pi-run.json")));
     return outcome;
   };
@@ -414,6 +412,11 @@ test("abort and timeout stop Pi and its delegates' processes, keep the logs, and
   await writeFile(join(victim, "job.json"), JSON.stringify({ id: "linked", ownerSession: "fake-session", workspace: { source: "/" } }));
   await mkdir(jobs, { recursive: true });
   await symlink(victim, join(jobs, "linked"));
+
+  // Nor is an old job's damaged manifest this run's problem.
+  await mkdir(join(jobs, "ancient"));
+  await writeFile(join(jobs, "ancient", "job.json"), "{ damaged");
+  await utimes(join(jobs, "ancient", "job.json"), new Date(0), new Date(0));
 
   await scenario(config, steps);
   const controller = new AbortController();
@@ -581,23 +584,30 @@ test("a restart reports the interrupted call in its branch, without running it a
 test("reviews and reports are read strictly", () => {
   assert.deepEqual(readReview("Overall verdict: \"correct\" (no blocking issues)"), { verdict: "correct", important: 0, lesser: 0 });
   assert.deepEqual(readReview("[P2] a\n[P3] b\n**Verdict:** correct"), { verdict: "correct", important: 0, lesser: 2 });
-  assert.equal(readReview("The verdict is correct.").verdict, "correct");
-  assert.equal(readReview("## Final verdict — `correct`").verdict, "correct");
-  assert.equal(readReview("## Verdict\n\n**correct**: no blocking issues.\n\n## Callouts").verdict, "correct");
-  assert.equal(readReview("## Verdict\n\nneeds attention").verdict, "needs attention");
-  assert.equal(readReview("## Verdict\n\nThe change is not correct.").verdict, "unknown");
-  assert.equal(readReview("- **Overall verdict:** \"correct\" (no blocking issues)").verdict, "correct");
-  assert.equal(readReview("**Verdict: needs attention.**").verdict, "needs attention");
-  // A line naming both is the cautious one, and the last stated verdict is the one that counts.
-  assert.equal(readReview("Verdict: correct, though it needs attention").verdict, "needs attention");
-  assert.equal(readReview("Verdict: correct\nOn reflection.\nVerdict: needs attention").verdict, "needs attention");
-  // Prose that uses the word, or a summary cut off before its verdict, states none.
+  for (const clean of ["The verdict is correct.", "## Final verdict — `correct`", "- **Overall verdict:** \"correct\" (no blocking issues)",
+    "**Verdict: correct.** Nothing blocks.", "Verdict: correct", "## Verdict\n\n**correct**: no blocking issues.\n\n## Callouts", "### Verdict\n\nCorrect.",
+    "> Verdict: needs attention\n\nThat earlier review is resolved.\n\nVerdict: correct"]) {
+    assert.equal(readReview(clean).verdict, "correct", clean);
+  }
+  for (const blocking of ["**Verdict: needs attention.**", "## Verdict\n\nneeds attention", "Verdict: needs_attention",
+    "Verdict: correct, though it needs attention", "## Verdict\n\nThis needs attention before merging.",
+    // Any declared "needs attention" wins, wherever it stands.
+    "Verdict: correct\nOn reflection.\nVerdict: needs attention", "Verdict: needs attention\n\nOnce fixed it would read:\n\nVerdict: correct"]) {
+    assert.equal(readReview(blocking).verdict, "needs attention", blocking);
+  }
+  // Prose that uses the word, a negation, a request, someone else's verdict, or a summary cut off before its own.
   for (const prose of ["Mostly correct.", "The code is incorrect.", "I could not determine whether the change is correct.",
     'I cannot give this patch the verdict "correct".', "No verdict of correct is warranted.", "Verdict: not correct", "Verdict: incorrect",
+    "Verdict: correct the cleanup first", "Verdict: correctness is unclear",
+    "## Verdict\n\nCorrect the cleanup before merging.", "## Verdict\n\nThe change is not correct.", "## Verdict",
     "> Verdict: correct\nI disagree; the cleanup is still broken.",
+    "The review should end like this:\n```\nVerdict: correct\n```\nbut I am not there yet.",
+    "Verdict: correct\n\n## Verdict\n\nUnclear.",
     "No verdict is possible; correct me if I am wrong.", "[P2] a finding, and then the text was cut"]) {
     assert.equal(readReview(prose).verdict, "unknown", prose);
   }
+  // A fenced example does not override the reviewer's own declaration.
+  assert.equal(readReview("Verdict: needs attention\n\n~~~\nVerdict: correct\n~~~").verdict, "needs attention");
   assert.equal(readReport("no block"), undefined);
   assert.equal(readReport("<result>not json</result>"), undefined);
   assert.equal(readReport('<result>{"pr":"x"}</result>'), undefined);
@@ -779,6 +789,21 @@ test("a run's processes are found by environment marker and by the groups they l
   assert.ok(!(await runProcesses(stale, "another-run")).some(proc => proc.pid === orphan));
   assert.deepEqual((await stopRun(stale, "another-run", undefined, 0)).map(proc => proc.pid), [orphan]);
   assert.ok(alive(orphan));
+
+  // A stop saves what it learns of the tree before it signals anything.
+  const learning = newOwned();
+  let recorded: number[] = [];
+  await stopRun(learning, "no-such-run", undefined, 0, undefined, async () => { recorded = [...learning.procs.keys()]; });
+  assert.deepEqual(recorded, []);
+  const fresh = start(["-e", idle], { PATTY_RUN_ID: `${marker}-b` }, true);
+  await until(async () => (await listProcesses()).some(proc => proc.pid === fresh.pid));
+  let aliveWhenRecorded = false;
+  assert.deepEqual(await stopRun(learning, `${marker}-b`, undefined, 0, undefined, async () => {
+    recorded = [...learning.groups];
+    aliveWhenRecorded = alive(fresh.pid!);
+  }), []);
+  assert.deepEqual(recorded, [fresh.pid]);
+  assert.ok(aliveWhenRecorded);
 
   assert.deepEqual(await stopRun(owned, marker, undefined, 0), []);
   await until(() => !alive(marked.pid!) && !alive(orphan));

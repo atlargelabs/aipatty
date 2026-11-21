@@ -43,10 +43,12 @@ in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits fo
   the host found wrong. The host does not take Pi's word for it. A run that was asked for a PR is `completed`
   only when all of this holds, and `failed` otherwise:
   - Pi exited cleanly: the event stream is well-formed and ends settled, with a last message that stopped normally.
-  - `gh` confirms the PR: open, against `main`, with a body that links a confirmed issue.
+  - `gh` confirms the PR: open, against `main`, and listed by GitHub as closing a confirmed issue of this
+    repository.
   - The last finished `crmanager` review was a `/review pr` of that PR, in a clone of this repository, at its
-    head commit; it declared the verdict "correct"; and it had no P0 or P1 finding. Otherwise the result says
-    `NOT REVIEWED` and why.
+    head commit; it declared the verdict "correct" and no other; and it had no P0 or P1 finding. Otherwise the
+    result says `NOT REVIEWED` and why. The verdict is read from the reviewer's text, which is a model's: it is
+    a check on the workflow, and Steve's review before merging is the gate.
 
   CI on the PR's head commit is the authoritative check. The tool does not wait for it.
 - **Cost.** Pi's spend and its delegates' is charged to the calling branch, once. When a run is cut off, the
@@ -65,8 +67,9 @@ in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits fo
 - **When cleanup fails.** If a run's processes cannot be stopped or cannot be told from another's, its files
   cannot be removed, or its saved record (`pi-run.json` in the data directory) cannot be read, nothing more is
   deleted and no new run starts until that is resolved and the server restarted. The refusal says what is wrong.
-  Spend that is only found by a later cleanup, after the call's result was already recorded in its branch, is
-  kept in the run's `result.json` and is not added to the branch's cost.
+  A run whose processes could not be stopped has not had its unfinished delegates' spend added. A later cleanup
+  that stops them adds it to the run's `result.json`; if the call's result was already recorded in its branch by
+  then, the branch's cost does not include it.
 
 A run needs `git`, `gh` and a GitHub login for the user the server runs as, the Pi sign-in, and the pi-review
 extension: at `git/github.com/earendil-works/pi-review/review.ts` in the Pi directory (where

@@ -78,26 +78,33 @@ function contentText(content: unknown): string {
 }
 
 /**
- * Read a review's findings and verdict from the reviewer's text, in the format pi-review asks for. The verdict is
- * the last line that mentions one, and only if that line opens by declaring it, as in `**Verdict: correct.**`.
- * Prose that uses the words, a negation, or a summary cut off before its verdict, is `unknown`; a line that names
- * "needs attention" at all is that.
+ * Read a review's findings and verdict from the reviewer's text, in the format pi-review asks for. A verdict is
+ * declared by a line that opens with it, as in `**Verdict: correct.**`, or by a `Verdict` heading and the line
+ * under it. The value must be exactly one of the two verdicts, not a sentence that starts with the word. Quoted
+ * lines and fenced examples are not the reviewer's own. Any declared "needs attention" wins; a declaration that
+ * cannot be read, or none at all, is `unknown`.
  */
 export function readReview(summary: string): Pick<Review, "verdict" | "important" | "lesser"> {
   const important = summary.match(/\[P[01]\]/g)?.length ?? 0;
   const lesser = summary.match(/\[P[23]\]/g)?.length ?? 0;
-  const lines = summary.split(/\r?\n/);
-  const at = lines.findLastIndex(line => /\bverdict\b/i.test(line));
-  let stated = lines[at] ?? "";
-  // A heading of its own, such as `## Verdict`, is declared by the next line that has text.
-  if (/^[\s#*_-]*(?:overall\s+|final\s+)?verdict[\s:*_-]*$/i.test(stated)) {
-    stated = `Verdict: ${lines.slice(at + 1).find(line => line.trim()) ?? ""}`;
+  const lines: string[] = [];
+  let fenced = false;
+  for (const line of summary.split(/\r?\n/)) {
+    if (/^\s*(```|~~~)/.test(line)) fenced = !fenced;
+    else if (!fenced && !/^\s*>/.test(line)) lines.push(line.replace(/^[\s#*_-]+/, ""));
   }
-  const declared = /^(?:the\s+)?(?:overall\s+|final\s+)?verdict(?:\s+is)?[\s:*_"'`“”–—-]{0,8}(correct|needs[ _-]attention)\b/i
-    // A quoted line is someone else's verdict.
-    .exec(stated.replace(/^[\s#*_-]+/, ""));
-  const verdict = /needs[ _-]attention/i.test(stated) ? "needs attention"
-    : declared?.[1].toLowerCase() === "correct" ? "correct" : "unknown";
+  const values = new Set<string>();
+  lines.forEach((line, index) => {
+    const opened = /^(?:the\s+)?(?:overall\s+|final\s+)?verdict\b(?:\s+is\b)?[\s:*_"'`“”–—-]*/i.exec(line);
+    if (!opened) return;
+    // A heading of its own is declared by the next line that has text.
+    const rest = line.slice(opened[0].length) || (lines.slice(index + 1).find(next => next.trim()) ?? "").replace(/^[\s:*_"'`“”–—-]+/, "");
+    // "needs attention" anywhere in the declaration is that; "correct" must be the whole value.
+    values.add(/needs[ _-]attention/i.test(rest) ? "needs attention"
+      : /^correct(?=\s*$|\s*[^\w\s])/i.test(rest) ? "correct" : "unknown");
+  });
+  const verdict = values.has("needs attention") ? "needs attention"
+    : values.has("unknown") || !values.has("correct") ? "unknown" : "correct";
   return { verdict, important, lesser };
 }
 

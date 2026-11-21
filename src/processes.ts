@@ -171,14 +171,16 @@ function signal(pid: number, name: NodeJS.Signals): void {
  * `graceMs` to stop its own children, as Pi and the delegates extension do; whatever is left is killed. Every
  * signal goes to a process found, by ID and start time, in a process table read just before, so a process that
  * took over a dead one's ID is not signalled. Returns what is left: the survivors, and the processes that could not
- * be told from the run's, which are not signalled. Rejects when the table cannot be read.
+ * be told from the run's, which are not signalled. `record` saves what the run remembers whenever that grows.
+ * Rejects when the table cannot be read.
  */
 export async function stopRun(
-  owned: Owned, runId: string, root: number | undefined, graceMs: number, term?: () => void,
+  owned: Owned, runId: string, root: number | undefined, graceMs: number, term?: () => void, record?: () => Promise<unknown>,
 ): Promise<Proc[]> {
-  // Remember the tree before it comes apart.
+  // Remember the tree before it comes apart, and have the caller save it: a group found only now would otherwise
+  // be forgotten if this process dies with a member of it still alive.
   const tree = await runProcesses(owned, runId);
-  remember(owned, tree);
+  if (remember(owned, tree)) await record?.();
   const rootStart = root === undefined ? undefined : owned.procs.get(root);
   if (root !== undefined && rootStart !== undefined && tree.some(proc => proc.pid === root && proc.start === rootStart)) {
     // Through the live child handle when there is one, which cannot reach a process that reused the ID.
@@ -195,7 +197,7 @@ export async function stopRun(
   for (let attempt = 0; attempt < 20; attempt++) {
     ({ ours: left, unsure } = await scan(owned, runId));
     if (!left.length) break;
-    remember(owned, left);
+    if (remember(owned, left)) await record?.();
     for (const proc of left) signal(proc.pid, "SIGKILL");
     await sleep(150);
   }

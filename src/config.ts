@@ -36,6 +36,8 @@ export interface PiConfig {
   gh: string;
   /** How often a run's process tree is recorded; the tests shorten it. */
   pollMs?: number;
+  /** How long to wait before asking GitHub again for a PR's linked issues; the tests shorten it. */
+  retryMs?: number;
 }
 
 /** The checkout this server runs from. */
