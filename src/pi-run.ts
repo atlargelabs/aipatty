@@ -425,9 +425,14 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     for (const id of ours) {
       const dir = join(jobsDir, id);
       const clone = join(dir, "workspace");
-      await cp(dir, join(saved.logDir, "delegates", id), {
-        recursive: true, filter: source => source !== clone && !inside(clone, source),
-      }).catch(error => console.error(`Pi run ${saved.runId}: could not keep the logs of delegate ${id}:`, error));
+      // The logs are kept before the clone goes. A copy that fails stops the cleanup, with the job left as it is.
+      try {
+        await cp(dir, join(saved.logDir, "delegates", id), {
+          recursive: true, filter: source => source !== clone && !inside(clone, source),
+        });
+      } catch (error) {
+        throw new Error(`the logs of delegate job ${id} could not be kept from ${dir}: ${message(error)}`);
+      }
       if (await ownDir(dir, clone)) await rm(clone, { recursive: true, force: true });
       await rm(join(dir, "lease.json"), { force: true });
       await writeFile(join(dir, "discarded"), new Date().toISOString(), { mode: 0o600 }).catch(() => {});
