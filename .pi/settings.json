@@ -1,0 +1,13 @@
+{
+  "delegates": {
+    "environment": {
+      "setup": [
+        { "name": "dependencies", "command": "npm ci --ignore-scripts", "timeoutMs": 600000 }
+      ],
+      "checks": [
+        { "name": "typecheck", "command": "npm run check", "timeoutMs": 120000 },
+        { "name": "tests", "command": "npm test", "timeoutMs": 600000 }
+      ]
+    }
+  }
+}
