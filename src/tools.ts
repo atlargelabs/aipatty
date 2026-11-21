@@ -7,6 +7,7 @@ import { int, obj, opt, str } from "@earendil-works/pi-schema";
 import { thinkingLevels, type BranchInfo } from "./branches.ts";
 import type { AgentHost } from "./host.ts";
 import { messageText } from "./protocol.ts";
+import { transcriptPage } from "./transcript.ts";
 
 
 
@@ -95,11 +96,9 @@ export function treeExtension(getHost: () => AgentHost) {
         if (before !== null) lines.push(`More matches may be older: continue with before=${before}.`);
         return text(lines.join("\n"));
       }
-      const query = args.before === undefined ? {} : { maxEntryId: (args.before - 1) as EntryId };
-      const { items } = await conversation.entries(query, limit + 1, undefined, context);
-      const entries = items.slice(0, limit).reverse();
+      const { entries, before } = await transcriptPage(conversation, context, limit, args.before);
       const lines: string[] = [];
-      if (items.length > limit) lines.push(`Older entries exist: continue with before=${entries[0].id}.`);
+      if (before !== null) lines.push(`Older entries exist: continue with before=${before}.`);
       for (const entry of entries) {
         for (const message of entry.model ?? []) {
           let body = messageText(message);

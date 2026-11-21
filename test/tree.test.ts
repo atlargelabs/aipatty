@@ -77,6 +77,87 @@ test("a fork shares history to the fork point, then diverges, and every branch s
   assert.equal((await call("/api/conversations/999/fork", "POST", { title: "x" })).status, 404);
 });
 
+test("HTTP and read_branch page the same fork history without gaps or duplicates", { timeout: 30_000 }, async t => {
+  const { host, call } = await server(t);
+  await say(host, "root", "inherited");
+  const root = (await host.conversation("root"))!;
+  const fork = (await call<BranchInfo>("/api/conversations/root/fork", "POST", { title: "Paged fork" })).body;
+  const id = String(fork.id);
+  const target = (await host.conversation(id))!;
+  assert.notEqual(target.id, root.id);
+  await say(host, "root", "parent only"); // A gap in the global IDs, not part of the fork's history.
+  await say(host, id, "local one");
+  // Limits count raw entries, even when a page has no visible model messages.
+  const silent = await target.commit(tx => tx.appendEntry(target.id, { kind: "test" }), ctx);
+  await say(host, id, "local two");
+  const all = (await target.entries({}, 100, undefined, ctx)).items.toReversed();
+  assert.deepEqual(await texts(host, id), [
+    "inherited", "Faux reply: inherited", "local one", "Faux reply: local one", "local two", "Faux reply: local two",
+  ]);
+  assert.ok(all.some(entry => entry.id === silent.id && !entry.model?.length));
+
+  const read = async (limit: number, before?: number) => {
+    // Run the real tool from a different branch so these calls cannot move the target's pages.
+    await say(host, "root", `call read_branch ${JSON.stringify({ branch: fork.id, limit, before })}`);
+    const recent = (await root.entries({}, 10, undefined, ctx)).items;
+    const result = recent.flatMap(entry => entry.model ?? [])
+      .find(message => message.role === "toolResult" && message.toolName === "read_branch");
+    assert.ok(result?.role === "toolResult" && !result.isError);
+    const output = messageText(result);
+    const cursor = /^Older entries exist: continue with before=(\d+)\./.exec(output);
+    const ids = [...output.matchAll(/^\[(\d+)\] /gm)].map(match => Number(match[1]));
+    return { output, ids, before: cursor ? Number(cursor[1]) : null };
+  };
+
+  // Single entries exercise invisible pages; three entries span the fork boundary; a large page ends immediately.
+  for (const limit of [1, 3, 50]) {
+    let before: number | undefined;
+    let end = all.length;
+    let seen: number[] = [];
+    do {
+      const start = Math.max(0, end - limit);
+      const expected = all.slice(start, end);
+      const expectedBefore = start > 0 ? expected[0].id : null;
+      const url = `/api/conversations/${id}?limit=${limit}${before === undefined ? "" : `&before=${before}`}`;
+      const http = await call<ConversationPage>(url);
+      assert.equal(http.status, 200);
+      assert.deepEqual(http.body.entries.map(entry => entry.id), expected.map(entry => entry.id));
+      assert.equal(http.body.before, expectedBefore);
+      assert.ok(http.body.entries.every(entry => before === undefined || entry.id < before));
+
+      const tool = await read(limit, before);
+      const visible = expected.flatMap(entry => (entry.model ?? []).flatMap(message => {
+        const body = messageText(message);
+        return body ? [{ id: entry.id, line: `[${entry.id}] ${message.role}: ${body}` }] : [];
+      }));
+      assert.deepEqual(tool.ids, visible.map(message => message.id));
+      assert.equal(tool.before, http.body.before);
+      const lines = [
+        ...(expectedBefore === null ? [] : [`Older entries exist: continue with before=${expectedBefore}.`]),
+        ...visible.map(message => message.line),
+      ];
+      assert.equal(tool.output, lines.length ? lines.join("\n")
+        : `Branch ${id} has no messages${before === undefined ? "" : " before that entry"}.`);
+      seen = [...http.body.entries.map(entry => entry.id), ...seen];
+      end = start;
+      before = expectedBefore ?? undefined;
+    } while (before !== undefined);
+    assert.equal(end, 0);
+    assert.deepEqual(seen, all.map(entry => entry.id));
+    assert.equal(new Set(seen).size, seen.length);
+  }
+
+  const oldest = all[0].id;
+  const empty = await call<ConversationPage>(`/api/conversations/${id}?limit=1&before=${oldest}`);
+  assert.equal(empty.status, 200);
+  assert.deepEqual(empty.body.entries, []);
+  assert.equal(empty.body.before, null);
+  assert.deepEqual(await read(1, oldest), {
+    output: `Branch ${id} has no messages before that entry.`, ids: [], before: null,
+  });
+  assert.deepEqual((await target.entries({}, 100, undefined, ctx)).items.toReversed(), all);
+});
+
 test("fork points reject incomplete multi-call exchanges, including the latest entry", async t => {
   const { host, call } = await server(t);
   await say(host, "root", 'call list_branches {}');
