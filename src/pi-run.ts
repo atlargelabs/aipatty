@@ -629,6 +629,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
 
   // A run the previous process left: stop it, clean up, and report its call `interrupted`. It is never run again.
   let left: SavedRun | undefined;
+  let pendingRecoveryRecord = false;
   try {
     const readAt = Date.now();
     const saved = await readJson<unknown>(stateFile);
@@ -642,7 +643,13 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     } else if (saved && saved.groups.some(([, seenAt]) => seenAt !== null && seenAt > readAt)) {
       // Persist this before replaying the run's logs: a future cutoff could become usable while we wait.
       left = { ...saved, groups: saved.groups.map(([pgid, seenAt]) => [pgid, seenAt !== null && seenAt > readAt ? null : seenAt]) };
-      await writeJson(stateFile, left);
+      try {
+        await writeJson(stateFile, left);
+      } catch {
+        // Use only the corrected record. A failed write must not prevent stopping verified processes; stopRun
+        // will retry the write and block cleanup if the corrected record still cannot be saved.
+        pendingRecoveryRecord = true;
+      }
     } else {
       left = saved;
     }
@@ -663,7 +670,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       const owned = newOwned(saved.procs, saved.groups, saved.unverifiedProcs);
       // What the cleanup learns of the run's processes is kept for the next start, should this one not finish.
       const record = () => writeJson(stateFile, { ...saved, procs: [...owned.procs], groups: [...owned.groups] });
-      const stop = () => stopRun(owned, saved.runId, saved.pid, graceMs, undefined, record);
+      const stop = () => stopRun(owned, saved.runId, saved.pid, graceMs, undefined, record, pendingRecoveryRecord);
       const trace = new RunTrace(pi.repo);
       const split = lineSplitter((line, whole) => trace.line(line, whole));
       try {

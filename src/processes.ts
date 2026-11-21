@@ -201,11 +201,10 @@ export async function trackRunProcesses(owned: Owned, runId: string, recordInval
 
 /**
  * Add a run's processes and groups to what it remembers. Only a group with an owned process observed during the
- * live run gets a new cutoff (`seenAt` is taken before reading the process table). Recovery leaves cutoffs alone.
- * Returns whether the record changed.
+ * live run gets a new cutoff (`seenAt` is the time before reading the process table, omitted if the clock went
+ * back during that read). Recovery does not advance cutoffs. Returns whether the record changed.
  */
 export function remember(owned: Owned, procs: readonly Proc[], seenAt?: number): boolean {
-  if (seenAt !== undefined && seenAt > Date.now()) seenAt = undefined;
   let changed = false;
   for (const proc of procs) {
     if (owned.procs.get(proc.pid) !== proc.start) {
@@ -237,11 +236,12 @@ function signal(pid: number, name: NodeJS.Signals): void {
  * `graceMs` to stop its own children, as Pi and the delegates extension do; whatever is left is killed. Every
  * signal goes to a process found, by ID and start time, in a process table read just before, so a process that
  * took over a dead one's ID is not signalled. Returns what is left: the survivors, and the processes that could not
- * be told from the run's, which are not signalled. `record` saves new or invalidated ownership evidence.
- * Rejects when the table cannot be read.
+ * be told from the run's, which are not signalled. `record` saves new or invalidated ownership evidence, including
+ * a `pendingRecord` that previously failed to save. Rejects if the table cannot be read or the record cannot be saved.
  */
 export async function stopRun(
   owned: Owned, runId: string, root: number | undefined, graceMs: number, term?: () => void, record?: () => Promise<unknown>,
+  pendingRecord = false,
 ): Promise<Proc[]> {
   // A record write failure blocks cleanup, but must not prevent us from stopping confirmed processes.
   let failedWrite: { error: unknown } | undefined;
@@ -263,7 +263,12 @@ export async function stopRun(
     const starts = new Map((await listProcesses()).map(proc => [proc.pid, proc.start]));
     return ours.filter(proc => starts.get(proc.pid) === proc.start);
   };
+  let stopFailure: { error: unknown } | undefined;
   try {
+    if (pendingRecord) {
+      invalidateFutureCutoffs(owned, Date.now());
+      await save();
+    }
     const tree = await recordScan(await scan(owned, runId, save));
     const rootStart = root === undefined ? undefined : owned.procs.get(root);
     if (root !== undefined && rootStart !== undefined && tree.some(proc => proc.pid === root && proc.start === rootStart)) {
@@ -287,12 +292,20 @@ export async function stopRun(
       await sleep(150);
     }
     return [...left, ...unsure];
+  } catch (error) {
+    stopFailure = { error };
+    throw error;
   } finally {
     if (failedWrite) {
       await save();
       if (failedWrite) {
         const { error } = failedWrite;
-        throw new Error(`the process record could not be saved: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+        const text = (cause: unknown) => cause instanceof Error ? cause.message : String(cause);
+        const reason = `the process record could not be saved: ${text(error)}`;
+        if (stopFailure) {
+          throw new AggregateError([stopFailure.error, error], `${text(stopFailure.error)}; ${reason}`);
+        }
+        throw new Error(reason, { cause: error });
       }
     }
   }

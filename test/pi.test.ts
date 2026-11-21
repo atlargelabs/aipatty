@@ -2,7 +2,8 @@ import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import fs, { mkdir, readdir, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
@@ -927,6 +928,27 @@ test("a run's processes are found by environment marker and by the groups they l
   await assert.rejects(unreadable.run(request({ pr: false })), /events could not be read/);
   assert.ok(alive(orphan) && existsSync(workspace));
   assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).groups, [[leader.pid, null]]);
+
+  // Even when the initial correction cannot be written, recovery stops independently verified processes and
+  // leaves the ambiguous process, workspace and run slot alone.
+  await rm(eventsFile, { recursive: true });
+  const verified = start(["-e", idle], {}, true);
+  const verifiedProc = await until(async () => (await listProcesses()).find(proc => proc.pid === verified.pid));
+  await writeFile(stateFile, JSON.stringify({ ...record, procs: [[verified.pid, verifiedProc!.start]], groups: [[leader.pid, cutoff]] }));
+  const rename = fs.rename;
+  const renameMock = t.mock.method(fs, "rename", async (from: Parameters<typeof rename>[0], to: Parameters<typeof rename>[1]) => {
+    if (to === stateFile) throw new Error("test state update failure");
+    await rename(from, to);
+  });
+  syncBuiltinESMExports();
+  try {
+    const writeFailed = await withClock(cutoff - 1, cutoff + 1, () => openPiRuns(config));
+    await assert.rejects(writeFailed.run(request({ pr: false })), /the process record could not be saved: test state update failure/);
+    assert.ok(!alive(verified.pid!) && alive(orphan) && existsSync(workspace));
+  } finally {
+    renameMock.mock.restore();
+    syncBuiltinESMExports();
+  }
 
   // A stop saves what it learns of the tree before it signals anything.
   const learning = newOwned();
