@@ -214,23 +214,32 @@ function repeated(line: string): boolean {
   return repeats.some(prefix => line.startsWith(prefix));
 }
 
-/** How far GitHub's clock and this one's may disagree about which came first, a review or a change of base. */
+/** How far GitHub's clock and this one's may disagree about which came first, a review's start or a change of base. */
 const clockSlackMs = 60_000;
 
-/** `baseChangedAt` is when the PR's base branch was last changed, 0 if never. */
+/**
+ * The review a run's result stands on: the last finished one. Reviews of one delegate call ran side by side, in no
+ * known order, so the least favourable of that call's decides. `baseChangedAt` is when the PR's base branch was
+ * last changed, 0 if never.
+ */
 function reviewOf(trace: RunTrace, pr: RunOutcome["pr"], requested: boolean, baseChangedAt = 0): RunOutcome["review"] {
   if (!requested) return { status: "none", important: 0, lesser: 0 };
-  const last = trace.reviews.findLast(review => review.finished);
+  const finished = trace.reviews.filter(review => review.finished);
+  const last = finished.at(-1);
   if (!last) return { status: "missing", important: 0, lesser: 0 };
-  const { verdict, sha, important, lesser } = last;
-  const status = verdict !== "correct" || important > 0 ? "findings"
+  const statusOf = (review: Review): RunOutcome["review"]["status"] =>
+    review.verdict !== "correct" || review.important > 0 ? "findings"
     : !pr?.confirmed ? "unverified"
     // The same head commit under another request, such as `/review commit`, is not a review of the PR's whole diff,
     // and the same number in a clone of another repository is another PR.
-    : !last.ownRepo || last.pr !== pr.number || sha !== pr.headSha ? "stale"
-    // A PR retargeted after its review has another diff under the same head.
-    : baseChangedAt > 0 && baseChangedAt >= last.at - clockSlackMs ? "stale" : "clean";
-  return { status, verdict, sha, important, lesser };
+    : !review.ownRepo || review.pr !== pr.number || review.sha !== pr.headSha ? "stale"
+    // A PR retargeted once its review had begun may have another diff under the same head.
+    : baseChangedAt > 0 && baseChangedAt >= review.at - clockSlackMs ? "stale" : "clean";
+  const worst = ["findings", "stale", "unverified", "clean"];
+  const decisive = finished.filter(review => review.call === last.call)
+    .reduce((chosen, review) => worst.indexOf(statusOf(review)) < worst.indexOf(statusOf(chosen)) ? review : chosen, last);
+  const { verdict, sha, important, lesser } = decisive;
+  return { status: statusOf(decisive), verdict, sha, important, lesser };
 }
 
 const reviewText: Record<RunOutcome["review"]["status"], string> = {
@@ -437,11 +446,14 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     for (const id of ours) {
       const dir = join(jobsDir, id);
       const clone = join(dir, "workspace");
-      // The logs are kept before the clone goes. A copy that fails stops the cleanup, with the job left as it is.
+      // The logs are kept before the clone goes. A copy that fails stops the cleanup, with the job left as it is;
+      // a manifest that cannot be read is left out, so that the logs beside it are still kept.
+      const keep = (manifest: boolean) => cp(dir, join(saved.logDir, "delegates", id), {
+        recursive: true, force: true,
+        filter: source => source !== clone && !inside(clone, source) && (manifest || source !== join(dir, "job.json")),
+      });
       try {
-        await cp(dir, join(saved.logDir, "delegates", id), {
-          recursive: true, filter: source => source !== clone && !inside(clone, source),
-        });
+        await keep(true).catch(() => keep(false));
       } catch (error) {
         throw new Error(`the logs of delegate job ${id} could not be kept from ${dir}: ${message(error)}`);
       }
@@ -540,11 +552,17 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         }
         // A review covers the diff against the base the PR had then.
         try {
-          const events = await gh(["api", `repos/${pi.repo}/issues/${prLink.number}/events?per_page=100`]) as { event?: string; created_at?: string }[];
-          for (const event of Array.isArray(events) ? events : []) {
-            if (event.event !== "base_ref_changed") continue;
-            const at = Date.parse(event.created_at ?? "");
-            baseChangedAt = Math.max(baseChangedAt, Number.isFinite(at) ? at : Infinity);
+          for (let page = 1; ; page++) {
+            // A history too long to read through is one that cannot be vouched for.
+            if (page > 30) throw new Error("the PR has too many events to read");
+            const events = await gh(["api", `repos/${pi.repo}/issues/${prLink.number}/events?per_page=100&page=${page}`]) as { event?: string; created_at?: string }[];
+            if (!Array.isArray(events)) throw new Error("gh's answer is not a list of events");
+            for (const event of events) {
+              if (event.event !== "base_ref_changed") continue;
+              const at = Date.parse(event.created_at ?? "");
+              baseChangedAt = Math.max(baseChangedAt, Number.isFinite(at) ? at : Infinity);
+            }
+            if (events.length < 100) break;
           }
         } catch (error) {
           baseChangedAt = Infinity;
@@ -648,11 +666,22 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       const { clean, reconciled } = await cleanUp(saved, owned, trace, outcome, settledBefore?.reconciled ?? false, { record });
       if (outcome.status === "completed" && outcome.problems.length) outcome.status = "failed";
       await remembered(saved, outcome, reconciled);
+      let handed = clean;
       if (clean) {
-        await rm(stateFile, { force: true });
+        try {
+          await rm(stateFile, { force: true });
+        } catch (error) {
+          handed = false;
+          outcome.problems.push(`The run's record could not be closed: ${clip(message(error), 300)}`);
+        }
+      }
+      if (handed) {
         console.error(`Pi run ${saved.runId} was interrupted by a restart; its processes and workspace are cleaned up.`);
       } else {
-        await record();
+        // As for a live run: one that leaves the slot shut did not complete.
+        if (outcome.status === "completed") outcome.status = "failed";
+        await remembered(saved, outcome, reconciled).catch(() => {});
+        await record().catch(() => {});
         stuck = `Pi run ${saved.runId} could not be cleaned up after a restart: ${outcome.problems.at(-1)} No new run starts until that is resolved and aipatty restarted.`;
       }
     } catch (error) {

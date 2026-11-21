@@ -233,6 +233,28 @@ test("a run is completed and reviewed only when the last finished review covers 
   await unreviewed(review("c1", "r11"), "stale");
   await retargeted("2020-01-01T00:00:00Z");
   assert.equal((await run(review("c1", "r12"))).status, "completed");
+  // The review's start is what counts: a base changed while a long review was running is not what it reviewed.
+  const startedAt = Date.now();
+  await github(config, { ...openPr, "events 12": [{ event: "base_ref_changed", created_at: new Date(startedAt + 2_000).toISOString() }] });
+  const [started, , ended] = review("c1", "r13");
+  await unreviewed([started, { sleep: 3_000 }, ended], "stale");
+  // A change on a later page of a long history is found.
+  await github(config, { ...openPr, "events 12": [...Array.from({ length: 150 }, () => ({ event: "labeled", created_at: "2020-01-01T00:00:00Z" })), { event: "base_ref_changed", created_at: new Date(Date.now() + 3_600_000).toISOString() }] });
+  await unreviewed(review("c1", "r14"), "stale");
+  await github(config, openPr);
+
+  // Reviews of one parallel call finished in no known order: a clean one does not outweigh a blocking one.
+  const both = (results: Step[][]) => {
+    const jobs = results.map(steps => (steps[2].emit as { result: { details: { delegateResult: object } } }).result.details.delegateResult);
+    const tasks = results.map(steps => (steps[0].emit as { args: object }).args);
+    return [
+      { emit: { type: "tool_execution_start", toolCallId: "p1", toolName: "delegate_parallel", args: { tasks } } },
+      { emit: { type: "tool_execution_end", toolCallId: "p1", toolName: "delegate_parallel", isError: false, result: { content: [], details: { delegateResult: jobs } } } },
+    ];
+  };
+  const blocking = await unreviewed(both([review("x", "r15", { summary: "[P1] broken\nVerdict: needs attention" }), review("x", "r16")]), "findings");
+  assert.equal(blocking.review.important, 1);
+  assert.equal((await run(both([review("x", "r17"), review("x", "r18")]))).status, "completed");
   assert.match(text, new RegExp(`PR: ${prUrl} \\(open, head ${head}\\)`));
 });
 

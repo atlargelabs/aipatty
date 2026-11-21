@@ -10,8 +10,10 @@ export interface Review {
   ownRepo: boolean;
   /** Whether the delegate finished; a failed review has no verdict. */
   finished: boolean;
-  /** When the host saw the review's result, in milliseconds. */
+  /** When the host saw the review's call start, in milliseconds: the review covers the PR as it was by then at the latest. */
   at: number;
+  /** The delegate call the review came from. Reviews of one call ran side by side, in no known order. */
+  call: string;
   /** The commit the delegate reviewed, when it reviewed one. */
   sha?: string;
   verdict: "correct" | "needs attention" | "unknown";
@@ -189,7 +191,7 @@ export class RunTrace {
   lastText = "";
   lastStop: string | undefined;
   lastError: string | undefined;
-  private readonly pending = new Map<string, { tool: string; args: unknown }>();
+  private readonly pending = new Map<string, { tool: string; args: unknown; at: number }>();
   private readonly repo: string;
 
   constructor(repo: string) {
@@ -260,7 +262,7 @@ export class RunTrace {
         return;
       case "tool_execution_start":
         if (typeof event.toolCallId === "string" && typeof event.toolName === "string") {
-          this.pending.set(event.toolCallId, { tool: event.toolName, args: event.args });
+          this.pending.set(event.toolCallId, { tool: event.toolName, args: event.args, at: Date.now() });
         }
         return;
       case "tool_execution_end": {
@@ -269,7 +271,7 @@ export class RunTrace {
         this.pending.delete(event.toolCallId);
         if (!call || !record(event.result)) return;
         if (delegateTools.has(call.tool)) {
-          this.delegates(call.args, event.result);
+          this.delegates(call.args, event.result, event.toolCallId, call.at);
         } else {
           // Model work another tool did itself.
           addUsage(this.usage, event.result.usage);
@@ -284,7 +286,7 @@ export class RunTrace {
     }
   }
 
-  private delegates(args: unknown, result: Record<string, unknown>): void {
+  private delegates(args: unknown, result: Record<string, unknown>, call: string, startedAt: number): void {
     const reported = record(result.details) ? result.details.delegateResult : undefined;
     const results = Array.isArray(reported) ? reported : [reported];
     const tasks = record(args) && Array.isArray(args.tasks) ? args.tasks : [args];
@@ -311,7 +313,7 @@ export class RunTrace {
       const sha = record(job.workspace) && typeof job.workspace.baseSha === "string" ? job.workspace.baseSha : undefined;
       const summary = typeof job.summary === "string" ? job.summary : "";
       this.reviews.push({
-        request, finished, at: Date.now(),
+        request, finished, at: startedAt, call,
         ownRepo: remoteRepo(record(job.workspace) ? job.workspace.remoteUrl : undefined)?.toLowerCase() === this.repo.toLowerCase(),
         pr: asked?.[1] !== "pr" ? undefined
           : /^[1-9]\d*$/.test(asked[2]) ? Number(asked[2]) : githubLink(asked[2], this.repo, "pull")?.number,

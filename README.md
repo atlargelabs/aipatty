@@ -68,7 +68,8 @@ in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits fo
 - **When cleanup fails.** If a run's processes cannot be stopped or cannot be told from another's, its files
   cannot be removed, or its saved record (`pi-run.json` in the data directory) cannot be read, nothing more is
   deleted and no new run starts until that is resolved and the server restarted. The refusal says what is wrong.
-  A run whose processes could not be stopped has not had its unfinished delegates' spend added. A later cleanup
+  A run whose processes could not be stopped, or whose events could not be read back after a restart, has not
+  had all its spend added. A later cleanup
   that stops them adds it to the run's `result.json`; if the call's result was already recorded in its branch by
   then, the branch's cost does not include it.
 
