@@ -12,7 +12,7 @@ installed and then asked to keep building itself. It is not the finished product
 | Merging | Only Steve merges PRs in `atlargelabs/aipatty`. |
 | Upgrade | Explicit, never automatic. If rollback also fails, Steve uses SSH or remote desktop. |
 | GitHub identity | The `pattycaik` account with write access, behind a ruleset on `main`. Other repos only when Steve directs it. |
-| Coding | Direct tools for inspection and `gh`; anything that ends in a PR goes through the `pi` CLI and a `prmanager` delegate. Each `pi` run is disposable: its own run directory, with the repos it works on cloned fresh into it, deleted when the run ends. |
+| Coding | Direct tools for inspection and `gh`; work intended for a PR goes through the `pi` CLI in a disposable workspace. Aipatty chooses the task to hand off. Pi can do it directly or use an installed extension such as `delegates`; delegation is not required, even for a PR. |
 | Tree | Branches are independent workstreams. Steve and aipatty can both fork. All branches stay listed. No automatic report-back. |
 | Models | Default `gpt-6.2-sol` on the OpenAI subscription. Per-branch model, set by Steve or by aipatty. Spark later. Claude through the `pi` CLI only, for now. |
 | Cost | Shown per branch and in total as `$<branch> / $<total>`. No spend limit. |
@@ -46,7 +46,7 @@ One Node process runs a pi-durable `Harness` over SQLite, with a small superviso
 | Tool | What it does |
 | --- | --- |
 | `read`, `write`, `edit`, `bash`, `codemode`, `tool_search` | pi-durable built-ins, added in step 3, working in `work/`. |
-| `pi` | Runs the `pi` CLI as a disposable subagent in its own run directory. Research mode is read-only (`thinker`, `thinktank`) and returns a report. Code mode uses `prmanager` and returns a PR link. Code mode: one per branch, at most 3 at once. Its cost counts toward the branch. |
+| `pi` | Runs one Pi session on a bounded task with the supplied workspace context and returns the result to the calling branch. Research runs are read-only; code runs are limited to one per branch and three at once across branches. These limits apply to Pi runs, not delegate profiles. |
 | `fork_branch`, `list_branches`, `read_branch`, `set_model` | Tree management, plus paging and text search over any branch. |
 | `upgrade` | Asks the supervisor to deploy the latest `main`. Refuses while any `pi` run is active. |
 | `mcp_status`, `mcp_reload`, `mcp_sign_in` | Server state, re-reading `mcp.json`, and OAuth by link. |
@@ -59,21 +59,24 @@ aipatty's MCP tools.
 Every `pi` call is a fresh, throwaway run. Nothing carries over from one run to the next except what it published
 (issues, PRs, comments) and the result it returned.
 
-1. **Directory:** the tool creates `runs/<run-id>/`, a new empty directory owned by that run alone.
+1. **Directory:** before starting Pi, the tool records the run ID and calling branch and creates a fresh `runs/<run-id>/`.
 2. **Repos:** the call names the repos to work on (`owner/name`, optionally a base branch or ref). Each is cloned
    fresh into the run directory with `pattycaik`'s `gh` login. Code mode needs at least one repo; research mode may
    have none. Repos outside `atlargelabs/aipatty` only when Steve has directed it in the branch.
-3. **Run:** `pi` starts with the run directory as its working directory, the task, and the mode's delegate profile.
-   It never sees `work/`, `deploy/`, another run's directory, or aipatty's MCP tools.
-4. **Result:** the tool returns the report (research) or the PR link (code), and the run's cost is added to the
-   branch.
-5. **Cleanup:** the run directory is deleted when the run ends, whether it succeeded, failed or was aborted. Its
-   transcript and log are kept in `data/logs/runs/` first.
-6. **Restart:** a run cut off by a restart is not resumed. Its tool call ends `interrupted`, and the directory it left
-   behind is deleted on the next startup.
+3. **Run:** start Pi in the prepared workspace with the task and its requested outcome. Aipatty can ask Pi to
+   delegate particular work, or leave that decision to Pi. The tool neither requires the `delegates` extension nor
+   maps a task or mode to a profile. The run's permissions apply whether Pi works directly or delegates.
+4. **Result:** return what the task asked for: for example, findings for a review, or a verified PR link when a PR
+   was requested. Exit zero alone does not establish delivery. Charge reported usage, including any delegated work,
+   to the calling branch once; identify incomplete usage if the run was interrupted.
+5. **Cleanup:** on abort, stop Pi and its child processes. On every exit, retain the transcript and log in
+   `data/logs/runs/`, then remove the run's workspace, including any temporary clones its extensions created for it.
+6. **Restart:** after taking the data-directory lock and before resuming conversations, stop any surviving processes
+   owned by interrupted runs and finish cleanup. The `pi` tool call ends `interrupted`: do not relaunch it or repeat
+   publication. Report any known PR link if publication happened before interruption.
 
-The system prompt carries the git-hygiene skill and the issue workflow: every change has an issue, a task branch and a
-PR that links the issue.
+Give Pi the git-hygiene skill and issue workflow, and pass them on to any writable delegate: every change has an
+issue, a task branch and a PR that links the issue. Only Steve merges.
 
 ## Remote access
 
@@ -108,7 +111,8 @@ without a login. It changes rarely.
   own PR.
 - **Hooks against mistakes:** block pushing to `main`, `gh pr merge`, and writes inside `deploy/`, for aipatty's own
   `write`, `edit` and `bash` and for `pi` runs.
-- **Disposable runs:** a `pi` run can only damage its own run directory, which is deleted afterwards.
+- **Disposable runs:** fresh workspaces keep one run's checkout out of the next. A working directory is not an OS
+  sandbox; deleting it does not undo an issue, push or PR.
 
 ## Gmail and OAuth
 
@@ -126,9 +130,12 @@ without a login. It changes rarely.
    a kill. The CLI can list models and switch the root model; reads and model selection remain available if its
    saved model is missing. Switching does not replay interrupted work. Faux mode has its own data directory.
 2. **Tree:** fork, list, read and search, per-branch model, the page, cost.
-3. **Coding:** the built-in tools (`read`, `write`, `edit`, `bash`, `codemode`, `tool_search`) in `work/`; the `pi`
-   tool with disposable run directories and fresh clones; the git and issue prompt; the hooks. Tested with a fake
-   `pi`.
+3. **Coding:** register pi-durable's existing coding tools, codemode and tool-search extensions with `work/` as the
+   scratch directory. Build the [`pi` tool](#pi-runs), the git and issue prompt, and the guard hooks; do not build a
+   delegate dispatcher. Use a fake CLI for concurrency, failure, abort and restart tests. The baseline acceptance
+   test runs the real Pi CLI with a fake model and **without `delegates`**: a task completes directly, its result
+   and usage reach the calling branch, and the workspace is cleaned up. Separately, test that Pi can choose an
+   installed delegate for part of a task without changing the `pi` tool contract.
 4. **Upgrade:** supervisor, health check, rollback, tested with a deliberately broken commit.
 5. **MCP:** config, one extension per server, reload, OAuth, the per-branch switch, then Gmail.
 6. **Install on the mini** and run the acceptance test: from a phone, ask aipatty to open an issue and a PR against
