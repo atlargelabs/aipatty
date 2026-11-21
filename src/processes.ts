@@ -17,19 +17,23 @@ export interface Proc {
 export const RUN_MARKER = "PATTY_RUN_ID";
 
 /**
- * What a run remembers of its processes: each one's ID and start time, the process groups its processes were in,
- * and when it last saw them (`asOf`, in milliseconds). A group outlives its leader while any member lives. Once it
- * is empty its ID can name a new group, so a leaderless group's members count as the run's only if they had
- * started by `asOf`.
+ * What a run remembers: each process's ID and start time, and each group's last observation of an owned member
+ * (milliseconds, or null when unknown). A group outlives its leader while any member lives. Once empty its ID can
+ * name a new group, so a leaderless group's members count as the run's only if they had started by that group's
+ * own observation time.
  */
 export interface Owned {
   procs: Map<number, string>;
-  groups: Set<number>;
-  asOf: number;
+  groups: Map<number, number | null>;
+  /** PIDs from a legacy record whose ownership may have been inferred from the unsafe run-wide cutoff. */
+  unverifiedProcs: Map<number, string>;
 }
 
-export function newOwned(procs: Iterable<[number, string]> = [], groups: Iterable<number> = [], asOf = 0): Owned {
-  return { procs: new Map(procs), groups: new Set(groups), asOf };
+export function newOwned(
+  procs: Iterable<[number, string]> = [], groups: Iterable<[number, number | null]> = [],
+  unverifiedProcs: Iterable<[number, string]> = [],
+): Owned {
+  return { procs: new Map(procs), groups: new Map(groups), unverifiedProcs: new Map(unverifiedProcs) };
 }
 
 async function ps(args: string[]): Promise<string> {
@@ -96,20 +100,29 @@ async function markedPids(runId: string, procs: readonly Proc[]): Promise<Set<nu
  * whose group leader, died is still found. A process that left both its parent and its group, and hides its
  * environment, is not found.
  *
- * `unsure` are members of a remembered, leaderless group that started after the run last saw it: a late child of
- * the run's, or a stranger in a group whose ID was reused. They are not the run's to kill, and not proof that the
- * run is gone either.
+ * `unsure` are unverified processes from a legacy record and unverified members of remembered, leaderless groups:
+ * they may be late children of the run's, or strangers in a group whose ID was reused. They are not the run's to
+ * kill, and not proof that the run is gone either.
  *
- * Forgets remembered groups that have no member left. The result is from a process table read last, after the
- * slower environment scan: act on it at once.
+ * Forgets empty groups and cutoffs invalidated by a clock rollback. The result is from a process table read last,
+ * after the slower environment scan: act on it at once.
  */
-async function scan(owned: Owned, runId: string): Promise<{ ours: Proc[]; unsure: Proc[] }> {
+async function scan(owned: Owned, runId: string): Promise<{ ours: Proc[]; unsure: Proc[]; groupsChanged: boolean }> {
   const before = new Map((await listProcesses()).map(proc => [proc.pid, proc.start]));
   const marked = await markedPids(runId, [...before].map(([pid, start]) => ({ pid, ppid: 0, pgid: 0, start })));
   const procs = await listProcesses();
   const byPid = new Map(procs.map(proc => [proc.pid, proc]));
-  for (const pgid of owned.groups) {
-    if (!procs.some(proc => proc.pgid === pgid)) owned.groups.delete(pgid);
+  const liveGroups = new Set(procs.map(proc => proc.pgid));
+  const now = Date.now();
+  let groupsChanged = false;
+  for (const [pgid, seenAt] of owned.groups) {
+    if (!liveGroups.has(pgid)) {
+      owned.groups.delete(pgid);
+      groupsChanged = true;
+    } else if (seenAt !== null && seenAt > now) {
+      owned.groups.set(pgid, null);
+      groupsChanged = true;
+    }
   }
   // Never this process, its group, or the system's.
   const skipGroups = new Set([0, 1, byPid.get(process.pid)?.pgid ?? -1]);
@@ -120,8 +133,10 @@ async function scan(owned: Owned, runId: string): Promise<{ ours: Proc[]; unsure
   // that leader, which is then remembered itself.
   const leaderless = (proc: Proc) => owned.groups.has(proc.pgid) && !skipGroups.has(proc.pgid) && !byPid.has(proc.pgid);
   const startedBy = (proc: Proc) => {
+    const seenAt = owned.groups.get(proc.pgid);
     const started = Date.parse(proc.start);
-    return Number.isFinite(started) && started <= owned.asOf;
+    // ps gives whole seconds. A process starting in the observation's own second might have started later.
+    return seenAt != null && Number.isFinite(started) && started + 1_000 <= seenAt;
   };
   const ours = new Map<number, Proc>();
   for (const proc of procs) {
@@ -139,7 +154,9 @@ async function scan(owned: Owned, runId: string): Promise<{ ours: Proc[]; unsure
       }
     }
   }
-  return { ours: [...ours.values()], unsure: procs.filter(proc => candidate(proc) && !ours.has(proc.pid) && leaderless(proc)) };
+  const unsure = procs.filter(proc => candidate(proc) && !ours.has(proc.pid)
+    && (owned.unverifiedProcs.get(proc.pid) === proc.start || leaderless(proc)));
+  return { ours: [...ours.values()], unsure, groupsChanged };
 }
 
 /** The live processes that belong to a run; see `scan`. Rejects when the process table cannot be read. */
@@ -147,21 +164,36 @@ export async function runProcesses(owned: Owned, runId: string): Promise<Proc[]>
   return (await scan(owned, runId)).ours;
 }
 
+/** Poll a live run, returning whether its recovery record needs updating. */
+export async function trackRunProcesses(owned: Owned, runId: string): Promise<boolean> {
+  const seenAt = Date.now();
+  const { ours, groupsChanged } = await scan(owned, runId);
+  const learned = remember(owned, ours, seenAt);
+  return learned || groupsChanged;
+}
+
 /**
- * Add a run's processes, and the groups they are in, to what it remembers. `seenAt` is when they were seen while the
- * run was being watched; a recovery, which may come long after, leaves `asOf` alone. Returns whether a process or
- * group was new.
+ * Add a run's processes and groups to what it remembers. Only a group with an owned process observed during the
+ * live run gets a new cutoff (`seenAt` is taken before reading the process table). Recovery leaves cutoffs alone.
+ * Returns whether the record changed.
  */
 export function remember(owned: Owned, procs: readonly Proc[], seenAt?: number): boolean {
-  const before = owned.procs.size + owned.groups.size;
+  let changed = false;
   for (const proc of procs) {
-    owned.procs.set(proc.pid, proc.start);
+    if (owned.procs.get(proc.pid) !== proc.start) {
+      owned.procs.set(proc.pid, proc.start);
+      changed = true;
+    }
     // The group of a process of the run is the run's, whether or not its leader was ever seen: the run's
     // processes are started in groups of their own, apart from this process's.
-    if (proc.pgid > 1 && proc.pgid !== hostGroup) owned.groups.add(proc.pgid);
+    if (proc.pgid <= 1 || proc.pgid === hostGroup) continue;
+    const prior = owned.groups.get(proc.pgid);
+    if (prior === undefined || (seenAt !== undefined && (prior === null || seenAt > prior))) {
+      owned.groups.set(proc.pgid, seenAt ?? null);
+      changed = true;
+    }
   }
-  if (seenAt !== undefined) owned.asOf = Math.max(owned.asOf, seenAt);
-  return owned.procs.size + owned.groups.size !== before;
+  return changed;
 }
 
 function signal(pid: number, name: NodeJS.Signals): void {

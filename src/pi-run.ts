@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import type { Config } from "./config.ts";
 import { instructions, taskPrompt } from "./pi-prompt.ts";
 import { addUsage, githubLink, readReport, RunTrace, usageKey, type JobUsage, type Review } from "./pi-trace.ts";
-import { listProcesses, newOwned, remember, runProcesses, RUN_MARKER, stopRun, type Owned } from "./processes.ts";
+import { listProcesses, newOwned, remember, RUN_MARKER, stopRun, trackRunProcesses, type Owned } from "./processes.ts";
 
 const exec = promisify(execFile);
 
@@ -74,10 +74,13 @@ interface SavedRun {
   /** The Pi process, once it runs. */
   pid?: number;
   procs: [number, string][];
-  groups: number[];
-  /** When the processes were last seen. */
-  asOf: number;
+  /** Group ID and when ownership was last observed, or null when unknown. */
+  groups: [number, number | null][];
+  /** Legacy process identities: they can block cleanup, but cannot establish ownership. */
+  unverifiedProcs?: [number, string][];
 }
+
+type LegacySavedRun = Omit<SavedRun, "groups" | "unverifiedProcs"> & { groups: number[]; asOf: number };
 
 /** A call's outcome as kept by task, and whether the spend of its cut-off delegate jobs has been added to it. */
 interface Kept {
@@ -608,16 +611,21 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     if (issue) outcome.issue = { url: issue.url, confirmed: false };
   }
 
+  const processIds = (value: unknown): value is [number, string][] => Array.isArray(value) && value.every(proc =>
+    Array.isArray(proc) && proc.length === 2 && Number.isSafeInteger(proc[0]) && typeof proc[1] === "string");
+
   /** Whether a saved record names the directories this host gives a run, so that cleanup deletes nothing else. */
-  const ownRecord = (saved: unknown): saved is SavedRun => {
-    const run = saved as SavedRun | null;
+  const ownRecord = (saved: unknown): saved is SavedRun | LegacySavedRun => {
+    const run = saved as SavedRun | LegacySavedRun | null;
     return typeof run === "object" && run !== null
       && typeof run.runId === "string" && /^[0-9A-Za-z][\w-]*$/.test(run.runId)
       && run.workspace === join(config.runsDir, run.runId) && run.logDir === join(logRoot, run.runId)
       && Number.isSafeInteger(run.conversationId) && Number.isSafeInteger(run.taskId)
-      && typeof run.asOf === "number" && Array.isArray(run.groups) && run.groups.every(Number.isSafeInteger)
-      && Array.isArray(run.procs) && run.procs.every(proc => Array.isArray(proc) && proc.length === 2
-        && Number.isSafeInteger(proc[0]) && typeof proc[1] === "string");
+      && Array.isArray(run.groups) && ("asOf" in run
+        ? typeof run.asOf === "number" && run.groups.every(Number.isSafeInteger)
+        : run.groups.every(group => Array.isArray(group) && group.length === 2 && Number.isSafeInteger(group[0])
+          && (group[1] === null || (Number.isSafeInteger(group[1]) && group[1] >= 0))))
+      && processIds(run.procs) && (!("unverifiedProcs" in run) || processIds(run.unverifiedProcs));
   };
 
   // A run the previous process left: stop it, clean up, and report its call `interrupted`. It is never run again.
@@ -626,7 +634,14 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     const saved = await readJson<unknown>(stateFile);
     // Anything the file holds that is not a run of this data directory, `null` included, is a damaged record.
     if (saved !== undefined && !ownRecord(saved)) throw new Error("it does not describe a run of this data directory");
-    left = saved;
+    if (saved && "asOf" in saved) {
+      // Neither the old run-wide time nor the processes it may have misclassified can prove ownership. Keep
+      // them as potential blockers (without the time), and require independent evidence before signalling.
+      const { asOf: _asOf, groups, procs, ...run } = saved;
+      left = { ...run, groups: groups.map(pgid => [pgid, null]), procs: [], unverifiedProcs: procs };
+    } else {
+      left = saved;
+    }
   } catch (error) {
     left = undefined;
     stuck = `The record of an earlier Pi run, ${stateFile}, cannot be used (${clip(message(error), 300)}). Its processes and workspace may still be there. `
@@ -641,7 +656,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       // directory is written first, so it can be ahead of the index.
       const settledBefore = (await logged(saved.runId, saved.taskId))?.entry
         ?? (kept.get(key)?.outcome.runId === saved.runId ? kept.get(key) : undefined);
-      const owned = newOwned(saved.procs, saved.groups, saved.asOf);
+      const owned = newOwned(saved.procs, saved.groups, saved.unverifiedProcs);
       // What the cleanup learns of the run's processes is kept for the next start, should this one not finish.
       const record = () => writeJson(stateFile, { ...saved, procs: [...owned.procs], groups: [...owned.groups] });
       const trace = new RunTrace(pi.repo);
@@ -707,14 +722,15 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     let saving: Promise<unknown> = Promise.resolve();
     const write = () => saving = saving.catch(() => {}).then(async () => {
       if (!recording) return;
-      await writeJson(stateFile, { ...saved, procs: [...run.owned.procs], groups: [...run.owned.groups], asOf: run.owned.asOf });
+      await writeJson(stateFile, { ...saved, procs: [...run.owned.procs], groups: [...run.owned.groups] });
     });
     const save = () => write().catch(error => console.error(`Pi run ${saved.runId}: could not save its record:`, error));
     /** Remember a process this host started for the run, before waiting on it. */
     const adopt = async (pid: number | undefined) => {
       if (pid === undefined) return;
+      const seenAt = Date.now();
       const own = (await listProcesses().catch(() => [])).find(proc => proc.pid === pid);
-      if (own) remember(run.owned, [own], Date.now());
+      if (own) remember(run.owned, [own], seenAt);
       await save();
     };
     /** The children this host started itself and still holds: stopped through their handles when all else fails. */
@@ -872,9 +888,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         // Remember the processes the run starts while their parents still live: a delegate leads its own group.
         let polling: Promise<void> | undefined;
         const poll = setInterval(() => {
-          const seenAt = Date.now();
-          polling ??= runProcesses(run.owned, saved.runId).then(async procs => {
-            if (remember(run.owned, procs, seenAt)) await save();
+          polling ??= trackRunProcesses(run.owned, saved.runId).then(async changed => {
+            if (changed) await save();
           }).catch(() => {}).finally(() => { polling = undefined; });
         }, pollMs);
         code = await exited;
@@ -988,9 +1003,9 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       const saved: SavedRun = {
         runId, conversationId: request.conversationId, taskId: request.taskId, pr: request.pr,
         startedAt: new Date().toISOString(), workspace: join(config.runsDir, runId), logDir: join(logRoot, runId),
-        procs: [], groups: [], asOf: Date.now(),
+        procs: [], groups: [],
       };
-      const run: ActiveRun = { saved, owned: newOwned([], [], saved.asOf), finalizing: false, kill: () => {}, done: Promise.resolve(undefined) };
+      const run: ActiveRun = { saved, owned: newOwned(), finalizing: false, kill: () => {}, done: Promise.resolve(undefined) };
       active = run;
       const onAbort = () => {
         if (run.finalizing) return;

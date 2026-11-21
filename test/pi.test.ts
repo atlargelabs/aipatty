@@ -10,7 +10,7 @@ import type { Config } from "../src/config.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
 import { openPiRuns, outcomeText, type RunOutcome, type RunRequest } from "../src/pi-run.ts";
 import { readReport, readReview } from "../src/pi-trace.ts";
-import { listProcesses, newOwned, remember, runProcesses, stopRun } from "../src/processes.ts";
+import { listProcesses, newOwned, remember, runProcesses, stopRun, trackRunProcesses } from "../src/processes.ts";
 import { messageText } from "../src/protocol.ts";
 import { checkout, fauxConfig, fixture, until } from "./helpers.ts";
 
@@ -500,12 +500,15 @@ test("after a crash, the next start stops the surviving processes, cleans up, an
   const exited = new Promise(resolve => host.once("exit", resolve));
   t.after(() => { host.kill("SIGKILL"); });
   await until(async () => (await spawned(config)).length === 1, Boolean, 20_000);
-  // Long enough for the host to have recorded the detached child.
-  await until(async () => JSON.parse(await readFile(join(config.dataDir, "pi-run.json"), "utf8")).procs.length >= 2);
+  const [child] = await spawned(config);
+  // Long enough for the host to have persisted this group's own observation time.
+  await until(async () => {
+    const saved = JSON.parse(await readFile(join(config.dataDir, "pi-run.json"), "utf8"));
+    return saved.groups.some(([pgid, seenAt]: [number, number | null]) => pgid === child && Number.isSafeInteger(seenAt));
+  });
   host.kill("SIGKILL");
   await exited;
   const [pi] = await launches(config);
-  const [child] = await spawned(config);
   assert.ok(alive(pi.pid) && alive(child), "the run outlives its host");
 
   const runs = await openPiRuns(config);
@@ -812,7 +815,7 @@ test("a run's processes are found by environment marker and by the groups they l
     started.push(child.pid!);
     return child;
   };
-  const marked = start(["-e", idle], { PATTY_RUN_ID: marker });
+  const marked = start(["-e", idle], { PATTY_RUN_ID: marker }, true);
   // The marker among the arguments, as a search for it would have.
   const bystander = start(["-e", idle, `PATTY_RUN_ID=${marker}`]);
   // A detached leader, as a delegate is, whose child stays in its group after the leader is gone.
@@ -829,8 +832,11 @@ test("a run's processes are found by environment marker and by the groups they l
     return [marked.pid, bystander.pid, leader.pid, orphan].every(pid => procs.some(proc => proc.pid === pid)) ? procs : undefined;
   });
   // The group is remembered from any of its members, so it need not be the leader that was seen.
-  remember(owned, table!.filter(proc => proc.pid === orphan), Date.now());
-  assert.deepEqual([...owned.groups], [leader.pid]);
+  const orphanProc = table!.find(proc => proc.pid === orphan)!;
+  const nextSecond = Date.parse(orphanProc.start) + 1_000;
+  await until(() => Date.now() >= nextSecond);
+  remember(owned, [orphanProc], Date.now());
+  assert.deepEqual([...owned.groups.keys()], [leader.pid]);
   owned.procs.clear();
   leader.kill("SIGKILL");
   await until(() => !alive(leader.pid!));
@@ -843,10 +849,49 @@ test("a run's processes are found by environment marker and by the groups they l
 
   // A member that started after the run last saw the group may be a late child of the run's, or a stranger in a
   // group whose ID was reused: it is not killed, and it is not passed over as if the run were gone.
-  const stale = newOwned([], [leader.pid!], Date.now() - 3_600_000);
-  assert.ok(!(await runProcesses(stale, "another-run")).some(proc => proc.pid === orphan));
-  assert.deepEqual((await stopRun(stale, "another-run", undefined, 0)).map(proc => proc.pid), [orphan]);
-  assert.ok(alive(orphan));
+  const staleTime = nextSecond - 60_000;
+  const stale = newOwned([], [[leader.pid!, staleTime]]);
+  assert.equal(await trackRunProcesses(stale, "another-run"), false, "an empty poll provides no evidence");
+  assert.equal(await trackRunProcesses(stale, marker), true, "the marked process is tracked in its own group");
+  await trackRunProcesses(stale, marker);
+  assert.equal(stale.groups.get(leader.pid!), staleTime, "polls of another group do not advance this group's cutoff");
+  assert.deepEqual((await runProcesses(stale, marker)).map(proc => proc.pid), [marked.pid]);
+  assert.deepEqual((await stopRun(stale, marker, undefined, 0)).map(proc => proc.pid), [orphan]);
+  assert.ok(!alive(marked.pid!) && alive(orphan));
+
+  const sameSecond = newOwned([], [[leader.pid!, nextSecond - 1]]);
+  assert.deepEqual(await runProcesses(sameSecond, "another-run"), [], "a whole-second start time is ambiguous within that second");
+
+  // The old poller could have used the recent run-wide cutoff to record processes without evidence of ownership.
+  // Retain them as blockers (even outside the remembered group), including on a subsequent restart.
+  const config = await setup(t);
+  t.mock.method(console, "error", () => {});
+  const runId = "20260101T000000-deadbeef";
+  const stateFile = join(config.dataDir, "pi-run.json");
+  const workspace = join(config.runsDir, runId);
+  const logDir = join(config.dataDir, "logs/runs", runId);
+  await mkdir(workspace, { recursive: true });
+  await mkdir(logDir, { recursive: true });
+  const record = { runId, workspace, logDir, conversationId: 1, taskId: 101, startedAt: "", pr: false };
+  const legacyProcs = table!.filter(proc => proc.pid === orphan || proc.pid === bystander.pid).map(proc => [proc.pid, proc.start]);
+  await writeFile(stateFile, JSON.stringify({ ...record, procs: legacyProcs, groups: [leader.pid], asOf: Date.now() }));
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const recovered = await openPiRuns(config);
+    await assert.rejects(recovered.run(request({ pr: false })), /2 process\(es\) could not be stopped, or could not be told from the run's/);
+    assert.ok(alive(orphan) && alive(bystander.pid!) && existsSync(workspace));
+    const saved = JSON.parse(await readFile(stateFile, "utf8"));
+    assert.deepEqual(saved.groups, [[leader.pid, null]]);
+    assert.deepEqual(saved.unverifiedProcs, legacyProcs);
+    assert.deepEqual(saved.procs, []);
+    assert.ok(!("asOf" in saved));
+  }
+
+  // A clock rollback (or a damaged record) can leave an observation time ahead of recovery.
+  await writeFile(stateFile, JSON.stringify({ ...record, procs: [], groups: [[leader.pid, Date.now() + 60_000]] }));
+  const recovered = await openPiRuns(config);
+  await assert.rejects(recovered.run(request({ pr: false })), /1 process\(es\) could not be stopped, or could not be told from the run's/);
+  assert.ok(alive(orphan) && existsSync(workspace));
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).groups, [[leader.pid, null]]);
 
   // A stop saves what it learns of the tree before it signals anything.
   const learning = newOwned();
@@ -857,7 +902,7 @@ test("a run's processes are found by environment marker and by the groups they l
   await until(async () => (await listProcesses()).some(proc => proc.pid === fresh.pid));
   let aliveWhenRecorded = false;
   assert.deepEqual(await stopRun(learning, `${marker}-b`, undefined, 0, undefined, async () => {
-    recorded = [...learning.groups];
+    recorded = [...learning.groups.keys()];
     aliveWhenRecorded = alive(fresh.pid!);
   }), []);
   assert.deepEqual(recorded, [fresh.pid]);
