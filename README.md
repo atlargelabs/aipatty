@@ -2,8 +2,10 @@
 
 aipatty is a personal assistant agent built on [pi-durable](https://github.com/earendil-works/pi/tree/main/packages/durable).
 It runs as one long-lived process, keeps its conversations in SQLite, and continues interrupted work after a restart.
-The design and build order are in [docs/PLAN.md](docs/PLAN.md). This checkout implements steps 1 and 2: a tree of
-conversation branches, each with its own model, over an HTTP and WebSocket API, a web page, and a CLI client.
+The design and build order are in [docs/PLAN.md](docs/PLAN.md). This checkout implements build steps 1 and 2: a tree
+of conversation branches, each with its own model, over an HTTP and WebSocket API, a web page, and a CLI client; and
+the `pi` tool, which hands coding work to a pinned Pi CLI. Installing it on the Mac mini is in
+[docs/INSTALL.md](docs/INSTALL.md).
 
 ## Branches
 
@@ -19,6 +21,67 @@ incomplete tool exchange are rejected: fork before the call or after its last re
 ends before its own call. If the optional first message cannot be admitted, the tool reports the created branch ID and
 the admission error; the branch remains available.
 
+## Tools
+
+Besides the tree tools, the model has pi-durable's `read`, `write`, `edit`, `bash`, `codemode` and `tool_search`.
+They start in the work directory (`--work-dir`), for inspection and scratch files. They are not confined to it: they
+have the permissions of the user the server runs as.
+
+## `pi` runs
+
+Work meant for a PR goes through the `pi` tool. Each call runs one session of the Pi CLI pinned in `package.json`,
+in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits for it.
+
+- **One at a time.** A second call, from any branch, is refused while a run is active.
+- **Launch.** The CLI runs in one-shot JSON mode with no session. It loads the pinned `delegates` extension and
+  nothing else: no settings, extensions, skills, context files or MCP servers from the checkout or by discovery.
+  It shares the server's Pi directory, and so its sign-in and its `delegates` settings.
+- **Rules.** Pi is told the git and issue workflow: an issue, a task branch and a PR that links the issue;
+  `npm run check` and `npm test` before every push; a `crmanager` review of the final commit, repeated until it
+  has no P0 or P1 finding; and that only Steve merges.
+- **Result.** The tool returns a status, Pi's summary, the PR and issue, the last review, the cost, and anything
+  the host found wrong. The host does not take Pi's word for it. A run that was asked for a PR is `completed`
+  only when all of this holds, and `failed` otherwise:
+  - Pi exited cleanly: the event stream is well-formed and ends settled, with a last message that stopped normally.
+  - `gh` confirms the PR: open, against `main`, and listed by GitHub as closing a confirmed issue of this
+    repository.
+  - The last finished `crmanager` review was a `/review pr` of that PR, in a clone of this repository, at its
+    head commit and after any change of its base branch; it declared the verdict "correct" and no other; and it
+    had no P0 or P1 finding. Otherwise the
+    result says `NOT REVIEWED` and why. The verdict is read from the reviewer's text, which is a model's: it is
+    a check on the workflow, and Steve's review before merging is the gate.
+
+  CI on the PR's head commit is the authoritative check. The tool does not wait for it.
+- **Cost.** Pi's spend and its delegates' is charged to the calling branch, once. When a run is cut off, the
+  cost includes what its unfinished delegate jobs had recorded, and is marked incomplete.
+- **Abort and timeout.** Aborting the branch, or the run's time limit (60 minutes unless the call says otherwise,
+  counted from the start of the clone), stops Pi and the processes it started, its delegates included. The result
+  reports what the run had done. Once Pi has finished and the host is checking the result, the run ends as it
+  ended.
+- **Cleanup.** Every run's events, error output, prompt and result are kept in `logs/runs/<run-id>/` in the data
+  directory, with the logs of its delegate jobs. The workspace and the delegates' clones are deleted. Logs can
+  hold private data.
+- **Restart.** A run does not survive the server. On the next start, before any conversation resumes, the server
+  stops what is left of the run, cleans up, and reports the call as `interrupted` in its branch, with any PR link
+  the run had printed. It never runs the call again. A run that had already settled when the server died keeps
+  its result.
+- **When cleanup fails.** If a run's processes cannot be stopped or cannot be told from another's, its files
+  cannot be removed, or its saved record (`pi-run.json` in the data directory) cannot be read, nothing more is
+  deleted and no new run starts until that is resolved and the server restarted. The refusal says what is wrong.
+  A run whose processes could not be stopped, or whose events could not be read back after a restart, has not
+  had all its spend added. A later cleanup
+  that stops them adds it to the run's `result.json`; if the call's result was already recorded in its branch by
+  then, the branch's cost does not include it.
+
+A run needs `git`, `gh` and a GitHub login for the user the server runs as, the Pi sign-in, and the pi-review
+extension: at `git/github.com/earendil-works/pi-review/review.ts` in the Pi directory (where
+`pi install git:github.com/earendil-works/pi-review` puts it), or wherever `delegates.reviewExtension` in the Pi
+directory's `settings.json` says. A run that must end with a PR is refused when the extension is missing.
+
+A run's processes are found by parent, by the process groups its processes led, and by a marker in their
+environment. A process that leaves both its parent and its group, and hides its environment, is not found. No
+process is signalled unless a process table read just before shows it, by ID and start time, to be the run's.
+
 ## Page
 
 Open `http://127.0.0.1:8790/` (or the port given with `--port`) for the branch list, transcript, input box, fork (of the whole branch, or
@@ -29,8 +92,10 @@ at a completed exchange with "Fork here"), rename, search, model and thinking pi
 Requires Node 26 or newer.
 
 ```sh
-npm install --ignore-scripts
+npm ci --ignore-scripts
 ```
+
+The `delegates` extension is a git dependency, which npm 12 refuses unless `.npmrc` allows it; this checkout's does.
 
 ## Run
 
@@ -46,13 +111,15 @@ If a send reports that OpenAI is not configured, sign in with the pi CLI. Stored
 
 ## Configure
 
-The server takes three command-line options:
+The server takes five command-line options:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--port <n>` | `8790` | Listen port. `0` asks the operating system for a free one, which the server prints |
-| `--data-dir <path>` | `~/.aipatty/data` (`~/.aipatty/faux` in faux mode) | Where the conversation database and ownership lock live |
-| `--pi-dir <path>` | `~/.pi/agent` | The pi CLI's directory: its login file `auth.json` and its cached model catalog `models-store.json`, which is only read |
+| `--data-dir <path>` | `~/.aipatty/data` (`~/.aipatty/faux` in faux mode) | Where the conversation database, the ownership lock and the run logs live |
+| `--pi-dir <path>` | `~/.pi/agent` | The Pi directory, shared with the pinned CLI: its login file `auth.json`, its cached model catalog `models-store.json`, which the server only reads, and the `delegates` settings and jobs |
+| `--work-dir <path>` | `~/.aipatty/work` | Where the model's own file and shell tools start |
+| `--runs-dir <path>` | `~/.aipatty/runs` | Where each `pi` run gets its disposable workspace |
 
 and one environment variable, `AIPATTY_FAUX`: `1` uses the fake model. An empty value counts as unset.
 

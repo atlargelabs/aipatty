@@ -30,7 +30,7 @@ export async function fixture(t: TestContext): Promise<string> {
 
 /** Server options that use no real paths and ask for a free port. */
 export function fixtureArgs(dir: string): string[] {
-  return ["--data-dir", dir, "--port", "0", "--pi-dir", dir];
+  return ["--data-dir", dir, "--port", "0", "--pi-dir", dir, "--work-dir", join(dir, "work"), "--runs-dir", join(dir, "runs")];
 }
 
 /** Isolated, ephemeral-port server settings on the fake model. */
