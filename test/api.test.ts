@@ -14,7 +14,7 @@ const health = { ok: true as const, commit: "test", startedAt: "now", version: "
 /** Start a faux-model server on a free port over `dir`. */
 async function start(dir: string, heartbeatMs?: number) {
   const host = await openHost(fauxConfig(dir));
-  const api = await startApi(host, health, "127.0.0.1", 0, [], heartbeatMs);
+  const api = await startApi(host, health, 0, heartbeatMs);
   let closed = false;
   return {
     base: `http://127.0.0.1:${api.port}`,
@@ -41,13 +41,22 @@ function post(base: string, body: unknown, headers: Record<string, string> = {})
   });
 }
 
+/** The root's page, without the branch summary and total that only the HTTP page carries. */
 async function page(base: string): Promise<ConversationPage> {
-  return await (await fetch(`${base}/api/conversations/root`)).json() as ConversationPage;
+  const { branch: _branch, totalCost: _total, ...rest } = await (await fetch(`${base}/api/conversations/root`)).json() as
+    ConversationPage & { branch: unknown; totalCost: number };
+  return rest;
 }
 
-/** The visible text of every model message, as `role: text`. */
+/**
+ * The visible text of every model message, as `role: text`. Messages without text, such as the system entry that
+ * announces the tree tools on the first turn, are left out.
+ */
 function lines(state: ConversationPage): string[] {
-  return state.entries.flatMap(entry => (entry.model ?? []).map(message => `${message.role}: ${messageText(message)}`));
+  return state.entries.flatMap(entry => (entry.model ?? []).flatMap(message => {
+    const text = messageText(message);
+    return text ? [`${message.role}: ${text}`] : [];
+  }));
 }
 
 const idleWith = (count: number) => (state: ConversationPage) => !state.busy && lines(state).length >= count;

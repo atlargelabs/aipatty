@@ -2,17 +2,23 @@
 import { randomUUID } from "node:crypto";
 import { on } from "node:events";
 import WebSocket, { type RawData } from "ws";
-import { DEFAULT_URL, readSettings } from "./config.ts";
+import { LOOPBACK, readFaux, readPort } from "./config.ts";
+import type { BranchInfo, SearchMatch } from "./branches.ts";
 import { failureText, messageText, type ConversationPage, type StreamFrame } from "./protocol.ts";
+import { branchLine } from "./tools.ts";
 
-const root = "/api/conversations/root";
+/** The conversation path of a branch ID, or the root's. */
+function conversationPath(branch = "root"): string {
+  if (branch !== "root" && !/^[1-9]\d*$/.test(branch)) throw new Error(`Expected a branch ID: ${branch}`);
+  return `/api/conversations/${branch}`;
+}
 
 async function request<T>(base: URL, path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(new URL(path, base), options).catch((error: unknown) => {
     // fetch() says only "fetch failed"; its cause has the reason.
     const cause = error instanceof Error && error.cause instanceof Error ? error.cause : error;
     const reason = (cause as NodeJS.ErrnoException).code ?? (cause instanceof Error ? cause.message : String(cause));
-    throw new Error(`Cannot reach the server at ${base.origin} (${reason}). Is it running, and is AIPATTY_URL its address?`);
+    throw new Error(`Cannot reach the server at ${base.origin} (${reason}). Is it running, and is --port its port?`);
   });
   const text = await response.text();
   let value: unknown;
@@ -29,14 +35,14 @@ async function request<T>(base: URL, path: string, options?: RequestInit): Promi
   return value as T;
 }
 
-async function send(base: URL, content: string): Promise<void> {
+async function send(base: URL, content: string, root: string): Promise<void> {
   const { submissionId } = await request<{ submissionId: number }>(base, `${root}/messages`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content, requestId: randomUUID() }),
   });
   const url = new URL(`${root}/stream?submissionId=${submissionId}`, base);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.protocol = "ws:";
   const socket = new WebSocket(url);
   let printed = "";
   const print = (text: string) => {
@@ -67,7 +73,7 @@ async function send(base: URL, content: string): Promise<void> {
   }
 }
 
-async function log(base: URL): Promise<void> {
+async function log(base: URL, root: string, limit?: number): Promise<void> {
   const pages: ConversationPage[] = [];
   let before: number | null = null;
   do {
@@ -75,42 +81,88 @@ async function log(base: URL): Promise<void> {
     const page: ConversationPage = await request(base, path);
     pages.push(page);
     before = page.before;
+    if (limit !== undefined && pages.reduce((n, p) => n + p.entries.length, 0) >= limit) break;
   } while (before !== null);
 
-  for (const page of pages.reverse()) {
-    for (const entry of page.entries) {
-      for (const message of entry.model ?? []) {
-        const text = messageText(message);
-        if (text) console.log(`${message.role}: ${text}`);
-      }
+  let entries = pages.reverse().flatMap(page => page.entries);
+  if (limit !== undefined) entries = entries.slice(-limit);
+  for (const entry of entries) {
+    for (const message of entry.model ?? []) {
+      const text = messageText(message);
+      if (text) console.log(limit === undefined ? `${message.role}: ${text}` : `[${entry.id}] ${message.role}: ${text}`);
     }
   }
 }
 
+const usage = `Usage: aipatty [--port <n>] [--branch <id>] <command>
+  health | models
+  model set [provider] <modelId> | thinking set <level>
+  send "<text>" | abort | log
+  branches [list] | branches read <id> [--limit <n>] | branches search <id> "<text>"
+  fork "<title>" [--at <entryId>] | rename "<title>"
+--branch selects the branch for model, thinking, send, abort, log, fork and rename; default the root.
+--port is the server's port on this machine; default 8790.`;
+
+/** Remove `--name <value>` from `args`, returning the value. */
+function takeOption(args: string[], name: string): string | undefined {
+  const index = args.indexOf(name);
+  if (index < 0) return undefined;
+  const value = args[index + 1];
+  if (value === undefined) throw new Error(`${name} needs a value`);
+  args.splice(index, 2);
+  return value;
+}
+
 async function main(): Promise<void> {
-  const [command, ...args] = process.argv.slice(2);
-  const base = new URL(readSettings().URL ?? DEFAULT_URL);
-  const put = (path: string, body: unknown) => request(base, path, {
-    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  const args = process.argv.slice(2);
+  const branch = takeOption(args, "--branch");
+  const limitArg = takeOption(args, "--limit");
+  const at = takeOption(args, "--at");
+  const port = readPort(takeOption(args, "--port"), 1);
+  const limit = limitArg === undefined ? undefined : Number(limitArg);
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) throw new Error("--limit must be a positive integer");
+  const [command, ...rest] = args;
+  const root = conversationPath(branch);
+  readFaux(); // The CLI has no environment settings; this rejects a leftover or misspelt one.
+  const base = new URL(`http://${LOOPBACK}:${port}`);
+  const json = (path: string, method: string, body: unknown) => request(base, path, {
+    method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   });
-  if (base.protocol !== "http:" && base.protocol !== "https:") throw new Error("AIPATTY_URL must be HTTP(S)");
-  if (command === "health" && args.length === 0) {
-    console.log(JSON.stringify(await request(base, "/health"), null, 2));
-  } else if (command === "models" && args.length === 0) {
-    console.log(JSON.stringify(await request(base, "/api/models"), null, 2));
-  } else if (command === "model" && (args.length === 2 || args.length === 3) && args[0] === "set") {
-    const model = { provider: args.length === 3 ? args[1] : undefined, modelId: args.at(-1) };
-    console.log(JSON.stringify(await put("/api/model", model), null, 2));
-  } else if (command === "thinking" && args.length === 2 && args[0] === "set") {
-    console.log(JSON.stringify(await put("/api/thinking", { level: args[1] }), null, 2));
-  } else if (command === "abort" && args.length === 0) {
+  const print = (value: unknown) => console.log(JSON.stringify(value, null, 2));
+  const scoped = branch !== undefined;
+  if (command === "health" && rest.length === 0 && !scoped) {
+    print(await request(base, "/health"));
+  } else if (command === "models" && rest.length === 0 && !scoped) {
+    print(await request(base, "/api/models"));
+  } else if (command === "model" && (rest.length === 2 || rest.length === 3) && rest[0] === "set") {
+    const model = { provider: rest.length === 3 ? rest[1] : undefined, modelId: rest.at(-1) };
+    print(await json(scoped ? `${root}/model` : "/api/model", "PUT", model));
+  } else if (command === "thinking" && rest.length === 2 && rest[0] === "set") {
+    print(await json(scoped ? `${root}/thinking` : "/api/thinking", "PUT", { level: rest[1] }));
+  } else if (command === "abort" && rest.length === 0) {
     await request(base, `${root}/abort`, { method: "POST" });
-  } else if (command === "log" && args.length === 0) {
-    await log(base);
-  } else if (command === "send" && args.length === 1 && args[0].trim()) {
-    await send(base, args[0]);
+  } else if (command === "log" && rest.length === 0) {
+    await log(base, root, limit);
+  } else if (command === "send" && rest.length === 1 && rest[0].trim()) {
+    await send(base, rest[0], root);
+  } else if (command === "fork" && rest.length === 1) {
+    const branchInfo = await json(`${root}/fork`, "POST", { title: rest[0], ...(at ? { at: Number(at) } : {}) });
+    print(branchInfo);
+  } else if (command === "rename" && rest.length === 1) {
+    print(await json(`${root}/title`, "PUT", { title: rest[0] }));
+  } else if (command === "branches" && !scoped && (rest.length === 0 || (rest.length === 1 && rest[0] === "list"))) {
+    const { branches, totalCost } = await request<{ branches: BranchInfo[]; totalCost: number }>(base, "/api/branches");
+    for (const info of branches) console.log(branchLine(info));
+    console.log(`Total spend: $${totalCost.toFixed(2)}`);
+  } else if (command === "branches" && !scoped && rest.length === 2 && rest[0] === "read") {
+    await log(base, conversationPath(rest[1]), limit ?? 50);
+  } else if (command === "branches" && !scoped && rest.length === 3 && rest[0] === "search") {
+    const query = new URLSearchParams({ q: rest[2], ...(limit ? { limit: String(limit) } : {}) });
+    const { matches } = await request<{ matches: SearchMatch[] }>(base, `${conversationPath(rest[1])}/search?${query}`);
+    if (!matches.length) console.log("No matches");
+    for (const match of matches) console.log(`[${match.entryId}] ${match.role}: ${match.excerpt}`);
   } else {
-    throw new Error('Usage: aipatty health | models | model set [provider] <modelId> | thinking set <level> | send "<text>" | abort | log');
+    throw new Error(usage);
   }
 }
 

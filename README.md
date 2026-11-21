@@ -2,8 +2,27 @@
 
 aipatty is a personal assistant agent built on [pi-durable](https://github.com/earendil-works/pi/tree/main/packages/durable).
 It runs as one long-lived process, keeps its conversations in SQLite, and continues interrupted work after a restart.
-The design and build order are in [docs/PLAN.md](docs/PLAN.md). This checkout implements step 1, the skeleton: one
-conversation, an HTTP and WebSocket API, and a CLI client.
+The design and build order are in [docs/PLAN.md](docs/PLAN.md). This checkout implements steps 1 and 2: a tree of
+conversation branches, each with its own model, over an HTTP and WebSocket API, a web page, and a CLI client.
+
+## Branches
+
+The root conversation ("Main") and every branch forked from it are independent workstreams. A fork shares its
+parent's history up to the fork point, starts with the parent's model and thinking level, and then continues on its
+own. Nothing reports back between branches, and every branch stays listed. Each branch has a title, its own model and
+thinking level, and its own cost; the page and the CLI show it as `$<branch> / $<total>`.
+
+The model gets four tools for the tree: `list_branches`, `read_branch` (paging and case-insensitive text search over
+any branch), `fork_branch` (optionally with a first message the new branch starts on), and `set_model`. A branch it
+forks gets the model it has; its `set_model` on another branch is refused while that branch is busy. Forks at an
+incomplete tool exchange are rejected: fork before the call or after its last result. A tool's default self-fork
+ends before its own call. If the optional first message cannot be admitted, the tool reports the created branch ID and
+the admission error; the branch remains available.
+
+## Page
+
+Open `http://127.0.0.1:8790/` (or the port given with `--port`) for the branch list, transcript, input box, fork (of the whole branch, or
+at a completed exchange with "Fork here"), rename, search, model and thinking pickers, and cost. ⌘/Ctrl+Enter sends.
 
 ## Install
 
@@ -18,6 +37,7 @@ npm install --ignore-scripts
 ```sh
 npm start                  # uses the pi CLI's ChatGPT subscription login
 AIPATTY_FAUX=1 npm start   # a fake model that echoes, for demos; needs no login
+npm start -- --port 9000   # server options go after the --
 ```
 
 The server uses only the pi CLI’s ChatGPT subscription login and takes the same lock when refreshing it.
@@ -26,25 +46,31 @@ If a send reports that OpenAI is not configured, sign in with the pi CLI. Stored
 
 ## Configure
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `AIPATTY_DATA_DIR` | `~/.aipatty/data` (`~/.aipatty/faux` in faux mode) | Where the conversation database and ownership lock live |
-| `AIPATTY_HOST` | `127.0.0.1` | Listen address; the tailnet address on the Mac mini. A wildcard (`0.0.0.0`, `::`) needs `AIPATTY_TRUSTED_HOSTS` |
-| `AIPATTY_TRUSTED_HOSTS` | unset | Additional trusted hostnames, comma-separated, without scheme or port (e.g. the mini’s Tailscale DNS name) |
-| `AIPATTY_PORT` | `8790` | Listen port |
-| `AIPATTY_PI_DIR` | `~/.pi/agent` | The pi CLI's directory: its login file `auth.json` and its cached model catalog `models-store.json`, which is only read |
-| `AIPATTY_FAUX` | unset | `1` uses the fake model |
-| `AIPATTY_URL` | `http://127.0.0.1:8790` | Server address for the CLI client |
+The server takes three command-line options:
 
-An empty value counts as unset. Any other `AIPATTY_` variable stops the server and the CLI with an error that names it.
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--port <n>` | `8790` | Listen port. `0` asks the operating system for a free one, which the server prints |
+| `--data-dir <path>` | `~/.aipatty/data` (`~/.aipatty/faux` in faux mode) | Where the conversation database and ownership lock live |
+| `--pi-dir <path>` | `~/.pi/agent` | The pi CLI's directory: its login file `auth.json` and its cached model catalog `models-store.json`, which is only read |
+
+and one environment variable, `AIPATTY_FAUX`: `1` uses the fake model. An empty value counts as unset.
+
+An unknown option stops the server. Any other `AIPATTY_` variable stops the server and the CLI with an error that
+names it, so a setting left over from an earlier version is not silently ignored.
+
+The server listens on `127.0.0.1` only; there is no listen address to configure. See [From another machine](#from-another-machine).
 
 A new root conversation starts with the model `gpt-6.2-sol` and the thinking level `high`. Both are saved with the
-conversation; change them with `model set` and `thinking set`.
+conversation; change them with `model set` and `thinking set` (add `--branch <id>` for a branch).
 
 `gpt-6.2-sol` is newer than the catalog bundled with pi-ai 1.5.2. It resolves only if the pi CLI has cached a newer
-catalog in `AIPATTY_PI_DIR`. If the saved model (or the default on first launch) is missing, the server
-still serves the transcript and model commands. `/health` returns HTTP 200, `modelStatus: "unavailable"`, and the
+catalog in the pi directory. If the saved model (or the default on first launch) is missing, the server
+still serves transcripts, branches and model commands. `/health` returns HTTP 200, `modelStatus: "unavailable"`, and the
 model reference; sends return 409. Availability means present in the local catalog, not that a login or network call succeeded.
+A branch whose model is missing refuses sends; the others keep working. If a branch has *interrupted work* waiting
+for a missing model, nothing runs anywhere until that branch's model is switched (the error names the branch), so
+that work is neither run on the wrong model nor silently failed.
 
 To keep interrupted work pending, restore the original model (e.g. `pi update --models`) and restart.
 Alternatively, select an available model. Switching withdraws outstanding work from the blocked turn, including
@@ -57,22 +83,53 @@ a separate `owner.sqlite` file before opening the conversation database. A crash
 ## CLI
 
 ```sh
-node src/cli.ts health                # the running commit, version, start time, model and thinking level
+node src/cli.ts health                # the running commit, version, start time, root model and thinking level
 node src/cli.ts models                # list available model IDs and providers
 node src/cli.ts model set <id>        # select a model from that list (optional provider before ID)
 node src/cli.ts thinking set <level>  # off, minimal, low, medium, high, xhigh or max
 node src/cli.ts send "hello"          # send a message and stream the answer
 node src/cli.ts abort                 # withdraw queued messages and stop the running turn
 node src/cli.ts log                   # print the transcript
+node src/cli.ts branches              # list branches: ID, title, model, own cost, fork point; and the total
+node src/cli.ts branches read <id> [--limit n]     # the newest n messages of a branch (default 50), with entry IDs
+node src/cli.ts branches search <id> "<text>"      # case-insensitive matches, newest first
+node src/cli.ts fork "<title>" [--at <entryId>]    # fork the root (or --branch <id>) at its newest or a given entry
+node src/cli.ts rename "<title>"                   # retitle the root (or --branch <id>)
 ```
+
+`--branch <id>` before or after the command points `model set`, `thinking set`, `send`, `abort`, `log`, `fork` and
+`rename` at a branch instead of the root.
+
+The CLI connects to `127.0.0.1:8790`. `--port <n>` names another port, for a server started with `--port`.
+
+## From another machine
+
+The server has no login and accepts connections from its own machine only. To use the page or the CLI from a laptop,
+forward the port over SSH and open `http://127.0.0.1:8790/` there:
+
+```sh
+ssh -N -L 8790:127.0.0.1:8790 <the machine aipatty runs on>
+```
+
+Use the same port number at both ends: the server answers only to `127.0.0.1` or `localhost` at its own port. SSH is
+the authentication.
 
 ## API
 
-- `GET /health` (includes the saved model, its catalog availability, and the thinking level)
+- `GET /` the page (and `/app.js`, `/app.css`)
+- `GET /health` (includes the root's saved model, its catalog availability, and the thinking level)
 - `GET /api/models`
-- `PUT /api/model` with `{ modelId, provider? }` to switch the root conversation
-- `PUT /api/thinking` with `{ level }` to change the root conversation's thinking level
-- `GET /api/conversations/:id` (`root` is the root conversation; `?limit=` and `?before=` page backwards)
+- `GET /api/branches`: `{ branches: [{ id, title, parent, model, modelStatus, thinking, busy, cost }], totalCost }`
+- `PUT /api/model` and `PUT /api/thinking`: the root's, as below
+- `GET /api/conversations/:id` (`root` is the root conversation; `?limit=` and `?before=` page backwards); also
+  carries `branch` and `totalCost`
+- `POST /api/conversations/:id/fork` with `{ title, at? }`: a new branch from `:id`'s history through entry `at`
+  (default its newest); returns the branch
+- `PUT /api/conversations/:id/title` with `{ title }` (1 to 100 characters)
+- `PUT /api/conversations/:id/model` with `{ modelId, provider? }`; 409 while the branch has active work
+- `PUT /api/conversations/:id/thinking` with `{ level }`
+- `GET /api/conversations/:id/search?q=&limit=&before=`: `{ matches: [{ entryId, role, excerpt }], before }`,
+  newest first; pass `before` back for the next page
 - `POST /api/conversations/:id/messages` with `{ content, requestId?, whenBusy?: "followUp" | "steer" }`
 - `POST /api/conversations/:id/abort` (returns once the conversation is idle)
 - `WS /api/conversations/:id/stream` sends one `state` frame (the newest 50 entries and the live state), then an
@@ -81,9 +138,9 @@ node src/cli.ts log                   # print the transcript
   answer, or the `reason` and `detail` of a failed run. The server pings every 30 s and drops a stream that does
   not answer.
 
-Both HTTP and WebSocket requests must use the configured listen name/address or an explicitly trusted hostname,
-at the actual listener port. If present, `Origin` must also match that same HTTP origin. Host validation is not
-authentication: bind only to loopback or the private tailnet address.
+Both HTTP and WebSocket requests must name the server as `127.0.0.1` or `localhost`, at the actual listener port. If
+present, `Origin` must also match that same HTTP origin. This stops a web page on another site from driving the
+server through the browser. It is not authentication: any process on the machine can connect.
 
 ## Test
 
@@ -92,4 +149,6 @@ npm run check
 npm test
 ```
 
-Tests use temporary files, fake credentials and the fake model.
+Tests use temporary files, fake credentials and the fake model. The page test drives headless Chrome over the
+DevTools protocol; it finds Chrome in the usual places or at `CHROME_PATH`, and is skipped when there is none. In faux mode, a message of the form
+`call <tool> <json arguments>` makes the fake model call that tool once, to try the tools by hand.

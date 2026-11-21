@@ -23,6 +23,12 @@ export type StreamFrame =
   | { type: "settled"; submissionId: number; status: "done"; answer: string }
   | { type: "settled"; submissionId: number; status: "unanswered"; reason: string; detail?: JsonValue };
 
+/** The dollars spent in a usage ledger: every model and tool bucket. */
+export function usageCost(usage: UsageState): number {
+  return [...Object.values(usage.models), ...Object.values(usage.tools)]
+    .reduce((total, bucket) => total + bucket.cost.total, 0);
+}
+
 /** A failed run's reason code and, when the harness recorded one, its cause. */
 export function failureText(reason: string, detail?: JsonValue): string {
   if (detail === undefined || detail === null || detail === "") return reason;
@@ -34,8 +40,7 @@ export function streamState(view: ConversationView): Extract<StreamFrame, { type
   const live = (view.docs["pi.live"] ?? {}) as LiveState;
   const model = (view.docs["pi.agent"]?.model ?? null) as ModelRef | null;
   const usage = (view.docs["pi.usage"] ?? { models: {}, tools: {} }) as UsageState;
-  const cost = [...Object.values(usage.models), ...Object.values(usage.tools)]
-    .reduce((total, bucket) => total + bucket.cost.total, 0);
+  const cost = usageCost(usage);
   return {
     type: "state",
     id: view.conversation.id,

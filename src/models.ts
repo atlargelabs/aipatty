@@ -1,5 +1,5 @@
 import {
-  contentText, createModels, fauxAssistantMessage, fauxProvider, getModelType,
+  contentText, createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, getModelType,
   type AnyModel, type Api, type Model, type Models, type Provider,
 } from "@earendil-works/pi-ai";
 import { getBuiltinModelDataGeneratedAt } from "@earendil-works/pi-ai/providers/all";
@@ -71,9 +71,21 @@ function withOverlay(base: Provider, overlay: readonly Model<Api>[]): Provider {
 
 function demoProvider(): Provider {
   const faux = fauxProvider({ tokensPerSecond: 80, tokenSize: { min: 3, max: 3 } });
+  // `call <tool> <json arguments>` makes it call that tool once, then report the result: for demos and tests of tools.
   const respond = () => faux.appendResponses([context => {
+    const last = context.messages.at(-1);
+    if (last?.role === "toolResult") return fauxAssistantMessage(`Faux tool result: ${contentText(last.content)}`);
     const input = context.messages.findLast(message => message.role === "user");
-    return fauxAssistantMessage(`Faux reply: ${input ? contentText(input.content) : "Hello!"}`);
+    const text = input ? contentText(input.content) : "Hello!";
+    const call = /^call (\w+) (\{.*\})$/s.exec(text);
+    if (call) {
+      try {
+        return fauxAssistantMessage(fauxToolCall(call[1], JSON.parse(call[2])), { stopReason: "toolUse" });
+      } catch {
+        return fauxAssistantMessage(`Faux reply: invalid JSON in ${text}`);
+      }
+    }
+    return fauxAssistantMessage(`Faux reply: ${text}`);
   }]);
   return {
     ...faux.provider,

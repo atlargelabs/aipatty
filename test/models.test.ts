@@ -4,13 +4,12 @@ import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import assert from "node:assert/strict";
 import { readFile, readdir, writeFile } from "node:fs/promises";
 import { test } from "node:test";
-import { readConfig } from "../src/config.ts";
 import { openHost } from "../src/host.ts";
 import { openModels } from "../src/models.ts";
-import { fixture, fixtureEnv } from "./helpers.ts";
+import { fixture, realConfig } from "./helpers.ts";
 
 test("the OpenAI provider uses the saved subscription credential", async t => {
-  const config = readConfig(fixtureEnv(await fixture(t), { AIPATTY_FAUX: "0" }));
+  const config = realConfig(await fixture(t));
   await writeFile(config.authFile, JSON.stringify({ openai: {
     type: "oauth", access: "fake-access", refresh: "fake-refresh", expires: Date.now() + 3_600_000,
   } }));
@@ -21,7 +20,7 @@ test("the OpenAI provider uses the saved subscription credential", async t => {
 
 test("newer pi CLI catalog entries are overlaid by model type and id, offline and read-only", async t => {
   const dir = await fixture(t);
-  const config = readConfig(fixtureEnv(dir, { AIPATTY_FAUX: "0" }));
+  const config = realConfig(dir);
   const bundled = openaiProvider().getModels().find(model => model.id === "gpt-6.1-sol");
   assert.ok(bundled);
   const added = { ...bundled, id: "gpt-6.2-sol", name: "GPT-6.2 Sol" };
@@ -54,7 +53,7 @@ test("newer pi CLI catalog entries are overlaid by model type and id, offline an
 
 test("missing, malformed and stale catalog snapshots fall back to bundled models", async t => {
   const dir = await fixture(t);
-  const config = readConfig(fixtureEnv(dir, { AIPATTY_FAUX: "0" }));
+  const config = realConfig(dir);
   async function unavailable() {
     const host = await openHost(config);
     assert.deepEqual(await host.modelStatus(), {
@@ -86,7 +85,7 @@ test("missing, malformed and stale catalog snapshots fall back to bundled models
 
 test("the default model is the openai provider's, taken from the cached catalog", async t => {
   const dir = await fixture(t);
-  const config = readConfig(fixtureEnv(dir, { AIPATTY_FAUX: "0" }));
+  const config = realConfig(dir);
   const bundled = (await openModels(config)).getModel("openai", "gpt-6.1-sol");
   assert.ok(bundled);
   const host = await openHost(config);

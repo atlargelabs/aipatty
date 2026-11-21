@@ -26,20 +26,19 @@ export async function fixture(t: TestContext): Promise<string> {
   return dir;
 }
 
-/** Use no real paths, even if test configuration changes provider. */
-export function fixtureEnv(dir: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  return {
-    AIPATTY_FAUX: "1",
-    AIPATTY_DATA_DIR: dir,
-    AIPATTY_PORT: "0",
-    AIPATTY_PI_DIR: dir,
-    ...overrides,
-  };
+/** Server options that use no real paths and ask for a free port. */
+export function fixtureArgs(dir: string): string[] {
+  return ["--data-dir", dir, "--port", "0", "--pi-dir", dir];
 }
 
-/** Build isolated, ephemeral-port server settings. */
+/** Isolated, ephemeral-port server settings on the fake model. */
 export function fauxConfig(dir: string) {
-  return readConfig(fixtureEnv(dir));
+  return readConfig(fixtureArgs(dir), { AIPATTY_FAUX: "1" });
+}
+
+/** The same on the real catalog: the bundled models plus any `models-store.json` in `dir`. */
+export function realConfig(dir: string) {
+  return readConfig(fixtureArgs(dir), {});
 }
 
 /** Collect frames starting with the first message, not just after the open event, and fold them as a client would. */
