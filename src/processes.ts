@@ -93,6 +93,13 @@ async function markedPids(runId: string, procs: readonly Proc[]): Promise<Set<nu
   return marked;
 }
 
+interface ProcessScan {
+  ours: Proc[];
+  unsure: Proc[];
+  groupsChanged: boolean;
+  scannedAt: number;
+}
+
 /**
  * The live processes that belong to a run: those it remembers (same ID and start time), those carrying its marker,
  * the members of the groups its processes led, and everything reached from them as a child or as a member of the
@@ -107,19 +114,19 @@ async function markedPids(runId: string, procs: readonly Proc[]): Promise<Set<nu
  * Forgets empty groups and cutoffs invalidated by a clock rollback. The result is from a process table read last,
  * after the slower environment scan: act on it at once.
  */
-async function scan(owned: Owned, runId: string): Promise<{ ours: Proc[]; unsure: Proc[]; groupsChanged: boolean }> {
+async function scan(owned: Owned, runId: string): Promise<ProcessScan> {
   const before = new Map((await listProcesses()).map(proc => [proc.pid, proc.start]));
   const marked = await markedPids(runId, [...before].map(([pid, start]) => ({ pid, ppid: 0, pgid: 0, start })));
   const procs = await listProcesses();
   const byPid = new Map(procs.map(proc => [proc.pid, proc]));
   const liveGroups = new Set(procs.map(proc => proc.pgid));
-  const now = Date.now();
+  const scannedAt = Date.now();
   let groupsChanged = false;
   for (const [pgid, seenAt] of owned.groups) {
     if (!liveGroups.has(pgid)) {
       owned.groups.delete(pgid);
       groupsChanged = true;
-    } else if (seenAt !== null && seenAt > now) {
+    } else if (seenAt !== null && seenAt > scannedAt) {
       owned.groups.set(pgid, null);
       groupsChanged = true;
     }
@@ -156,7 +163,7 @@ async function scan(owned: Owned, runId: string): Promise<{ ours: Proc[]; unsure
   }
   const unsure = procs.filter(proc => candidate(proc) && !ours.has(proc.pid)
     && (owned.unverifiedProcs.get(proc.pid) === proc.start || leaderless(proc)));
-  return { ours: [...ours.values()], unsure, groupsChanged };
+  return { ours: [...ours.values()], unsure, groupsChanged, scannedAt };
 }
 
 /** The live processes that belong to a run; see `scan`. Rejects when the process table cannot be read. */
@@ -167,8 +174,8 @@ export async function runProcesses(owned: Owned, runId: string): Promise<Proc[]>
 /** Poll a live run, returning whether its recovery record needs updating. */
 export async function trackRunProcesses(owned: Owned, runId: string): Promise<boolean> {
   const seenAt = Date.now();
-  const { ours, groupsChanged } = await scan(owned, runId);
-  const learned = remember(owned, ours, seenAt);
+  const { ours, groupsChanged, scannedAt } = await scan(owned, runId);
+  const learned = remember(owned, ours, seenAt <= scannedAt ? seenAt : undefined);
   return learned || groupsChanged;
 }
 
@@ -178,6 +185,7 @@ export async function trackRunProcesses(owned: Owned, runId: string): Promise<bo
  * Returns whether the record changed.
  */
 export function remember(owned: Owned, procs: readonly Proc[], seenAt?: number): boolean {
+  if (seenAt !== undefined && seenAt > Date.now()) seenAt = undefined;
   let changed = false;
   for (const proc of procs) {
     if (owned.procs.get(proc.pid) !== proc.start) {
@@ -209,16 +217,23 @@ function signal(pid: number, name: NodeJS.Signals): void {
  * `graceMs` to stop its own children, as Pi and the delegates extension do; whatever is left is killed. Every
  * signal goes to a process found, by ID and start time, in a process table read just before, so a process that
  * took over a dead one's ID is not signalled. Returns what is left: the survivors, and the processes that could not
- * be told from the run's, which are not signalled. `record` saves what the run remembers whenever that grows.
+ * be told from the run's, which are not signalled. `record` saves new or invalidated ownership evidence.
  * Rejects when the table cannot be read.
  */
 export async function stopRun(
   owned: Owned, runId: string, root: number | undefined, graceMs: number, term?: () => void, record?: () => Promise<unknown>,
 ): Promise<Proc[]> {
-  // Remember the tree before it comes apart, and have the caller save it: a group found only now would otherwise
-  // be forgotten if this process dies with a member of it still alive.
-  const tree = await runProcesses(owned, runId);
-  if (remember(owned, tree)) await record?.();
+  // Save what changed before signalling: a new group could otherwise be lost on a crash, and a discarded
+  // cutoff must not become usable again on restart. Recheck the targets' identities after a write.
+  const recordScan = async ({ ours, groupsChanged }: ProcessScan) => {
+    const learned = remember(owned, ours);
+    if (!record || (!learned && !groupsChanged)) return ours;
+    await record();
+    if (!ours.length) return ours;
+    const starts = new Map((await listProcesses()).map(proc => [proc.pid, proc.start]));
+    return ours.filter(proc => starts.get(proc.pid) === proc.start);
+  };
+  const tree = await recordScan(await scan(owned, runId));
   const rootStart = root === undefined ? undefined : owned.procs.get(root);
   if (root !== undefined && rootStart !== undefined && tree.some(proc => proc.pid === root && proc.start === rootStart)) {
     // Through the live child handle when there is one, which cannot reach a process that reused the ID.
@@ -233,10 +248,11 @@ export async function stopRun(
   let left: Proc[] = [];
   let unsure: Proc[] = [];
   for (let attempt = 0; attempt < 20; attempt++) {
-    ({ ours: left, unsure } = await scan(owned, runId));
+    const scanned = await scan(owned, runId);
+    ({ ours: left, unsure } = scanned);
+    const targets = await recordScan(scanned);
     if (!left.length) break;
-    if (remember(owned, left)) await record?.();
-    for (const proc of left) signal(proc.pid, "SIGKILL");
+    for (const proc of targets) signal(proc.pid, "SIGKILL");
     await sleep(150);
   }
   return [...left, ...unsure];

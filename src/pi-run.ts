@@ -631,6 +631,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
   // A run the previous process left: stop it, clean up, and report its call `interrupted`. It is never run again.
   let left: SavedRun | undefined;
   try {
+    const readAt = Date.now();
     const saved = await readJson<unknown>(stateFile);
     // Anything the file holds that is not a run of this data directory, `null` included, is a damaged record.
     if (saved !== undefined && !ownRecord(saved)) throw new Error("it does not describe a run of this data directory");
@@ -639,6 +640,10 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       // them as potential blockers (without the time), and require independent evidence before signalling.
       const { asOf: _asOf, groups, procs, ...run } = saved;
       left = { ...run, groups: groups.map(pgid => [pgid, null]), procs: [], unverifiedProcs: procs };
+    } else if (saved && saved.groups.some(([, seenAt]) => seenAt !== null && seenAt > readAt)) {
+      // Persist this before replaying the run's logs: a future cutoff could become usable while we wait.
+      left = { ...saved, groups: saved.groups.map(([pgid, seenAt]) => [pgid, seenAt !== null && seenAt > readAt ? null : seenAt]) };
+      await writeJson(stateFile, left);
     } else {
       left = saved;
     }

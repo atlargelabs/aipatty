@@ -886,10 +886,34 @@ test("a run's processes are found by environment marker and by the groups they l
     assert.ok(!("asOf" in saved));
   }
 
-  // A clock rollback (or a damaged record) can leave an observation time ahead of recovery.
-  await writeFile(stateFile, JSON.stringify({ ...record, procs: [], groups: [[leader.pid, Date.now() + 60_000]] }));
-  const recovered = await openPiRuns(config);
+  const withClock = async <T>(first: number, later: number, run: () => Promise<T>): Promise<T> => {
+    let readings = 0;
+    const clock = t.mock.method(Date, "now", () => readings++ === 0 ? first : later);
+    try {
+      return await run();
+    } finally {
+      clock.mock.restore();
+    }
+  };
+  const cutoff = Date.now() + 1_000;
+  const futureRecord = JSON.stringify({ ...record, procs: [], groups: [[leader.pid, cutoff]] });
+  const eventsFile = join(logDir, "events.jsonl");
+  // Recovery takes another clock reading when replaying the tool start. The bad timestamp must stay invalid
+  // even after the clock catches up during replay, before the first process scan.
+  await writeFile(eventsFile, JSON.stringify(delegate("c1", { id: "replay", profile: "crmanager", task: "Review.", cost: 0 })[0].emit) + "\n");
+  await writeFile(stateFile, futureRecord);
+  const recovered = await withClock(cutoff - 1, cutoff + 1, () => openPiRuns(config));
   await assert.rejects(recovered.run(request({ pr: false })), /1 process\(es\) could not be stopped, or could not be told from the run's/);
+  assert.ok(alive(orphan) && existsSync(workspace));
+  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).groups, [[leader.pid, null]]);
+
+  // If the clock steps back after load and the transcript can't be read, the stop scan must still save the
+  // invalidation, even when no owned process is found and recovery exits without finalizing the record.
+  await rm(eventsFile);
+  await mkdir(eventsFile);
+  await writeFile(stateFile, futureRecord);
+  const unreadable = await withClock(cutoff + 1, cutoff - 1, () => openPiRuns(config));
+  await assert.rejects(unreadable.run(request({ pr: false })), /events could not be read/);
   assert.ok(alive(orphan) && existsSync(workspace));
   assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).groups, [[leader.pid, null]]);
 
@@ -900,13 +924,16 @@ test("a run's processes are found by environment marker and by the groups they l
   assert.deepEqual(recorded, []);
   const fresh = start(["-e", idle], { PATTY_RUN_ID: `${marker}-b` }, true);
   await until(async () => (await listProcesses()).some(proc => proc.pid === fresh.pid));
-  let aliveWhenRecorded = false;
+  const rolledBack = newOwned([], [[fresh.pid!, cutoff]]);
+  assert.equal(await withClock(cutoff, cutoff - 1, () => trackRunProcesses(rolledBack, `${marker}-b`)), true);
+  assert.ok(rolledBack.procs.has(fresh.pid!), "keep the confirmed identity from the poll");
+  assert.equal(rolledBack.groups.get(fresh.pid!), null, "do not restore a future cutoff after a rollback");
+  const records: { groups: number[]; alive: boolean }[] = [];
   assert.deepEqual(await stopRun(learning, `${marker}-b`, undefined, 0, undefined, async () => {
-    recorded = [...learning.groups.keys()];
-    aliveWhenRecorded = alive(fresh.pid!);
+    records.push({ groups: [...learning.groups.keys()], alive: alive(fresh.pid!) });
   }), []);
-  assert.deepEqual(recorded, [fresh.pid]);
-  assert.ok(aliveWhenRecorded);
+  assert.deepEqual(records[0], { groups: [fresh.pid], alive: true });
+  assert.deepEqual(records.at(-1)?.groups, [], "the forgotten group is also persisted");
 
   assert.deepEqual(await stopRun(owned, marker, undefined, 0), []);
   await until(() => !alive(marked.pid!) && !alive(orphan));
