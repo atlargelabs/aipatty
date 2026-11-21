@@ -37,8 +37,9 @@ for (const step of scenario.steps ?? []) {
     writeFileSync(join(dir, "child-1.log"), "delegate log");
     writeFileSync(join(dir, "lease.json"), JSON.stringify({ pid: process.pid }));
     writeFileSync(join(dir, "job.json"), JSON.stringify({
-      id: step.job.id, ownerSession: step.job.session ?? sessionId, parentId: step.job.parentId, finishedAt: step.job.finishedAt,
-      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: step.job.cost ?? 0, turns: 1 },
+      id: step.job.id, ownerSession: step.job.session ?? sessionId, parentId: step.job.parentId,
+      startedAt: step.job.startedAt, finishedAt: step.job.finishedAt,
+      usage: step.job.usage ?? { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: step.job.cost ?? 0, turns: 1 },
       workspace: { kind: "clone", path: join(dir, "workspace"), source: step.job.source ?? process.cwd() },
     }));
   }

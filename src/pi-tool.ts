@@ -49,7 +49,7 @@ export function piExtension(getRuns: () => PiRuns) {
       const thinking = args.thinking ?? "high";
       if (!thinkingLevels.some(level => level === thinking)) throw new Error(`Expected a thinking level: ${thinkingLevels.join(", ")}`);
       return result(await getRuns().run({
-        conversationId: api.conversationId, callId: api.callId, task: args.task, pr: args.pr ?? true, base, model, thinking,
+        conversationId: api.conversationId, taskId: api.taskId, task: args.task, pr: args.pr ?? true, base, model, thinking,
         timeoutMs: (args.timeoutMinutes ?? defaultMinutes) * 60_000,
       }, context.abortSignal));
     },
@@ -62,7 +62,7 @@ export function piExtension(getRuns: () => PiRuns) {
   const afterPi = hook(ToolTask, {
     async afterTool(call, written, api) {
       if (call.name !== "pi" || call.parent || !written.diagnostics?.some(diagnostic => ended.has(diagnostic.code ?? ""))) return undefined;
-      const outcome = await getRuns().settled(api.conversationId, call.id);
+      const outcome = await getRuns().settled(api.taskId);
       return outcome ? result(outcome) : undefined;
     },
   });

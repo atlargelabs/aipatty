@@ -44,8 +44,9 @@ in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits fo
   only when all of this holds, and `failed` otherwise:
   - Pi exited cleanly: the event stream is well-formed and ends settled, with a last message that stopped normally.
   - `gh` confirms the PR: open, against `main`, with a body that links a confirmed issue.
-  - The last finished `crmanager` review was a `/review pr` of that PR at its head commit, stated the verdict
-    "correct", and had no P0 or P1 finding. Otherwise the result says `NOT REVIEWED` and why.
+  - The last finished `crmanager` review was a `/review pr` of that PR, in a clone of this repository, at its
+    head commit; it declared the verdict "correct"; and it had no P0 or P1 finding. Otherwise the result says
+    `NOT REVIEWED` and why.
 
   CI on the PR's head commit is the authoritative check. The tool does not wait for it.
 - **Cost.** Pi's spend and its delegates' is charged to the calling branch, once. When a run is cut off, the
@@ -71,7 +72,8 @@ extension: at `git/github.com/earendil-works/pi-review/review.ts` in the Pi dire
 directory's `settings.json` says. A run that must end with a PR is refused when the extension is missing.
 
 A run's processes are found by parent, by the process groups its processes led, and by a marker in their
-environment. A process that leaves both its parent and its group, and hides its environment, is not found.
+environment. A process that leaves both its parent and its group, and hides its environment, is not found. No
+process is signalled unless a process table read just before shows it, by ID and start time, to be the run's.
 
 ## Page
 

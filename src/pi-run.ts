@@ -1,5 +1,5 @@
 import type { Usage } from "@earendil-works/pi-ai";
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream, type WriteStream } from "node:fs";
 import { cp, lstat, mkdir, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
@@ -8,7 +8,7 @@ import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import type { Config } from "./config.ts";
 import { instructions, taskPrompt } from "./pi-prompt.ts";
-import { addUsage, githubLink, readReport, RunTrace, type JobUsage, type Review } from "./pi-trace.ts";
+import { addUsage, githubLink, readReport, RunTrace, usageKey, type JobUsage, type Review } from "./pi-trace.ts";
 import { listProcesses, newOwned, remember, runProcesses, RUN_MARKER, stopRun, type Owned } from "./processes.ts";
 
 const exec = promisify(execFile);
@@ -49,7 +49,8 @@ export interface RunOutcome {
 
 export interface RunRequest {
   conversationId: number;
-  callId: string;
+  /** The harness task of the tool call: what a call is known by across an abort or a restart. */
+  taskId: number;
   task: string;
   /** Whether the run must end with a PR. */
   pr: boolean;
@@ -64,7 +65,7 @@ export interface RunRequest {
 interface SavedRun {
   runId: string;
   conversationId: number;
-  callId: string;
+  taskId: number;
   pr: boolean;
   startedAt: string;
   workspace: string;
@@ -73,6 +74,10 @@ interface SavedRun {
   pid?: number;
   procs: [number, string][];
   groups: number[];
+  /** When the processes were last seen. */
+  asOf: number;
+  /** Whether the spend of the run's cut-off delegate jobs has been added to its outcome. */
+  reconciled: boolean;
 }
 
 interface ActiveRun {
@@ -90,6 +95,7 @@ interface ActiveRun {
 interface JobManifest {
   parentId?: string;
   ownerSession?: string;
+  startedAt?: string;
   finishedAt?: string;
   usage?: JobUsage;
   workspace?: { source?: string };
@@ -101,10 +107,10 @@ const maxItem = 600;
 const defaultPollMs = 2_000;
 const outcomesKept = 50;
 const graceMs = 5_000;
+/** The longest event kept whole. Longer ones are the CLI's copies of a whole conversation, which the host does not read. */
+const maxLine = 16 * 1024 * 1024;
 
-function callKey(conversationId: number, callId: string): string {
-  return `${conversationId}:${callId}`;
-}
+const isMissing = (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT";
 
 function clip(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}… (${text.length - max} more characters)` : text;
@@ -128,37 +134,52 @@ async function readJson<T>(path: string): Promise<T | undefined> {
   try {
     text = await readFile(path, "utf8");
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    if (isMissing(error)) return undefined;
     throw error;
   }
   return JSON.parse(text) as T;
 }
 
-/** Feed complete lines to `onLine`. Pi's stream is split on LF only: other separators are valid inside its JSON. */
-function lineSplitter(onLine: (line: string) => void) {
+/**
+ * Feed complete lines to `onLine`. Pi's stream is split on LF only: other separators are valid inside its JSON. A
+ * line longer than `maxLine` is passed cut short, with `whole` false, so memory stays bounded.
+ */
+function lineSplitter(onLine: (line: string, whole: boolean) => void) {
   const decoder = new StringDecoder("utf8");
   let rest = "";
+  let cut = false;
   const feed = (text: string) => {
-    rest += text;
-    let end: number;
-    while ((end = rest.indexOf("\n")) >= 0) {
-      onLine(rest.slice(0, end));
-      rest = rest.slice(end + 1);
+    for (let from = 0; from < text.length;) {
+      const end = text.indexOf("\n", from);
+      const part = text.slice(from, end < 0 ? text.length : end);
+      if (rest.length + part.length > maxLine) {
+        rest += part.slice(0, maxLine - rest.length);
+        cut = true;
+      } else {
+        rest += part;
+      }
+      if (end < 0) break;
+      onLine(rest, !cut);
+      rest = "";
+      cut = false;
+      from = end + 1;
     }
   };
   return {
     write: (chunk: Buffer) => feed(decoder.write(chunk)),
     end: () => {
       feed(decoder.end());
-      if (rest) onLine(rest);
+      if (rest) onLine(rest, !cut);
       rest = "";
+      cut = false;
     },
   };
 }
 
-/** Streaming deltas repeat what the completed messages carry; the retained transcript leaves them out. */
-function retained(line: string): boolean {
-  return !line.startsWith('{"type":"message_update"') && !line.startsWith('{"type":"tool_execution_update"');
+/** Events that only repeat what others carry: streaming deltas, and the copies of whole turns and conversations. */
+const repeats = ["message_update", "tool_execution_update", "turn_end", "agent_end"].map(type => `{"type":"${type}"`);
+function repeated(line: string): boolean {
+  return repeats.some(prefix => line.startsWith(prefix));
 }
 
 function reviewOf(trace: RunTrace, pr: RunOutcome["pr"], requested: boolean): RunOutcome["review"] {
@@ -168,8 +189,9 @@ function reviewOf(trace: RunTrace, pr: RunOutcome["pr"], requested: boolean): Ru
   const { verdict, sha, important, lesser } = last;
   const status = verdict !== "correct" || important > 0 ? "findings"
     : !pr?.confirmed ? "unverified"
-    // The same head commit under another request, such as `/review commit`, is not a review of the PR's whole diff.
-    : last.pr !== pr.number || sha !== pr.headSha ? "stale" : "clean";
+    // The same head commit under another request, such as `/review commit`, is not a review of the PR's whole diff,
+    // and the same number in a clone of another repository is another PR.
+    : !last.ownRepo || last.pr !== pr.number || sha !== pr.headSha ? "stale" : "clean";
   return { status, verdict, sha, important, lesser };
 }
 
@@ -177,7 +199,7 @@ const reviewText: Record<RunOutcome["review"]["status"], string> = {
   clean: "reviewed",
   missing: "NOT REVIEWED: no crmanager review finished",
   findings: "NOT REVIEWED CLEAN: the last review has important findings or states no \"correct\" verdict",
-  stale: "NOT REVIEWED: the last review was not a `/review pr` of this PR at its head commit",
+  stale: "NOT REVIEWED: the last review was not a `/review pr` of this PR, in this repository, at its head commit",
   unverified: "NOT REVIEWED: the PR head could not be confirmed, so the review cannot be matched to it",
   none: "not requested",
 };
@@ -222,7 +244,7 @@ export interface PiRuns {
    * The outcome of a call whose result the harness did not get from the tool: aborted, or cut off by a restart.
    * Stops the call's run if it is still working, and waits for its cleanup.
    */
-  settled(conversationId: number, callId: string): Promise<RunOutcome | undefined>;
+  settled(taskId: number): Promise<RunOutcome | undefined>;
   /** Stop the active run's processes and leave its cleanup and its result to the next start. */
   close(): Promise<void>;
 }
@@ -241,7 +263,11 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
   const inside = (parent: string, child: string) => resolve(child).startsWith(resolve(parent) + sep);
   /** Whether `path` is a real directory, not a link to one, directly inside `parent`. */
   const ownDir = async (parent: string, path: string) => {
-    const stat = await lstat(path).catch(() => undefined);
+    const stat = await lstat(path).catch(error => {
+      // Only a missing path is "not there": anything else leaves the question open.
+      if (isMissing(error)) return undefined;
+      throw error;
+    });
     return !!stat?.isDirectory() && !stat.isSymbolicLink()
       && await realpath(path) === join(await realpath(parent), path.slice(resolve(parent).length + 1));
   };
@@ -253,28 +279,37 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
   // harness can still be given it when the process dies, or the call is aborted, before the result is committed.
   let outcomes = new Map<string, RunOutcome>();
   try {
-    outcomes = new Map(Object.entries(await readJson<Record<string, RunOutcome>>(outcomesFile) ?? {}));
+    const saved = await readJson<Record<string, RunOutcome>>(outcomesFile);
+    if (saved !== undefined && (saved === null || typeof saved !== "object" || Array.isArray(saved))) throw new Error("expected a JSON object");
+    outcomes = new Map(Object.entries(saved ?? {}));
   } catch (error) {
+    // Each run's log directory has its own copy, with the call it belongs to: rebuild the index from the newest.
     const aside = `${outcomesFile}.unreadable-${Date.now()}`;
     await rename(outcomesFile, aside).catch(() => {});
-    console.error(`Pi runs: ${outcomesFile} could not be read (${message(error)}); moved to ${aside}.`);
+    for (const runId of (await readdir(logRoot)).sort().slice(-outcomesKept)) {
+      const kept = await readJson<RunOutcome & { taskId?: unknown }>(join(logRoot, runId, "result.json")).catch(() => undefined);
+      if (kept && typeof kept === "object" && typeof kept.taskId === "number") outcomes.set(String(kept.taskId), kept);
+    }
+    console.error(`Pi runs: ${outcomesFile} could not be read (${message(error)}); moved to ${aside} and rebuilt from the run logs.`);
   }
   const remembered = async (saved: SavedRun, outcome: RunOutcome) => {
-    outcomes.set(callKey(saved.conversationId, saved.callId), outcome);
+    outcomes.set(String(saved.taskId), outcome);
     for (const key of [...outcomes.keys()].slice(0, Math.max(0, outcomes.size - outcomesKept))) outcomes.delete(key);
+    await writeJson(join(saved.logDir, "result.json"), { ...outcome, taskId: saved.taskId }).catch(() => {});
     await writeJson(outcomesFile, Object.fromEntries(outcomes));
-    await writeJson(join(saved.logDir, "result.json"), outcome).catch(() => {});
   };
 
   /**
-   * Account for and clear away the delegate jobs a run started. A job belongs to the run when it carries the run's
-   * session ID or was cloned from the run's workspace or from another of its jobs. Their logs are kept, the spend
-   * of jobs that never reported is added from their manifests, and their clones, which the extension leaves in the
-   * agent directory, are deleted.
+   * The delegate jobs a run started. A job belongs to the run when it carries the run's session ID or was cloned
+   * from the run's workspace or from another of its jobs. Throws when the jobs cannot be listed.
    */
-  async function collectJobs(saved: SavedRun, trace: RunTrace, outcome: RunOutcome, reconcile: boolean): Promise<void> {
+  async function findJobs(saved: SavedRun, trace: RunTrace, outcome: RunOutcome): Promise<{ jobs: Map<string, JobManifest>; ours: Set<string> }> {
     const jobs = new Map<string, JobManifest>();
-    for (const id of await readdir(jobsDir).catch(() => [] as string[])) {
+    const ids = await readdir(jobsDir).catch(error => {
+      if (isMissing(error)) return [] as string[];
+      throw error;
+    });
+    for (const id of ids) {
       const dir = join(jobsDir, id);
       // A job directory that is a link could lead anywhere.
       if (!await ownDir(jobsDir, dir)) continue;
@@ -301,19 +336,39 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         }
       }
     }
-    // Spend the event stream did not carry: jobs cut off before their call reported. A finished job's usage includes
-    // the jobs it started, as a reported one's does, so a job below either is already counted.
-    const reported = (id: string) => trace.countedJobs.has(id) && !trace.continuing.has(id);
-    for (const id of reconcile ? ours : []) {
+    return { jobs, ours };
+  }
+
+  /**
+   * Add the spend the event stream did not carry: that of jobs cut off before their call reported, from their
+   * manifests. A job's usage includes the jobs it started once it has finished, as a reported one's does.
+   */
+  function reconcile(trace: RunTrace, outcome: RunOutcome, jobs: Map<string, JobManifest>, ours: Set<string>): void {
+    const continuing = trace.continuing;
+    // Whether a result covers the job's manifest. A job being continued is covered only until its manifest is
+    // replaced by the new attempt's, which starts from zero.
+    const reported = (id: string) => trace.countedJobs.has(id)
+      && (!continuing.has(id) || usageKey(jobs.get(id)?.usage) === trace.countedJobs.get(id));
+    for (const id of ours) {
       if (reported(id)) continue;
+      const job = jobs.get(id)!;
       let covered = false;
       const walked = new Set([id]);
-      for (let parent = jobs.get(id)?.parentId; parent !== undefined && !walked.has(parent); parent = jobs.get(parent)?.parentId) {
-        walked.add(parent);
-        if (ours.has(parent) && (reported(parent) || jobs.get(parent)?.finishedAt !== undefined)) covered = true;
+      for (let parentId = job.parentId; parentId !== undefined && !walked.has(parentId); parentId = jobs.get(parentId)?.parentId) {
+        walked.add(parentId);
+        const parent = jobs.get(parentId);
+        if (!ours.has(parentId) || !parent) continue;
+        // Counted with a parent that reported or finished, or with an earlier attempt of a parent since continued.
+        const earlier = trace.countedJobs.has(parentId) && typeof job.startedAt === "string" && typeof parent.startedAt === "string"
+          && job.startedAt < parent.startedAt;
+        if (reported(parentId) || parent.finishedAt !== undefined || earlier) covered = true;
       }
-      if (!covered) addUsage(outcome.usage, jobs.get(id)?.usage);
+      if (!covered) addUsage(outcome.usage, job.usage);
     }
+  }
+
+  /** Keep the jobs' logs, then delete their clones, which the extension leaves in the agent directory. */
+  async function discardJobs(saved: SavedRun, ours: Set<string>): Promise<void> {
     for (const id of ours) {
       const dir = join(jobsDir, id);
       const clone = join(dir, "workspace");
@@ -327,25 +382,33 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
   }
 
   /**
-   * Stop what is left of a run, keep its logs, and delete its workspace and its delegates' clones. False when
-   * something of the run is still there: the caller then keeps the run's record and admits no new run.
+   * Stop what is left of a run, add its cut-off delegates' spend, keep its logs, and delete its workspace and its
+   * delegates' clones. False when something of the run is still there, or could not be looked at: the caller then
+   * keeps the run's record and admits no new run.
    */
   async function cleanUp(
-    saved: SavedRun, owned: Owned, trace: RunTrace, outcome: RunOutcome, options: { term?: () => void; reconcile?: boolean } = {},
+    saved: SavedRun, owned: Owned, trace: RunTrace, outcome: RunOutcome, options: { term?: () => void; save?: () => Promise<unknown> } = {},
   ): Promise<boolean> {
     try {
       const left = await stopRun(owned, saved.runId, saved.pid, graceMs, options.term);
+      const { jobs, ours } = await findJobs(saved, trace, outcome);
+      if (!saved.reconciled) {
+        reconcile(trace, outcome, jobs, ours);
+        saved.reconciled = true;
+        await options.save?.();
+      }
       if (left.length) {
         outcome.problems.push(`${left.length} process(es) of the run could not be stopped (${left.map(proc => proc.pid).join(", ")}); its workspace was left in ${saved.workspace}.`);
         outcome.usageComplete = false;
         return false;
       }
-      await collectJobs(saved, trace, outcome, options.reconcile ?? true);
+      await discardJobs(saved, ours);
       // Only the directory this host made for the run, never a path a damaged record names.
       if (saved.workspace !== join(config.runsDir, saved.runId)) throw new Error(`${saved.workspace} is not this run's workspace`);
-      if (await lstat(saved.workspace).catch(() => undefined)) {
-        if (!await ownDir(config.runsDir, saved.workspace)) throw new Error(`${saved.workspace} is not a directory of ${config.runsDir}`);
+      if (await ownDir(config.runsDir, saved.workspace)) {
         await rm(saved.workspace, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+      } else if (await lstat(saved.workspace).catch(error => { if (!isMissing(error)) throw error; })) {
+        throw new Error(`${saved.workspace} is not a directory of ${config.runsDir}`);
       }
       return true;
     } catch (error) {
@@ -373,6 +436,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     const prUrl = trace.prLinks.at(-1) ?? reported.pr;
     const prLink = prUrl ? githubLink(prUrl, pi.repo, "pull") : undefined;
     let body = "";
+    let closes: (number | undefined)[] = [];
     if (!prUrl) {
       problem("No PR was found, though one was requested.");
     } else if (!prLink) {
@@ -380,12 +444,16 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     } else {
       outcome.pr = { url: prLink.url, number: prLink.number, confirmed: false };
       try {
-        const pr = await gh(["pr", "view", String(prLink.number), "--repo", pi.repo, "--json", "number,url,state,headRefOid,baseRefName,body"]) as {
+        const pr = await gh(["pr", "view", String(prLink.number), "--repo", pi.repo, "--json", "number,url,state,headRefOid,baseRefName,body,closingIssuesReferences"]) as {
           state?: string; headRefOid?: string; baseRefName?: string; body?: string;
+          closingIssuesReferences?: { number?: number; repository?: { name?: string; owner?: { login?: string } } }[];
         };
         if (typeof pr.headRefOid !== "string" || !/^[0-9a-f]{40}$/.test(pr.headRefOid)) throw new Error("no head commit in gh's answer");
         outcome.pr = { ...outcome.pr, headSha: pr.headRefOid, state: pr.state ?? "UNKNOWN", confirmed: true };
         body = pr.body ?? "";
+        closes = (pr.closingIssuesReferences ?? [])
+          .filter(issue => `${issue.repository?.owner?.login}/${issue.repository?.name}`.toLowerCase() === pi.repo.toLowerCase())
+          .map(issue => issue.number);
         if (pr.state !== "OPEN") problem(`The PR is ${pr.state?.toLowerCase()}, not open.`);
         if (pr.baseRefName !== "main") problem(`The PR targets ${pr.baseRefName}, not main.`);
       } catch (error) {
@@ -403,9 +471,11 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       try {
         await gh(["issue", "view", String(issueLink.number), "--repo", pi.repo, "--json", "number,state"]);
         outcome.issue.confirmed = true;
-        if (outcome.pr?.confirmed && !new RegExp(`#${issueLink.number}\\b`).test(body)) {
-          problem(`The PR body does not link issue #${issueLink.number}.`);
-        }
+        // GitHub's own reading of the body, or, before it has caught up, an unqualified reference in the body:
+        // `other/repo#11` is another repository's issue.
+        const linked = closes.includes(issueLink.number)
+          || new RegExp(`(?<![\\w/.-])#${issueLink.number}\\b`).test(body) || body.includes(issueLink.url);
+        if (outcome.pr?.confirmed && !linked) problem(`The PR does not link issue #${issueLink.number}.`);
       } catch (error) {
         problem(`The issue could not be confirmed with gh: ${clip(message(error), 300)}`);
       }
@@ -434,16 +504,22 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
   }
 
   /** Whether a saved record names the directories this host gives a run, so that cleanup deletes nothing else. */
-  const ownRecord = (saved: SavedRun) => typeof saved.runId === "string" && /^[0-9A-Za-z][\w-]*$/.test(saved.runId)
-    && saved.workspace === join(config.runsDir, saved.runId) && saved.logDir === join(logRoot, saved.runId)
-    && Number.isSafeInteger(saved.conversationId) && typeof saved.callId === "string"
-    && Array.isArray(saved.procs) && Array.isArray(saved.groups);
+  const ownRecord = (saved: unknown): saved is SavedRun => {
+    const run = saved as SavedRun | null;
+    return typeof run === "object" && run !== null
+      && typeof run.runId === "string" && /^[0-9A-Za-z][\w-]*$/.test(run.runId)
+      && run.workspace === join(config.runsDir, run.runId) && run.logDir === join(logRoot, run.runId)
+      && Number.isSafeInteger(run.conversationId) && Number.isSafeInteger(run.taskId)
+      && Array.isArray(run.procs) && Array.isArray(run.groups) && typeof run.asOf === "number";
+  };
 
   // A run the previous process left: stop it, clean up, and report its call `interrupted`. It is never run again.
   let left: SavedRun | undefined;
   try {
-    left = await readJson<SavedRun>(stateFile);
-    if (left && !ownRecord(left)) throw new Error("it does not describe a run of this data directory");
+    const saved = await readJson<unknown>(stateFile);
+    // Anything the file holds that is not a run of this data directory, `null` included, is a damaged record.
+    if (saved !== undefined && !ownRecord(saved)) throw new Error("it does not describe a run of this data directory");
+    left = saved;
   } catch (error) {
     left = undefined;
     stuck = `The record of an earlier Pi run, ${stateFile}, cannot be used (${clip(message(error), 300)}). Its processes and workspace may still be there. `
@@ -451,31 +527,33 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     console.error(`Pi runs: ${stuck}`);
   }
   if (left) {
+    const saved = left;
     const trace = new RunTrace(pi.repo);
-    const split = lineSplitter(line => trace.line(line));
+    const split = lineSplitter((line, whole) => trace.line(line, whole));
     try {
-      for await (const chunk of createReadStream(join(left.logDir, "events.jsonl"))) split.write(chunk as Buffer);
+      for await (const chunk of createReadStream(join(saved.logDir, "events.jsonl"))) split.write(chunk as Buffer);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.error(`Pi run ${left.runId}: its events could not be read:`, error);
+      if (!isMissing(error)) console.error(`Pi run ${saved.runId}: its events could not be read:`, error);
     }
     split.end();
-    const key = callKey(left.conversationId, left.callId);
+    const key = String(saved.taskId);
     // A run that had already settled keeps its outcome; only its cleanup is finished here.
-    const outcome = outcomes.get(key) ?? baseOutcome(left, trace, "interrupted");
+    const outcome = outcomes.get(key) ?? baseOutcome(saved, trace, "interrupted");
     if (!outcomes.has(key)) {
       outcome.summary = "aipatty stopped while this run was in progress. The run was stopped and is not run again; "
         + "it may have partially run. Check GitHub for what it published before starting another.";
       outcome.usageComplete = false;
       unconfirmedLinks(trace, outcome);
     }
-    // An outcome settled before the restart already has its delegates' spend.
-    const clean = await cleanUp(left, newOwned(left.procs, left.groups), trace, outcome, { reconcile: !outcomes.has(key) });
-    await remembered(left, outcome);
+    const clean = await cleanUp(saved, newOwned(saved.procs, saved.groups, saved.asOf), trace, outcome, {
+      save: () => writeJson(stateFile, saved),
+    });
+    await remembered(saved, outcome);
     if (clean) {
       await rm(stateFile, { force: true });
-      console.error(`Pi run ${left.runId} was interrupted by a restart; its processes and workspace are cleaned up.`);
+      console.error(`Pi run ${saved.runId} was interrupted by a restart; its processes and workspace are cleaned up.`);
     } else {
-      stuck = `Pi run ${left.runId} could not be cleaned up after a restart: ${outcome.problems.at(-1)} No new run starts until that is resolved and aipatty restarted.`;
+      stuck = `Pi run ${saved.runId} could not be cleaned up after a restart: ${outcome.problems.at(-1)} No new run starts until that is resolved and aipatty restarted.`;
       console.error(`Pi runs: ${stuck}`);
     }
   }
@@ -493,20 +571,40 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
 
     // One writer at a time, and none once the run's record is handed over.
     let recording = true;
-    let saving = Promise.resolve();
-    const save = () => saving = saving.then(async () => {
-      if (recording) await writeJson(stateFile, { ...saved, procs: [...run.owned.procs], groups: [...run.owned.groups] });
-    }).catch(error => console.error(`Pi run ${saved.runId}: could not save its record:`, error));
+    let saving: Promise<unknown> = Promise.resolve();
+    const write = () => saving = saving.catch(() => {}).then(async () => {
+      if (!recording) return;
+      await writeJson(stateFile, { ...saved, procs: [...run.owned.procs], groups: [...run.owned.groups], asOf: run.owned.asOf });
+    });
+    const save = () => write().catch(error => console.error(`Pi run ${saved.runId}: could not save its record:`, error));
     /** Remember a process this host started for the run, before waiting on it. */
     const adopt = async (pid: number | undefined) => {
       if (pid === undefined) return;
       const own = (await listProcesses().catch(() => [])).find(proc => proc.pid === pid);
-      if (own) remember(run.owned, [own]);
+      if (own) remember(run.owned, [own], Date.now());
       await save();
     };
+    /** The children this host started itself and still holds: stopped through their handles when all else fails. */
+    const held = new Set<ChildProcess>();
     let stopping = Promise.resolve();
     run.kill = () => {
-      stopping = stopping.then(async () => { await stopRun(run.owned, saved.runId, saved.pid, graceMs, term); }).catch(() => {});
+      stopping = stopping.then(async () => {
+        try {
+          await stopRun(run.owned, saved.runId, saved.pid, graceMs, term);
+        } catch (error) {
+          // The process table could not be read. Kill what this host started, by handle and so by group: each
+          // leads its own. What they started is left to the cleanup, which keeps the slot closed if it cannot look.
+          console.error(`Pi run ${saved.runId}: could not stop its processes by scanning:`, error);
+          for (const child of held) {
+            if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) continue;
+            try {
+              process.kill(-child.pid, "SIGKILL");
+            } catch {
+              child.kill("SIGKILL");
+            }
+          }
+        }
+      });
     };
     // The deadline covers the whole run, cloning included.
     const timer = setTimeout(() => {
@@ -525,6 +623,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     const command = async (file: string, args: string[], cwd?: string): Promise<string> => {
       if (run.stop) throw new Error("the run was stopped");
       const child = spawn(file, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true });
+      held.add(child);
+      child.once("close", () => held.delete(child));
       let out = "", err = "";
       child.stdout.on("data", (chunk: Buffer) => { out = (out + chunk).slice(0, 1024 * 1024); });
       child.stderr.on("data", (chunk: Buffer) => { err = (err + chunk).slice(-8_000); });
@@ -544,7 +644,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     try {
       await mkdir(saved.logDir, { recursive: true, mode: 0o700 });
       await mkdir(saved.workspace, { recursive: true, mode: 0o700 });
-      await save();
+      // Nothing starts without the record a later process needs to stop it.
+      await write();
       if (request.pr) {
         // The review cannot run without pi-review, and the delegates extension only says so once a review is asked for.
         const settings = await readJson<{ delegates?: { reviewExtension?: unknown } }>(join(pi.agentDir, "settings.json")).catch(() => undefined);
@@ -592,6 +693,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
           "--no-context-files", "--no-mcp", "--append-system-prompt", rules,
         ], { cwd: repo, env, stdio: ["pipe", "pipe", "pipe"], detached: true });
         launched = true;
+        held.add(child);
+        child.once("close", () => held.delete(child));
         term = () => { child.kill("SIGTERM"); };
         const exited = new Promise<number | null>(resolveExit => {
           child.once("error", error => {
@@ -627,9 +730,9 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         };
         const keepEvent = throttled(child.stdout, events);
         const keepError = throttled(child.stderr, errors);
-        const split = lineSplitter(line => {
-          trace.line(line);
-          if (retained(line)) keepEvent(line + "\n");
+        const split = lineSplitter((line, whole) => {
+          trace.line(line, whole);
+          if (whole && !repeated(line)) keepEvent(line + "\n");
         });
         child.stdout.on("data", (chunk: Buffer) => split.write(chunk));
         child.stderr.on("data", (chunk: Buffer) => {
@@ -644,8 +747,9 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         // Remember the processes the run starts while their parents still live: a delegate leads its own group.
         let polling: Promise<void> | undefined;
         const poll = setInterval(() => {
+          const seenAt = Date.now();
           polling ??= runProcesses(run.owned, saved.runId).then(async procs => {
-            if (remember(run.owned, procs)) await save();
+            if (remember(run.owned, procs, seenAt)) await save();
           }).catch(() => {}).finally(() => { polling = undefined; });
         }, pollMs);
         code = await exited;
@@ -663,19 +767,19 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     }
     clearTimeout(timer);
     await stopping;
-    await saving;
+    await saving.catch(() => {});
 
     // A stopped host leaves the workspace, the saved run and the result to the next start.
     if (run.stop === "shutdown") {
       await stopRun(run.owned, saved.runId, saved.pid, 0, term).catch(() => {});
       await save();
-      await saving;
       return undefined;
     }
     // From here the run ends as it ended: a later abort or shutdown gets this outcome.
     run.finalizing = true;
 
-    const ok = launched && code === 0 && trace.settled && !trace.aborted && trace.lastStop === "stop" && trace.malformed === 0 && !problems.length;
+    const ok = launched && code === 0 && trace.settled && !trace.aborted && trace.lastStop === "stop"
+      && trace.malformed === 0 && trace.oversized === 0 && !problems.length;
     const outcome = baseOutcome(saved, trace, run.stop ?? (ok ? "completed" : "failed"));
     outcome.problems.push(...problems);
     if (outcome.status === "aborted") outcome.summary = "The run was aborted. It may have partially run.";
@@ -683,6 +787,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     if (launched && outcome.status === "failed" && !problems.length) {
       if (trace.events === 0) outcome.problems.push("Pi produced no event stream.");
       if (trace.malformed) outcome.problems.push(`Pi's output had ${trace.malformed} line(s) that were not JSON events; the result is not trusted.`);
+      if (trace.oversized) outcome.problems.push(`Pi's output had ${trace.oversized} event(s) too long to read; the result is not trusted.`);
       if (code !== 0) outcome.problems.push(`Pi exited with ${code === null ? "a signal" : `code ${code}`}.`);
       else if (!trace.settled) outcome.problems.push("Pi exited before it reported the run as settled.");
       else if (trace.lastStop !== "stop") outcome.problems.push(`Pi's last message ended with "${trace.lastStop}"${trace.lastError ? `: ${clip(trace.lastError, 400)}` : ""}.`);
@@ -714,18 +819,25 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     }
     if (trace.unfinishedDelegates) outcome.problems.push(`${trace.unfinishedDelegates} delegate call(s) were cut off before they reported; the cost includes what their jobs had recorded.`);
     if (trace.unaccountedDelegates) outcome.problems.push(`${trace.unaccountedDelegates} delegate call(s) ended without a result; their spend is not included.`);
-    const clean = await cleanUp(saved, run.owned, trace, outcome, { term });
+    const clean = await cleanUp(saved, run.owned, trace, outcome, { term, save });
     // `completed` only when everything the host checked holds.
     if (outcome.status === "completed" && outcome.problems.length) outcome.status = "failed";
     outcome.problems = outcome.problems.slice(0, maxItems);
     // Saved by call before the run's record goes: the harness may not have committed the result when this process dies.
-    await remembered(saved, outcome);
-    recording = false;
-    await saving;
-    if (clean) {
-      await rm(stateFile, { force: true });
-    } else {
+    // The outcome is settled now. Whatever fails from here keeps the slot closed, and still returns it.
+    let handed = clean;
+    try {
+      await remembered(saved, outcome);
+      recording = false;
+      await saving.catch(() => {});
+      if (clean) await rm(stateFile, { force: true });
+    } catch (error) {
+      handed = false;
+      outcome.problems.push(`The run's record could not be closed: ${clip(message(error), 300)}`);
+    }
+    if (!handed) {
       stuck = `Pi run ${saved.runId} could not be cleaned up: ${outcome.problems.at(-1)} No new run starts until that is resolved and aipatty restarted.`;
+      console.error(`Pi runs: ${stuck}`);
     }
     return outcome;
   }
@@ -742,10 +854,11 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       signal?.throwIfAborted();
       const runId = `${new Date().toISOString().replace(/[-:]|\.\d+Z$/g, "")}-${randomUUID().slice(0, 8)}`;
       const saved: SavedRun = {
-        runId, conversationId: request.conversationId, callId: request.callId, pr: request.pr,
-        startedAt: new Date().toISOString(), workspace: join(config.runsDir, runId), logDir: join(logRoot, runId), procs: [], groups: [],
+        runId, conversationId: request.conversationId, taskId: request.taskId, pr: request.pr,
+        startedAt: new Date().toISOString(), workspace: join(config.runsDir, runId), logDir: join(logRoot, runId),
+        procs: [], groups: [], asOf: Date.now(), reconciled: false,
       };
-      const run: ActiveRun = { saved, owned: newOwned(), finalizing: false, kill: () => {}, done: Promise.resolve(undefined) };
+      const run: ActiveRun = { saved, owned: newOwned([], [], saved.asOf), finalizing: false, kill: () => {}, done: Promise.resolve(undefined) };
       active = run;
       const onAbort = () => {
         if (run.finalizing) return;
@@ -775,9 +888,9 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       }
       return outcome;
     },
-    async settled(conversationId, callId) {
-      const key = callKey(conversationId, callId);
-      if (active && callKey(active.saved.conversationId, active.saved.callId) === key) {
+    async settled(taskId) {
+      const key = String(taskId);
+      if (active && active.saved.taskId === taskId) {
         if (!active.finalizing) {
           active.stop ??= "aborted";
           active.kill();

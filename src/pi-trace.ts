@@ -6,6 +6,8 @@ export interface Review {
   request: string;
   /** The PR the delegate was asked to review, when the request names one of this repository by number or URL. */
   pr?: number;
+  /** Whether the delegate's clone was of this repository, so that a PR number means this repository's PR. */
+  ownRepo: boolean;
   /** Whether the delegate finished; a failed review has no verdict. */
   finished: boolean;
   /** The commit the delegate reviewed, when it reviewed one. */
@@ -77,17 +79,31 @@ function contentText(content: unknown): string {
 
 /**
  * Read a review's findings and verdict from the reviewer's text, in the format pi-review asks for. The verdict is
- * the last line that states one. Prose that merely uses the word, or a summary cut off before its verdict, is
- * `unknown`, and a line naming both verdicts is the cautious one.
+ * the last line that mentions one, and only if that line opens by declaring it, as in `**Verdict: correct.**`.
+ * Prose that uses the words, a negation, or a summary cut off before its verdict, is `unknown`; a line that names
+ * "needs attention" at all is that.
  */
 export function readReview(summary: string): Pick<Review, "verdict" | "important" | "lesser"> {
   const important = summary.match(/\[P[01]\]/g)?.length ?? 0;
   const lesser = summary.match(/\[P[23]\]/g)?.length ?? 0;
   const stated = summary.split(/\r?\n/).findLast(line => /\bverdict\b/i.test(line)) ?? "";
-  const after = stated.slice(stated.search(/\bverdict\b/i));
-  const verdict = /needs[ _-]attention/i.test(after) ? "needs attention"
-    : /^verdict(?:\s+is)?\W{0,12}correct\b/i.test(after) ? "correct" : "unknown";
+  const declared = /^(?:the\s+)?(?:overall\s+|final\s+)?verdict(?:\s+is)?[\s:*_"'`“”–—-]{0,8}(correct|needs[ _-]attention)\b/i
+    .exec(stated.replace(/^[\s>#*_-]+/, ""));
+  const verdict = /needs[ _-]attention/i.test(stated) ? "needs attention"
+    : declared?.[1].toLowerCase() === "correct" ? "correct" : "unknown";
   return { verdict, important, lesser };
+}
+
+/** `owner/name` of a GitHub remote, from its SSH or HTTPS URL. */
+export function remoteRepo(url: unknown): string | undefined {
+  if (typeof url !== "string") return undefined;
+  return /^(?:git@github\.com:|ssh:\/\/git@github\.com\/|https:\/\/github\.com\/)([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/.exec(url.trim())?.[1];
+}
+
+/** A job's usage as one comparable value. */
+export function usageKey(usage: unknown): string {
+  const value = record(usage) ? usage : {};
+  return [value.input, value.output, value.cacheRead, value.cacheWrite, value.cost].map(number).join("/");
 }
 
 /** The `<result>` block Pi is asked to end with. */
@@ -123,8 +139,12 @@ export class RunTrace {
   sessionId: string | undefined;
   /** Pi's own model calls and its delegates', each counted once. */
   readonly usage = emptyUsage();
-  /** Delegate jobs whose newest result, and so whose spend, was seen. */
-  readonly countedJobs = new Set<string>();
+  /** Delegate jobs whose results were seen, each with the usage its newest result reported. */
+  readonly countedJobs = new Map<string, string>();
+  /** Jobs that a call which ended without a result was continuing. */
+  private readonly lostContinuations = new Set<string>();
+  /** Records too long to keep, of a kind the host reads. */
+  oversized = 0;
   /** Delegate calls that ended without a result to account for. */
   unaccountedDelegates = 0;
   readonly reviews: Review[] = [];
@@ -153,9 +173,12 @@ export class RunTrace {
     return [...this.pending.values()].filter(call => delegateTools.has(call.tool)).length;
   }
 
-  /** Jobs an unfinished call was continuing: an earlier result of theirs does not cover that work. */
+  /**
+   * Jobs that a call was continuing when it was cut off or ended without a result: their newest result does not
+   * cover that work.
+   */
   get continuing(): Set<string> {
-    const ids = new Set<string>();
+    const ids = new Set(this.lostContinuations);
     for (const call of this.pending.values()) {
       if (!delegateTools.has(call.tool) || !record(call.args)) continue;
       for (const task of Array.isArray(call.args.tasks) ? call.args.tasks : [call.args]) {
@@ -165,9 +188,16 @@ export class RunTrace {
     return ids;
   }
 
-  line(line: string): void {
+  /** One line of the stream. `whole` is false for a record that was too long to keep. */
+  line(line: string, whole = true): void {
     const text = line.endsWith("\r") ? line.slice(0, -1) : line;
     if (!text.trim()) return;
+    if (!whole) {
+      // The CLI's copies of a whole turn or conversation are not read. Anything else that long is a loss.
+      if (/^\{"type":"(agent_end|turn_end|message_update|tool_execution_update)"/.test(text)) this.events++;
+      else this.oversized++;
+      return;
+    }
     let event: unknown;
     try {
       event = JSON.parse(text);
@@ -231,11 +261,17 @@ export class RunTrace {
     const results = Array.isArray(reported) ? reported : [reported];
     const tasks = record(args) && Array.isArray(args.tasks) ? args.tasks : [args];
     let accounted = 0;
+    tasks.forEach((task, index) => {
+      const job = results[index];
+      if (record(job) && typeof job.id === "string") return;
+      if (record(task) && typeof task.continue === "string") this.lostContinuations.add(task.continue);
+    });
     results.forEach((job, index) => {
       if (!record(job) || typeof job.id !== "string") return;
       accounted++;
       // Each call reports the work of that call: a continued job reports again under the same ID, with new spend.
-      this.countedJobs.add(job.id);
+      this.countedJobs.set(job.id, usageKey(job.usage));
+      this.lostContinuations.delete(job.id);
       // A job's usage already includes the delegates it started itself.
       addUsage(this.usage, job.usage);
       if (record(job.delivery) && typeof job.delivery.prUrl === "string") this.link(job.delivery.prUrl);
@@ -248,6 +284,7 @@ export class RunTrace {
       const summary = typeof job.summary === "string" ? job.summary : "";
       this.reviews.push({
         request, finished,
+        ownRepo: remoteRepo(record(job.workspace) ? job.workspace.remoteUrl : undefined)?.toLowerCase() === this.repo.toLowerCase(),
         pr: asked?.[1] !== "pr" ? undefined
           : /^[1-9]\d*$/.test(asked[2]) ? Number(asked[2]) : githubLink(asked[2], this.repo, "pull")?.number,
         // A review of uncommitted changes names the commit it started from, not what it reviewed.
