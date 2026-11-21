@@ -44,7 +44,8 @@ async function openBrowser(t: TestContext, flags: string[] = []) {
 
   // Chrome writes the port it chose to this file once DevTools listens.
   const portFile = join(profile, "DevToolsActivePort");
-  const port = await until(async () => (await readFile(portFile, "utf8").catch(() => "")).split("\n")[0]);
+  // The first launch on a cold machine, such as a CI runner, can take longer than the default wait.
+  const port = await until(async () => (await readFile(portFile, "utf8").catch(() => "")).split("\n")[0], Boolean, 40_000);
   const target = await until<{ type: string; webSocketDebuggerUrl: string } | undefined>(async () => {
     const targets = await (await fetch(`http://127.0.0.1:${port}/json`)).json() as { type: string; webSocketDebuggerUrl: string }[];
     return targets.find(candidate => candidate.type === "page");
@@ -118,7 +119,7 @@ async function say(host: AgentHost, id: string, content: string): Promise<void> 
   assert.equal((await (await host.submit(conversation, { type: "input", content })).wait(ctx)).status, "done");
 }
 
-test("clicking a branch in the page's list switches to it, and back", { skip: chrome ? false : "no Chrome found; set CHROME_PATH", timeout: 30_000 }, async t => {
+test("clicking a branch in the page's list switches to it, and back", { skip: chrome ? false : "no Chrome found; set CHROME_PATH", timeout: 60_000 }, async t => {
   const dir = await fixture(t);
   const host = await openHost(fauxConfig(dir));
   const api = await startApi(host, health, 0);
@@ -154,7 +155,7 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
   assert.deepEqual(browser.errors, []);
 });
 
-test("Send by the name localhost admits once, preserves a new draft, and shows a failed run", { skip: !chrome, timeout: 30_000 }, async t => {
+test("Send by the name localhost admits once, preserves a new draft, and shows a failed run", { skip: !chrome, timeout: 60_000 }, async t => {
   const host = await openHost(realConfig(await fixture(t)));
   await host.setModel({ provider: "openai", modelId: "gpt-6.1-sol" }); // available model, no login in this fixture
   const gate = Promise.withResolvers<void>();
@@ -186,7 +187,7 @@ test("Send by the name localhost admits once, preserves a new draft, and shows a
   assert.deepEqual(browser.errors, []);
 });
 
-test("an older page is requested once and cannot overwrite a different branch", { skip: !chrome, timeout: 30_000 }, async t => {
+test("an older page is requested once and cannot overwrite a different branch", { skip: !chrome, timeout: 60_000 }, async t => {
   const host = await openHost(fauxConfig(await fixture(t)));
   const api = await startApi(host, health, 0);
   t.after(async () => { await api.close(); await host.harness.close(ctx); });
@@ -225,7 +226,7 @@ test("an older page is requested once and cannot overwrite a different branch", 
   assert.deepEqual(browser.errors, []);
 });
 
-test("a click on another branch lands while the current branch is streaming", { skip: chrome ? false : "no Chrome found; set CHROME_PATH", timeout: 30_000 }, async t => {
+test("a click on another branch lands while the current branch is streaming", { skip: chrome ? false : "no Chrome found; set CHROME_PATH", timeout: 60_000 }, async t => {
   const host = await openHost(fauxConfig(await fixture(t)));
   const api = await startApi(host, health, 0);
   t.after(async () => { await api.close(); await host.harness.close(ctx); });

@@ -9,8 +9,10 @@ import { applyUpdate, type StreamFrame } from "../src/protocol.ts";
 
 export const checkout = join(import.meta.dirname, "..");
 
-export async function until<T>(read: () => Promise<T> | T, done: (value: T) => boolean = Boolean): Promise<T> {
-  const deadline = Date.now() + 10_000;
+export async function until<T>(
+  read: () => Promise<T> | T, done: (value: T) => boolean = Boolean, timeoutMs = 10_000,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
   for (;;) {
     const value = await read();
     if (done(value)) return value;
