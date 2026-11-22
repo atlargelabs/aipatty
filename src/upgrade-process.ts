@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { LOOPBACK, DEFAULT_PORT, shutdownHeader } from "./config.ts";
 import { ownDataDir, OwnerBusy } from "./ownership.ts";
+import { listProcesses, newOwned, runProcesses, stopRun } from "./processes.ts";
 import { command } from "./upgrade-release.ts";
 import { ownedFile, upgradeChildEnv, upgradeProtocol, type ProcessIdentity, type UpgradeJournal, type UpgradePaths } from "./upgrade-state.ts";
 
@@ -59,11 +60,37 @@ export async function getHealth(port: number): Promise<UpgradeHealth> {
 }
 
 export async function identify(pid: number): Promise<ProcessIdentity | undefined> {
-  const start = (await command("ps", ["-p", String(pid), "-o", "lstart="], { env: psEnv, ms: probeMs, exitCodes: [0, 1] })).trim();
-  if (start) return { pid, start };
+  const row = (await command("ps", ["-p", String(pid), "-o", "stat=,lstart="], { env: psEnv, ms: probeMs, exitCodes: [0, 1] })).trim();
+  const match = /^(\S+)\s+(.+)$/.exec(row);
+  if (match) return match[1].startsWith("Z") ? undefined : { pid, start: match[2] };
   // If ps did not find the process, distinguish absence from failure to inspect a still-live PID.
   try { process.kill(pid, 0); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return; throw error; }
   throw new Error(`Cannot identify process ${pid}`);
+}
+
+export const stageMarker = (id: string) => `upgrade-stage-${id}`;
+
+/** Stage commands inherit the recorded worker's group and marker. Never trust a reused/leaderless group alone. */
+export async function reapStage(j: UpgradeJournal): Promise<void> {
+  const worker = j.stageProcess;
+  if (!worker) return; // Not authorized to spawn commands before its identity is persisted.
+  const marker = stageMarker(j.id);
+  const rootIsOurs = (await runProcesses(newOwned(), marker)).some(p => p.pid === worker.pid && p.start === worker.start);
+  if (!rootIsOurs && (await identify(worker.pid))?.start === worker.start) {
+    throw new Error(`Cannot verify the staging marker on PID ${worker.pid}; inspect before recovering`);
+  }
+  const owned = newOwned(rootIsOurs ? [[worker.pid, worker.start]] : [], [worker.pid]);
+  const left = await stopRun(owned, marker, worker.pid, 250);
+  if (left.length) throw new Error(`Cannot prove staging processes exited (${left.map(p => p.pid).join(", ")}); leave the private stage in place and investigate`);
+}
+
+/** The stage worker itself is still the live group leader when it publishes or removes its private checkout. */
+export async function assertStageIdle(id: string): Promise<void> {
+  const group = (await listProcesses()).filter(p => p.pid !== process.pid && p.pgid === process.pid);
+  // ps is itself a short-lived member on some platforms. Don't mistake the probe for a staging command.
+  const repeat = await listProcesses();
+  const found = group.some(p => repeat.some(next => next.pid === p.pid && next.start === p.start && next.pgid === process.pid));
+  if (found || (await runProcesses(newOwned(), stageMarker(id))).length) throw new Error("Staging still has subprocesses");
 }
 
 function assertOwnerFiles(paths: UpgradePaths): void {
@@ -256,9 +283,12 @@ export async function stopCandidate(server: ServerChild): Promise<void> {
   })]);
 }
 
-export function leaveRunning(server: ServerChild): void {
-  // Commit has already been synced. The private disconnect lets the server re-read it and serve; it also
-  // covers helper loss after commit, without a second commit message that could be lost on crash.
-  if (server.child.connected) server.child.disconnect();
-  server.child.unref();
+export function detachServer(server: ServerChild): void {
+  // The child decides from the synced journal whether disconnect means serve or close. Release the IPC and
+  // process handles even if the coordinator cannot read the journal or prove the child stopped.
+  try { if (server.child.connected) server.child.disconnect(); }
+  finally {
+    server.child.channel?.unref();
+    server.child.unref();
+  }
 }

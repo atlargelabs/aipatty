@@ -98,7 +98,7 @@ async function openBrowser(t: TestContext, flags: string[] = []) {
 /** What the page shows: the header title, the highlighted branch, the URL fragment and the visible messages. */
 interface Shown { title: string; current: string | null; hash: string; messages: string[] }
 const shown = `({
-  title: document.getElementById("title").textContent,
+  title: document.getElementById("title")?.textContent ?? "",
   current: document.querySelector("#branch-list li.current div")?.textContent ?? null,
   hash: location.hash,
   messages: [...document.querySelectorAll("#entries .entry")].map(entry => entry.lastChild.textContent),

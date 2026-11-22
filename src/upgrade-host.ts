@@ -8,7 +8,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import type { Config } from "./config.ts";
 import { HttpError, type AgentHost } from "./host.ts";
 import { OwnerBusy } from "./ownership.ts";
-import { openUpgradeLog } from "./upgrade-process.ts";
+import { openUpgradeLog, reapStage } from "./upgrade-process.ts";
 import {
   errorText, exists, finish, idPattern, ownedFile, resultText, sameInstall, upgradeEntryKind,
   UpgradePaths, type UpgradeJournal,
@@ -63,7 +63,7 @@ function assertSelected(paths: UpgradePaths, source: string, commit: string, exp
 interface StartupState { paths: UpgradePaths; journal: UpgradeJournal }
 
 /** Run under owner.sqlite and before opening Durable storage or Pi recovery. */
-export function guardStartup(config: Config, source: string, commit: string, childId?: string): StartupState | undefined {
+export async function guardStartup(config: Config, source: string, commit: string, childId?: string): Promise<StartupState | undefined> {
   const paths = UpgradePaths.forStartup(config);
   if (!paths) {
     if (childId !== undefined) throw new Error("Validation start requires the managed upgrade layout and journal");
@@ -86,6 +86,7 @@ export function guardStartup(config: Config, source: string, commit: string, chi
       j = paths.load();
       if (!j) throw new Error("Upgrade journal disappeared during startup");
       if (j.phase === "requested" || j.phase === "staging") {
+        if (j.phase === "staging") await reapStage(j);
         const unstaged = j.phase === "staging" ? paths.stagingLease(j.id) : undefined;
         try {
           assertSelected(paths, source, commit, j.old);
@@ -141,8 +142,10 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
     let drainStarted = false;
     const id = randomUUID();
     const settleHandoff = async (reason: string) => {
-      // A short bounded wait is solely for a racing explicit recover; there is no poller or supervisor to keep alive.
-      for (let attempt = 0; ; attempt++) {
+      // Reap the recorded group before settling; a bounded wait is only for a racing explicit recover or
+      // the stage worker finishing its own cleanup. There is no recurring background upgrade job.
+      const deadline = Date.now() + 30_000;
+      for (;;) {
         let unlock: (() => void) | undefined;
         try {
           unlock = paths.lease();
@@ -151,6 +154,7 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
           if (j.phase === "requested" || j.phase === "staging"
             || (j.phase === "stopping" && !drainStarted && paths.selected() === commit)) {
             // This same host still owns Durable storage; a dead helper cannot have advanced past stopping.
+            if (j.phase === "staging") await reapStage(j);
             const unstaged = j.phase === "staging" ? paths.stagingLease(j.id) : undefined;
             try {
               j = finish(j, { kind: "cancelled", active: commit, reason });
@@ -165,7 +169,7 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
           catch (error) { console.error(`Could not deliver upgrade ${id}:`, error); }
           break;
         } catch (error) {
-          if (error instanceof OwnerBusy && attempt < 40) { await sleep(100); continue; }
+          if (error instanceof OwnerBusy && Date.now() < deadline) { await sleep(100); continue; }
           console.error(`Could not settle upgrade ${id}:`, error);
           // A failing handoff must not wedge the old process. Uncertain cutover is the one exception.
           const j = paths.load();

@@ -4,16 +4,18 @@ import { randomUUID } from "node:crypto";
 import { closeSync, realpathSync, writeSync } from "node:fs";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { setTimeout as sleep } from "node:timers/promises";
 import { parseArgs } from "node:util";
 import { readConfig, type Config } from "./config.ts";
+import { RUN_MARKER } from "./processes.ts";
 import { backupDb, restoreDb } from "./upgrade-db.ts";
 import {
-  confirmActivation, getHealth, identify, launchServer, leaveRunning, legacyConnection, openUpgradeLog, probeServer,
-  quiescent, sendParent, stopCandidate, type ServerChild,
+  assertStageIdle, confirmActivation, detachServer, getHealth, identify, launchServer, legacyConnection, openUpgradeLog, probeServer,
+  quiescent, reapStage, sendParent, stageMarker, stopCandidate, type ServerChild,
 } from "./upgrade-process.ts";
 import { stageRelease, verifyRelease } from "./upgrade-release.ts";
 import {
-  errorText, exists, finish, idPattern, resultText, sameInstall, upgradeProtocol, UpgradePaths, type UpgradeJournal,
+  errorText, exists, finish, idPattern, resultText, sameInstall, upgradeProtocol, UpgradePaths, type ProcessIdentity, type UpgradeJournal,
 } from "./upgrade-state.ts";
 
 function noPi(paths: UpgradePaths): void {
@@ -28,12 +30,20 @@ async function verifySelected(paths: UpgradePaths, sha: string): Promise<void> {
 /** Child of the one-shot owner, not a public mode. Deadlines and command cleanup survive loss of that owner. */
 async function runStage(paths: UpgradePaths, config: Config, id: string, scriptRelease: string): Promise<void> {
   const signal = new AbortController();
-  process.once("disconnect", () => signal.abort(new Error("Staging supervisor disconnected")));
+  const authorized = await new Promise<boolean>(resolve => {
+    process.once("disconnect", () => {
+      signal.abort(new Error("Staging supervisor disconnected"));
+      resolve(false);
+    });
+    process.once("message", value => resolve(value === "prepare"));
+  });
+  if (!authorized) throw new Error("Stage worker was not authorized");
   const unlock = paths.stagingLease(id);
   let log: number | undefined;
   try {
     const j = paths.load();
-    if (!process.connected || j?.id !== id || j.phase !== "staging" || paths.selected() !== j.old) {
+    if (!process.connected || j?.id !== id || j.phase !== "staging" || j.stageProcess?.pid !== process.pid
+      || process.env[RUN_MARKER] !== stageMarker(id) || paths.selected() !== j.old) {
       throw new Error("Invalid or cancelled stage handoff");
     }
     sameInstall(j, config);
@@ -42,6 +52,7 @@ async function runStage(paths: UpgradePaths, config: Config, id: string, scriptR
       bootstrap: j.legacy ? scriptRelease : undefined,
       pinned: target => { paths.save({ ...j, target }); },
       note: text => { writeSync(log!, `${new Date().toISOString()} ${text}\n`); },
+      assertIdle: () => assertStageIdle(id),
     });
   } catch (error) {
     if (process.connected) await sendParent(errorText(error)).catch(() => {});
@@ -52,20 +63,43 @@ async function runStage(paths: UpgradePaths, config: Config, id: string, scriptR
   }
 }
 
-function prepare(paths: UpgradePaths, j: UpgradeJournal, source: string, log: number): Promise<void> {
+async function prepare(paths: UpgradePaths, j: UpgradeJournal, source: string, log: number, record: (p: ProcessIdentity) => void): Promise<void> {
+  if (!j.legacy && !process.connected) throw new Error("Requesting host exited before staging");
   const child = spawn(process.execPath, [join(source, "src/upgrade-supervisor.ts"), "stage",
     "--install-dir", paths.root, "--port", String(j.port), "--id", j.id], {
-    cwd: source, detached: true, stdio: ["ignore", log, log, "ipc"],
+    cwd: source, detached: true, env: { ...process.env, [RUN_MARKER]: stageMarker(j.id) }, stdio: ["ignore", log, log, "ipc"],
   });
   let failure: string | undefined;
   child.on("message", value => { if (typeof value === "string") failure = value; });
-  return new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("close", (code, signal) => {
-      if (code === 0) resolve();
-      else reject(new Error(failure ?? `Stage worker exited (${code ?? signal})`));
-    });
+  const completed = new Promise<Error | undefined>(resolve => {
+    child.once("error", resolve);
+    // All stdio is redirected; exit suffices, even if an already-disconnected IPC stream never emits close.
+    child.once("exit", (code, signal) => resolve(code === 0 ? undefined : new Error(failure ?? `Stage worker exited (${code ?? signal})`)));
   });
+  const disconnect = () => { if (child.connected) child.disconnect(); };
+  const parentLost = Promise.withResolvers<Error>();
+  const onHostExit = () => {
+    disconnect();
+    parentLost.resolve(new Error("Requesting host exited during staging"));
+  };
+  if (!j.legacy) process.once("disconnect", onHostExit);
+  try {
+    const identity = child.pid && await identify(child.pid);
+    if (!identity || !child.connected || (!j.legacy && !process.connected)) throw new Error("Stage handoff ended before the worker could be verified");
+    // A surviving owner can reap this group even if we lose the worker or both owners after it starts a command.
+    record(identity);
+    await new Promise<void>((resolve, reject) => child.send("prepare", error => error ? reject(error) : resolve()));
+    const error = await Promise.race([completed, parentLost.promise]);
+    if (error) throw error;
+  } finally {
+    process.off("disconnect", onHostExit);
+    disconnect();
+    const deadline = new AbortController();
+    try { await Promise.race([completed, sleep(3_000, undefined, { signal: deadline.signal })]); }
+    finally { deadline.abort(); }
+    child.channel?.unref();
+    child.unref();
+  }
 }
 
 /** One owner, one target, no retry. The only replayable part is safe restoration of the recorded old release. */
@@ -137,14 +171,13 @@ async function run(paths: UpgradePaths, args: {
         if (legacy.identity.pid !== old.child.pid) throw new Error("Rollback listener isn't the old process we launched");
       }
       const verified = done(current, { kind: "rolled-back", active: current.old, reason: current.reason ?? why });
-      leaveRunning(old);
+      detachServer(old);
       if (!current.legacy) await confirmActivation(old, current, current.old);
       return verified;
     } catch (error) {
       if (!current.legacy && paths.load()?.phase !== "done") await stopCandidate(old);
-      else leaveRunning(old); // A committed or legacy server can already have admitted work.
       throw error;
-    }
+    } finally { detachServer(old); }
   }
 
   try {
@@ -167,6 +200,7 @@ async function run(paths: UpgradePaths, args: {
       openLog();
       try {
         if (current.phase === "requested" || current.phase === "staging") {
+          if (current.phase === "staging") await reapStage(current);
           const unstaged = current.phase === "staging" ? paths.stagingLease(current.id) : undefined;
           try {
             await verifySelected(paths, current.old);
@@ -207,9 +241,10 @@ async function run(paths: UpgradePaths, args: {
     try {
       const initial = requireJournal();
       noPi(paths);
-      await prepare(paths, initial, scriptRelease, log!);
+      await prepare(paths, initial, scriptRelease, log!, stageProcess => { save({ ...initial, stageProcess }); });
       const prepared = paths.load();
       if (prepared?.id !== initial.id || prepared.phase !== "staging" || !prepared.target) throw new Error("Stage worker did not pin a target");
+      await reapStage(prepared);
       j = prepared;
       const sha = prepared.target;
       await verifySelected(paths, initial.old);
@@ -243,18 +278,22 @@ async function run(paths: UpgradePaths, args: {
       candidate = launchServer(paths, requireJournal(), sha, true);
       await probeServer(candidate, requireJournal(), sha, true);
       const verified = done(requireJournal(), { kind: "upgraded", active: sha });
-      leaveRunning(candidate);
+      detachServer(candidate);
       await confirmActivation(candidate, verified, sha);
       return verified;
     } catch (error) {
       const why = errorText(error);
       const current = paths.load() ?? requireJournal();
       if (current.phase === "done") {
-        if (candidate) leaveRunning(candidate);
         note(why);
         throw error; // Never restore over a possibly committed release.
       }
       if (current.phase === "requested" || current.phase === "staging") {
+        try { await reapStage(current); }
+        catch (cleanup) {
+          note(`STAGE CLEANUP FAILED: ${why}; ${errorText(cleanup)}. Journal retained.`);
+          throw cleanup;
+        }
         return done(current, { kind: "failed", active: await verifyOld(current, parent?.pid), reason: why });
       }
       try {
@@ -264,6 +303,8 @@ async function run(paths: UpgradePaths, args: {
         note(`ROLLBACK FAILED (${requireJournal().phase}): ${why}; ${errorText(failure)}. Journal and backup retained.`);
         throw new Error(`Upgrade failed: ${why}. Rollback failed: ${errorText(failure)}. See ${paths.log(current.id)} and ${paths.journal}; use recover after investigating.`);
       }
+    } finally {
+      if (candidate) detachServer(candidate);
     }
   } catch (error) {
     if (bootstrapId && log !== undefined) {

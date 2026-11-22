@@ -38,9 +38,14 @@ export interface UpgradeJournal {
   phase: typeof phases[number];
   target?: string;
   oldProcess?: ProcessIdentity;
+  stageProcess?: ProcessIdentity;
   reason?: string;
   result?: UpgradeResult;
   reported?: true;
+}
+
+function validProcess(value: ProcessIdentity | undefined): boolean {
+  return value === undefined || (!!value && Number.isSafeInteger(value.pid) && value.pid > 1 && typeof value.start === "string" && !!value.start);
 }
 
 export const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
@@ -212,8 +217,7 @@ export class UpgradePaths {
       || typeof j.legacy !== "boolean" || !phases.includes(j.phase)
       || (j.branch !== undefined && (!Number.isSafeInteger(j.branch) || j.branch < 1 || j.legacy))
       || (j.branch === undefined ? j.requestKey !== undefined : typeof j.requestKey !== "string" || !upgradeRequestKey.test(j.requestKey))
-      || (j.oldProcess !== undefined && (!j.oldProcess || !Number.isSafeInteger(j.oldProcess.pid) || j.oldProcess.pid < 2
-        || typeof j.oldProcess.start !== "string" || !j.oldProcess.start))
+      || !validProcess(j.oldProcess) || !validProcess(j.stageProcess)
       || (j.reason !== undefined && typeof j.reason !== "string")
       || (j.reported !== undefined && (j.phase !== "done" || j.reported !== true))
       || (j.phase === "done" ? !j.result || !outcomes.includes(j.result.kind) : j.result !== undefined)

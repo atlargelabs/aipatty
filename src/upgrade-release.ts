@@ -19,7 +19,9 @@ export function command(file: string, args: string[], options: {
   const { cwd, ms = gitMs, log, env, exitCodes = [0], signal } = options;
   signal?.throwIfAborted();
   return new Promise((done, reject) => {
-    const child = spawn(file, args, { cwd, env, detached: true, stdio: ["ignore", log ?? "pipe", log ?? "pipe"] });
+    // Commands given the stage signal inherit its recorded process group. The surviving owner can find them
+    // even if this worker is killed. Independent inspection commands keep their own transient group.
+    const child = spawn(file, args, { cwd, env, detached: signal === undefined, stdio: ["ignore", log ?? "pipe", log ?? "pipe"] });
     let out = "", err = "", exited = false;
     let failure: Error | undefined, reap: NodeJS.Timeout | undefined;
     child.stdout?.setEncoding("utf8").on("data", data => { out = (out + data).slice(-2_000_000); });
@@ -28,8 +30,10 @@ export function command(file: string, args: string[], options: {
       if (failure) return;
       failure = reason;
       if (!exited && child.pid !== undefined) {
-        // Only signal the group we just created and only while its leader is our live child.
-        try { process.kill(-child.pid, "SIGKILL"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") console.error(error); }
+        try {
+          if (signal) child.kill("SIGKILL"); // Coordinator/recover accounts for any descendants in the worker group.
+          else process.kill(-child.pid, "SIGKILL"); // Only the group we created while its leader is our live child.
+        } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") console.error(error); }
       }
       reap = setTimeout(() => {
         clean();
@@ -130,9 +134,9 @@ function syncTree(dir: string): void {
 /** Resolve one remote main tip into a fresh, private directory. Never use the live release's Git config. */
 export async function stageRelease(options: {
   paths: UpgradePaths; id: string; old: string; bootstrap?: string; origin: string; log: number; signal: AbortSignal;
-  pinned(sha: string): void; note(text: string): void;
+  pinned(sha: string): void; note(text: string): void; assertIdle(): Promise<void>;
 }): Promise<string> {
-  const { paths, id, old, bootstrap, origin, log, pinned, note, signal } = options;
+  const { paths, id, old, bootstrap, origin, log, pinned, note, signal, assertIdle } = options;
   const staging = join(paths.deploy, `.stage-${id}`);
   mkdirSync(staging, { mode: 0o700 }); // Exclusive: never reuse a half-prepared release.
   let reaped = true;
@@ -169,11 +173,13 @@ export async function stageRelease(options: {
     ownedDir(dependencies);
     syncTree(staging);
     await verifyBootstrap();
+    await assertIdle();
     signal.throwIfAborted();
     if (bootstrap) {
       // Only publish the checked pinned dependencies; the verified operator checkout already supplies the code.
       renameSync(dependencies, join(bootstrap, "node_modules"));
-      syncPath(bootstrap);
+      // The selected checkout's own sources and Git metadata also need to survive a reboot.
+      syncTree(bootstrap);
     } else {
       if (exists(dest)) throw new Error(`Release appeared during staging: ${dest}`);
       renameSync(staging, dest);
@@ -184,7 +190,11 @@ export async function stageRelease(options: {
     reaped = !(error instanceof UnreapedCommand);
     throw error;
   } finally {
-    // This is only the unique directory we created, never current or a published release.
-    if (reaped) rmSync(staging, { recursive: true, force: true });
+    // This is only the unique directory we created, never current or a published release. If the command
+    // left descendants, leave that private directory to inspect even after the coordinator reaps the group.
+    if (reaped && exists(staging)) {
+      const idle = await assertIdle().then(() => true, error => { note(`Retaining ${staging}: ${String(error)}`); return false; });
+      if (idle) rmSync(staging, { recursive: true, force: true });
+    }
   }
 }

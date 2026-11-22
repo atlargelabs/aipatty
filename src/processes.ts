@@ -28,7 +28,7 @@ export function newOwned(procs: Iterable<[number, string]> = [], groups: Iterabl
 
 async function ps(args: string[]): Promise<string> {
   // The C locale fixes the format of the start time.
-  return (await exec("ps", args, { maxBuffer: 64 * 1024 * 1024, env: { ...process.env, LC_ALL: "C" } })).stdout;
+  return (await exec("ps", args, { maxBuffer: 64 * 1024 * 1024, timeout: 5_000, env: { ...process.env, LC_ALL: "C" } })).stdout;
 }
 
 /** This process's own group, once the process table has been read: never a run's. */
@@ -36,9 +36,10 @@ let hostGroup: number | undefined;
 
 export async function listProcesses(): Promise<Proc[]> {
   const procs: Proc[] = [];
-  for (const line of (await ps(["-A", "-o", "pid=,ppid=,pgid=,lstart="])).split("\n")) {
-    const row = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s*$/.exec(line);
-    if (row) procs.push({ pid: Number(row[1]), ppid: Number(row[2]), pgid: Number(row[3]), start: row[4] });
+  for (const line of (await ps(["-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="])).split("\n")) {
+    const row = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(line);
+    // A zombie has exited and cannot keep an owner lock or do work. Some PID 1s take time to reap it.
+    if (row && !row[4].startsWith("Z")) procs.push({ pid: Number(row[1]), ppid: Number(row[2]), pgid: Number(row[3]), start: row[5] });
   }
   hostGroup = procs.find(proc => proc.pid === process.pid)?.pgid ?? hostGroup;
   return procs;

@@ -87,11 +87,11 @@ export interface AgentHost {
 }
 
 /** Open paused, so an unavailable saved model never executes interrupted work. */
-export async function openHost(config: Config, options: { paused?: boolean; beforeOpen?: () => void } = {}): Promise<AgentHost> {
+export async function openHost(config: Config, options: { paused?: boolean; beforeOpen?: () => void | Promise<void> } = {}): Promise<AgentHost> {
   await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
   const release = ownDataDir(config.dataDir);
   try {
-    options.beforeOpen?.();
+    await options.beforeOpen?.();
     const agent = await openOwnedHost(config, options.paused === true);
     void agent.harness.closed.then(release);
     return agent;
@@ -314,7 +314,13 @@ async function openOwnedHost(config: Config, paused: boolean): Promise<AgentHost
             throw new HttpError(409, error instanceof Error ? error.message : String(error));
           }
           upgrading = true;
-          const unblock = () => { upgrading = false; release(); };
+          let held = true;
+          const unblock = () => {
+            if (!held) return;
+            held = false;
+            upgrading = false;
+            release();
+          };
           try {
             await assertAvailable();
             await assertAvailable(target);

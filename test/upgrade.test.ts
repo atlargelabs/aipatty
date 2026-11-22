@@ -13,7 +13,7 @@ import type { ConversationPage } from "../src/protocol.ts";
 import { ownDataDir } from "../src/ownership.ts";
 import { backupDb, restoreDb } from "../src/upgrade-db.ts";
 import { upgradeEntryKind, UpgradePaths } from "../src/upgrade-state.ts";
-import type { UpgradeHealth } from "../src/upgrade-process.ts";
+import { identify, reapStage, type UpgradeHealth } from "../src/upgrade-process.ts";
 import { checkout, until } from "./helpers.ts";
 
 const exec = promisify(execFile);
@@ -80,11 +80,12 @@ while (existsSync(join(process.env.UPGRADE_FIXTURE, "hold-legacy-exit"))) await 
 `;
 
 const npmFixture = `#!/usr/bin/env node
-const { appendFileSync, existsSync, mkdirSync, readdirSync, symlinkSync } = require("node:fs");
+const { appendFileSync, existsSync, mkdirSync, readdirSync, symlinkSync, writeFileSync } = require("node:fs");
 const { join } = require("node:path");
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const root = process.env.UPGRADE_FIXTURE;
 const args = process.argv.slice(2).join(" ");
+writeFileSync(join(root, "npm.pid"), String(process.pid));
 appendFileSync(join(root, "npm.log"), args + "\\n");
 (async () => {
   while (existsSync(join(root, "hold-stage"))) await sleep(25);
@@ -138,19 +139,31 @@ async function fixture(t: TestContext, legacy = false) {
     for (const name of ["hold-stage", "hold-pi", "hold-legacy-exit", "hold-probe"]) await rm(join(scratch, name), { force: true });
     for (const child of children) child.kill("SIGTERM");
     // Successful cutover's child belongs to the one-shot helper, not this test. Use the local graceful protocol.
-    await until(async () => {
-      const health = await healthNow();
-      if (health?.validation) return false;
-      if (!health) {
-        const j = paths.load();
-        if (j?.phase === "staging" || j?.phase === "stopping" || j?.phase === "switching") return false;
-        try { ownDataDir(paths.data)(); return true; } catch { return false; }
-      }
-      if (!health.commit || !commits.has(health.commit)) return false;
-      await fetch(url + "/api/shutdown", { method: "POST", headers: { "X-Aipatty-Shutdown": "1" }, signal: AbortSignal.timeout(1_000) }).catch(() => {});
-      return false;
-    }, Boolean, 3_000).catch(() => {});
-    for (const child of children) child.kill("SIGKILL");
+    try {
+      await until(async () => {
+        const health = await healthNow();
+        if (health?.validation) return false;
+        if (health) {
+          if (!health.commit || !commits.has(health.commit)) return false;
+          await fetch(url + "/api/shutdown", { method: "POST", headers: { "X-Aipatty-Shutdown": "1" }, signal: AbortSignal.timeout(1_000) }).catch(() => {});
+          return false;
+        }
+        if (children.size) return false;
+        // Confirm even the helper-launched processes, which aren't this test's ChildProcess handles, have exited.
+        const { stdout } = await exec("ps", ["-A", "-ww", "-o", "stat=,command="], { timeout: 2_000 });
+        if (stdout.split("\n").some(line => !line.trimStart().startsWith("Z") && line.includes(`--install-dir ${root}`)
+          && /\/src\/(main|upgrade-supervisor)\.ts /.test(line))) return false;
+        let unlock: (() => void) | undefined;
+        try {
+          unlock = paths.lease();
+          const j = paths.load();
+          if (j?.phase === "staging") await reapStage(j);
+          ownDataDir(paths.data)();
+          return true;
+        } catch { return false; }
+        finally { unlock?.(); }
+      }, Boolean, 15_000);
+    } catch (error) { throw new Error(`Fixture still has a possible writer; preserved ${scratch}`, { cause: error }); }
     await rm(scratch, { recursive: true, force: true });
   });
   for (const dir of [paths.deploy, paths.data, join(root, "pi"), join(root, "work"), join(root, "runs"), repo, bin]) {
@@ -446,12 +459,54 @@ test("a crashed supervisor drains its bounded stage worker before cancelling and
   process.kill(Number(await readFile(join(f.scratch, "coordinator.pid"), "utf8")), "SIGKILL");
   const [result] = await f.result(j.id);
   assert.match(JSON.stringify(result.data), /cancelled before cutover/);
-  assert.match(await f.log(j.id), /cancelled: staging supervisor disconnected/);
+  assert.match(await f.log(j.id), /npm ci --ignore-scripts/);
   assert.equal(f.paths.selected(), f.old);
   assert.equal(existsSync(f.paths.release(target)), false);
-  assert.equal(existsSync(join(f.paths.deploy, `.stage-${j.id}`)), false);
+  const npm = Number(await readFile(join(f.scratch, "npm.pid"), "utf8"));
+  assert.equal(await identify(npm), undefined);
   assert.equal((await f.healthNow())?.pid, old.child.pid);
   assert.equal((await f.cli("send", "still serving")).stdout.trim(), "Faux reply: still serving");
+});
+
+test("a killed stage worker's live command is reaped by the surviving coordinator before staging settles", { timeout }, async t => {
+  const f = await fixture(t);
+  const old = f.launch();
+  await f.health(f.old);
+  const target = await f.next("worker killed mid-install");
+  await f.flag("hold-stage");
+  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
+  await until(() => existsSync(join(f.scratch, "npm.log")));
+  const j = f.paths.load()!;
+  const npm = Number(await readFile(join(f.scratch, "npm.pid"), "utf8"));
+  assert.ok(await identify(npm));
+  process.kill(j.stageProcess!.pid, "SIGKILL");
+  const [result] = await f.result(j.id);
+  assert.match(JSON.stringify(result.data), /failed before cutover.*Stage worker exited/);
+  assert.equal(await identify(npm), undefined);
+  assert.equal(f.paths.selected(), f.old);
+  assert.equal(existsSync(f.paths.release(target)), false);
+  assert.equal((await f.healthNow())?.pid, old.child.pid);
+});
+
+test("losing the requesting host during staging closes the worker and allows an ordinary restart", { timeout }, async t => {
+  const f = await fixture(t);
+  const old = f.launch();
+  await f.health(f.old);
+  const target = await f.next("requesting host lost before stop");
+  await f.flag("hold-stage");
+  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
+  await until(() => existsSync(join(f.scratch, "npm.log")));
+  const j = f.paths.load()!;
+  old.child.kill("SIGKILL");
+  await old.exited;
+  try { await until(() => f.paths.load()?.phase === "done"); }
+  catch (error) { throw new Error(`${JSON.stringify(f.paths.load())}\n${await f.log(j.id)}`, { cause: error }); }
+  f.launch();
+  await f.health(f.old);
+  const [result] = await f.result(j.id);
+  assert.match(JSON.stringify(result.data), /failed before cutover.*Requesting host exited during staging/);
+  assert.equal(f.paths.selected(), f.old);
+  assert.equal(existsSync(f.paths.release(target)), false);
 });
 
 test("bootstrap rejects Pi records, non-main and dirty/ignored input before touching a legacy host", { timeout }, async t => {
@@ -576,6 +631,33 @@ test("an interrupted switch closes the gated candidate; startup refuses the unce
   assert.equal((await f.result(j.id, branch)).length, 1);
   assert.match((await f.cli("--branch", String(branch), "log")).stdout, /Faux reply: durable before interrupted cutover/);
   assert.ok(existsSync(backup));
+});
+
+test("a broken journal still disconnects the validation child without admitting work or clobbering the backup", { timeout }, async t => {
+  const f = await fixture(t);
+  f.launch();
+  await f.health(f.old);
+  const target = await f.next("candidate health will fail", code => code.replace("      const api = await startApi", `
+      if (childId) health.validation = { id: childId, ready: false, reason: "fixture validation failure" };
+      const api = await startApi`));
+  await f.flag("hold-probe");
+  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
+  const candidate = await f.health(target, true);
+  const j = f.paths.load()!;
+  const helper = Number(await readFile(join(f.scratch, "helper.pid"), "utf8"));
+  await writeFile(f.paths.journal, "not valid JSON");
+  await f.unflag("hold-probe");
+  await until(() => identify(helper), value => !value);
+  await until(() => identify(candidate!.pid!), value => !value);
+  assert.equal(await f.healthNow(), undefined);
+  assert.equal(f.paths.selected(), target);
+  assert.ok(existsSync(f.paths.backup(j.id)));
+  assert.match(await f.log(j.id), /not valid JSON|Unexpected token/);
+  // Put back the known-good phase in this private fixture, then use the actual recovery path.
+  f.paths.save(j);
+  await f.supervisor(target, "recover");
+  await f.health(f.old);
+  assert.equal((await f.result(j.id)).length, 1);
 });
 
 test("SQLite backup includes uncheckpointed committed WAL, and restore discards an abandoned candidate WAL", { timeout }, async t => {

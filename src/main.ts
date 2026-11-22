@@ -44,9 +44,9 @@ async function main(): Promise<void> {
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
   try {
-    let startup: ReturnType<typeof guardStartup>;
-    const agent = await openHost(config, { paused: true, beforeOpen() {
-      startup = guardStartup(config, source, health.commit, childId);
+    let startup: Awaited<ReturnType<typeof guardStartup>>;
+    const agent = await openHost(config, { paused: true, async beforeOpen() {
+      startup = await guardStartup(config, source, health.commit, childId);
     } });
     const { harness } = agent;
     const closed = harness.closed.then(end => {
