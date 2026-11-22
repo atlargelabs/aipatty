@@ -483,6 +483,14 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     }
   }
 
+  /** Save a verified, empty stop before reporting or deleting anything that recovery might need again. */
+  const disarmLaunchGuard = async (saved: SavedRun, record: () => Promise<void>) => {
+    if (saved.activeChild && !saved.cleanupUncertain) {
+      delete saved.activeChild;
+      await record();
+    }
+  };
+
   /**
    * Stop what is left of a run, add its cut-off delegates' spend, keep its logs, and delete its workspace and its
    * delegates' clones. `clean` is false when something of the run is still there, or could not be looked at: the
@@ -505,12 +513,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         outcome.usageComplete = false;
         return { clean: false, reconciled };
       }
-      if (saved.activeChild) {
-        // A verified stop completed. Disarm the launch guard before deleting anything, so a restart midway
-        // through workspace cleanup does not mistake the stopped launcher for a lost ownership anchor.
-        delete saved.activeChild;
-        await record();
-      }
+      await disarmLaunchGuard(saved, record);
       const { jobs, ours } = await findJobs(saved, trace, outcome);
       if (!reconciled) {
         reconcile(trace, outcome, jobs, ours);
@@ -726,7 +729,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
           // Part of a transcript is not the run's account: stop the run, and keep its record for another try.
           const reason = `its events could not be read: ${message(error)}`;
           try {
-            await stop();
+            if (!(await stop()).length) await disarmLaunchGuard(saved, record);
           } catch (stopError) {
             throw new Error(`${reason}; stopping it also failed: ${message(stopError)}`);
           }
@@ -885,25 +888,33 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     const live = (child: ChildProcess): child is ChildProcess & { pid: number } =>
       child.pid !== undefined && child.exitCode === null && child.signalCode === null;
     const livePids = (children = held) => new Set([...children].filter(live).map(child => child.pid));
-    const stop = async (grace = graceMs) => {
+    const stop = async (grace = graceMs, observe?: (tree: readonly Proc[]) => void) => {
       if (!recordEstablished) return []; // Nothing could have been launched.
-      return stopRun(run.owned, saved.runId, saved.pid, grace, term, write, () => recordDirty, livePids);
+      return stopRun(run.owned, saved.runId, saved.pid, grace, term, write, () => recordDirty, livePids, observe);
     };
     run.kill = () => {
+      if (killRequested) return;
       killRequested = true;
+      // Capture the released handles before waiting behind a poll or adoption. A launcher can lose its
+      // ancestry while we wait, and another command cannot open its gate once a stop has been requested.
+      const pending = livePids(released);
       void withOwnership(async () => {
-        if (abandonedChildren) return;
         for (let attempt = 0; attempt < 2; attempt++) {
-          const before = livePids(released);
+          const verified = new Set<number>();
           try {
-            await stop(attempt === 0 ? graceMs : 0);
+            await stop(attempt === 0 ? graceMs : 0, tree => {
+              const live = livePids(released);
+              for (const proc of tree) if (live.has(proc.pid)) verified.add(proc.pid);
+            });
           } catch (error) {
+            verified.clear();
             console.error(`Pi run ${saved.runId}: could not stop its processes by scanning:`, error);
-            // Only a released child can lose the last link to an unmarked descendant.
-            const after = livePids(released);
-            if ([...before].some(pid => !after.has(pid))) break;
           }
-          if (!livePids(released).size) return;
+          const after = livePids(released);
+          const exited = [...pending].filter(pid => !after.has(pid));
+          if (exited.some(pid => !verified.has(pid))) break;
+          for (const pid of exited) pending.delete(pid);
+          if (!after.size) return;
         }
         // Keep the workspace when an emergency stop could not verify the tree. If this write fails, the
         // launcher guard was already saved before the command started, and the fallback must not signal.
@@ -968,8 +979,6 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       stderr.on("data", (chunk: Buffer) => { err = (err + chunk).slice(-8_000); });
       const exit = exitOf(child, error => { failure = error; });
       const adoptionError = await withOwnership(() => adopt(child, release));
-      // Stopped while it was being recorded: the stop may have missed it.
-      if (run.stop && !adoptionError) run.kill();
       const exitCode = await Promise.race([exit, abandonment.promise]);
       if (adoptionError) throw adoptionError;
       if (abandonedChildren) throw new Error("a child could not be safely stopped");
@@ -1079,7 +1088,6 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
           return adopt(child, release);
         });
         if (adoptionError) problems.push(`Could not record Pi: ${adoptionError.message}`);
-        else if (run.stop) run.kill();
         // Remember the processes the run starts while their parents still live: a delegate leads its own group.
         let polling: Promise<void> | undefined;
         const poll = adoptionError ? undefined : setInterval(() => {

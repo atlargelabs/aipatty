@@ -486,7 +486,7 @@ test("abort and timeout stop Pi and its delegates' processes, keep the logs, and
   assert.ok(existsSync(join(victim, "workspace")) && !existsSync(join(victim, "discarded")), "the linked directory is untouched");
 });
 
-test("after a crash, the next start stops the surviving processes, cleans up, and reports the call interrupted", { timeout: 60_000 }, async t => {
+for (const unreadable of [false, true]) test(`crash recovery stops surviving processes and reports the call interrupted${unreadable ? " after an unreadable transcript is repaired" : ""}`, { timeout: 60_000 }, async t => {
   const config = await setup(t);
   await scenario(config, [
     assistant("Working.", 0.5, "toolUse"),
@@ -513,6 +513,20 @@ test("after a crash, the next start stops the surviving processes, cleans up, an
   const [pi] = await launches(config);
   assert.ok(alive(pi.pid) && alive(child), "the run outlives its host");
 
+  if (unreadable) {
+    const stateFile = join(config.dataDir, "pi-run.json");
+    const saved = JSON.parse(await readFile(stateFile, "utf8"));
+    const events = join(saved.logDir, "events.jsonl");
+    await fs.rename(events, `${events}.aside`);
+    await mkdir(events);
+    const stuck = await openPiRuns(config);
+    await assert.rejects(stuck.run(request({ pr: false })), /its events could not be read/);
+    assert.ok(!alive(pi.pid) && !alive(child));
+    assert.ok(existsSync(saved.workspace), "the stop is verified but the unreadable transcript still blocks cleanup");
+    assert.equal(JSON.parse(await readFile(stateFile, "utf8")).activeChild, undefined, "the successful stop was recorded");
+    await rm(events, { recursive: true });
+    await fs.rename(`${events}.aside`, events);
+  }
   const runs = await openPiRuns(config);
   assert.ok(!alive(pi.pid) && !alive(child));
   assert.deepEqual(await readdir(config.runsDir), []);
@@ -955,12 +969,21 @@ for (const failSecondRead of [false, true]) test(`polling keeps an unmarked dele
   }
 });
 
-for (const rejectWrite of [false, true]) test(`stopping Pi waits for a ${rejectWrite ? "failed" : "delayed"} poll checkpoint and rechecks its tree`, { timeout: 30_000 }, async t => {
+for (const mode of ["delayed", "failed", "orphaned"] as const) test(mode === "orphaned"
+  ? "an abort remembers a released parent that exits while stop is queued behind a poll checkpoint"
+  : `stopping Pi waits for a ${mode} poll checkpoint and rechecks its tree`, { timeout: 30_000 }, async t => {
   const config = await setup(t);
+  const orphaned = mode === "orphaned";
   await scenario(config, [
     { waitForFile: "first-worker" }, { spawn: "unmarked" },
-    { waitForFile: "second-worker" }, { spawn: "unmarked" }, { hang: true },
+    { waitForFile: "second-worker" }, { spawn: "unmarked" }, orphaned ? { exit: 0 } : { hang: true },
   ]);
+  const path = process.env.PATH;
+  const failStop = join(config.dataDir, "fail-stop-scan");
+  if (orphaned) await writeFile(join(config.dataDir, "ps"), `#!/bin/sh
+    if [ -f ${JSON.stringify(failStop)} ]; then rm ${JSON.stringify(failStop)}; exit 1; fi
+    exec /bin/ps "$@"
+  `, { mode: 0o700 });
   const stateFile = join(config.dataDir, "pi-run.json");
   const children = (saved: { procs: [number, string][] }) => saved.procs.map(([pid]) => pid);
   const resume = Promise.withResolvers<void>();
@@ -972,7 +995,7 @@ for (const rejectWrite of [false, true]) test(`stopping Pi waits for a ${rejectW
       if (worker && children(JSON.parse(await readFile(from, "utf8"))).includes(worker)) {
         delayed = true;
         await resume.promise;
-        if (rejectWrite) throw new Error("test poll checkpoint failure");
+        if (mode === "failed") throw new Error("test poll checkpoint failure");
       }
     }
     await rename(from, to);
@@ -988,6 +1011,7 @@ for (const rejectWrite of [false, true]) test(`stopping Pi waits for a ${rejectW
   });
   syncBuiltinESMExports();
   t.mock.method(console, "error", () => {});
+  if (orphaned) process.env.PATH = `${config.dataDir}:${path ?? ""}`;
   try {
     const runs = await openPiRuns(config);
     running = runs.run(request({ pr: false, timeoutMs: 20_000 }), controller.signal);
@@ -1002,6 +1026,18 @@ for (const rejectWrite of [false, true]) test(`stopping Pi waits for a ${rejectW
     controller.abort();
     await writeFile(join(config.pi.agentDir, "second-worker"), "");
     const workers = await until(() => spawned(config), pids => pids.length === 2);
+    if (orphaned) {
+      await until(() => !alive(piPid));
+      await writeFile(failStop, "");
+      resume.resolve();
+      const outcome = await running;
+      assert.equal(outcome.status, "aborted");
+      assert.match(outcome.problems.join("\n"), /process tree could not be verified/);
+      const saved = JSON.parse(await readFile(stateFile, "utf8"));
+      assert.equal(saved.cleanupUncertain, true);
+      assert.ok(!alive(workers[0]) && alive(workers[1]) && existsSync(saved.workspace), "an undiscovered orphan must keep the workspace in place");
+      return;
+    }
     await sleep(500); // Give a stop that bypasses the checkpoint time to scan and signal.
     assert.equal(savedAtTerm, undefined, "SIGTERM must wait for the in-flight poll's checkpoint");
     assert.ok([piPid, ...workers].every(alive), "no process should be signalled before the checkpoint");
@@ -1016,6 +1052,8 @@ for (const rejectWrite of [false, true]) test(`stopping Pi waits for a ${rejectW
     renameMock.mock.restore();
     killMock.mock.restore();
     syncBuiltinESMExports();
+    if (path === undefined) delete process.env.PATH;
+    else process.env.PATH = path;
     for (const pid of [piPid, ...await spawned(config)]) if (pid && alive(pid)) process.kill(pid, "SIGKILL");
   }
 });
