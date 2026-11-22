@@ -34,6 +34,7 @@ async function main(): Promise<void> {
   };
   const config = readConfig();
   const childId = process.env[upgradeChildEnv];
+  delete process.env[upgradeChildEnv]; // Validation is this process's startup mode, not inherited configuration.
   const disconnected = Promise.withResolvers<"parent">();
   if (childId !== undefined) {
     if (!process.connected) throw new Error("Upgrade validation requires a private supervisor connection");

@@ -13,7 +13,7 @@ import type { ConversationPage } from "../src/protocol.ts";
 import { ownDataDir } from "../src/ownership.ts";
 import { backupDb, restoreDb } from "../src/upgrade-db.ts";
 import { upgradeEntryKind, UpgradePaths } from "../src/upgrade-state.ts";
-import { identify, reapStage, type UpgradeHealth } from "../src/upgrade-process.ts";
+import { identify, reapStage, stageEnvironment, type UpgradeHealth } from "../src/upgrade-process.ts";
 import { checkout, until } from "./helpers.ts";
 
 const exec = promisify(execFile);
@@ -82,6 +82,7 @@ while (existsSync(join(process.env.UPGRADE_FIXTURE, "hold-legacy-exit"))) await 
 const npmFixture = `#!/usr/bin/env node
 const { appendFileSync, existsSync, mkdirSync, readdirSync, symlinkSync, writeFileSync } = require("node:fs");
 const { join } = require("node:path");
+const { spawn } = require("node:child_process");
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const root = process.env.UPGRADE_FIXTURE;
 const args = process.argv.slice(2).join(" ");
@@ -99,6 +100,11 @@ appendFileSync(join(root, "npm.log"), args + "\\n");
   else if (args === "run check" && existsSync(join(root, "fail-check"))) {
     console.error("fixture check failed");
     process.exitCode = 7;
+  } else if (args === "test" && existsSync(join(root, "nest-test"))) {
+    const child = spawn(process.execPath, ["--test", "--test-name-pattern=nested fixture starts a replacement", join(process.env.UPGRADE_FIXTURE_CHECKOUT, "test/upgrade.test.ts")], {
+      env: { ...process.env, UPGRADE_NESTED_TEST: root }, stdio: "inherit",
+    });
+    process.exitCode = await new Promise(resolve => child.once("exit", code => resolve(code ?? 9)));
   } else if (args !== "run check" && args !== "test") process.exitCode = 8;
 })();
 `;
@@ -127,7 +133,7 @@ async function unusedPort(): Promise<number> {
  * and links this test run's already installed deps. All process hooks below exist only in these scratch commits.
  */
 async function fixture(t: TestContext, legacy = false) {
-  const scratch = await realpath(await mkdtemp(join(tmpdir(), "aipatty-upgrade-")));
+  const scratch = await realpath(await mkdtemp(join(process.env.UPGRADE_NESTED_TEST ?? tmpdir(), "aipatty-upgrade-")));
   const root = join(scratch, "install root"), repo = join(scratch, "fixture-origin"), bin = join(scratch, "bin");
   const deps = await realpath(join(checkout, "node_modules"));
   const port = await unusedPort(), url = `http://127.0.0.1:${port}`;
@@ -136,7 +142,7 @@ async function fixture(t: TestContext, legacy = false) {
   const commits = new Set<string>();
   t.after(async () => {
     // Wake a fixture process held at a barrier even when a test fails. Don't signal by PID from /health.
-    for (const name of ["hold-stage", "hold-pi", "hold-legacy-exit", "hold-probe"]) await rm(join(scratch, name), { force: true });
+    for (const name of ["hold-stage", "hold-pi", "hold-legacy-exit", "hold-probe", "hold-reap"]) await rm(join(scratch, name), { force: true });
     for (const child of children) child.kill("SIGTERM");
     // Successful cutover's child belongs to the one-shot helper, not this test. Use the local graceful protocol.
     try {
@@ -151,7 +157,7 @@ async function fixture(t: TestContext, legacy = false) {
         if (children.size) return false;
         // Confirm even the helper-launched processes, which aren't this test's ChildProcess handles, have exited.
         const { stdout } = await exec("ps", ["-A", "-ww", "-o", "stat=,command="], { timeout: 2_000 });
-        if (stdout.split("\n").some(line => !line.trimStart().startsWith("Z") && line.includes(`--install-dir ${root}`)
+        if (stdout.split("\n").some(line => !line.trimStart().startsWith("Z") && line.includes(scratch)
           && /\/src\/(main|upgrade-supervisor)\.ts /.test(line))) return false;
         let unlock: (() => void) | undefined;
         try {
@@ -170,8 +176,9 @@ async function fixture(t: TestContext, legacy = false) {
     await mkdir(dir, { recursive: true, mode: 0o700 });
   }
   const env = {
+    ...stageEnvironment(),
     PATH: `${bin}:${process.env.PATH}`, HOME: scratch, AIPATTY_FAUX: "1", UPGRADE_FIXTURE: scratch,
-    UPGRADE_FIXTURE_DEPS: deps, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", LC_ALL: "C",
+    UPGRADE_FIXTURE_CHECKOUT: checkout, UPGRADE_FIXTURE_DEPS: deps, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", LC_ALL: "C",
   };
   const git = (...args: string[]) => exec("git", ["-c", "user.name=test", "-c", "user.email=test@example.invalid", ...args], { cwd: repo, env });
   await git("init", "--quiet", "--initial-branch=main");
@@ -188,8 +195,12 @@ async function fixture(t: TestContext, legacy = false) {
   const processPath = join(repo, "src/upgrade-process.ts");
   const processCode = await readFile(processPath, "utf8");
   const probeStart = "  const deadline = Date.now() + startupMs;";
-  assert.ok(processCode.includes(probeStart));
-  await writeFile(processPath, processCode.replace(probeStart, `
+  const reapStart = "export async function reapStage(j: UpgradeJournal): Promise<void> {";
+  assert.ok(processCode.includes(probeStart) && processCode.includes(reapStart));
+  await writeFile(processPath, processCode.replace(reapStart, `${reapStart}
+  const { existsSync } = await import("node:fs");
+  if (existsSync(join(process.env.UPGRADE_FIXTURE!, "hold-reap"))) throw new Error("fixture cannot prove stage quiescence");
+`).replace(probeStart, `
   if (gated && sha === j.target) {
     const { existsSync, writeFileSync } = await import("node:fs");
     const directory = process.env.UPGRADE_FIXTURE!;
@@ -486,6 +497,62 @@ test("a killed stage worker's live command is reaped by the surviving coordinato
   assert.equal(f.paths.selected(), f.old);
   assert.equal(existsSync(f.paths.release(target)), false);
   assert.equal((await f.healthNow())?.pid, old.child.pid);
+});
+
+if (process.env.UPGRADE_NESTED_TEST) {
+  // Run only as a real subprocess of the outer fixture's `npm test` command.
+  test("nested fixture starts a replacement whose coordinator exits", { timeout }, async t => {
+    const inner = await fixture(t);
+    inner.launch();
+    await inner.health(inner.old);
+    const target = await inner.next("nested replacement");
+    assert.equal((await inner.send("/upgrade", "root", { marker: "1" })).status, 202);
+    const server = await inner.health(target);
+    const ownHelper = Number(await readFile(join(inner.scratch, "coordinator.pid"), "utf8"));
+    await until(() => identify(ownHelper), value => !value);
+    // The listener has detached into a different group and no longer has a coordinator parent to find it by.
+    await writeFile(join(process.env.UPGRADE_NESTED_TEST!, "nested-server.json"), JSON.stringify({ pid: server!.pid }));
+    await until(() => existsSync(join(process.env.UPGRADE_NESTED_TEST!, "let-nested-finish")), Boolean, 30_000);
+  });
+}
+
+test("staging reaps a detached replacement started by its interrupted nested test", { timeout }, async t => {
+  const f = await fixture(t);
+  f.launch();
+  await f.health(f.old);
+  await f.next("target running the nested process fixture as npm test");
+  await f.flag("nest-test");
+  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
+  try {
+    const nested = await until(async () => {
+      try { return JSON.parse(await readFile(join(f.scratch, "nested-server.json"), "utf8")) as { pid: number }; }
+      catch { return undefined; }
+    }, Boolean, 15_000);
+    const j = f.paths.load()!;
+    assert.ok(await identify(nested!.pid));
+    process.kill(j.stageProcess!.pid, "SIGKILL");
+    assert.match(JSON.stringify((await f.result(j.id))[0].data), /failed before cutover/);
+    assert.equal(await identify(nested!.pid), undefined);
+    assert.equal(f.paths.selected(), f.old);
+  } finally { await f.flag("let-nested-finish"); }
+});
+
+test("unproven stage cleanup keeps admission closed until explicit recovery delivers the result", { timeout }, async t => {
+  const f = await fixture(t);
+  const old = f.launch();
+  await f.health(f.old);
+  await f.next("target whose stage cannot prove cleanup");
+  await f.flag("hold-reap");
+  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
+  const j = f.paths.load()!;
+  await until(() => old.output().includes("Could not settle upgrade"));
+  assert.equal(f.paths.load()?.phase, "staging");
+  assert.equal((await f.send("should not be admitted")).status, 409);
+  await f.unflag("hold-reap");
+  assert.match((await f.supervisor(f.old, "recover")).stdout, /cancelled before cutover/);
+  assert.equal((await f.result(j.id)).length, 1);
+  assert.equal((await f.healthNow())?.pid, old.child.pid);
+  assert.equal((await f.cli("send", "after verified cleanup")).stdout.trim(), "Faux reply: after verified cleanup");
 });
 
 test("losing the requesting host during staging closes the worker and allows an ordinary restart", { timeout }, async t => {

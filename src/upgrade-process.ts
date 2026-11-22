@@ -68,19 +68,27 @@ export async function identify(pid: number): Promise<ProcessIdentity | undefined
   throw new Error(`Cannot identify process ${pid}`);
 }
 
-export const stageMarker = (id: string) => `upgrade-stage-${id}`;
+const stagePrefix = /^PATTY_STAGE_[0-9a-f]{32}$/;
+export const stageMarker = (id: string) => `PATTY_STAGE_${id.replaceAll("-", "")}`;
+
+/** Preserve only the stage identities when a test builds a deliberately filtered child environment. Independent
+ * variables let nested stages and their detached apps keep both scopes, without exporting any credentials.
+ */
+export function stageEnvironment(): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(process.env).filter(([name, value]) => stagePrefix.test(name) && value === "1"));
+}
 
 /** Stage commands inherit the recorded worker's group and marker. Never trust a reused/leaderless group alone. */
 export async function reapStage(j: UpgradeJournal): Promise<void> {
   const worker = j.stageProcess;
   if (!worker) return; // Not authorized to spawn commands before its identity is persisted.
   const marker = stageMarker(j.id);
-  const rootIsOurs = (await runProcesses(newOwned(), marker)).some(p => p.pid === worker.pid && p.start === worker.start);
+  const rootIsOurs = (await runProcesses(newOwned(), "1", marker)).some(p => p.pid === worker.pid && p.start === worker.start);
   if (!rootIsOurs && (await identify(worker.pid))?.start === worker.start) {
     throw new Error(`Cannot verify the staging marker on PID ${worker.pid}; inspect before recovering`);
   }
   const owned = newOwned(rootIsOurs ? [[worker.pid, worker.start]] : [], [worker.pid]);
-  const left = await stopRun(owned, marker, worker.pid, 250);
+  const left = await stopRun(owned, "1", worker.pid, 250, undefined, undefined, marker);
   if (left.length) throw new Error(`Cannot prove staging processes exited (${left.map(p => p.pid).join(", ")}); leave the private stage in place and investigate`);
 }
 
@@ -90,7 +98,7 @@ export async function assertStageIdle(id: string): Promise<void> {
   // ps is itself a short-lived member on some platforms. Don't mistake the probe for a staging command.
   const repeat = await listProcesses();
   const found = group.some(p => repeat.some(next => next.pid === p.pid && next.start === p.start && next.pgid === process.pid));
-  if (found || (await runProcesses(newOwned(), stageMarker(id))).length) throw new Error("Staging still has subprocesses");
+  if (found || (await runProcesses(newOwned(), "1", stageMarker(id))).length) throw new Error("Staging still has subprocesses");
 }
 
 function assertOwnerFiles(paths: UpgradePaths): void {

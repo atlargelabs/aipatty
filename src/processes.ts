@@ -58,8 +58,8 @@ function commands(output: string): Map<number, string> {
  * The IDs of the processes whose environment has `RUN_MARKER=<runId>`. Best effort: macOS hides the environment of
  * its own binaries, such as `/bin/bash`, and both systems hide other users' processes.
  */
-async function markedPids(runId: string, procs: readonly Proc[]): Promise<Set<number>> {
-  const needle = `${RUN_MARKER}=${runId}`;
+async function markedPids(runId: string, procs: readonly Proc[], variable: string): Promise<Set<number>> {
+  const needle = `${variable}=${runId}`;
   const marked = new Set<number>();
   if (process.platform === "linux") {
     await Promise.all(procs.map(async proc => {
@@ -95,9 +95,9 @@ async function markedPids(runId: string, procs: readonly Proc[]): Promise<Set<nu
  * Forgets remembered groups that have no member left. The result is from a process table read last, after the
  * slower environment scan: act on it at once.
  */
-async function scan(owned: Owned, runId: string): Promise<{ ours: Proc[]; unsure: Proc[] }> {
+async function scan(owned: Owned, runId: string, variable: string): Promise<{ ours: Proc[]; unsure: Proc[] }> {
   const before = new Map((await listProcesses()).map(proc => [proc.pid, proc.start]));
-  const marked = await markedPids(runId, [...before].map(([pid, start]) => ({ pid, ppid: 0, pgid: 0, start })));
+  const marked = await markedPids(runId, [...before].map(([pid, start]) => ({ pid, ppid: 0, pgid: 0, start })), variable);
   const procs = await listProcesses();
   const byPid = new Map(procs.map(proc => [proc.pid, proc]));
   for (const pgid of owned.groups) {
@@ -130,8 +130,8 @@ async function scan(owned: Owned, runId: string): Promise<{ ours: Proc[]; unsure
 }
 
 /** The live processes that belong to a run; see `scan`. Rejects when the process table cannot be read. */
-export async function runProcesses(owned: Owned, runId: string): Promise<Proc[]> {
-  return (await scan(owned, runId)).ours;
+export async function runProcesses(owned: Owned, runId: string, variable = RUN_MARKER): Promise<Proc[]> {
+  return (await scan(owned, runId, variable)).ours;
 }
 
 /** Remember a run's processes and their groups. Returns whether a process or group was new. */
@@ -163,10 +163,11 @@ function signal(pid: number, name: NodeJS.Signals): void {
  */
 export async function stopRun(
   owned: Owned, runId: string, root: number | undefined, graceMs: number, term?: () => void, record?: () => Promise<unknown>,
+  variable = RUN_MARKER,
 ): Promise<Proc[]> {
   // Remember the tree before it comes apart, and have the caller save it: a group found only now would otherwise
   // be forgotten if this process dies with a member of it still alive.
-  const tree = await runProcesses(owned, runId);
+  const tree = await runProcesses(owned, runId, variable);
   if (remember(owned, tree)) await record?.();
   const rootStart = root === undefined ? undefined : owned.procs.get(root);
   if (root !== undefined && rootStart !== undefined && tree.some(proc => proc.pid === root && proc.start === rootStart)) {
@@ -182,7 +183,7 @@ export async function stopRun(
   let left: Proc[] = [];
   let unsure: Proc[] = [];
   for (let attempt = 0; attempt < 20; attempt++) {
-    ({ ours: left, unsure } = await scan(owned, runId));
+    ({ ours: left, unsure } = await scan(owned, runId, variable));
     if (!left.length) break;
     if (remember(owned, left)) await record?.();
     for (const proc of left) signal(proc.pid, "SIGKILL");

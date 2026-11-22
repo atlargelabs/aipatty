@@ -7,7 +7,6 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 import { parseArgs } from "node:util";
 import { readConfig, type Config } from "./config.ts";
-import { RUN_MARKER } from "./processes.ts";
 import { backupDb, restoreDb } from "./upgrade-db.ts";
 import {
   assertStageIdle, confirmActivation, detachServer, getHealth, identify, launchServer, legacyConnection, openUpgradeLog, probeServer,
@@ -17,6 +16,8 @@ import { stageRelease, verifyRelease } from "./upgrade-release.ts";
 import {
   errorText, exists, finish, idPattern, resultText, sameInstall, upgradeProtocol, UpgradePaths, type ProcessIdentity, type UpgradeJournal,
 } from "./upgrade-state.ts";
+
+const stageDeadlineMs = 26 * 60_000;
 
 function noPi(paths: UpgradePaths): void {
   if (exists(paths.piRun)) throw new Error(`Pi run or recovery is present: ${paths.piRun}. Leave the record intact and let the old release recover it.`);
@@ -43,7 +44,7 @@ async function runStage(paths: UpgradePaths, config: Config, id: string, scriptR
   try {
     const j = paths.load();
     if (!process.connected || j?.id !== id || j.phase !== "staging" || j.stageProcess?.pid !== process.pid
-      || process.env[RUN_MARKER] !== stageMarker(id) || paths.selected() !== j.old) {
+      || process.env[stageMarker(id)] !== "1" || paths.selected() !== j.old) {
       throw new Error("Invalid or cancelled stage handoff");
     }
     sameInstall(j, config);
@@ -67,7 +68,7 @@ async function prepare(paths: UpgradePaths, j: UpgradeJournal, source: string, l
   if (!j.legacy && !process.connected) throw new Error("Requesting host exited before staging");
   const child = spawn(process.execPath, [join(source, "src/upgrade-supervisor.ts"), "stage",
     "--install-dir", paths.root, "--port", String(j.port), "--id", j.id], {
-    cwd: source, detached: true, env: { ...process.env, [RUN_MARKER]: stageMarker(j.id) }, stdio: ["ignore", log, log, "ipc"],
+    cwd: source, detached: true, env: { ...process.env, [stageMarker(j.id)]: "1" }, stdio: ["ignore", log, log, "ipc"],
   });
   let failure: string | undefined;
   child.on("message", value => { if (typeof value === "string") failure = value; });
@@ -83,15 +84,19 @@ async function prepare(paths: UpgradePaths, j: UpgradeJournal, source: string, l
     parentLost.resolve(new Error("Requesting host exited during staging"));
   };
   if (!j.legacy) process.once("disconnect", onHostExit);
+  const stageDeadline = new AbortController();
   try {
     const identity = child.pid && await identify(child.pid);
     if (!identity || !child.connected || (!j.legacy && !process.connected)) throw new Error("Stage handoff ended before the worker could be verified");
     // A surviving owner can reap this group even if we lose the worker or both owners after it starts a command.
     record(identity);
     await new Promise<void>((resolve, reject) => child.send("prepare", error => error ? reject(error) : resolve()));
-    const error = await Promise.race([completed, parentLost.promise]);
+    const expired = sleep(stageDeadlineMs, undefined, { signal: stageDeadline.signal, ref: false })
+      .then(() => new Error(`Staging exceeded its total deadline (${stageDeadlineMs} ms)`));
+    const error = await Promise.race([completed, parentLost.promise, expired]);
     if (error) throw error;
   } finally {
+    stageDeadline.abort();
     process.off("disconnect", onHostExit);
     disconnect();
     const deadline = new AbortController();

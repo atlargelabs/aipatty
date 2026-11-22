@@ -167,13 +167,13 @@ export async function stageRelease(options: {
       note(`Running npm ${args.join(" ")}`);
       await command("npm", [...args], { cwd: staging, ms, log, signal });
     }
+    await assertIdle(); // No check descendants may write after the final integrity and durability pass.
     await verifyRelease(staging, sha, signal);
     ownedFile(join(staging, "src/upgrade-supervisor.ts"));
     const dependencies = join(staging, "node_modules");
     ownedDir(dependencies);
     syncTree(staging);
     await verifyBootstrap();
-    await assertIdle();
     signal.throwIfAborted();
     if (bootstrap) {
       // Only publish the checked pinned dependencies; the verified operator checkout already supplies the code.

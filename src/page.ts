@@ -365,7 +365,12 @@ $("composer").addEventListener("submit", guard(async event => {
       method: "POST", body: upgrade ? { command: content, requestId } : { content, requestId, whenBusy: "followUp" },
       headers: upgrade ? { ${JSON.stringify(upgradeHeader)}: "1" } : undefined,
     });
-    if (upgrade) notice("Upgrade " + accepted.upgradeId + " accepted. The result will appear in this branch.");
+    if (upgrade) {
+      if (typeof accepted?.upgradeId !== "string" || !accepted.upgradeId) {
+        throw new Error("Could not confirm acceptance. Check this branch before sending /upgrade again.");
+      }
+      notice("Upgrade " + accepted.upgradeId + " accepted. The result will appear in this branch.");
+    }
     if (branch === app.branch && revision === draftRevision) $("input").value = "";
   } finally {
     send.disabled = false;

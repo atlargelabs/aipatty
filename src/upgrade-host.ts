@@ -2,7 +2,7 @@ import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
 import { defineDoc, defineDocFamily, type Conversation } from "@earendil-works/pi-durable";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync } from "node:fs";
+import { closeSync, watch, type FSWatcher } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { Config } from "./config.ts";
@@ -141,7 +141,26 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
     let handed = false;
     let drainStarted = false;
     const id = randomUUID();
-    const settleHandoff = async (reason: string) => {
+    let recoveryWatch: FSWatcher | undefined;
+    const watchRecovery = () => {
+      if (recoveryWatch) return;
+      const close = () => { recoveryWatch?.close(); recoveryWatch = undefined; };
+      const check = () => {
+        let j: UpgradeJournal | undefined;
+        try { j = paths.load(); } catch { return; }
+        if (j?.id !== id) { close(); return; }
+        if (j.phase !== "done") return;
+        close();
+        void settleHandoff("Explicit recovery completed.", false).catch(error => console.error(`Upgrade ${id}:`, error));
+      };
+      try {
+        // Only for this unresolved request. No polling, and the watcher never keeps the app alive.
+        recoveryWatch = watch(paths.state, { persistent: false }, (_event, name) => { if (!name || name === "journal.json") check(); });
+        recoveryWatch.on("error", error => { close(); console.error(`Cannot watch recovery of ${id}:`, error); });
+        check(); // Cover a terminal rename just before subscribing.
+      } catch (error) { console.error(`Cannot watch recovery of ${id}:`, error); }
+    };
+    const settleHandoff = async (reason: string, observeRecovery = true) => {
       // Reap the recorded group before settling; a bounded wait is only for a racing explicit recover or
       // the stage worker finishing its own cleanup. There is no recurring background upgrade job.
       const deadline = Date.now() + 30_000;
@@ -171,9 +190,13 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
         } catch (error) {
           if (error instanceof OwnerBusy && Date.now() < deadline) { await sleep(100); continue; }
           console.error(`Could not settle upgrade ${id}:`, error);
-          // A failing handoff must not wedge the old process. Uncertain cutover is the one exception.
           const j = paths.load();
-          if (j?.id === id && !["requested", "staging", "done"].includes(j.phase)) return;
+          if (j?.id === id && j.phase !== "done") {
+            // Never reopen while the stage may still have writers or the DB/current can be uncertain.
+            // A successful explicit pre-cutover recover can release this same host without a restart.
+            if (observeRecovery && (j.phase === "requested" || j.phase === "staging")) watchRecovery();
+            return;
+          }
           break;
         } finally { unlock?.(); }
       }

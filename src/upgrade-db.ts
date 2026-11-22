@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, constants, copyFileSync, renameSync, rmSync } from "node:fs";
+import { constants, copyFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { backup, DatabaseSync } from "node:sqlite";
 import { exists, ownedFile, syncPath, type UpgradePaths } from "./upgrade-state.ts";
 
@@ -24,8 +24,8 @@ export async function backupDb(paths: UpgradePaths, id: string): Promise<void> {
   try {
     // SQLite reads committed WAL frames too; an abrupt stop need not have checkpointed them.
     using source = new DatabaseSync(paths.db, { timeout: 0 });
+    writeFileSync(temp, "", { mode: 0o600, flag: "wx" });
     await backup(source, temp);
-    chmodSync(temp, 0o600);
     {
       using copy = new DatabaseSync(temp, { timeout: 0 });
       if (copy.prepare("PRAGMA journal_mode = DELETE").get()?.journal_mode !== "delete") throw new Error("Could not make a standalone SQLite backup");

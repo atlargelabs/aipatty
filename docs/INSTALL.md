@@ -280,9 +280,9 @@ node "$ROOT/deploy/current/src/cli.ts" --port "$PORT" health
 - `requested`/`staging`: no switch began. The bounded stage worker cancels its command if its coordinator
   disappears; the process group is recorded before any command runs. Recovery verifies it is gone and does
   not refetch. If it cannot identify or stop that group, leave the private `.stage-<id>` directory and journal
-  in place and inspect the log before running `recover` again. A normal modern start can also cancel orphaned
-  staging. If an interrupted stage required manual recovery, start the old app (or stop and restart it if it
-  was still serving) with the original configuration to deliver any pending branch result.
+  in place and inspect the log before running `recover` again. New work is refused until quiescence is proven.
+  A surviving host can deliver the result and reopen admission after explicit recovery; if the old app is
+  stopped, start it with the original configuration. A normal modern start can also cancel orphaned staging.
 - `stopping`/`switching`/`restoring`/`restored`: don't start either release by hand. The new app refuses an
   unguarded start. `recover` verifies quiescence and restores the recorded old release as required, never a
   different or newer SHA. If an old app is still running after a failed handoff, stop that **verified** app
