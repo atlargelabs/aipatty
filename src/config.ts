@@ -25,8 +25,10 @@ export interface PiConfig {
   node: string;
   /** The pinned Pi CLI of this release. */
   cli: string;
-  /** The pinned delegates extension of this release, the only extension a run loads. */
+  /** The pinned delegates extension of this release, the only extension the top-level run loads. */
   extension: string;
+  /** The pinned pi-review entry point of this release, loaded only by crmanager. */
+  reviewExtension: string;
   /** The Pi agent directory the CLI shares with the server: sign-in, model cache, delegates settings and jobs. */
   agentDir: string;
   /** The only repository a run may work on, and the URL it is cloned from with the service account's access. */
@@ -113,6 +115,7 @@ export function readConfig(args: readonly string[] = process.argv.slice(2), env:
       node: process.execPath,
       cli: join(release, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"),
       extension: join(release, "node_modules/pi-delegates/src/index.ts"),
+      reviewExtension: join(release, "node_modules/@earendil-works/pi-review/review.ts"),
       agentDir: piDir,
       repo: "atlargelabs/aipatty",
       repoUrl: "git@github.com:atlargelabs/aipatty.git",

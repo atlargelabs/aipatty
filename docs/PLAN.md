@@ -55,8 +55,9 @@ bump the dependency through a reviewed PR so rolling back aipatty also rolls bac
 
 Use a dedicated Pi agent directory owned by the `aipatty` account, outside the release and run directories. The
 legacy default is `~/.pi/agent`; the root install derives `$ROOT/pi`. Point the host and CLI at the same
-path: for root installs explicitly set `PI_CODING_AGENT_DIR="$ROOT/pi"` for pinned CLI login/bootstrap, pi-review
-installation, and model-cache commands (see [INSTALL.md](INSTALL.md)). The host and CLI share that account's OpenAI sign-in (`auth.json`, with compatible refresh locking) and the Pi
+path: for root installs explicitly set `PI_CODING_AGENT_DIR="$ROOT/pi"` for pinned CLI login/bootstrap and
+model-cache commands (see [INSTALL.md](INSTALL.md)). The host and CLI share that account's OpenAI sign-in
+(`auth.json`, with compatible refresh locking) and the Pi
 model catalog cache (`models-store.json`, which supplies models newer than the bundled catalog). Steve bootstraps the service
 login with the pinned CLI; neither process uses Steve's personal Pi install, settings, or credential files. When
 bumping Pi, verify that the active and rollback releases can both use the shared sign-in and model cache.
@@ -70,10 +71,10 @@ Pi runs use two extensions, and only these two:
 - **`pi-review`** (`github.com/earendil-works/pi-review`): the `/review` command. The run does not load it.
   `delegates` loads it inside a `crmanager` job and runs `/review` there without its interactive UI.
 
-Neither is published on npm. `delegates` is a git dependency pinned to a full commit SHA, so the lockfile fixes
-it and a rollback of aipatty rolls it back too; the run loads the copy in the running release by absolute path.
-`pi-review` is to be pinned the same way. For now it is the copy `pi install` puts in the agent directory, which
-`delegates` finds by itself and which is not tied to a release.
+Both are direct git dependencies pinned to full commit SHAs in `package.json` and the lockfile. Each release
+installs its own copies with `npm ci --ignore-scripts`; rolling back aipatty rolls both extensions back too.
+`pi-review` uses the known working upstream revision `f1de050504936046c0f85b21fec0e0a93ef394eb`. Its
+peers reuse Pi 1.6.0, including `pi-tui`, which the CLI already requires at exactly 1.6.0.
 
 `delegates` reads its settings from the service account's `settings.json` in the Pi agent directory, not from the
 checkout:
@@ -81,9 +82,10 @@ checkout:
 - **Publication:** `atlargelabs/aipatty` as the one authorized repository, with base branch `main`.
 - **Models:** none set. The extension's defaults are on the `openai` provider: `openai/gpt-6.2-sol` for every
   profile except `crmanager`, which reviews with `openai/gpt-6.2-astra`.
-- **Review extension:** unset for now, so `delegates` uses the `pi install` copy at
-  `git/github.com/earendil-works/pi-review/review.ts` in the agent directory. Once `pi-review` is pinned,
-  `delegates.reviewExtension` names the pinned `review.ts` by absolute path.
+- **Review extension:** `delegates.reviewExtension` names the pinned `review.ts` by absolute path through
+  `deploy/current` for service installs, or directly into the running checkout for development. Before cloning for
+  a PR, the host checks that it resolves to the running release's pinned file. There is no shared reviewer
+  fallback for PR runs in pinned releases, and the top-level run does not load pi-review.
 - **Checks:** `npm ci --ignore-scripts` as setup, and `npm run check` and `npm test` as required checks. A
   `prmanager` refuses to submit with no checks configured, and the copy in the repo's `.pi/settings.json` is not
   read because checkout settings stay untrusted.
@@ -91,9 +93,9 @@ checkout:
 `delegates` keeps its jobs, logs, and `prmanager` and `crmanager` clones in `delegates/jobs/` under the agent
 directory, outside `runs/`.
 
-**Not settled:** how to pin `pi-review`. The settings file is shared by every release, but a pinned `review.ts`
-sits at a different absolute path in each one. `reviewExtension` needs either a stable path to the active release
-or an update on each deploy and rollback.
+The settings file is shared and never rewritten by the host. The stable path follows `current` on deploy and
+rollback between pinned releases; stop the server and wait for it to exit before repointing the symlink or
+changing the setting. See [INSTALL.md](INSTALL.md) for the first pinned deploy and rollback to older releases.
 
 ## Tools the model gets
 
@@ -114,8 +116,9 @@ Every `pi` call starts a fresh session. A later run does not inherit the session
 the tool result, and operator logs remain available.
 
 1. **Request and workspace:** refuse if another run is active. Record the run ID, calling branch, requested
-   outcome, and base, then create `runs/<run-id>/`. `atlargelabs/aipatty` is the only allowed repo for now. Clone it
-   with the service account's GitHub access and record the resolved base SHA.
+   outcome, and base, then create `runs/<run-id>/`. For a PR run, check the configured reviewer matches the running
+   release. `atlargelabs/aipatty` is the only allowed repo for now. Clone it with the service account's GitHub access
+   and record the resolved base SHA.
 2. **Launch:** use the pinned CLI in one-shot JSON mode (`--mode json --no-session`). Collect structured events and
    stderr separately. Use `openai/gpt-6.2-sol` unless the call names another model. Disable automatic loading of
    checkout settings and executable resources, extensions, and MCP, then load the pinned
@@ -214,12 +217,12 @@ at boot without a login. It is not replaced by the normal aipatty upgrade.
 1. **Done: skeleton and tree.** Durable SQLite conversations, restart/resume, subscription login, loopback API,
    CLI and web page, per-branch models and cost, and `/health` reporting the commit.
 2. **Done: the Pi tool.** [CI](#guard-rails), the Pi packages at 1.6.0 with the [pinned Pi CLI](#pi-installation)
-   and the pinned `delegates` [extension](#pi-extensions), pi-durable's coding tools, codemode and tool search in
+   and pinned `delegates` and `pi-review` [extensions](#pi-extensions), pi-durable's coding tools, codemode and tool search in
    `work/`, and the [run contract](#pi-runs) with the git/issue workflow. Tested with a fake CLI: a second run
    refused, missing auth or model, malformed output, false success, abort, child cleanup, restart, the launch
    loading only the pinned extension, delegate usage charged once, delegate clones removed, and a result not
    reported as reviewed when its review is missing, has important findings, or covers a different SHA from the PR
-   head. The real CLI, with both extensions and the review loop, is first exercised in step 3.
+   head. Step 3 is the live end-to-end proof of the review and deploy loop.
 3. **Install on the mini and prove the loop by hand.** From the laptop over SSH, ask aipatty for a small change to
    itself. It opens an issue and a checked PR that a `crmanager` has reviewed. Steve merges and deploys it by
    hand; verify the new SHA and keep talking in the original conversation. At this point aipatty can help build the supervisor.

@@ -277,15 +277,16 @@ test("legacy server settings and AIPATTY_FAUX as the only environment setting", 
     authFile: join(homedir(), ".pi/agent/auth.json"), modelsStore: join(homedir(), ".pi/agent/models-store.json"),
     workDir: join(homedir(), ".aipatty/work"), runsDir: join(homedir(), ".aipatty/runs"),
   });
-  // A run launches this release's own pinned CLI and extension by absolute path, never one found on PATH.
+  // A run uses this release's own pinned CLI and extensions by absolute path, never ones found on PATH.
   assert.deepEqual(pi, {
     node: process.execPath,
     cli: join(checkout, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"),
     extension: join(checkout, "node_modules/pi-delegates/src/index.ts"),
+    reviewExtension: join(checkout, "node_modules/@earendil-works/pi-review/review.ts"),
     agentDir: join(homedir(), ".pi/agent"),
     repo: "atlargelabs/aipatty", repoUrl: "git@github.com:atlargelabs/aipatty.git", git: "git", gh: "gh",
   });
-  assert.ok(existsSync(pi.cli) && existsSync(pi.extension), "the pinned CLI and extension are installed");
+  assert.ok(existsSync(pi.cli) && existsSync(pi.extension) && existsSync(pi.reviewExtension), "the pinned CLI and extensions are installed");
   const dirs = readConfig(["--pi-dir", "~/elsewhere", "--work-dir", "~/w", "--runs-dir=/tmp/r"], {});
   assert.deepEqual([dirs.pi.agentDir, dirs.workDir, dirs.runsDir], [join(homedir(), "elsewhere"), join(homedir(), "w"), "/tmp/r"]);
   const { authFile, modelsStore, port } = readConfig(["--pi-dir", "~/elsewhere", "--port=0"], {});
