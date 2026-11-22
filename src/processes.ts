@@ -38,7 +38,7 @@ export function newOwned(
 
 async function ps(args: string[]): Promise<string> {
   // The C locale fixes the format of the start time.
-  return (await exec("ps", args, { maxBuffer: 64 * 1024 * 1024, env: { ...process.env, LC_ALL: "C" } })).stdout;
+  return (await exec("ps", args, { timeout: 5_000, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, LC_ALL: "C" } })).stdout;
 }
 
 /** This process's own group, once the process table has been read: never a run's. */
@@ -134,11 +134,6 @@ function reachable(procs: readonly Proc[], skipGroups: ReadonlySet<number>, root
     }
   }
   return ours;
-}
-
-/** The processes reached from still-held children in a snapshot read immediately before this call. */
-export function heldTree(procs: readonly Proc[], held: ReadonlySet<number>): Proc[] {
-  return [...reachable(procs, excludedGroups(procs), proc => heldRoot(proc, held)).values()];
 }
 
 /** Expand PIDs whose start times were independently verified, using a new table. */
@@ -279,14 +274,16 @@ function signal(pid: number, name: NodeJS.Signals): void {
  * signal goes to a process found, by ID and start time, in a process table read just before, so a process that
  * took over a dead one's ID is not signalled. Returns what is left: the survivors, and the processes that could not
  * be told from the run's, which are not signalled. `record` saves new or invalidated ownership evidence, including
- * a `pendingRecord` that previously failed to save. `liveChildren` supplies PIDs verified by a live child handle.
+ * a `pendingRecord` that previously failed to save. The caller must exclude other ownership updates and wait
+ * for in-flight writes before calling. `liveChildren` supplies PIDs verified by a live child handle.
  * Rejects if the table cannot be read or the record cannot be saved.
  */
 export async function stopRun(
   owned: Owned, runId: string, root: number | undefined, graceMs: number, term?: () => void, record?: () => Promise<unknown>,
   pendingRecord: () => boolean = () => false, liveChildren?: () => ReadonlySet<number>,
 ): Promise<Proc[]> {
-  // A record write failure blocks cleanup, but must not prevent us from stopping confirmed processes.
+  // Even a verified process can be the only proof of ownership for surviving group members or descendants.
+  // Do not signal anything until the evidence the scan relied on is safely checkpointed.
   let failedWrite: { error: unknown } | undefined;
   const save = async () => {
     try {
@@ -300,10 +297,10 @@ export async function stopRun(
   // started while we were writing. A signal must not orphan an unmarked child this table can still identify.
   const recordScan = async ({ ours, changed }: ProcessScan) => {
     const learned = remember(owned, ours);
-    if (!record || (!learned && !changed)) return ours;
+    if (!record || (!learned && !changed && !failedWrite)) return ours;
     for (let attempt = 0; attempt < 20; attempt++) {
       await save();
-      if (!ours.length) return ours;
+      if (failedWrite || !ours.length) return ours;
       const starts = new Map(ours.map(proc => [proc.pid, proc.start]));
       const current = await listProcesses();
       ours = identifiedTree(current, starts);
@@ -333,11 +330,8 @@ export async function stopRun(
       const scanned = await scan(owned, runId, save, false, liveChildren);
       ({ ours: left, unsure } = scanned);
       const targets = await recordScan(scanned);
-      if (!left.length) break;
-      const parents = new Set(targets.map(proc => proc.ppid));
-      const members = new Set(targets.filter(proc => proc.pgid !== proc.pid).map(proc => proc.pgid));
-      // With no durable checkpoint, stop verified leaves first, leaving roots available for recovery.
-      for (const proc of targets) if (!failedWrite || (!parents.has(proc.pid) && !members.has(proc.pid))) signal(proc.pid, "SIGKILL");
+      if (failedWrite || !left.length) break;
+      for (const proc of targets) signal(proc.pid, "SIGKILL");
       await sleep(150);
     }
     return [...left, ...unsure];

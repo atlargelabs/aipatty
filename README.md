@@ -84,9 +84,9 @@ been there when the run last saw an owned member of that same group. Process IDs
 records with only a run-wide timestamp can block cleanup, but require independent evidence before signalling.
 Finish any pending Pi run recovery before downgrading: older versions cannot read the new recovery record.
 A process that leaves both its parent and its group before it is observed, and hides its environment, may not be
-found. A process is signalled only when identified by a live child handle or a recent process-table read. If the
-server has to stop a direct child without verifying its process tree, it keeps the record and workspace for
-manual inspection, even after restart.
+found. A scan can authorize a signal only after its ownership evidence is saved. If the server cannot verify a
+child's tree after launch, or has to stop a direct child by its live handle without verifying its tree, it keeps
+the record and workspace for manual inspection, even after restart.
 
 ## Page
 
