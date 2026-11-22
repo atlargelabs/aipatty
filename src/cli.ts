@@ -134,7 +134,7 @@ async function main(): Promise<void> {
     print(await request(base, "/health"));
   } else if (command === "models" && rest.length === 0 && !scoped) {
     print(await request(base, "/api/models"));
-  } else if (command === "shutdown" && rest.length === 0 && !scoped) {
+  } else if (command === "shutdown" && rest.length === 0 && !scoped && at === undefined && limitArg === undefined) {
     const ack = await request<{ status: string } | null>(base, "/api/shutdown", {
       method: "POST", headers: { [shutdownHeader]: "1" }, redirect: "manual",
     });

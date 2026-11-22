@@ -134,11 +134,11 @@ directory**: the old runbook used `--data-dir ~/data`, so check `~/data/pi-run.j
 `$ROOT/data` or the legacy default unless that was the path actually used.
 
 Stop the old server as above (use Ctrl-C or `SIGTERM` if the old release lacks `shutdown`), wait for it to exit,
-and check that old path again. Shutdown during a
-Pi run deliberately leaves its record and cleanup for recovery on the next start; a fresh root cannot see that
-record. **If `pi-run.json` remains after shutdown, do not delete it or proceed with the cutover.** Restart the old
-server with the same old configuration (including its data, Pi, and runs directories) to finish recovery. Confirm
-the record is gone, then shut down the old server and recheck that it is still gone before starting the new one.
+and check that old path again. Shutdown during a Pi run deliberately leaves its record and cleanup for recovery
+on the next start; a fresh root cannot see that record. **If `pi-run.json` remains after shutdown, do not delete it
+or proceed with the cutover.** Restart the old server with the same old configuration (including its data, Pi,
+and runs directories) to finish recovery. Confirm the record is gone, then shut down the old server and recheck
+that it is still gone before starting the new one.
 If recovery cannot clear the record, stop and investigate; do not bypass it by switching roots or deleting old state.
 
 Only then start with a fresh root: do not migrate conversations. Reauthenticate with the pinned CLI as above and

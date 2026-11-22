@@ -198,10 +198,10 @@ The CLI connects to `127.0.0.1:8790`. `--port <n>` names another port, for a ser
 `shutdown` is server-wide, takes no branch, and works even when no saved model is available. `Shutdown requested.`
 acknowledges the request, not that cleanup has finished. The server closes its HTTP and WebSocket connections and
 cleans up as for Ctrl-C or `SIGTERM`, without waiting for a conversation to go idle. Unlike `abort`, it doesn't
-withdraw queued messages. Conversations persist; interrupted conversation work continues on restart if its model
-is available, and a partial answer may remain in the transcript. Active [`pi` runs](#pi-runs) are stopped and
-reported as interrupted on restart, not replayed.
-Wait for the server process to exit before starting another one on the same data directory.
+withdraw queued messages. Conversations persist, and interrupted conversation work continues on restart unless
+scheduling is [blocked by an unavailable model](#configure). Partial answers may remain in the transcript.
+Active [`pi` runs](#pi-runs) are stopped and reported as interrupted on restart, not replayed. Wait for the server
+process to exit before starting another one on the same data directory.
 
 ## From another machine
 

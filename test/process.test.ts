@@ -138,9 +138,13 @@ test("CLI shutdown acknowledges, closes a live stream and listener, and preserve
   assert.equal(await resumed.exit, 0, resumed.stderr());
 });
 
-test("shutdown requires POST, the CLI marker, and trusted Host and Origin", { timeout: 10_000 }, async t => {
+test("shutdown rejects unsupported CLI options and requires POST, the CLI marker, and trusted Host and Origin", { timeout: 10_000 }, async t => {
   const running = launch(t, await fixture(t));
   const base = await running.url();
+  const cli = cliAt(base);
+  for (const [option, value] of [["--branch", "1"], ["--at", "42"], ["--limit", "10"]]) {
+    await assert.rejects(cli("shutdown", option, value), /Usage: aipatty/);
+  }
   const marker = { "X-Aipatty-Shutdown": "1" };
   // node:http sends the exact Host we supply, rather than deriving it from the URL.
   const probe = (method: string, headers: Record<string, string>) =>
