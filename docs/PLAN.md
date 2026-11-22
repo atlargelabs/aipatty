@@ -17,7 +17,7 @@ conversation. The conversation host, branch tree, CLI, web page, and commit-repo
 | Tree | Branches are independent workstreams. Steve and aipatty can both fork. All branches stay listed. No automatic report-back. |
 | Models | Default `openai/gpt-6.2-sol`, on the `openai` provider with the OpenAI subscription, for aipatty's conversations and for Pi runs. Per-branch model, set by Steve or by aipatty. Spark later. Claude through the `pi` CLI only, for now. |
 | Cost | Shown per branch and in total as `$<branch> / $<total>`. No spend limit. |
-| macOS account | A standard user `aipatty`; Steve keeps administrator access. |
+| macOS account | An existing standard service user `aipatty`; manual app installation needs no macOS administrator access. Steve retains administrator access for separate machine provisioning. |
 | Guard rails | No approval prompts. The `protect-main` ruleset with required CI is the enforcement. No hooks for now. |
 | MCP | Gmail first (`aipattychestnut@gmail.com`). OAuth by link. Gmail is off by default and off for every new branch; it is switched on per branch. |
 
@@ -29,9 +29,12 @@ until then releases are deployed and rolled back manually.
 - **Stack:** TypeScript on Node 26. The Pi packages (`pi-durable`, `pi-ai`, `pi-codemode`, `chord`, `pi-schema`, and
   the `pi-coding-agent` CLI) are pinned at exactly 1.6.0 from npm, all at the same version so the host and the CLI share
   one `pi-ai`. Later bumps are normal reviewed PRs.
-- **Service installation layout:** an administrator provisions a private, service-user-writable absolute root,
-  `ROOT=/opt/aipatty`. Manual committed-main releases live at `$ROOT/deploy/<sha>`, with dependencies installed
-  per release and `$ROOT/deploy/current` pointing at the active one. Keep the last-known-good release for rollback.
+- **Service installation layout:** the service account creates its own private root; the recommended default is
+  `~/aipatty` in its own home: set `ROOT="$HOME/aipatty"`, run `(umask 077 && mkdir -p "$ROOT")`, then
+  `chmod 700 "$ROOT"` (also for a reused dedicated root owned by that account). Another writable absolute path
+  is fine; no administrator provisions the root. Manual committed-main releases live at `$ROOT/deploy/<sha>`,
+  with dependencies installed per release and `$ROOT/deploy/current` pointing at the active one. Keep the
+  last-known-good release for rollback.
   - `$ROOT/work/`: working directory of aipatty's own tools, for inspection and scratch, not PR work.
   - `$ROOT/runs/`: disposable workspaces for [`pi` runs](#pi-runs).
   - `$ROOT/data/`: SQLite, logs, and later upgrade state and MCP configuration and sign-ins.
@@ -229,15 +232,21 @@ at boot without a login. It is not replaced by the normal aipatty upgrade.
 5. **After self-upgrade:** phone access, MCP configuration and OAuth, the per-branch switch, and Gmail. Add research
    mode, concurrent runs, hooks, or more repos only when needed.
 
-## Setup only Steve can do
+## Setup responsibilities
 
-- Create the `aipatty` user on the mini, provision the private writable `/opt/aipatty` root, and install Node 26 or newer, Git, and `gh`. Set up the service account's
-  model sign-in with the release's Pi CLI and configure `pattycaik`'s SSH key and `gh` login. Write the
-  [`delegates` settings](#pi-extensions) into the service account's Pi agent directory. Confirm `main` protection,
-  with the CI check required, before enabling PR publication. No global Pi install or copy of Steve's dotfiles is
-  needed.
-- Fix SSH from the laptop to `macmini` (host key verification fails), and later install the launchd supervisor.
-- For Gmail later, create the Google Cloud project and OAuth client.
+- **Manual app install, as the service account:** assume an existing standard `aipatty` account with a writable
+  home and user-accessible Node 26 or newer, Git, and `gh`. Follow [INSTALL.md](INSTALL.md) to create its private
+  `~/aipatty` root, install releases, set up the model sign-in with the release's Pi CLI, configure `pattycaik`'s
+  SSH key and `gh` login, and write the [`delegates` settings](#pi-extensions) into its Pi agent directory. None
+  of this needs `sudo` or a macOS administrator account. No global Pi install or copy of Steve's dotfiles is needed.
+- **GitHub maintainer work:** confirm `pattycaik` has write, not admin, access and `main` has the `protect-main`
+  ruleset with the CI check required before enabling PR publication. These are repository permissions, separate
+  from macOS administrator access. Only Steve merges PRs.
+- **Optional machine provisioning, separately:** if the service account or system tools do not exist, arrange
+  their creation or installation with the machine owner; this may need a macOS administrator. The service account
+  still creates its own install root. Fix SSH from the laptop to `macmini` (host key verification fails).
+- **Future work for Steve:** install the privileged launchd supervisor described above, not as part of the manual
+  app install. For Gmail later, create the Google Cloud project and OAuth client.
 
 ## Left for aipatty to build
 

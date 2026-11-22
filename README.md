@@ -133,7 +133,14 @@ paths containing spaces. Blank paths are rejected. The root option is server-onl
 variable, CLI client option, or API setting. Pi executables and the delegates extension still come from the pinned
 release, not the state root.
 
-For a service install, choose one private, service-user-writable absolute root such as `ROOT=/opt/aipatty`.
+For a service install, the default recommended root is `~/aipatty` in the service account's own home, not a new
+runtime default. As that account, set `ROOT="$HOME/aipatty"`, create it with `(umask 077 && mkdir -p "$ROOT")`,
+and run `chmod 700 "$ROOT"` to ensure even a reused dedicated root owned by that account is private. Another
+writable absolute path is fine. The manual app install needs no `sudo` or macOS administrator account: an existing
+standard service account and user-accessible Node 26 or newer, Git, and `gh` are prerequisites. Optional machine
+provisioning and GitHub maintainer setup are separate; retain the `pattycaik` service identity and `protect-main`
+branch protection described in the runbook.
+
 Keep committed-main releases in `$ROOT/deploy/<sha>` with a `deploy/current` symlink and launch
 `node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT"`. Explicitly set `PI_CODING_AGENT_DIR="$ROOT/pi"`
 when using the pinned Pi CLI for login, pi-review installation, or model-cache updates. Follow

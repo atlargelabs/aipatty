@@ -4,23 +4,37 @@ This is build step 3 of [PLAN.md](PLAN.md): install by hand, then prove that aip
 reviewed PR. Use a committed `main` release containing `--install-dir`. Deploys and rollback are manual; the
 supervisor is future work (step 4). No installer, migration, or automatic deletion is involved.
 
-Choose one absolute root, here `ROOT=/opt/aipatty`, and use it consistently. Commands run as the `aipatty` user on
-the mini unless they say otherwise. Set `ROOT=/opt/aipatty` in each shell that runs them. The root is private and
-writable by the service user, not a security boundary against that user.
+The default recommended service root is `~/aipatty` in the home of the account that will run aipatty. Set
+`ROOT="$HOME/aipatty"` in each shell that runs these commands, so the path is absolute and quoted. Another
+writable absolute path is fine; use the same root consistently. This is an install recommendation, not a change
+to the server's no-flag defaults. The root is private and writable by the service user, not a security boundary
+against that user.
 
-## Once, as an administrator
+## Prerequisites and separate provisioning
 
-1. Create a standard macOS user `aipatty`. It gets none of Steve's credentials.
-2. Install Node 26 or newer, Git and `gh` where that user can run them.
-3. Provision `/opt/aipatty` as a private directory owned and writable by `aipatty` (for example, create it as
-   administrator, set its owner to `aipatty`, and its mode to `0700`).
-4. Add the `ci` check to the `protect-main` ruleset as a required status check, once the CI workflow is on `main`.
+- An existing standard macOS service account, called `aipatty` here, with its own writable home and none of
+  Steve's credentials. Node 26 or newer, Git and `gh` must already be accessible to that account.
+- **Optional machine provisioning:** if a new account or system-wide tools are needed, arrange that separately
+  with the machine owner; it may require a macOS administrator. It is not part of the manual app install below,
+  which needs neither `sudo` nor a macOS administrator account. No administrator provisions the install root.
+- **GitHub maintainer setup:** before enabling PR publication, confirm the `pattycaik` service identity has write,
+  not admin, access and `main` has the `protect-main` ruleset. Add `ci` as a required status check once the workflow
+  is on `main`. These are repository permissions, not macOS administrator privileges; only Steve merges PRs.
 
 ## Once, as `aipatty`
 
+All app installation and runtime commands below run as the service account, not as an administrator. Create the
+dedicated root under that account's own home privately; the subshell scopes the restrictive umask to `mkdir`:
+
 ```sh
-ROOT=/opt/aipatty
+ROOT="$HOME/aipatty"
+(umask 077 && mkdir -p "$ROOT")
+chmod 700 "$ROOT"
 ```
+
+If reusing a dedicated root, first confirm it is owned by this account, then ensure it is private (`0700`, as
+above) before writing credentials or state. Do not use the home directory itself or a shared directory as the
+root. For an alternative path, choose one this account can create and own without elevated privileges.
 
 1. **GitHub.** Give the `pattycaik` account an SSH key and sign `gh` in as it:
 
@@ -85,7 +99,7 @@ PI_CODING_AGENT_DIR="$ROOT/pi" node "$ROOT/deploy/current/node_modules/@earendil
 
 ## Start
 
-From any working directory, with `ROOT=/opt/aipatty` set:
+From any working directory, with `ROOT="$HOME/aipatty"` (or your chosen root) set:
 
 ```sh
 node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT"
