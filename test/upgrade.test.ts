@@ -11,7 +11,7 @@ import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
 import type { ConversationPage } from "../src/protocol.ts";
 import { ownDataDir } from "../src/ownership.ts";
-import { RUN_MARKER } from "../src/processes.ts";
+import { newOwned, RUN_MARKER, runProcesses } from "../src/processes.ts";
 import { backupDb, restoreDb } from "../src/upgrade-db.ts";
 import { upgradeEntryKind, UpgradePaths } from "../src/upgrade-state.ts";
 import { identify, reapStage, stageEnvironment, stageMarker, type UpgradeHealth } from "../src/upgrade-process.ts";
@@ -531,13 +531,13 @@ if (process.env.UPGRADE_NESTED_TEST) {
   });
 }
 
-test("staging scans a marked successor born between process table reads", { timeout }, async t => {
+for (const hideSuccessor of [false, true]) test(`staging checks a detached successor ${hideSuccessor ? "missed by a non-atomic process snapshot" : "created between process table reads"}`, { timeout }, async t => {
   const scratch = await mkdtemp(join(tmpdir(), "aipatty-scan-"));
   const marker = stageMarker(randomUUID());
   const pidFile = join(scratch, "successor.pid");
   t.after(async () => {
     const pid = Number(await readFile(pidFile, "utf8").catch(() => ""));
-    if (pid > 1 && await identify(pid)) process.kill(pid, "SIGKILL");
+    if (pid > 1 && (await runProcesses(newOwned(), "1", marker)).some(p => p.pid === pid)) process.kill(pid, "SIGKILL");
     await rm(scratch, { recursive: true, force: true });
   });
   await writeFile(join(scratch, "detach.cjs"), `
@@ -555,6 +555,16 @@ if [ "$3" = "pid=,ppid=,pgid=,uid=,stat=,lstart=" ]; then
     touch "$SCAN_FIXTURE/sampled"
   elif [ ! -f "$SCAN_FIXTURE/successor.pid" ]; then
     "$SCAN_NODE" "$SCAN_FIXTURE/detach.cjs"
+    if [ "$SCAN_HIDE" = 1 ]; then
+      IFS= read -r successor < "$SCAN_FIXTURE/successor.pid"
+      /bin/ps "$@" > "$SCAN_FIXTURE/table" &
+      observer=$!
+      wait "$observer" || exit $?
+      while read -r pid row; do
+        if [ "$pid" != "$observer" ] && [ "$pid" != "$successor" ]; then printf '%s %s\\n' "$pid" "$row"; fi
+      done < "$SCAN_FIXTURE/table"
+      exit 0
+    fi
   fi
 fi
 exec /bin/ps "$@"
@@ -563,7 +573,8 @@ exec /bin/ps "$@"
     const { newOwned, runProcesses } = await import("./src/processes.ts");
     console.log(JSON.stringify((await runProcesses(newOwned(), "1", process.argv[1])).map(p => p.pid)));
   `, marker], {
-    cwd: checkout, env: { ...process.env, PATH: `${scratch}:${process.env.PATH}`, SCAN_FIXTURE: scratch, SCAN_NODE: process.execPath }, timeout: 15_000,
+    cwd: checkout, env: { ...process.env, PATH: `${scratch}:${process.env.PATH}`, SCAN_FIXTURE: scratch, SCAN_NODE: process.execPath,
+      SCAN_HIDE: hideSuccessor ? "1" : "0" }, timeout: 15_000,
   });
   assert.deepEqual(JSON.parse(stdout), [Number(await readFile(pidFile, "utf8"))]);
 });

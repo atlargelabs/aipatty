@@ -94,11 +94,10 @@ export async function reapStage(j: UpgradeJournal): Promise<void> {
 
 /** The stage worker itself is still the live group leader when it publishes or removes its private checkout. */
 export async function assertStageIdle(id: string): Promise<void> {
-  const group = (await listProcesses()).filter(p => p.pid !== process.pid && p.pgid === process.pid);
-  // ps is itself a short-lived member on some platforms. Don't mistake the probe for a staging command.
-  const repeat = await listProcesses();
-  const found = group.some(p => repeat.some(next => next.pid === p.pid && next.start === p.start && next.pgid === process.pid));
-  if (found || (await runProcesses(newOwned(), "1", stageMarker(id))).length) throw new Error("Staging still has subprocesses");
+  const hasGroupMember = async () => (await listProcesses()).some(p => p.pid !== process.pid && p.pgid === process.pid);
+  if (await hasGroupMember() || (await runProcesses(newOwned(), "1", stageMarker(id))).length || await hasGroupMember()) {
+    throw new Error("Staging still has subprocesses");
+  }
 }
 
 function assertOwnerFiles(paths: UpgradePaths): void {
@@ -135,11 +134,13 @@ function linuxListeningInodes(port: number): Set<string> {
     .map(line => line.trim().split(/\s+/)).filter(row => row[1] === address && row[3] === "0A").map(row => row[9]));
 }
 
+export class LegacyInspectionError extends Error {}
+
 function procEntry<T>(path: string, read: (path: string) => T): T | undefined {
   try { return read(path); }
   catch (error) {
     if (processEntryUnavailable(error)) return undefined;
-    throw new Error(`Could not inspect ${path} during legacy ownership check`, { cause: error });
+    throw new LegacyInspectionError(`Could not inspect ${path} during legacy ownership check`, { cause: error });
   }
 }
 

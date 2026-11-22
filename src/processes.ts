@@ -122,6 +122,7 @@ async function scan(owned: Owned, runId: string, variable: string): Promise<{ ou
   const eligible = (proc: Proc) => proc.pid !== process.pid && (!isStage || proc.uid === process.geteuid?.());
   let sample = (await listProcesses()).filter(eligible);
   let procs: Proc[];
+  let confirmedQuiet = false;
   for (let attempt = 0;; attempt++) {
     const observation = await markedPids(runId, sample, variable);
     for (const p of sample) {
@@ -133,7 +134,16 @@ async function scan(owned: Owned, runId: string, variable: string): Promise<{ ou
     // before declaring it idle. Unrelated system-user churn need not settle; staging doesn't change UID.
     if (!isStage) break;
     sample = procs.filter(p => eligible(p) && sampled.get(p.pid) !== p.start);
-    if (!sample.length) break;
+    if (!sample.length) {
+      const live = new Map(procs.map(p => [p.pid, p.start]));
+      const disappeared = [...marked].filter(([pid, start]) => live.get(pid) !== start);
+      if (!disappeared.length && (confirmedQuiet || marked.size)) break;
+      // ps is not atomic: a parent can exit after enumeration but before its row is read, and its
+      // new child may be missing from that same snapshot. Confirm apparent quiet with a fresh scan.
+      for (const [pid] of disappeared) marked.delete(pid);
+      confirmedQuiet = true;
+      sample = (await listProcesses()).filter(eligible);
+    }
     if (attempt === 15) throw new Error("Process table kept changing during staging cleanup; cannot establish quiescence");
   }
   const byPid = new Map(procs.map(proc => [proc.pid, proc]));

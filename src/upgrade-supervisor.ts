@@ -10,7 +10,7 @@ import { readConfig, type Config } from "./config.ts";
 import { backupDb, restoreDb } from "./upgrade-db.ts";
 import {
   assertStageIdle, confirmActivation, detachServer, getHealth, identify, launchServer, legacyConnection, openUpgradeLog, probeServer,
-  quiescent, reapStage, sendParent, stageMarker, stopCandidate, type ServerChild,
+  LegacyInspectionError, quiescent, reapStage, sendParent, stageMarker, stopCandidate, type ServerChild,
 } from "./upgrade-process.ts";
 import { stageRelease, verifyRelease } from "./upgrade-release.ts";
 import {
@@ -137,7 +137,10 @@ async function run(paths: UpgradePaths, args: {
           || (pid !== undefined && health.pid !== pid)) return;
       }
       return current.old;
-    } catch { return; }
+    } catch (error) {
+      if (error instanceof LegacyInspectionError) throw error;
+      return;
+    }
   };
   const done = (before: UpgradeJournal, status: NonNullable<UpgradeJournal["result"]>) => {
     const next = save(finish(before, status));
