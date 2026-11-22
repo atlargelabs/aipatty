@@ -78,16 +78,13 @@ extension: at `git/github.com/earendil-works/pi-review/review.ts` in the Pi dire
 `pi install git:github.com/earendil-works/pi-review` puts it), or wherever `delegates.reviewExtension` in the Pi
 directory's `settings.json` says. A run that must end with a PR is refused when the extension is missing.
 
-A run's processes are found by parent, by the process groups its processes led, and by a marker in their
-environment. If a group has lost its leader, membership alone counts only for processes old enough to have
-been there when the run last saw an owned member of that same group. Process IDs and groups in older recovery
-records with only a run-wide timestamp can block cleanup, but require independent evidence before signalling.
-Finish any pending Pi run recovery before downgrading: older versions cannot read the new recovery record.
-A process that leaves both its parent and its group before it is observed, and hides its environment, may not be
-found. A scan can authorize a signal only after its ownership evidence is saved. If the server cannot verify a
-child's tree after launch or during an emergency stop, it keeps the record and workspace for manual inspection.
-The launcher is recorded before the command starts. If an interrupted run's last launcher cannot be verified
-on restart, the workspace stays in place even if the previous host could not record why its stop failed.
+A run's processes are identified by a remembered PID and start time or by a marker in their environment.
+Discovery also follows their children and other members of their live process groups. A remembered group ID
+alone can be reused: if the leader is gone and no member can be independently identified, the remaining
+members are not signalled and cleanup stays pending. Inspect the reported PIDs and restart once the ambiguity
+is resolved. Existing `pi-run.json` records are still readable; the legacy `asOf` timestamp is ignored for
+ownership. A process that leaves both its parent and its group and hides its environment is not found unless
+its identity was remembered.
 
 ## Page
 

@@ -1,7 +1,7 @@
 // A stand-in for the Pi CLI in one-shot JSON mode. It plays the steps of `fake-scenario.json` in the agent directory
 // and records how it was launched in `fake-launches.jsonl` there.
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -26,10 +26,7 @@ for (const step of scenario.steps ?? []) {
   if (step.stderr !== undefined) process.stderr.write(step.stderr);
   if (step.spawn) {
     // As the delegates extension starts its children: detached, leading their own process group.
-    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 600000)"], {
-      detached: true, stdio: step.inheritOutput ? ["ignore", "inherit", "ignore"] : "ignore",
-      ...(step.spawn === "unmarked" ? { env: {} } : {}),
-    });
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 600000)"], { detached: true, stdio: "ignore" });
     child.unref();
     appendFileSync(join(agentDir, "fake-pids.txt"), `${child.pid}\n`);
   }
@@ -47,7 +44,6 @@ for (const step of scenario.steps ?? []) {
     }));
   }
   if (step.sleep) await sleep(step.sleep);
-  if (step.waitForFile) while (!existsSync(join(agentDir, step.waitForFile))) await sleep(20);
   if (step.hang) await new Promise(() => setInterval(() => {}, 1000));
   if (step.exit !== undefined) process.exit(step.exit);
 }

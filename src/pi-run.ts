@@ -4,14 +4,13 @@ import { randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream, type WriteStream } from "node:fs";
 import { copyFile, cp, lstat, mkdir, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
-import type { Writable } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import type { Config } from "./config.ts";
 import { instructions, taskPrompt } from "./pi-prompt.ts";
 import { addUsage, githubLink, readReport, RunTrace, usageKey, type JobUsage, type Review } from "./pi-trace.ts";
-import { identifiedTree, invalidateFutureCutoffs, listProcesses, newOwned, remember, RUN_MARKER, stopRun, trackRunProcesses, type Owned, type Proc } from "./processes.ts";
+import { listProcesses, newOwned, remember, runProcesses, RUN_MARKER, stopRun, type Owned } from "./processes.ts";
 
 const exec = promisify(execFile);
 
@@ -75,20 +74,10 @@ interface SavedRun {
   /** The Pi process, once it runs. */
   pid?: number;
   procs: [number, string][];
-  /** Group ID and when ownership was last observed, or null when unknown. */
-  groups: [number, number | null][];
-  /** Legacy process identities: they can block cleanup, but cannot establish ownership. */
-  unverifiedProcs?: [number, string][];
-  /** The last launcher whose gate may have opened. It guards recovery, but does not authorize signals. */
-  activeChild?: [pid: number, start: string];
-  /** A launched child's tree may not have been verified; require manual inspection. */
-  cleanupUncertain?: true;
+  groups: number[];
+  /** Legacy cutoff; ignored for ownership. Write 0 so older readers can still parse the record. */
+  asOf: number;
 }
-
-type LegacySavedRun = Omit<SavedRun, "groups" | "unverifiedProcs"> & { groups: number[]; asOf: number };
-
-/** A detached child's group or process tree could not be verified or saved for recovery. */
-class GroupRecordError extends Error {}
 
 /** A call's outcome as kept by task, and whether the spend of its cut-off delegate jobs has been added to it. */
 interface Kept {
@@ -135,7 +124,7 @@ const isMissing = (error: unknown) => (error as NodeJS.ErrnoException).code === 
  * A child's exit code, once its output has ended. A process the child left behind can hold the pipes open for
  * ever: after `drainMs` they are closed here instead.
  */
-function exitOf(child: ChildProcess, onError: (error: Error) => void, onDrainTimeout: () => void): Promise<number | null> {
+function exitOf(child: ChildProcess, onError: (error: Error) => void): Promise<number | null> {
   return new Promise(done => {
     child.once("error", error => {
       onError(error);
@@ -143,7 +132,6 @@ function exitOf(child: ChildProcess, onError: (error: Error) => void, onDrainTim
     });
     child.once("exit", code => {
       const timer = setTimeout(() => {
-        onDrainTimeout();
         child.stdout?.destroy();
         child.stderr?.destroy();
         done(code);
@@ -168,17 +156,8 @@ const message = (error: unknown) => error instanceof Error ? error.message : Str
 
 async function writeJson(path: string, value: unknown): Promise<void> {
   const temp = `${path}.${randomUUID()}.tmp`;
-  try {
-    await writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
-    await rename(temp, path);
-  } catch (error) {
-    try {
-      await rm(temp, { force: true });
-    } catch (removeError) {
-      throw new AggregateError([error, removeError], `${message(error)}; could not remove ${temp}: ${message(removeError)}`);
-    }
-    throw error;
-  }
+  await writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
+  await rename(temp, path);
 }
 
 /** A JSON file's value, or `undefined` when there is no such file. A file that exists and cannot be read throws. */
@@ -484,20 +463,6 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     }
   }
 
-  /** Save a verified, empty stop before reporting or deleting anything that recovery might need again. */
-  const disarmLaunchGuard = async (saved: SavedRun, record: () => Promise<void>) => {
-    const activeChild = saved.activeChild;
-    if (activeChild && !saved.cleanupUncertain) {
-      delete saved.activeChild;
-      try {
-        await record();
-      } catch (error) {
-        saved.activeChild = activeChild;
-        throw error;
-      }
-    }
-  };
-
   /**
    * Stop what is left of a run, add its cut-off delegates' spend, keep its logs, and delete its workspace and its
    * delegates' clones. `clean` is false when something of the run is still there, or could not be looked at: the
@@ -505,22 +470,17 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
    * spend; when this call added it, the outcome was saved with it before anything was deleted.
    */
   async function cleanUp(
-    saved: SavedRun, trace: RunTrace, outcome: RunOutcome, reconciled: boolean, stop: () => Promise<Proc[]>, record: () => Promise<void>,
+    saved: SavedRun, owned: Owned, trace: RunTrace, outcome: RunOutcome, reconciled: boolean,
+    options: { term?: () => void; record: () => Promise<unknown> },
   ): Promise<{ clean: boolean; reconciled: boolean }> {
     try {
-      const left = await stop();
+      const left = await stopRun(owned, saved.runId, saved.pid, graceMs, options.term, options.record);
       if (left.length) {
         // Its jobs may still be spending: their spend is added by the cleanup that finds them stopped.
         outcome.problems.push(`${left.length} process(es) could not be stopped, or could not be told from the run's (${left.map(proc => proc.pid).join(", ")}); its workspace was left in ${saved.workspace}.`);
         outcome.usageComplete = false;
         return { clean: false, reconciled };
       }
-      if (saved.cleanupUncertain) {
-        outcome.problems.push("A child's process tree could not be verified; descendants may remain. Inspect the run before removing its record or workspace.");
-        outcome.usageComplete = false;
-        return { clean: false, reconciled };
-      }
-      await disarmLaunchGuard(saved, record);
       const { jobs, ours } = await findJobs(saved, trace, outcome);
       if (!reconciled) {
         reconcile(trace, outcome, jobs, ours);
@@ -648,51 +608,25 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     if (issue) outcome.issue = { url: issue.url, confirmed: false };
   }
 
-  const processIds = (value: unknown): value is [number, string][] => Array.isArray(value) && value.every(proc =>
-    Array.isArray(proc) && proc.length === 2 && Number.isSafeInteger(proc[0]) && typeof proc[1] === "string");
-
   /** Whether a saved record names the directories this host gives a run, so that cleanup deletes nothing else. */
-  const ownRecord = (saved: unknown): saved is SavedRun | LegacySavedRun => {
-    const run = saved as SavedRun | LegacySavedRun | null;
+  const ownRecord = (saved: unknown): saved is SavedRun => {
+    const run = saved as SavedRun | null;
     return typeof run === "object" && run !== null
       && typeof run.runId === "string" && /^[0-9A-Za-z][\w-]*$/.test(run.runId)
       && run.workspace === join(config.runsDir, run.runId) && run.logDir === join(logRoot, run.runId)
       && Number.isSafeInteger(run.conversationId) && Number.isSafeInteger(run.taskId)
-      && Array.isArray(run.groups) && ("asOf" in run
-        ? typeof run.asOf === "number" && run.groups.every(Number.isSafeInteger)
-        : run.groups.every(group => Array.isArray(group) && group.length === 2 && Number.isSafeInteger(group[0])
-          && (group[1] === null || (Number.isSafeInteger(group[1]) && group[1] >= 0))))
-      && processIds(run.procs) && (!("unverifiedProcs" in run) || processIds(run.unverifiedProcs))
-      && (!("activeChild" in run) || processIds([run.activeChild]))
-      && (!("cleanupUncertain" in run) || run.cleanupUncertain === true);
+      && typeof run.asOf === "number" && Array.isArray(run.groups) && run.groups.every(Number.isSafeInteger)
+      && Array.isArray(run.procs) && run.procs.every(proc => Array.isArray(proc) && proc.length === 2
+        && Number.isSafeInteger(proc[0]) && typeof proc[1] === "string");
   };
 
   // A run the previous process left: stop it, clean up, and report its call `interrupted`. It is never run again.
   let left: SavedRun | undefined;
-  let pendingRecoveryRecord = false;
   try {
-    const readStartedAt = Date.now();
     const saved = await readJson<unknown>(stateFile);
-    const readAt = Math.min(readStartedAt, Date.now());
     // Anything the file holds that is not a run of this data directory, `null` included, is a damaged record.
     if (saved !== undefined && !ownRecord(saved)) throw new Error("it does not describe a run of this data directory");
-    if (saved && "asOf" in saved) {
-      // Neither the old run-wide time nor the processes it may have misclassified can prove ownership. Keep
-      // them as potential blockers (without the time), and require independent evidence before signalling.
-      const { asOf: _asOf, groups, procs, ...run } = saved;
-      left = { ...run, groups: groups.map(pgid => [pgid, null]), procs: [], unverifiedProcs: procs };
-    } else if (saved && saved.groups.some(([, seenAt]) => seenAt !== null && seenAt > readAt)) {
-      // Persist this before replaying the run's logs: a future cutoff could become usable while we wait.
-      left = { ...saved, groups: saved.groups.map(([pgid, seenAt]) => [pgid, seenAt !== null && seenAt > readAt ? null : seenAt]) };
-      try {
-        await writeJson(stateFile, left);
-      } catch {
-        // Use only the corrected record. stopRun will retry the write before signalling or allowing cleanup.
-        pendingRecoveryRecord = true;
-      }
-    } else {
-      left = saved;
-    }
+    left = saved;
   } catch (error) {
     left = undefined;
     stuck = `The record of an earlier Pi run, ${stateFile}, cannot be used (${clip(message(error), 300)}). Its processes and workspace may still be there. `
@@ -707,26 +641,9 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       // directory is written first, so it can be ahead of the index.
       const settledBefore = (await logged(saved.runId, saved.taskId))?.entry
         ?? (kept.get(key)?.outcome.runId === saved.runId ? kept.get(key) : undefined);
-      const owned = newOwned(saved.procs, saved.groups, saved.unverifiedProcs);
+      const owned = newOwned(saved.procs, saved.groups);
       // What the cleanup learns of the run's processes is kept for the next start, should this one not finish.
-      const record = async () => {
-        await writeJson(stateFile, { ...saved, procs: [...owned.procs], groups: [...owned.groups] });
-        pendingRecoveryRecord = false;
-      };
-      const stop = async () => {
-        const activeChild = saved.activeChild;
-        let verified = !activeChild;
-        const survivors = await stopRun(owned, saved.runId, saved.pid, graceMs, undefined, record, () => pendingRecoveryRecord, undefined, tree => {
-          if (activeChild) {
-            const [pid, start] = activeChild;
-            verified = tree.some(proc => proc.pid === pid && proc.start === start && proc.pgid === pid);
-          }
-        });
-        // An emergency stop may not have been able to write its permanent blocker. If the launcher is now
-        // gone too, an empty scan cannot distinguish a clean stop from a detached, unmarked orphan.
-        if (!verified) saved.cleanupUncertain = true;
-        return survivors;
-      };
+      const record = () => writeJson(stateFile, { ...saved, procs: [...owned.procs], groups: [...owned.groups], asOf: 0 });
       const trace = new RunTrace(pi.repo);
       const split = lineSplitter((line, whole) => trace.line(line, whole));
       try {
@@ -734,13 +651,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       } catch (error) {
         if (!isMissing(error)) {
           // Part of a transcript is not the run's account: stop the run, and keep its record for another try.
-          const reason = `its events could not be read: ${message(error)}`;
-          try {
-            if (!(await stop()).length) await disarmLaunchGuard(saved, record);
-          } catch (stopError) {
-            throw new Error(`${reason}; stopping it also failed: ${message(stopError)}`);
-          }
-          throw new Error(reason);
+          await stopRun(owned, saved.runId, saved.pid, graceMs, undefined, record).catch(() => {});
+          throw new Error(`its events could not be read: ${message(error)}`);
         }
       }
       split.end();
@@ -751,7 +663,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         outcome.usageComplete = false;
         unconfirmedLinks(trace, outcome);
       }
-      const { clean, reconciled } = await cleanUp(saved, trace, outcome, settledBefore?.reconciled ?? false, stop, record);
+      const { clean, reconciled } = await cleanUp(saved, owned, trace, outcome, settledBefore?.reconciled ?? false, { record });
       if (outcome.status === "completed" && outcome.problems.length) outcome.status = "failed";
       await remembered(saved, outcome, reconciled);
       let handed = clean;
@@ -790,181 +702,42 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     let launched = false;
     let term: (() => void) | undefined;
 
-    // Serialize ownership discovery as well as writes. A stop must start with a fresh scan after any in-flight
-    // adoption or poll has saved what it learned (or left the record dirty), and no poll may change it mid-stop.
-    let ownership = Promise.resolve();
-    const withOwnership = <T>(operation: () => Promise<T>): Promise<T> => {
-      const result = ownership.then(operation);
-      ownership = result.then(() => {}, () => {});
-      return result;
-    };
+    // One writer at a time, and none once the run's record is handed over.
     let recording = true;
-    let recordEstablished = false;
-    let recordDirty = false;
-    const write = async (launchPending = false) => {
+    let saving: Promise<unknown> = Promise.resolve();
+    const write = () => saving = saving.catch(() => {}).then(async () => {
       if (!recording) return;
-      recordDirty = true;
-      await writeJson(stateFile, {
-        ...saved, cleanupUncertain: launchPending || saved.cleanupUncertain,
-        procs: [...run.owned.procs], groups: [...run.owned.groups],
-      });
-      recordEstablished = true;
-      recordDirty = launchPending;
-    };
+      await writeJson(stateFile, { ...saved, procs: [...run.owned.procs], groups: [...run.owned.groups] });
+    });
     const save = () => write().catch(error => console.error(`Pi run ${saved.runId}: could not save its record:`, error));
-    let killRequested = false;
-    let verifiedEmptyStop = false;
-    let drainUncertain = false;
-    let abandonedChildren = false;
-    const abandonment = Promise.withResolvers<null>();
-    /** Remember a detached process this host started for the run, before waiting on it. */
-    const adopt = async (child: ChildProcess, release: (start: boolean) => void): Promise<GroupRecordError | undefined> => {
-      const pid = child.pid;
-      if (pid === undefined) {
-        release(false);
-        return;
-      }
-      if (run.stop || killRequested) {
-        release(false);
-        return;
-      }
-      const seenAt = Date.now();
-      if (invalidateFutureCutoffs(run.owned, seenAt)) {
-        // Do not let a cutoff we observed in the future become usable again during a slow preflight read.
-        try {
-          await write();
-        } catch (error) {
-          release(false);
-          run.kill();
-          return new GroupRecordError(`could not save corrected process group cutoffs: ${message(error)}`);
-        }
-      }
-      let before: Proc[];
-      try {
-        before = await listProcesses();
-      } catch (error) {
-        release(false);
-        return new GroupRecordError(`could not read the process table for launcher ${pid}: ${message(error)}`);
-      }
-      const leader = live(child) ? before.find(proc => proc.pid === pid && proc.ppid === process.pid && proc.pgid === pid) : undefined;
-      if (run.stop || killRequested || !leader) {
-        release(false);
-        if (!run.stop && !killRequested) return new GroupRecordError(`could not verify the launcher for process group ${pid}`);
-        return;
-      }
-      // Before preflight completes, EOF on the gate is sufficient. Now checkpoint the group and block
-      // cleanup before opening the gate: a crash during adoption could hide an already detached worker.
-      invalidateFutureCutoffs(run.owned, Date.now());
-      run.owned.groups.set(pid, null);
-      const previousChild = saved.activeChild;
-      // Keep this recovery guard even after adoption succeeds. Later storage failures must not prevent us
-      // from noticing that the last launcher's ancestry is no longer available after a restart.
-      saved.activeChild = [pid, leader.start];
-      try {
-        await write(true);
-      } catch (error) {
-        saved.activeChild = previousChild;
-        release(false); // EOF lets the launcher exit without running the command or starting descendants.
-        run.kill(); // Retry the dirty record and stop any other processes that can be verified.
-        return new GroupRecordError(`could not save process group ${pid}: ${message(error)}`);
-      }
-      if (run.stop || killRequested) {
-        saved.activeChild = previousChild;
-        release(false);
-        return;
-      }
-      // Exec keeps the verified identity. Keep descendants visible in this read even if a fast command exits.
-      release(true);
-      let procs: Proc[];
-      try {
-        procs = await listProcesses();
-      } catch (error) {
-        // The leader may have exited and an unmarked worker may no longer be reachable. Keep the blocker
-        // already on disk, even if a later scan is empty. Stop only what can still be verified.
-        saved.cleanupUncertain = true;
-        remember(run.owned, [leader]);
-        run.kill();
-        return new GroupRecordError(`could not scan process group ${pid} after launch: ${message(error)}`);
-      }
-      const scannedAt = Date.now();
-      invalidateFutureCutoffs(run.owned, scannedAt);
-      remember(run.owned, [leader, ...identifiedTree(procs, new Map([[pid, leader.start]]))], seenAt <= scannedAt ? seenAt : undefined);
+    /** Remember a process this host started for the run, before waiting on it. */
+    const adopt = async (pid: number | undefined) => {
+      if (pid === undefined) return;
+      const own = (await listProcesses().catch(() => [])).find(proc => proc.pid === pid);
+      if (own) remember(run.owned, [own]);
       await save();
     };
-    /** The children this host started directly: their live handles also anchor a stop scan. */
+    /** The children this host started itself and still holds: stopped through their handles when all else fails. */
     const held = new Set<ChildProcess>();
-    const released = new Set<ChildProcess>();
-    const live = (child: ChildProcess): child is ChildProcess & { pid: number } =>
-      child.pid !== undefined && child.exitCode === null && child.signalCode === null;
-    const livePids = (children = held) => new Set([...children].filter(live).map(child => child.pid));
-    const stop = async (grace = graceMs, observe?: (tree: readonly Proc[]) => void) => {
-      if (!recordEstablished) return []; // Nothing could have been launched.
-      return stopRun(run.owned, saved.runId, saved.pid, grace, term, write, () => recordDirty, livePids, observe);
-    };
-    const disarmStoppedLaunch = async () => {
-      if (verifiedEmptyStop && !released.size && !drainUncertain) {
-        await disarmLaunchGuard(saved, write).catch(error => console.error(`Pi run ${saved.runId}: could not record the verified stop:`, error));
-      }
-    };
+    let stopping = Promise.resolve();
     run.kill = () => {
-      if (killRequested) return;
-      killRequested = true;
-      // Include a released launcher that exited but whose pipes are still open. Do not forget an anchor
-      // simply because it exited while output drained or while the stop waited behind an ownership write.
-      const pending = new Set([...released].flatMap(child => child.pid === undefined ? [] : [child.pid]));
-      void withOwnership(async () => {
-        for (let attempt = 0; attempt < 2; attempt++) {
-          const verified = new Set<number>();
-          let left: Proc[] | undefined;
-          try {
-            left = await stop(attempt === 0 ? graceMs : 0, tree => {
-              const live = livePids(released);
-              for (const proc of tree) if (live.has(proc.pid)) verified.add(proc.pid);
-            });
-          } catch (error) {
-            verified.clear();
-            console.error(`Pi run ${saved.runId}: could not stop its processes by scanning:`, error);
-          }
-          const after = livePids(released);
-          const exited = [...pending].filter(pid => !after.has(pid));
-          if (exited.some(pid => !verified.has(pid))) break;
-          for (const pid of exited) pending.delete(pid);
-          if (!after.size) {
-            verifiedEmptyStop = left?.length === 0;
-            await disarmStoppedLaunch();
-            return;
-          }
-        }
-        // Keep the workspace when an emergency stop could not verify the tree. If this write fails, the
-        // launcher guard was already saved before the command started, and the fallback must not signal.
-        saved.cleanupUncertain = true;
+      stopping = stopping.then(async () => {
         try {
-          await write();
+          await stopRun(run.owned, saved.runId, saved.pid, graceMs, term, save);
         } catch (error) {
-          // Do not sever the ancestry without the active record checkpoint, or wait forever for the child.
-          console.error(`Pi run ${saved.runId}: could not save the cleanup blocker:`, error);
+          // The process table could not be read. Kill what this host started, by handle and so by group: each
+          // leads its own. What they started is left to the cleanup, which keeps the slot closed if it cannot look.
+          console.error(`Pi run ${saved.runId}: could not stop its processes by scanning:`, error);
           for (const child of held) {
-            child.unref();
-            for (const stream of child.stdio) {
-              if (stream && "unref" in stream && typeof stream.unref === "function") stream.unref();
+            if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) continue;
+            try {
+              process.kill(-child.pid, "SIGKILL");
+            } catch {
+              child.kill("SIGKILL");
             }
           }
-          abandonedChildren = true;
-          abandonment.resolve(null);
-          return;
         }
-        for (const child of released) if (live(child)) child.kill("SIGKILL");
-      }).catch(error => console.error(`Pi run ${saved.runId}: could not stop its children:`, error));
-    };
-    const drainTimedOut = () => {
-      // A detached descendant may still hold an output pipe without being visible in a later scan.
-      // Prevent an in-flight stop from disarming after we destroy the pipe, before this write runs.
-      drainUncertain = true;
-      void withOwnership(async () => {
-        saved.cleanupUncertain = true;
-        await save();
       });
-      run.kill();
     };
     // The deadline covers the whole run, cloning included.
     const timer = setTimeout(() => {
@@ -979,38 +752,21 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     // The server's own setting must not reach the checkout's tests, which refuse a stray AIPATTY_ variable.
     for (const name of Object.keys(env)) if (name.startsWith("AIPATTY_")) delete env[name];
 
-    /** Start a group without running its command until the group is recorded. EOF (even on a crash) fails closed. */
-    const launch = (file: string, args: string[], cwd: string | undefined, input: "ignore" | "pipe") => {
-      // The shell only waits and execs literal argv; exec preserves the detached leader's PID and group.
-      const child = spawn("/bin/sh", ["-c", 'IFS= read -r ready <&3 && [ "$ready" = run ] && exec "$@" 3<&-',
-        "aipatty-launch", file, ...args], { cwd, env, stdio: [input, "pipe", "pipe", "pipe"], detached: true });
-      const gate = child.stdio[3] as Writable | null;
-      gate?.on("error", () => gate.destroy()); // The child can exit before the writer closes.
-      held.add(child);
-      child.once("close", () => {
-        held.delete(child);
-        released.delete(child);
-      });
-      const release = (start: boolean) => {
-        if (start) released.add(child);
-        gate?.end(start ? "run\n" : "");
-      };
-      return { child, stdout: child.stdout!, stderr: child.stderr!, release };
-    };
-
     /** Run a setup command as part of the run: in its own process group, recorded, and stopped with the run. */
     const command = async (file: string, args: string[], cwd?: string): Promise<string> => {
       if (run.stop) throw new Error("the run was stopped");
-      const { child, stdout, stderr, release } = launch(file, args, cwd, "ignore");
+      const child = spawn(file, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true });
+      held.add(child);
+      child.once("close", () => held.delete(child));
       let out = "", err = "";
       let failure: Error | undefined;
-      stdout.on("data", (chunk: Buffer) => { out = (out + chunk).slice(0, 1024 * 1024); });
-      stderr.on("data", (chunk: Buffer) => { err = (err + chunk).slice(-8_000); });
-      const exit = exitOf(child, error => { failure = error; }, drainTimedOut);
-      const adoptionError = await withOwnership(() => adopt(child, release));
-      const exitCode = await Promise.race([exit, abandonment.promise]);
-      if (adoptionError) throw adoptionError;
-      if (abandonedChildren) throw new Error("a child could not be safely stopped");
+      child.stdout.on("data", (chunk: Buffer) => { out = (out + chunk).slice(0, 1024 * 1024); });
+      child.stderr.on("data", (chunk: Buffer) => { err = (err + chunk).slice(-8_000); });
+      const exit = exitOf(child, error => { failure = error; });
+      await adopt(child.pid);
+      // Stopped while it was being recorded: the stop may have missed it.
+      if (run.stop) run.kill();
+      const exitCode = await exit;
       if (failure) throw failure;
       if (exitCode !== 0) throw new Error(tail(err, 6) || `${file} exited with ${exitCode ?? "a signal"}`);
       return out;
@@ -1020,7 +776,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       await mkdir(saved.logDir, { recursive: true, mode: 0o700 });
       await mkdir(saved.workspace, { recursive: true, mode: 0o700 });
       // Nothing starts without the record a later process needs to stop it.
-      await withOwnership(() => write());
+      await write();
       if (request.pr) {
         // The review cannot run without pi-review, and the delegates extension only says so once a review is asked for.
         const settings = await readJson<{ delegates?: { reviewExtension?: unknown } }>(join(pi.agentDir, "settings.json")).catch(() => undefined);
@@ -1037,10 +793,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         // Resolve the base to a commit: a name that is only a file in the tree is not one.
         const names = [`refs/remotes/origin/${request.base}`, `refs/tags/${request.base}`, ...(/^[0-9a-f]{7,40}$/.test(request.base) ? [request.base] : [])];
         for (const name of names) {
-          baseSha = (await command(pi.git, ["rev-parse", "--verify", "--quiet", `${name}^{commit}`], repo).catch(error => {
-            if (error instanceof GroupRecordError) throw error;
-            return "";
-          })).trim();
+          baseSha = (await command(pi.git, ["rev-parse", "--verify", "--quiet", `${name}^{commit}`], repo).catch(() => "")).trim();
           if (baseSha) break;
         }
         if (!/^[0-9a-f]{40}$/.test(baseSha)) {
@@ -1051,7 +804,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         if (cloned !== baseSha) await command(pi.git, ["checkout", "--quiet", "--detach", baseSha], repo);
       } catch (error) {
         baseSha = "";
-        if (!run.stop || error instanceof GroupRecordError) problems.push(`Could not clone ${pi.repo} at ${request.base}: ${clip(message(error), 600)}`);
+        if (!run.stop) problems.push(`Could not clone ${pi.repo} at ${request.base}: ${clip(message(error), 600)}`);
       }
       if (baseSha && !run.stop) {
         const input = {
@@ -1062,26 +815,27 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         await writeFile(rules, instructions(input), { mode: 0o600 });
         const prompt = taskPrompt(input);
         await writeFile(join(saved.logDir, "prompt.md"), prompt, { mode: 0o600 });
-        if (run.stop) throw new Error("the run was stopped"); // Do not spawn after a stop scan may have started.
         const events = createWriteStream(join(saved.logDir, "events.jsonl"), { mode: 0o600 });
         const errors = createWriteStream(join(saved.logDir, "stderr.log"), { mode: 0o600 });
-        const { child, stdout, stderr: childStderr, release } = launch(pi.node, [
+        const child = spawn(pi.node, [
           pi.cli, "--mode", "json", "--no-session", "--model", request.model, "--thinking", request.thinking,
           // Nothing from the checkout or the agent directory loads by itself: only the pinned delegates extension.
           "--no-approve", "--no-extensions", "-e", pi.extension, "--no-skills", "--no-prompt-templates", "--no-themes",
           "--no-context-files", "--no-mcp", "--append-system-prompt", rules,
-        ], repo, "pipe");
+        ], { cwd: repo, env, stdio: ["pipe", "pipe", "pipe"], detached: true });
         launched = true;
+        held.add(child);
+        child.once("close", () => held.delete(child));
         term = () => { child.kill("SIGTERM"); };
-        const exited = exitOf(child, error => { problems.push(`Could not start Pi: ${error.message}`); }, drainTimedOut);
+        const exited = exitOf(child, error => { problems.push(`Could not start Pi: ${error.message}`); });
         // A transcript that cannot be written ends the run: its result could not be checked or kept.
         let logFailed = false;
         const logFailure = (error: Error) => {
           if (logFailed) return;
           logFailed = true;
           problems.push(`The run's logs could not be written: ${clip(error.message, 300)}`);
-          stdout.resume();
-          childStderr.resume();
+          child.stdout.resume();
+          child.stderr.resume();
           run.kill();
         };
         events.on("error", logFailure);
@@ -1099,43 +853,32 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
             });
           };
         };
-        const keepEvent = throttled(stdout, events);
-        const keepError = throttled(childStderr, errors);
+        const keepEvent = throttled(child.stdout, events);
+        const keepError = throttled(child.stderr, errors);
         const split = lineSplitter((line, whole) => {
           trace.line(line, whole);
           if (whole && !repeated(line)) keepEvent(line + "\n");
         });
-        stdout.on("data", (chunk: Buffer) => split.write(chunk));
-        childStderr.on("data", (chunk: Buffer) => {
+        child.stdout.on("data", (chunk: Buffer) => split.write(chunk));
+        child.stderr.on("data", (chunk: Buffer) => {
           stderr = (stderr + chunk.toString()).slice(-8_000);
           keepError(chunk);
         });
-        child.stdin!.on("error", () => {});
-        child.stdin!.end(prompt);
-        const adoptionError = await withOwnership(() => {
-          saved.pid = child.pid;
-          return adopt(child, release);
-        });
-        if (adoptionError) problems.push(`Could not record Pi: ${adoptionError.message}`);
+        child.stdin.on("error", () => {});
+        child.stdin.end(prompt);
+        saved.pid = child.pid;
+        await adopt(child.pid);
+        if (run.stop) run.kill();
         // Remember the processes the run starts while their parents still live: a delegate leads its own group.
         let polling: Promise<void> | undefined;
-        const poll = adoptionError ? undefined : setInterval(() => {
-          if (killRequested || polling) return;
-          polling = withOwnership(async () => {
-            const changed = await trackRunProcesses(run.owned, saved.runId, save, livePids).catch(() => false);
-            if (changed || recordDirty) await save();
-          }).finally(() => { polling = undefined; });
+        const poll = setInterval(() => {
+          polling ??= runProcesses(run.owned, saved.runId).then(async procs => {
+            if (remember(run.owned, procs)) await save();
+          }).catch(() => {}).finally(() => { polling = undefined; });
         }, pollMs);
-        code = await Promise.race([exited, abandonment.promise]);
+        code = await exited;
         clearInterval(poll);
         await polling;
-        if (abandonedChildren) {
-          // Drain the pipes without logging once the run has settled.
-          stdout.removeAllListeners("data");
-          childStderr.removeAllListeners("data");
-          stdout.resume();
-          childStderr.resume();
-        }
         split.end();
         const flushed = (stream: WriteStream) => new Promise<void>(done => {
           if (stream.destroyed) done();
@@ -1147,34 +890,17 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       problems.push(`The run failed in the host: ${clip(message(error), 600)}`);
     }
     clearTimeout(timer);
-    await ownership;
-    // From here the run ends as it ended: a later abort or shutdown gets this outcome.
-    run.finalizing = true;
+    await stopping;
+    await saving.catch(() => {});
+
     // A stopped host leaves the workspace, the saved run and the result to the next start.
     if (run.stop === "shutdown") {
-      await withOwnership(async () => {
-        try {
-          if (!(await stop(0)).length && !saved.cleanupUncertain) delete saved.activeChild;
-        } catch {
-          // The next start must still verify the guarded launcher before cleaning up.
-        }
-        await save();
-      });
+      await stopRun(run.owned, saved.runId, saved.pid, 0, term, save).catch(() => {});
+      await save();
       return undefined;
     }
-    // Save a verified empty stop before waiting on GitHub, including after an ordinary exit. If the scan
-    // or checkpoint fails, keep recovery armed and skip confirmation rather than reporting a saved stop.
-    let confirmationStopFailure: { error: unknown } | undefined;
-    if (request.pr && launched && run.stop !== "aborted") {
-      try {
-        await withOwnership(async () => {
-          const alreadyVerified = verifiedEmptyStop && !released.size && !drainUncertain;
-          if (alreadyVerified || !(await stop()).length) await disarmLaunchGuard(saved, write);
-        });
-      } catch (error) {
-        confirmationStopFailure = { error };
-      }
-    }
+    // From here the run ends as it ended: a later abort or shutdown gets this outcome.
+    run.finalizing = true;
 
     const ok = launched && code === 0 && trace.settled && !trace.aborted && trace.lastStop === "stop"
       && trace.malformed === 0 && trace.oversized === 0 && !problems.length;
@@ -1202,8 +928,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       }
     }
     try {
-      if (outcome.status === "aborted" || !launched || confirmationStopFailure) {
-        // Report what the run printed without asking GitHub.
+      if (outcome.status === "aborted" || !launched) {
+        // An abort answers quickly: report what the run printed without asking GitHub.
         unconfirmedLinks(trace, outcome);
       } else if (request.pr) {
         const baseChangedAt = await confirm(trace, outcome, { pr: report?.pr, issue: report?.issue });
@@ -1217,10 +943,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     }
     if (trace.unfinishedDelegates) outcome.problems.push(`${trace.unfinishedDelegates} delegate call(s) were cut off before they reported; the cost includes what their jobs had recorded.`);
     if (trace.unaccountedDelegates) outcome.problems.push(`${trace.unaccountedDelegates} delegate call(s) ended without a result; their spend is not included.`);
-    const { clean, reconciled } = await cleanUp(saved, trace, outcome, false, async () => {
-      if (confirmationStopFailure) throw confirmationStopFailure.error;
-      return withOwnership(() => stop());
-    }, () => withOwnership(() => write()));
+    const { clean, reconciled } = await cleanUp(saved, run.owned, trace, outcome, false, { term, record: save });
     // `completed` only when everything the host checked holds.
     if (outcome.status === "completed" && outcome.problems.length) outcome.status = "failed";
     outcome.problems = outcome.problems.slice(0, maxItems);
@@ -1230,10 +953,9 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     try {
       await remembered(saved, outcome, reconciled);
       // The record's last state has everything the cleanup learned, for the next start if this one was not clean.
-      await withOwnership(async () => {
-        await write();
-        recording = false;
-      });
+      await write();
+      recording = false;
+      await saving.catch(() => {});
       if (clean) await rm(stateFile, { force: true });
     } catch (error) {
       handed = false;
@@ -1265,7 +987,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       const saved: SavedRun = {
         runId, conversationId: request.conversationId, taskId: request.taskId, pr: request.pr,
         startedAt: new Date().toISOString(), workspace: join(config.runsDir, runId), logDir: join(logRoot, runId),
-        procs: [], groups: [],
+        procs: [], groups: [], asOf: 0,
       };
       const run: ActiveRun = { saved, owned: newOwned(), finalizing: false, kill: () => {}, done: Promise.resolve(undefined) };
       active = run;
