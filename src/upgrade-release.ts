@@ -67,7 +67,7 @@ export function command(file: string, args: string[], options: {
   });
 }
 
-function gitEnv(): NodeJS.ProcessEnv {
+export function gitEnv(): NodeJS.ProcessEnv {
   // Do not let a workspace or inherited Git index, configuration, or repository choose the fetched tree.
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
   return { ...env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" };

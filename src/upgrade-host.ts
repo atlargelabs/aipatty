@@ -142,12 +142,17 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
     let drainStarted = false;
     const id = randomUUID();
     let recoveryWatch: FSWatcher | undefined;
+    const cannotWatch = (error: unknown) => console.error(`Cannot watch recovery of ${id}; after recover returns, restart the selected app to reopen admission:`, error);
     const watchRecovery = () => {
       if (recoveryWatch) return;
       const close = () => { recoveryWatch?.close(); recoveryWatch = undefined; };
       const check = () => {
         let j: UpgradeJournal | undefined;
-        try { j = paths.load(); } catch { return; }
+        try { j = paths.load(); }
+        catch (error) {
+          console.error(`Cannot read recovery of ${id}; admission will stay closed until a terminal journal is verified. If already recovered, restart the selected app:`, error);
+          return;
+        }
         if (j?.id !== id) { close(); return; }
         if (j.phase !== "done") return;
         close();
@@ -156,9 +161,9 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
       try {
         // Only for this unresolved request. No polling, and the watcher never keeps the app alive.
         recoveryWatch = watch(paths.state, { persistent: false }, (_event, name) => { if (!name || name === "journal.json") check(); });
-        recoveryWatch.on("error", error => { close(); console.error(`Cannot watch recovery of ${id}:`, error); });
+        recoveryWatch.on("error", error => { close(); cannotWatch(error); });
         check(); // Cover a terminal rename just before subscribing.
-      } catch (error) { console.error(`Cannot watch recovery of ${id}:`, error); }
+      } catch (error) { cannotWatch(error); }
     };
     const settleHandoff = async (reason: string, observeRecovery = true) => {
       // Reap the recorded group before settling; a bounded wait is only for a racing explicit recover or

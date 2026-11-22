@@ -14,7 +14,7 @@ import { ownDataDir } from "../src/ownership.ts";
 import { RUN_MARKER } from "../src/processes.ts";
 import { backupDb, restoreDb } from "../src/upgrade-db.ts";
 import { upgradeEntryKind, UpgradePaths } from "../src/upgrade-state.ts";
-import { identify, reapStage, stageEnvironment, type UpgradeHealth } from "../src/upgrade-process.ts";
+import { identify, reapStage, stageEnvironment, stageMarker, type UpgradeHealth } from "../src/upgrade-process.ts";
 import { checkout, until } from "./helpers.ts";
 
 const exec = promisify(execFile);
@@ -136,7 +136,7 @@ async function unusedPort(): Promise<number> {
  * are a fixture: no GitHub, live credentials, or nested npm test recursion. The shim records each required command
  * and links this test run's already installed deps. All process hooks below exist only in these scratch commits.
  */
-async function fixture(t: TestContext, legacy = false) {
+async function fixture(t: TestContext, legacy = false, hostHasGitPaths = false) {
   const scratch = await realpath(await mkdtemp(join(process.env.UPGRADE_NESTED_TEST ?? tmpdir(), "aipatty-upgrade-")));
   const root = join(scratch, "install root"), repo = join(scratch, "fixture-origin"), bin = join(scratch, "bin");
   const deps = await realpath(join(checkout, "node_modules"));
@@ -258,7 +258,9 @@ ${probeStart}`));
   function launch(sha = old, ...extra: string[]) {
     const entry = hostFile(legacy && sha === old ? paths.current : paths.release(sha));
     const child = spawn(process.execPath, [entry, ...flags, ...extra], {
-      cwd: paths.release(sha), env: { ...env, GIT_INDEX_FILE: join(scratch, "host-index") }, stdio: ["ignore", "pipe", "pipe"],
+      cwd: paths.release(sha), env: { ...env, ...(hostHasGitPaths ? {
+        GIT_INDEX_FILE: join(scratch, "host-index"), GIT_DIR: join(paths.release(old), ".git"), GIT_WORK_TREE: paths.release(old),
+      } : {}) }, stdio: ["ignore", "pipe", "pipe"],
     });
     children.add(child);
     let output = "";
@@ -352,7 +354,7 @@ test("first bootstrap uses legacy shutdown, waits for exit beyond the ACK and pr
 });
 
 test("command is explicit, serialized across branches, survives cutover and delivers once even if the ack is lost", { timeout }, async t => {
-  const f = await fixture(t);
+  const f = await fixture(t, false, true);
   const old = f.launch();
   await f.health(f.old);
   const branch = await f.fork();
@@ -528,6 +530,43 @@ if (process.env.UPGRADE_NESTED_TEST) {
     await until(() => existsSync(join(process.env.UPGRADE_NESTED_TEST!, "let-nested-finish")), Boolean, 30_000);
   });
 }
+
+test("staging scans a marked successor born between process table reads", { timeout }, async t => {
+  const scratch = await mkdtemp(join(tmpdir(), "aipatty-scan-"));
+  const marker = stageMarker(randomUUID());
+  const pidFile = join(scratch, "successor.pid");
+  t.after(async () => {
+    const pid = Number(await readFile(pidFile, "utf8").catch(() => ""));
+    if (pid > 1 && await identify(pid)) process.kill(pid, "SIGKILL");
+    await rm(scratch, { recursive: true, force: true });
+  });
+  await writeFile(join(scratch, "detach.cjs"), `
+const { spawn } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+  detached: true, stdio: "ignore", env: { ...process.env, ${marker}: "1" },
+});
+child.unref();
+writeFileSync(process.env.SCAN_FIXTURE + "/successor.pid", String(child.pid));
+`);
+  await writeFile(join(scratch, "ps"), `#!/bin/sh
+if [ "$3" = "pid=,ppid=,pgid=,uid=,stat=,lstart=" ]; then
+  if [ ! -f "$SCAN_FIXTURE/sampled" ]; then
+    touch "$SCAN_FIXTURE/sampled"
+  elif [ ! -f "$SCAN_FIXTURE/successor.pid" ]; then
+    "$SCAN_NODE" "$SCAN_FIXTURE/detach.cjs"
+  fi
+fi
+exec /bin/ps "$@"
+`, { mode: 0o700 });
+  const { stdout } = await exec(process.execPath, ["--input-type=module", "-e", `
+    const { newOwned, runProcesses } = await import("./src/processes.ts");
+    console.log(JSON.stringify((await runProcesses(newOwned(), "1", process.argv[1])).map(p => p.pid)));
+  `, marker], {
+    cwd: checkout, env: { ...process.env, PATH: `${scratch}:${process.env.PATH}`, SCAN_FIXTURE: scratch, SCAN_NODE: process.execPath }, timeout: 15_000,
+  });
+  assert.deepEqual(JSON.parse(stdout), [Number(await readFile(pidFile, "utf8"))]);
+});
 
 test("staging reaps a detached replacement started by its interrupted nested test", { timeout }, async t => {
   const f = await fixture(t);

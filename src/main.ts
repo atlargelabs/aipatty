@@ -6,6 +6,7 @@ import { startApi, type Health } from "./api.ts";
 import { LOOPBACK, readConfig } from "./config.ts";
 import { openHost } from "./host.ts";
 import { committedValidation, guardStartup, hostUpgrade, reportStartup } from "./upgrade-host.ts";
+import { gitEnv } from "./upgrade-release.ts";
 import { errorText, upgradeChildEnv, upgradeProtocol } from "./upgrade-state.ts";
 
 const source = realpathSync(fileURLToPath(new URL("../", import.meta.url)));
@@ -14,6 +15,7 @@ function runningCommit(): string {
   try {
     return execFileSync("git", ["rev-parse", "--verify", "HEAD"], {
       cwd: source,
+      env: gitEnv(),
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 1_000,

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { LOOPBACK, DEFAULT_PORT, shutdownHeader } from "./config.ts";
 import { ownDataDir, OwnerBusy } from "./ownership.ts";
-import { listProcesses, newOwned, runProcesses, stopRun } from "./processes.ts";
+import { listProcesses, newOwned, processEntryUnavailable, runProcesses, stopRun } from "./processes.ts";
 import { command } from "./upgrade-release.ts";
 import { ownedFile, upgradeChildEnv, upgradeProtocol, type ProcessIdentity, type UpgradeJournal, type UpgradePaths } from "./upgrade-state.ts";
 
@@ -135,6 +135,14 @@ function linuxListeningInodes(port: number): Set<string> {
     .map(line => line.trim().split(/\s+/)).filter(row => row[1] === address && row[3] === "0A").map(row => row[9]));
 }
 
+function procEntry<T>(path: string, read: (path: string) => T): T | undefined {
+  try { return read(path); }
+  catch (error) {
+    if (processEntryUnavailable(error)) return undefined;
+    throw new Error(`Could not inspect ${path} during legacy ownership check`, { cause: error });
+  }
+}
+
 async function legacyOwner(paths: UpgradePaths, j: UpgradeJournal): Promise<ProcessIdentity> {
   assertOwnerFiles(paths);
   const lock = join(paths.data, "owner.sqlite");
@@ -142,12 +150,10 @@ async function legacyOwner(paths: UpgradePaths, j: UpgradeJournal): Promise<Proc
   if (process.platform === "linux") {
     const sockets = linuxListeningInodes(j.port);
     pids = readdirSync("/proc").filter(value => /^\d+$/.test(value)).map(Number).filter(pid => {
-      let links: string[];
-      try {
-        links = readdirSync(`/proc/${pid}/fd`).map(fd => {
-          try { return readlinkSync(`/proc/${pid}/fd/${fd}`); } catch { return ""; }
-        });
-      } catch { return false; }
+      const dir = `/proc/${pid}/fd`;
+      const fds = procEntry(dir, path => readdirSync(path));
+      if (!fds) return false;
+      const links = fds.map(fd => procEntry(`${dir}/${fd}`, path => readlinkSync(path)) ?? "");
       return links.includes(lock) && links.some(link => sockets.has(/^socket:\[(\d+)\]$/.exec(link)?.[1] ?? ""));
     });
   } else {
@@ -235,6 +241,9 @@ export function launchServer(paths: UpgradePaths, j: UpgradeJournal, sha: string
   const log = openUpgradeLog(paths, j.id);
   try {
     const env = { ...process.env };
+    // Legacy still calls Git directly to identify its release. Retain service-wide Git configuration and SSH.
+    for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+      "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_IMPLICIT_WORK_TREE", "GIT_NAMESPACE"]) delete env[name];
     delete env[upgradeChildEnv];
     if (gated) env[upgradeChildEnv] = j.id;
     const child = spawn(process.execPath, [join(paths.release(sha), "src/main.ts"), "--install-dir", paths.root, "--port", String(j.port)], {

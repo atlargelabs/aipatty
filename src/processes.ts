@@ -10,6 +10,7 @@ export interface Proc {
   pid: number;
   ppid: number;
   pgid: number;
+  uid: number;
   start: string;
 }
 
@@ -26,9 +27,14 @@ export function newOwned(procs: Iterable<[number, string]> = [], groups: Iterabl
   return { procs: new Map(procs), groups: new Set(groups) };
 }
 
-async function ps(args: string[]): Promise<string> {
+function ps(args: string[]) {
   // The C locale fixes the format of the start time.
-  return (await exec("ps", args, { maxBuffer: 64 * 1024 * 1024, timeout: 5_000, env: { ...process.env, LC_ALL: "C" } })).stdout;
+  return exec("ps", args, { maxBuffer: 64 * 1024 * 1024, timeout: 5_000, env: { ...process.env, LC_ALL: "C" } });
+}
+
+/** Expected races or permission boundaries when inspecting another process through /proc. */
+export function processEntryUnavailable(error: unknown): boolean {
+  return !!error && ["ENOENT", "ESRCH", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "");
 }
 
 /** This process's own group, once the process table has been read: never a run's. */
@@ -36,10 +42,13 @@ let hostGroup: number | undefined;
 
 export async function listProcesses(): Promise<Proc[]> {
   const procs: Proc[] = [];
-  for (const line of (await ps(["-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="])).split("\n")) {
-    const row = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(line);
-    // A zombie has exited and cannot keep an owner lock or do work. Some PID 1s take time to reap it.
-    if (row && !row[4].startsWith("Z")) procs.push({ pid: Number(row[1]), ppid: Number(row[2]), pgid: Number(row[3]), start: row[5] });
+  const observation = ps(["-A", "-o", "pid=,ppid=,pgid=,uid=,stat=,lstart="]);
+  for (const line of (await observation).stdout.split("\n")) {
+    const row = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(line);
+    // Ignore zombies and the ps we just waited for; neither can continue the observed work.
+    if (row && Number(row[1]) !== observation.child.pid && !row[5].startsWith("Z")) {
+      procs.push({ pid: Number(row[1]), ppid: Number(row[2]), pgid: Number(row[3]), uid: Number(row[4]), start: row[6] });
+    }
   }
   hostGroup = procs.find(proc => proc.pid === process.pid)?.pgid ?? hostGroup;
   return procs;
@@ -58,9 +67,10 @@ function commands(output: string): Map<number, string> {
  * The IDs of the processes whose environment has `RUN_MARKER=<runId>`. Best effort: macOS hides the environment of
  * its own binaries, such as `/bin/bash`, and both systems hide other users' processes.
  */
-async function markedPids(runId: string, procs: readonly Proc[], variable: string): Promise<Set<number>> {
+async function markedPids(runId: string, procs: readonly Proc[], variable: string) {
   const needle = `${variable}=${runId}`;
   const marked = new Set<number>();
+  const unstable = new Set<number>();
   if (process.platform === "linux") {
     // Bound descriptors and never interpret a resource/I/O failure as proof of no marker.
     for (let offset = 0; offset < procs.length; offset += 16) {
@@ -69,13 +79,13 @@ async function markedPids(runId: string, procs: readonly Proc[], variable: strin
           if ((await readFile(`/proc/${proc.pid}/environ`, "utf8")).split("\0").includes(needle)) marked.add(proc.pid);
         } catch (error) {
           // Gone since ps, or an environment the OS does not disclose (e.g. another user).
-          if (!["ENOENT", "ESRCH", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+          if (!processEntryUnavailable(error)) {
             throw new Error(`Could not inspect process ${proc.pid}'s environment`, { cause: error });
           }
         }
       }));
     }
-    return marked;
+    return { marked, unstable };
   }
   // `ps -E` prints the arguments and then the environment. Only the environment counts: a process that merely
   // has the marker among its arguments, such as a search for it, is not the run's. The entries are not delimited,
@@ -84,13 +94,15 @@ async function markedPids(runId: string, procs: readonly Proc[], variable: strin
   const [plain, withEnv] = await Promise.all([
     ps(["-A", "-ww", "-o", "pid=,command="]), ps(["-A", "-E", "-ww", "-o", "pid=,command="]),
   ]);
-  const args = commands(plain);
-  for (const [pid, full] of commands(withEnv)) {
-    const own = args.get(pid);
-    if (own === undefined || !full.startsWith(own)) continue;
-    if (` ${full.slice(own.length)} `.includes(` ${needle} `)) marked.add(pid);
+  const args = commands(plain.stdout);
+  const environments = commands(withEnv.stdout);
+  for (const { pid } of procs) {
+    const own = args.get(pid), full = environments.get(pid);
+    if (!full || !` ${full} `.includes(` ${needle} `)) continue;
+    if (own === undefined || !full.startsWith(own)) unstable.add(pid);
+    else if (` ${full.slice(own.length)} `.includes(` ${needle} `)) marked.add(pid);
   }
-  return marked;
+  return { marked, unstable };
 }
 
 /**
@@ -105,9 +117,25 @@ async function markedPids(runId: string, procs: readonly Proc[], variable: strin
  * slower environment scan: act on it at once.
  */
 async function scan(owned: Owned, runId: string, variable: string): Promise<{ ours: Proc[]; unsure: Proc[] }> {
-  const before = new Map((await listProcesses()).map(proc => [proc.pid, proc.start]));
-  const marked = await markedPids(runId, [...before].map(([pid, start]) => ({ pid, ppid: 0, pgid: 0, start })), variable);
-  const procs = await listProcesses();
+  const isStage = variable !== RUN_MARKER;
+  const sampled = new Map<number, string>(), marked = new Map<number, string>();
+  const eligible = (proc: Proc) => proc.pid !== process.pid && (!isStage || proc.uid === process.geteuid?.());
+  let sample = (await listProcesses()).filter(eligible);
+  let procs: Proc[];
+  for (let attempt = 0;; attempt++) {
+    const observation = await markedPids(runId, sample, variable);
+    for (const p of sample) {
+      if (!observation.unstable.has(p.pid)) sampled.set(p.pid, p.start);
+      if (observation.marked.has(p.pid)) marked.set(p.pid, p.start);
+    }
+    procs = await listProcesses();
+    // A stage parent can detach a successor and exit during marker inspection. Inspect new identities
+    // before declaring it idle. Unrelated system-user churn need not settle; staging doesn't change UID.
+    if (!isStage) break;
+    sample = procs.filter(p => eligible(p) && sampled.get(p.pid) !== p.start);
+    if (!sample.length) break;
+    if (attempt === 15) throw new Error("Process table kept changing during staging cleanup; cannot establish quiescence");
+  }
   const byPid = new Map(procs.map(proc => [proc.pid, proc]));
   for (const pgid of owned.groups) {
     if (!procs.some(proc => proc.pgid === pgid)) owned.groups.delete(pgid);
@@ -116,7 +144,7 @@ async function scan(owned: Owned, runId: string, variable: string): Promise<{ ou
   const skipGroups = new Set([0, 1, byPid.get(process.pid)?.pgid ?? -1]);
   const candidate = (proc: Proc) => proc.pid !== process.pid && proc.pid > 1;
   // Marked, and still the process that was scanned.
-  const isMarked = (proc: Proc) => marked.has(proc.pid) && before.get(proc.pid) === proc.start;
+  const isMarked = (proc: Proc) => marked.get(proc.pid) === proc.start;
   // A remembered, leaderless group can flag ambiguity, but cannot seed ownership.
   const leaderless = (proc: Proc) => owned.groups.has(proc.pgid) && !skipGroups.has(proc.pgid) && !byPid.has(proc.pgid);
   const ours = new Map<number, Proc>();
