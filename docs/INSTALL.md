@@ -107,8 +107,20 @@ node src/cli.ts health          # compare the commit with the expected release S
 
 ## Fresh cutover from an old installation
 
-Stop the old server before starting the new one. Start with a fresh root: do not migrate conversations. Reauthenticate
-with the pinned CLI as above and configure pi-review and delegates in the new Pi directory. Verify `health` reports
+While still on the old server with its old configuration, finish any active Pi runs or abort them and wait for
+cleanup to settle. Do not start more runs. Check for a pending `pi-run.json` in the **actual old configured data
+directory**: the old runbook used `--data-dir ~/data`, so check `~/data/pi-run.json` in that case, not the new
+`$ROOT/data` or the legacy default unless that was the path actually used.
+
+Stop the old server (Ctrl-C or `SIGTERM`), wait for it to exit, and check that old path again. Shutdown during a
+Pi run deliberately leaves its record and cleanup for recovery on the next start; a fresh root cannot see that
+record. **If `pi-run.json` remains after shutdown, do not delete it or proceed with the cutover.** Restart the old
+server with the same old configuration (including its data, Pi, and runs directories) to finish recovery. Confirm
+the record is gone, then shut down the old server and recheck that it is still gone before starting the new one.
+If recovery cannot clear the record, stop and investigate; do not bypass it by switching roots or deleting old state.
+
+Only then start with a fresh root: do not migrate conversations. Reauthenticate with the pinned CLI as above and
+configure pi-review and delegates in the new Pi directory. Verify `health` reports
 the expected SHA, `node src/cli.ts log` shows an empty transcript, and a send succeeds. Then exercise the actual Pi
 run and review loop below. Only after all of those checks succeed, identify and delete old paths **confirmed** to be
 owned solely by aipatty, if no longer needed. Never blindly delete `~/.pi`: it may contain other state. Preserve the
