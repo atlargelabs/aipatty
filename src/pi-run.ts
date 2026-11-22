@@ -1162,8 +1162,19 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       });
       return undefined;
     }
-    // If the pipes closed after the verified scan, finish disarming before waiting on GitHub or log cleanup.
-    await withOwnership(disarmStoppedLaunch);
+    // Save a verified empty stop before waiting on GitHub, including after an ordinary exit. If the scan
+    // or checkpoint fails, keep recovery armed and skip confirmation rather than reporting a saved stop.
+    let confirmationStopFailure: { error: unknown } | undefined;
+    if (request.pr && launched && run.stop !== "aborted") {
+      try {
+        await withOwnership(async () => {
+          const alreadyVerified = verifiedEmptyStop && !released.size && !drainUncertain;
+          if (alreadyVerified || !(await stop()).length) await disarmLaunchGuard(saved, write);
+        });
+      } catch (error) {
+        confirmationStopFailure = { error };
+      }
+    }
 
     const ok = launched && code === 0 && trace.settled && !trace.aborted && trace.lastStop === "stop"
       && trace.malformed === 0 && trace.oversized === 0 && !problems.length;
@@ -1191,8 +1202,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       }
     }
     try {
-      if (outcome.status === "aborted" || !launched) {
-        // An abort answers quickly: report what the run printed without asking GitHub.
+      if (outcome.status === "aborted" || !launched || confirmationStopFailure) {
+        // Report what the run printed without asking GitHub.
         unconfirmedLinks(trace, outcome);
       } else if (request.pr) {
         const baseChangedAt = await confirm(trace, outcome, { pr: report?.pr, issue: report?.issue });
@@ -1206,8 +1217,10 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     }
     if (trace.unfinishedDelegates) outcome.problems.push(`${trace.unfinishedDelegates} delegate call(s) were cut off before they reported; the cost includes what their jobs had recorded.`);
     if (trace.unaccountedDelegates) outcome.problems.push(`${trace.unaccountedDelegates} delegate call(s) ended without a result; their spend is not included.`);
-    const { clean, reconciled } = await cleanUp(saved, trace, outcome, false,
-      () => withOwnership(() => stop()), () => withOwnership(() => write()));
+    const { clean, reconciled } = await cleanUp(saved, trace, outcome, false, async () => {
+      if (confirmationStopFailure) throw confirmationStopFailure.error;
+      return withOwnership(() => stop());
+    }, () => withOwnership(() => write()));
     // `completed` only when everything the host checked holds.
     if (outcome.status === "completed" && outcome.problems.length) outcome.status = "failed";
     outcome.problems = outcome.problems.slice(0, maxItems);

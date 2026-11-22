@@ -104,10 +104,15 @@ const spawned = async (config: Config) => (await readFile(join(config.pi.agentDi
 
 test("a run launches the pinned CLI with only the pinned delegates extension, in a fresh clone that is then deleted", async t => {
   const config = await setup(t);
-  await github(config, openPr);
+  await github(config, { ...openPr, delayMs: 500 });
   await scenario(config, [...review("c1", "job-review"), assistant(report()), settled]);
   const runs = await openPiRuns(config);
-  const outcome = await runs.run(request({ task: "Add the thing.\nSecond line.", model: "openai/gpt-6.2-astra", thinking: "low" }));
+  const running = runs.run(request({ task: "Add the thing.\nSecond line.", model: "openai/gpt-6.2-astra", thinking: "low" }));
+  await until(() => existsSync(join(config.dataDir, "fake-gh-calls.txt")));
+  const saved = JSON.parse(await readFile(join(config.dataDir, "pi-run.json"), "utf8"));
+  assert.ok(existsSync(saved.workspace));
+  assert.equal(saved.activeChild, undefined, "an ordinary exit is verified before GitHub confirmation");
+  const outcome = await running;
   assert.equal(outcome.status, "completed", JSON.stringify(outcome));
 
   const [launch, ...more] = await launches(config);
@@ -134,6 +139,34 @@ test("a run launches the pinned CLI with only the pinned delegates extension, in
   assert.ok(existsSync(join(outcome.logDir, "events.jsonl")));
   assert.deepEqual(JSON.parse(await readFile(join(outcome.logDir, "result.json"), "utf8")), { outcome, reconciled: true, taskId: 101 });
   assert.ok(!existsSync(join(config.dataDir, "pi-run.json")));
+});
+
+test("a failed final stop checkpoint skips GitHub confirmation and retains the recovery guard", async t => {
+  const config = await setup(t);
+  await github(config, openPr);
+  await scenario(config, [...review("c1", "job-review"), assistant(report()), settled]);
+  const stateFile = join(config.dataDir, "pi-run.json");
+  const rename = fs.rename;
+  const mock = t.mock.method(fs, "rename", async (...args: Parameters<typeof rename>) => {
+    if (args[1] === stateFile) {
+      const snapshot = JSON.parse(await readFile(args[0], "utf8"));
+      if (snapshot.pid && !snapshot.activeChild) throw new Error("test final stop checkpoint failure");
+    }
+    await rename(...args);
+  });
+  syncBuiltinESMExports();
+  t.mock.method(console, "error", () => {});
+  try {
+    const outcome = await (await openPiRuns(config)).run(request());
+    assert.equal(outcome.status, "failed");
+    assert.match(outcome.problems.join("\n"), /test final stop checkpoint failure/);
+    const saved = JSON.parse(await readFile(stateFile, "utf8"));
+    assert.ok(saved.activeChild && existsSync(saved.workspace));
+    assert.ok(!existsSync(join(config.dataDir, "fake-gh-calls.txt")));
+  } finally {
+    mock.mock.restore();
+    syncBuiltinESMExports();
+  }
 });
 
 test("the result is confirmed with gh, and delegate spend is charged once", async t => {
