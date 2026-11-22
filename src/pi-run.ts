@@ -82,6 +82,9 @@ interface SavedRun {
 
 type LegacySavedRun = Omit<SavedRun, "groups" | "unverifiedProcs"> & { groups: number[]; asOf: number };
 
+/** A detached child was launched but its group could not be saved for recovery. */
+class GroupRecordError extends Error {}
+
 /** A call's outcome as kept by task, and whether the spend of its cut-off delegate jobs has been added to it. */
 interface Kept {
   outcome: RunOutcome;
@@ -763,12 +766,9 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         throw error;
       }
     });
-    const save = () => write().then(() => true, error => {
-      console.error(`Pi run ${saved.runId}: could not save its record:`, error);
-      return false;
-    });
+    const save = () => write().catch(error => console.error(`Pi run ${saved.runId}: could not save its record:`, error));
     /** Remember a detached process this host started for the run, before waiting on it. */
-    const adopt = async (child: ChildProcess) => {
+    const adopt = async (child: ChildProcess): Promise<GroupRecordError | undefined> => {
       const pid = child.pid;
       if (pid === undefined) return;
       const seenAt = Date.now();
@@ -776,7 +776,14 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       // Record the new group before waiting for ps: if the host and leader die during that read, recovery
       // still knows to check for survivors. The group ID alone can block cleanup, but cannot authorize a signal.
       run.owned.groups.set(pid, null);
-      if (!(await save())) return; // Leave the record dirty for a later write; do not wait on this optional scan.
+      try {
+        await write();
+      } catch (error) {
+        // Do not leave an unrecorded command running. Use the child handle, not the unverified group ID.
+        child.kill("SIGKILL");
+        run.kill(); // Retry the dirty record and stop any other processes that can be verified.
+        return new GroupRecordError(`could not save process group ${pid}: ${message(error)}`);
+      }
       const own = (await listProcesses().catch(() => [])).find(proc => proc.pid === pid);
       const scannedAt = Date.now();
       invalidateFutureCutoffs(run.owned, scannedAt);
@@ -836,10 +843,11 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       child.stdout.on("data", (chunk: Buffer) => { out = (out + chunk).slice(0, 1024 * 1024); });
       child.stderr.on("data", (chunk: Buffer) => { err = (err + chunk).slice(-8_000); });
       const exit = exitOf(child, error => { failure = error; });
-      await adopt(child);
+      const adoptionError = await adopt(child);
       // Stopped while it was being recorded: the stop may have missed it.
-      if (run.stop) run.kill();
+      if (run.stop && !adoptionError) run.kill();
       const exitCode = await exit;
+      if (adoptionError) throw adoptionError;
       if (failure) throw failure;
       if (exitCode !== 0) throw new Error(tail(err, 6) || `${file} exited with ${exitCode ?? "a signal"}`);
       return out;
@@ -866,7 +874,10 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         // Resolve the base to a commit: a name that is only a file in the tree is not one.
         const names = [`refs/remotes/origin/${request.base}`, `refs/tags/${request.base}`, ...(/^[0-9a-f]{7,40}$/.test(request.base) ? [request.base] : [])];
         for (const name of names) {
-          baseSha = (await command(pi.git, ["rev-parse", "--verify", "--quiet", `${name}^{commit}`], repo).catch(() => "")).trim();
+          baseSha = (await command(pi.git, ["rev-parse", "--verify", "--quiet", `${name}^{commit}`], repo).catch(error => {
+            if (error instanceof GroupRecordError) throw error;
+            return "";
+          })).trim();
           if (baseSha) break;
         }
         if (!/^[0-9a-f]{40}$/.test(baseSha)) {
@@ -888,6 +899,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         await writeFile(rules, instructions(input), { mode: 0o600 });
         const prompt = taskPrompt(input);
         await writeFile(join(saved.logDir, "prompt.md"), prompt, { mode: 0o600 });
+        if (run.stop) throw new Error("the run was stopped"); // Do not spawn after a stop scan may have started.
         const events = createWriteStream(join(saved.logDir, "events.jsonl"), { mode: 0o600 });
         const errors = createWriteStream(join(saved.logDir, "stderr.log"), { mode: 0o600 });
         const child = spawn(pi.node, [
@@ -940,11 +952,12 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         child.stdin.on("error", () => {});
         child.stdin.end(prompt);
         saved.pid = child.pid;
-        await adopt(child);
-        if (run.stop) run.kill();
+        const adoptionError = await adopt(child);
+        if (adoptionError) problems.push(`Could not record Pi: ${adoptionError.message}`);
+        else if (run.stop) run.kill();
         // Remember the processes the run starts while their parents still live: a delegate leads its own group.
         let polling: Promise<void> | undefined;
-        const poll = setInterval(() => {
+        const poll = adoptionError ? undefined : setInterval(() => {
           polling ??= trackRunProcesses(run.owned, saved.runId, save)
             .catch(() => false).then(async changed => {
               if (changed || recordDirty) await save();

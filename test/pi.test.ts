@@ -532,36 +532,47 @@ test("after a crash, the next start stops the surviving processes, cleans up, an
   assert.equal((await (await openPiRuns(config)).settled(107))?.status, "interrupted");
 });
 
-test("a crash during adoption leaves an unknown group that blocks recovery cleanup without authorizing a signal", { timeout: 30_000 }, async t => {
+for (const leaderExits of [true, false]) test(`a crash during adoption blocks recovery cleanup without signalling the ${leaderExits ? "orphan" : "unmarked leader or its child"}`, { timeout: 30_000 }, async t => {
   const config = await setup(t);
   const pidsFile = join(config.dataDir, "setup-pids.json");
   const scanStarted = join(config.dataDir, "scan-started");
+  const git = config.pi.git;
   config.pi.git = join(config.dataDir, "fake-git");
-  // The first setup command leaves an unmarked member in its group and exits without waiting for it.
+  // The first setup command leaves an unmarked member in its group, then either exits or stays alive.
   await writeFile(config.pi.git, `#!/usr/bin/env node
     const child = require("node:child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { env: {}, stdio: "ignore" });
     require("node:fs").writeFileSync(${JSON.stringify(pidsFile)}, JSON.stringify({ leader: process.pid, survivor: child.pid }));
     child.unref();
+    ${leaderExits ? "" : "setTimeout(() => {}, 60000);"}
   `, { mode: 0o700 });
-  // Stall the first process-table read in the host only, without leaving a fake ps process behind.
+  // Stall the first process-table read in the host only and hide the setup command's environment marker.
   const script = `
     import cp from "node:child_process";
     import { writeFileSync } from "node:fs";
     import { syncBuiltinESMExports } from "node:module";
     const execFile = cp.execFile;
     cp.execFile = (file, ...args) => file === "ps" ? writeFileSync(${JSON.stringify(scanStarted)}, "") : execFile(file, ...args);
+    const spawn = cp.spawn;
+    cp.spawn = (file, args, options) => {
+      if (file !== ${JSON.stringify(config.pi.git)}) return spawn(file, args, options);
+      const { PATTY_RUN_ID, ...env } = options.env;
+      return spawn(file, args, { ...options, env });
+    };
     syncBuiltinESMExports();
     const { openPiRuns } = await import(${JSON.stringify(join(checkout, "src/pi-run.ts"))});
     const runs = await openPiRuns(${JSON.stringify(config)});
     await runs.run(${JSON.stringify(request({ pr: false }))});`;
   const host = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: "ignore" });
   const exited = new Promise(resolve => host.once("exit", resolve));
-  const readPids = () => readFile(pidsFile, "utf8").then(text => text ? JSON.parse(text) as { leader: number; survivor: number } : undefined, () => undefined);
+  const readPids = async () => {
+    const text = await readFile(pidsFile, "utf8").catch(() => "");
+    return text ? JSON.parse(text) as { leader: number; survivor: number } : undefined;
+  };
   let pids: Awaited<ReturnType<typeof readPids>>;
   try {
     pids = await until(readPids, Boolean);
     const { leader, survivor } = pids!;
-    await until(() => existsSync(scanStarted) && !alive(leader));
+    await until(() => existsSync(scanStarted) && (!leaderExits || !alive(leader)));
     host.kill("SIGKILL");
     await exited;
     const stateFile = join(config.dataDir, "pi-run.json");
@@ -570,15 +581,59 @@ test("a crash during adoption leaves an unknown group that blocks recovery clean
     assert.deepEqual(saved.procs, []);
 
     t.mock.method(console, "error", () => {});
+    config.pi.git = git;
     const recovered = await openPiRuns(config);
-    await assert.rejects(recovered.run(request({ pr: false })), /1 process\(es\) could not be stopped, or could not be told from the run's/);
-    assert.ok(alive(survivor), "unknown group evidence does not authorize a signal");
+    await assert.rejects(recovered.run(request({ pr: false })), new RegExp(
+      `${leaderExits ? 1 : 2} process\\(es\\) could not be stopped, or could not be told from the run's`,
+    ));
+    assert.ok(alive(survivor) && (leaderExits || alive(leader)), "unknown group evidence does not authorize a signal");
     assert.ok(existsSync(saved.workspace) && existsSync(stateFile), "the survivor blocks cleanup");
   } finally {
     host.kill("SIGKILL");
     await exited;
-    const survivor = (pids ?? await readPids())?.survivor;
-    if (survivor && alive(survivor)) process.kill(survivor, "SIGKILL");
+    const children = pids ?? await readPids();
+    for (const pid of [children?.survivor, leaderExits ? undefined : children?.leader]) {
+      if (pid && alive(pid)) process.kill(pid, "SIGKILL");
+    }
+  }
+});
+
+test("a failed group checkpoint stops the setup command and retries the record", { timeout: 30_000 }, async t => {
+  const config = await setup(t);
+  config.pi.git = join(config.dataDir, "slow-git");
+  const pidFile = join(config.dataDir, "git-pid");
+  await writeFile(config.pi.git, `#!/usr/bin/env node
+    require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+    setTimeout(() => {}, 60000);
+  `, { mode: 0o700 });
+  const stateFile = join(config.dataDir, "pi-run.json");
+  let pid = 0;
+  let retried = false;
+  const rename = fs.rename;
+  const renameMock = t.mock.method(fs, "rename", async (from: Parameters<typeof rename>[0], to: Parameters<typeof rename>[1]) => {
+    if (to === stateFile) {
+      const { groups } = JSON.parse(await readFile(from, "utf8"));
+      if (groups.length && !pid) {
+        pid = await until(async () => Number(await readFile(pidFile, "utf8").catch(() => "")));
+        assert.deepEqual(groups, [[pid, null]]);
+        throw new Error("test group checkpoint failure");
+      }
+      if (groups.some(([pgid, cutoff]: [number, number | null]) => pgid === pid && cutoff === null)) retried = true;
+    }
+    await rename(from, to);
+  });
+  syncBuiltinESMExports();
+  try {
+    const runs = await openPiRuns(config);
+    const outcome = await runs.run(request({ pr: false, timeoutMs: 10_000 }));
+    assert.equal(outcome.status, "failed", "do not keep waiting on the unrecorded command");
+    assert.match(outcome.problems.join("\n"), /could not save process group \d+: test group checkpoint failure/);
+    assert.ok(pid && !alive(pid) && retried, "stop the child and retry the unknown group record");
+    assert.ok(!existsSync(stateFile));
+  } finally {
+    renameMock.mock.restore();
+    syncBuiltinESMExports();
+    if (pid && alive(pid)) process.kill(pid, "SIGKILL");
   }
 });
 
@@ -854,6 +909,22 @@ test("nothing is launched without a saved record, and a record that cannot be re
   assert.match(outcome.problems.join("\n"), /The run's record could not be closed/);
   assert.deepEqual(await runs.settled(101), outcome);
   await assert.rejects(runs.run(request({ pr: false })), /could not be cleaned up[^]*No new run starts until that is resolved/);
+});
+
+test("a process scan cannot prune groups added or changed while it was in flight", async () => {
+  const changed = Number.MAX_SAFE_INTEGER;
+  const added = changed - 1;
+  const future = added - 1;
+  const now = Date.now();
+  const owned = newOwned([], [[changed, now - 2_000], [future, now + 60_000]]);
+  // The future cutoff triggers a write mid-scan. Simulate a concurrent updater during that pause.
+  await trackRunProcesses(owned, "no-such-run", async () => {
+    owned.groups.set(changed, now - 1_000);
+    owned.groups.set(added, null);
+  });
+  assert.deepEqual([...owned.groups], [[changed, now - 1_000], [added, null]]);
+  await trackRunProcesses(owned, "no-such-run");
+  assert.deepEqual([...owned.groups], [], "a later scan can forget the empty groups");
 });
 
 test("a run's processes are found by environment marker and by the groups they led, not by their arguments", { timeout: 30_000 }, async t => {

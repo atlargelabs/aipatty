@@ -126,9 +126,9 @@ async function processSnapshot(runId: string) {
  * whose group leader, died is still found. A process that left both its parent and its group, and hides its
  * environment, is not found.
  *
- * `unsure` are unverified processes from a legacy record and unverified members of remembered, leaderless groups:
- * they may be late children of the run's, or strangers in a group whose ID was reused. They are not the run's to
- * kill, and not proof that the run is gone either.
+ * `unsure` are unverified processes from a legacy record and unverified members of remembered groups with no
+ * cutoff or no leader. They may be the run's, or strangers in a group whose ID was reused. They are not the run's
+ * to kill, and not proof that the run is gone either.
  *
  * Forgets empty groups and cutoffs invalidated by a clock rollback. The result is from a process table read last,
  * after the slower environment scan: act on it at once.
@@ -139,21 +139,24 @@ async function scan(
   const beganAt = Date.now();
   // Invalidate and save before awaiting ps, in case the clock catches up during the scan or the host dies.
   const invalidatedAtEntry = invalidateFutureCutoffs(owned, beganAt);
+  const groupsAtEntry = new Map(owned.groups);
   if (invalidatedAtEntry || pendingRecord) await recordInvalidation?.();
   const { before, marked, procs } = await processSnapshot(runId).catch(async error => {
     if (invalidateFutureCutoffs(owned, Date.now())) await recordInvalidation?.();
     throw error;
   });
   const scannedAt = Date.now();
-  let groupsChanged = invalidateFutureCutoffs(owned, scannedAt) || invalidatedAtEntry;
+  let groupsChanged = invalidatedAtEntry;
   const byPid = new Map(procs.map(proc => [proc.pid, proc]));
   const liveGroups = new Set(procs.map(proc => proc.pgid));
-  for (const pgid of owned.groups.keys()) {
-    if (!liveGroups.has(pgid)) {
+  // This snapshot cannot rule out groups added or updated by another operation while it was in flight.
+  for (const [pgid, cutoff] of groupsAtEntry) {
+    if (!liveGroups.has(pgid) && owned.groups.get(pgid) === cutoff) {
       owned.groups.delete(pgid);
       groupsChanged = true;
     }
   }
+  groupsChanged = invalidateFutureCutoffs(owned, scannedAt) || groupsChanged;
   // Never this process, its group, or the system's.
   const skipGroups = new Set([0, 1, byPid.get(process.pid)?.pgid ?? -1]);
   const candidate = (proc: Proc) => proc.pid !== process.pid && proc.pid > 1;
@@ -161,7 +164,8 @@ async function scan(
   const isMarked = (proc: Proc) => marked.has(proc.pid) && before.get(proc.pid) === proc.start;
   // A member of a remembered group whose leader is gone. With a live leader the group is the run's only through
   // that leader, which is then remembered itself.
-  const leaderless = (proc: Proc) => owned.groups.has(proc.pgid) && !skipGroups.has(proc.pgid) && !byPid.has(proc.pgid);
+  const knownGroup = (proc: Proc) => owned.groups.has(proc.pgid) && !skipGroups.has(proc.pgid);
+  const leaderless = (proc: Proc) => knownGroup(proc) && !byPid.has(proc.pgid);
   const startedBy = (proc: Proc) => {
     const seenAt = owned.groups.get(proc.pgid);
     const started = Date.parse(proc.start);
@@ -185,7 +189,8 @@ async function scan(
     }
   }
   const unsure = procs.filter(proc => candidate(proc) && !ours.has(proc.pid)
-    && (owned.unverifiedProcs.get(proc.pid) === proc.start || leaderless(proc)));
+    && (owned.unverifiedProcs.get(proc.pid) === proc.start
+      || (knownGroup(proc) && (owned.groups.get(proc.pgid) === null || !byPid.has(proc.pgid)))));
   return { ours: [...ours.values()], unsure, groupsChanged, beganAt, scannedAt };
 }
 
