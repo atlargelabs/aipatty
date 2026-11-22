@@ -6,7 +6,7 @@ import { mkdir, readdir, readFile, rm, symlink, utimes, writeFile } from "node:f
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
-import type { Config } from "../src/config.ts";
+import { readConfig, type Config } from "../src/config.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
 import { openPiRuns, outcomeText, type RunOutcome, type RunRequest } from "../src/pi-run.ts";
 import { readReport, readReview } from "../src/pi-trace.ts";
@@ -22,7 +22,7 @@ const prUrl = `https://github.com/${repo}/pull/12`;
 const issueUrl = `https://github.com/${repo}/issues/11`;
 
 /** A fixture directory with a repository to clone, the fake CLI and the fake `gh`. */
-async function setup(t: TestContext): Promise<Config> {
+async function setup(t: TestContext, installRoot = false): Promise<Config> {
   const dir = await fixture(t);
   const origin = join(dir, "origin");
   await mkdir(origin);
@@ -31,8 +31,11 @@ async function setup(t: TestContext): Promise<Config> {
   await writeFile(join(origin, "README.md"), "fixture\n");
   await git("add", "README.md");
   await git("commit", "--quiet", "-m", "initial");
-  const config = fauxConfig(dir);
-  const reviewDir = join(dir, "git/github.com/earendil-works/pi-review");
+  const config = installRoot
+    ? readConfig(["--install-dir", join(dir, "installation root"), "--port", "0"], { AIPATTY_FAUX: "1" })
+    : fauxConfig(dir);
+  await mkdir(config.dataDir, { recursive: true });
+  const reviewDir = join(config.pi.agentDir, "git/github.com/earendil-works/pi-review");
   await mkdir(reviewDir, { recursive: true });
   await writeFile(join(reviewDir, "review.ts"), "");
   return {
@@ -100,8 +103,9 @@ const launches = async (config: Config) => (await readFile(join(config.pi.agentD
 const spawned = async (config: Config) => (await readFile(join(config.pi.agentDir, "fake-pids.txt"), "utf8").catch(() => ""))
   .trim().split("\n").filter(Boolean).map(Number);
 
-test("a run launches the pinned CLI with only the pinned delegates extension, in a fresh clone that is then deleted", async t => {
-  const config = await setup(t);
+test("an install-root run forwards its Pi directory and loads only the pinned delegates extension in a disposable clone", async t => {
+  const config = await setup(t, true);
+  assert.equal(config.pi.agentDir, join(config.dataDir, "../pi"));
   await github(config, openPr);
   await scenario(config, [...review("c1", "job-review"), assistant(report()), settled]);
   const runs = await openPiRuns(config);

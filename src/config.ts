@@ -19,7 +19,7 @@ export interface Config {
   pi: PiConfig;
 }
 
-/** What a `pi` run launches and where it publishes. Everything is an absolute path into this release, or a fixed name. */
+/** What a `pi` run launches and where it publishes. Executables are release-relative; agent state is shared. */
 export interface PiConfig {
   /** The Node binary that runs this server. */
   node: string;
@@ -49,7 +49,7 @@ export const LOOPBACK = "127.0.0.1";
 /** The port the server listens on, and the CLI connects to, unless `--port` says otherwise. */
 export const DEFAULT_PORT = 8790;
 
-const serverUsage = "Usage: node src/main.ts [--port <n>] [--data-dir <path>] [--pi-dir <path>] [--work-dir <path>] [--runs-dir <path>]";
+const serverUsage = "Usage: node src/main.ts [--port <n>] [--install-dir <path>] [--data-dir <path>] [--pi-dir <path>] [--work-dir <path>] [--runs-dir <path>]";
 
 /**
  * Whether `AIPATTY_FAUX` asks for the fake model. It is the only environment setting; an empty value is unset. The
@@ -81,12 +81,13 @@ function absolutePath(path: string): string {
 /** Parse the server's command-line options and its one environment setting. */
 export function readConfig(args: readonly string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env): Config {
   const faux = readFaux(env);
-  let values: { port?: string; "data-dir"?: string; "pi-dir"?: string; "work-dir"?: string; "runs-dir"?: string };
+  let values: { port?: string; "install-dir"?: string; "data-dir"?: string; "pi-dir"?: string; "work-dir"?: string; "runs-dir"?: string };
   try {
     ({ values } = parseArgs({
       args: [...args],
       options: {
-        port: { type: "string" }, "data-dir": { type: "string" }, "pi-dir": { type: "string" },
+        port: { type: "string" }, "install-dir": { type: "string" },
+        "data-dir": { type: "string" }, "pi-dir": { type: "string" },
         "work-dir": { type: "string" }, "runs-dir": { type: "string" },
       },
       allowPositionals: false,
@@ -94,18 +95,20 @@ export function readConfig(args: readonly string[] = process.argv.slice(2), env:
   } catch (error) {
     throw new Error(`${error instanceof Error ? error.message : error}\n${serverUsage}`);
   }
-  for (const name of ["data-dir", "pi-dir", "work-dir", "runs-dir"] as const) {
-    if (values[name] === "") throw new Error(`--${name} needs a path`);
+  for (const name of ["install-dir", "data-dir", "pi-dir", "work-dir", "runs-dir"] as const) {
+    if (values[name] !== undefined && !values[name].trim()) throw new Error(`--${name} needs a path`);
   }
-  const piDir = absolutePath(values["pi-dir"] ?? "~/.pi/agent");
+  const root = values["install-dir"] === undefined ? undefined : absolutePath(values["install-dir"]);
+  const piDir = absolutePath(values["pi-dir"] ?? (root === undefined ? "~/.pi/agent" : join(root, "pi")));
   return {
-    dataDir: absolutePath(values["data-dir"] ?? (faux ? "~/.aipatty/faux" : "~/.aipatty/data")),
+    dataDir: absolutePath(values["data-dir"] ?? (root === undefined
+      ? (faux ? "~/.aipatty/faux" : "~/.aipatty/data") : join(root, faux ? "faux" : "data"))),
     port: readPort(values.port, 0),
     authFile: join(piDir, "auth.json"),
     modelsStore: join(piDir, "models-store.json"),
     faux,
-    workDir: absolutePath(values["work-dir"] ?? "~/.aipatty/work"),
-    runsDir: absolutePath(values["runs-dir"] ?? "~/.aipatty/runs"),
+    workDir: absolutePath(values["work-dir"] ?? (root === undefined ? "~/.aipatty/work" : join(root, "work"))),
+    runsDir: absolutePath(values["runs-dir"] ?? (root === undefined ? "~/.aipatty/runs" : join(root, "runs"))),
     pi: {
       node: process.execPath,
       cli: join(release, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"),

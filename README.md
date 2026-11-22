@@ -115,17 +115,37 @@ If a send reports that OpenAI is not configured, sign in with the pi CLI. Stored
 
 ## Configure
 
-The server takes five command-line options:
+The server takes six command-line options:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--port <n>` | `8790` | Listen port. `0` asks the operating system for a free one, which the server prints |
+| `--install-dir <path>` | Unset | Derive the state directories below from one installation root |
 | `--data-dir <path>` | `~/.aipatty/data` (`~/.aipatty/faux` in faux mode) | Where the conversation database, the ownership lock and the run logs live |
 | `--pi-dir <path>` | `~/.pi/agent` | The Pi directory, shared with the pinned CLI: its login file `auth.json`, its cached model catalog `models-store.json`, which the server only reads, and the `delegates` settings and jobs |
 | `--work-dir <path>` | `~/.aipatty/work` | Where the model's own file and shell tools start |
 | `--runs-dir <path>` | `~/.aipatty/runs` | Where each `pi` run gets its disposable workspace |
 
-and one environment variable, `AIPATTY_FAUX`: `1` uses the fake model. An empty value counts as unset.
+The defaults in the table apply when `--install-dir` is omitted. With it, the server derives `data/` (or `faux/`
+in faux mode), `pi/`, `work/`, and `runs/` under that root. Each individual directory option overrides only its
+corresponding derived path. Paths may be absolute, relative to the starting directory, or start with `~`; quote
+paths containing spaces. Blank paths are rejected. The root option is server-only: there is no new environment
+variable, CLI client option, or API setting. Pi executables and the delegates extension still come from the pinned
+release, not the state root.
+
+For a service install, the recommended root is `~/aipatty` in the service account's own home, not a new
+runtime default. Set `ROOT="$HOME/aipatty"` or choose another writable absolute path. The first release step
+creates the root if needed. The manual app install needs no `sudo` or macOS administrator account: an existing
+standard service account and user-accessible Node 26 or newer, Git, and `gh` are prerequisites. Optional machine
+provisioning and GitHub maintainer setup are separate; retain the `pattycaik` service identity and `protect-main`
+branch protection described in the runbook.
+
+Keep committed-main releases in `$ROOT/deploy/<sha>` with a `deploy/current` symlink and launch
+`node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT"`. Explicitly set `PI_CODING_AGENT_DIR="$ROOT/pi"`
+when using the pinned Pi CLI for login, pi-review installation, or model-cache updates. Follow
+[the manual installation and fresh-cutover procedure](docs/INSTALL.md); redeploy and rollback preserve root state.
+
+The server also takes one environment variable, `AIPATTY_FAUX`: `1` uses the fake model. An empty value counts as unset.
 
 An unknown option stops the server. Any other `AIPATTY_` variable stops the server and the CLI with an error that
 names it, so a setting left over from an earlier version is not silently ignored.
