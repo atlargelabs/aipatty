@@ -174,8 +174,13 @@ async function readJson<T>(path: string): Promise<T | undefined> {
 
 /** Delegates reads the trusted setting itself. Check it without editing it or using the legacy fallback. */
 async function reviewerProblem(pi: Config["pi"]): Promise<string | undefined> {
-  const pinned = await realpath(pi.reviewExtension).catch(() => undefined);
-  if (!pinned || !(await stat(pinned).catch(() => undefined))?.isFile()) {
+  const missingFile = (error: NodeJS.ErrnoException) => {
+    // Do not mistake permission errors (or other filesystem failures) for a missing install.
+    if (!isMissing(error) && error.code !== "ENOTDIR") throw error;
+    return undefined;
+  };
+  const pinned = await realpath(pi.reviewExtension).catch(missingFile);
+  if (!pinned || !(await stat(pinned).catch(missingFile))?.isFile()) {
     return `The pinned review extension is missing or not a file at ${pi.reviewExtension}. Run npm ci --ignore-scripts in the running release.`;
   }
   const path = join(pi.agentDir, "settings.json");
@@ -191,7 +196,7 @@ async function reviewerProblem(pi: Config["pi"]): Promise<string | undefined> {
     return `The review extension setting is missing or is not a normalized absolute file path. ${fix}`;
   }
   // The stable deploy/current path is usually a symlink; compare the files it selects, not the path spelling.
-  const selected = await realpath(configured).catch(() => undefined);
+  const selected = await realpath(configured).catch(missingFile);
   if (!selected) return `The configured review extension at ${configured} cannot be resolved. ${fix}`;
   if (selected !== pinned) return `The configured review extension at ${configured} does not match the running release. ${fix}`;
 }

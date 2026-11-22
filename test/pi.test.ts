@@ -422,6 +422,12 @@ test("PR runs refuse missing or mismatched reviewer settings before cloning, wit
   await refused(/does not match the running release/);
   await reviewSetting(config, `${config.pi.reviewExtension}.gone`);
   await refused(/cannot be resolved/);
+  const loop = join(config.dataDir, "review-link-loop");
+  await symlink(loop, loop);
+  await reviewSetting(config, loop);
+  const linkFailure = await runs.run(request());
+  assert.equal(linkFailure.status, "failed");
+  assert.match(linkFailure.problems.join("\n"), /ELOOP.*review-link-loop/);
   await reviewSetting(config, config.pi.reviewExtension);
   await rm(config.pi.reviewExtension);
   await refused(/pinned review extension is missing/, "npm ci --ignore-scripts");
