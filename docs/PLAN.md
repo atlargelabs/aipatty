@@ -23,18 +23,25 @@ conversation. The conversation host, branch tree, CLI, web page, and commit-repo
 
 ## Shape
 
-One Node process runs a pi-durable `Harness` over SQLite, with a small supervisor beside it.
+One Node process runs a pi-durable `Harness` over SQLite. A small supervisor beside it is planned for step 4;
+until then releases are deployed and rolled back manually.
 
 - **Stack:** TypeScript on Node 26. The Pi packages (`pi-durable`, `pi-ai`, `pi-codemode`, `chord`, `pi-schema`, and
   the `pi-coding-agent` CLI) are pinned at exactly 1.6.0 from npm, all at the same version so the host and the CLI share
   one `pi-ai`. Later bumps are normal reviewed PRs.
-- **Layout in the `aipatty` user's home:**
-  - `deploy/`: release checkouts of committed `main`, with dependencies installed separately for each release. Keep
-    the active and last-known-good releases available for rollback.
-  - `work/`: the working directory of aipatty's own `read`, `write`, `edit` and `bash`, for inspection and scratch
-    files. Nothing that becomes a PR is done here.
-  - `runs/`: disposable workspaces for [`pi` runs](#pi-runs).
-  - `data/`: the SQLite database, logs, upgrade state, and later MCP configuration and sign-ins.
+- **Service installation layout:** an administrator provisions a private, service-user-writable absolute root,
+  `ROOT=/opt/aipatty`. Manual committed-main releases live at `$ROOT/deploy/<sha>`, with dependencies installed
+  per release and `$ROOT/deploy/current` pointing at the active one. Keep the last-known-good release for rollback.
+  - `$ROOT/work/`: working directory of aipatty's own tools, for inspection and scratch, not PR work.
+  - `$ROOT/runs/`: disposable workspaces for [`pi` runs](#pi-runs).
+  - `$ROOT/data/`: SQLite, logs, and later upgrade state and MCP configuration and sign-ins.
+  - `$ROOT/pi/`: shared Pi sign-in, model cache, delegates settings and jobs.
+
+  The server-only `--install-dir` derives these four state paths (using `$ROOT/faux` instead of
+  `$ROOT/data` in faux mode); each individual directory option takes precedence. Without it the legacy defaults
+  remain unchanged. It adds no environment variable or API. Launch from any cwd with
+  `node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT"`. State stays outside releases on redeploy and
+  rollback; see [INSTALL.md](INSTALL.md) for the manual procedure and fresh cutover.
 - **Conversations:** one root plus forks. Each has a title and its own model.
 
 ### Pi installation
@@ -44,9 +51,10 @@ npm dependency. Commit the lockfile and install with `npm ci --ignore-scripts`. 
 running release by absolute path, never via `PATH` or `npx`. Do not fork Pi or update it in place with `pi update`;
 bump the dependency through a reviewed PR so rolling back aipatty also rolls back its Pi CLI.
 
-Use a dedicated Pi agent directory owned by the `aipatty` account (default `~/.pi/agent` under that account),
-outside the release and run directories. Point the host's `--pi-dir` and the CLI's `PI_CODING_AGENT_DIR` at the same
-path. The host and CLI share that account's OpenAI sign-in (`auth.json`, with compatible refresh locking) and the Pi
+Use a dedicated Pi agent directory owned by the `aipatty` account, outside the release and run directories. The
+legacy default is `~/.pi/agent`; the root install derives `$ROOT/pi`. Point the host and CLI at the same
+path: for root installs explicitly set `PI_CODING_AGENT_DIR="$ROOT/pi"` for pinned CLI login/bootstrap, pi-review
+installation, and model-cache commands (see [INSTALL.md](INSTALL.md)). The host and CLI share that account's OpenAI sign-in (`auth.json`, with compatible refresh locking) and the Pi
 model catalog cache (`models-store.json`, which supplies models newer than the bundled catalog). Steve bootstraps the service
 login with the pinned CLI; neither process uses Steve's personal Pi install, settings, or credential files. When
 bumping Pi, verify that the active and rollback releases can both use the shared sign-in and model cache.
@@ -152,6 +160,8 @@ Deferred until something needs them: a read-only research mode, concurrent runs,
 
 ## Upgrade and rollback
 
+This section describes the future supervisor, not an implemented or required part of the manual install.
+
 1. Steve says "upgrade" in a branch and aipatty calls the `upgrade` tool. The tool refuses while a Pi run is
    active and blocks new runs once it accepts. It persists a request ID and the calling branch, hands off to the
    supervisor, and ends the turn.
@@ -221,7 +231,7 @@ at boot without a login. It is not replaced by the normal aipatty upgrade.
 
 ## Setup only Steve can do
 
-- Create the `aipatty` user on the mini and install Node 26.3 or newer, Git, and `gh`. Set up the service account's
+- Create the `aipatty` user on the mini, provision the private writable `/opt/aipatty` root, and install Node 26 or newer, Git, and `gh`. Set up the service account's
   model sign-in with the release's Pi CLI and configure `pattycaik`'s SSH key and `gh` login. Write the
   [`delegates` settings](#pi-extensions) into the service account's Pi agent directory. Confirm `main` protection,
   with the CI check required, before enabling PR publication. No global Pi install or copy of Steve's dotfiles is

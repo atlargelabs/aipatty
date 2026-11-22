@@ -3,10 +3,10 @@ import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
@@ -20,8 +20,8 @@ function cliAt(url: string) {
 }
 
 /** Wait for readiness or early exit, and reap every child even when assertions fail. */
-function launch(t: TestContext, dir: string, env: NodeJS.ProcessEnv = { AIPATTY_FAUX: "1" }, args = fixtureArgs(dir)) {
-  const child = spawn(process.execPath, ["src/main.ts", ...args], { cwd: checkout, env, stdio: ["ignore", "pipe", "pipe"] });
+function launch(t: TestContext, dir: string, env: NodeJS.ProcessEnv = { AIPATTY_FAUX: "1" }, args = fixtureArgs(dir), cwd = checkout) {
+  const child = spawn(process.execPath, [join(checkout, "src/main.ts"), ...args], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
   let out = "", err = "";
   const ready = Promise.withResolvers<string>();
   child.stdout.on("data", chunk => {
@@ -44,6 +44,50 @@ test("faux has its own default database directory and an explicit override still
   assert.equal(readConfig([], {}).dataDir, join(homedir(), ".aipatty/data"));
   assert.equal(readConfig([], { AIPATTY_FAUX: "1" }).dataDir, join(homedir(), ".aipatty/faux"));
   assert.equal(readConfig(["--data-dir", "~/demo"], { AIPATTY_FAUX: "1" }).dataDir, join(homedir(), "demo"));
+});
+
+test("install root owns actual state outside the release cwd, separates faux, and preserves transcripts on restart", { timeout: 20_000 }, async t => {
+  const temp = await mkdtemp(join(tmpdir(), "aipatty-install-"));
+  t.after(() => rm(temp, { recursive: true, force: true }));
+  const root = join(temp, "private root");
+  const cwd = join(temp, "unrelated cwd");
+  await mkdir(cwd);
+  const args = ["--install-dir", root, "--port", "0"];
+
+  const real = launch(t, root, {}, args, cwd);
+  const realCli = cliAt(await real.url());
+  assert.equal((await realCli("log")).stdout, "");
+  for (const file of ["data/aipatty.sqlite", "data/owner.sqlite"]) assert.ok((await stat(join(root, file))).isFile(), file);
+  real.child.kill("SIGTERM");
+  assert.equal(await real.exit, 0);
+
+  const faux = launch(t, root, { AIPATTY_FAUX: "1" }, args, cwd);
+  const cli = cliAt(await faux.url());
+  assert.equal((await cli("log")).stdout, "");
+  assert.equal((await cli("send", "root state survives")).stdout.trim(), "Faux reply: root state survives");
+  for (const file of ["faux/aipatty.sqlite", "faux/aipatty.sqlite-wal", "faux/owner.sqlite"]) {
+    assert.ok((await stat(join(root, file))).isFile(), file);
+  }
+  for (const dir of ["work", "runs", "faux/logs/runs"]) assert.ok((await stat(join(root, dir))).isDirectory(), dir);
+  // The root chooses the ownership lock, not cwd or listen port.
+  const other = launch(t, root, { AIPATTY_FAUX: "1" }, args, temp);
+  assert.equal(await other.exit, 1);
+  assert.ok(other.stderr().includes(`owns data directory ${join(root, "faux")}`));
+  const transcript = (await cli("log")).stdout;
+  assert.match(transcript, /user: root state survives/);
+  assert.match(transcript, /assistant: Faux reply: root state survives/);
+  faux.child.kill("SIGTERM");
+  assert.equal(await faux.exit, 0);
+
+  const restarted = launch(t, root, { AIPATTY_FAUX: "1" }, args, temp);
+  assert.equal((await cliAt(await restarted.url())("log")).stdout, transcript);
+  restarted.child.kill("SIGTERM");
+  assert.equal(await restarted.exit, 0);
+  const realRestart = launch(t, root, {}, args, cwd);
+  assert.equal((await cliAt(await realRestart.url())("log")).stdout, "");
+  realRestart.child.kill("SIGTERM");
+  assert.equal(await realRestart.exit, 0);
+  assert.ok(!existsSync(join(cwd, "data")) && !existsSync(join(cwd, "faux")));
 });
 
 test("CLI recovers a saved model the catalog lacks, without a login or model call", { timeout: 15_000 }, async t => {
@@ -141,7 +185,7 @@ test("one owner per directory across ports; SIGKILL releases ownership and inter
   assert.equal(result.modelStatus, "available");
 });
 
-test("settings: three server options, and AIPATTY_FAUX as the only environment setting", () => {
+test("legacy server settings and AIPATTY_FAUX as the only environment setting", () => {
   const { pi, ...settings } = readConfig([], {});
   assert.deepEqual(settings, {
     dataDir: join(homedir(), ".aipatty/data"), port: 8790, faux: false,
