@@ -27,7 +27,8 @@ for (const step of scenario.steps ?? []) {
   if (step.spawn) {
     // As the delegates extension starts its children: detached, leading their own process group.
     const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 600000)"], {
-      detached: true, stdio: "ignore", ...(step.spawn === "unmarked" ? { env: {} } : {}),
+      detached: true, stdio: step.inheritOutput ? ["ignore", "inherit", "ignore"] : "ignore",
+      ...(step.spawn === "unmarked" ? { env: {} } : {}),
     });
     child.unref();
     appendFileSync(join(agentDir, "fake-pids.txt"), `${child.pid}\n`);

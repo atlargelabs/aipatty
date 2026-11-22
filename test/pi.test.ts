@@ -477,9 +477,14 @@ test("abort and timeout stop Pi and its delegates' processes, keep the logs, and
   await check(await aborted, "aborted");
 
   // A run that ignores SIGTERM is killed, and a timeout reports any PR the run had already published.
-  await github(config, openPr);
+  await github(config, { ...openPr, delayMs: 500 });
   await scenario(config, [...delegate("c0", { id: "job-pr", profile: "prmanager", task: "Publish.", cost: 0, prUrl }), ...steps], { ignoreTerm: true });
-  const timedOut = await check(await runs.run(request({ timeoutMs: 3_000 })), "timed_out");
+  const pending = runs.run(request({ timeoutMs: 3_000 }));
+  await until(() => existsSync(join(config.dataDir, "fake-gh-calls.txt")), Boolean, 20_000);
+  const saved = JSON.parse(await readFile(join(config.dataDir, "pi-run.json"), "utf8"));
+  assert.ok(existsSync(saved.workspace), "the run is still confirming its result");
+  assert.equal(saved.activeChild, undefined, "the verified stop is saved before any GitHub requests");
+  const timedOut = await check(await pending, "timed_out");
   assert.equal(timedOut.pr?.confirmed, true);
   assert.equal(timedOut.review.status, "missing");
   assert.match(timedOut.summary, /stopped after/);
@@ -1055,6 +1060,39 @@ for (const mode of ["delayed", "failed", "orphaned"] as const) test(mode === "or
     if (path === undefined) delete process.env.PATH;
     else process.env.PATH = path;
     for (const pid of [piPid, ...await spawned(config)]) if (pid && alive(pid)) process.kill(pid, "SIGKILL");
+  }
+});
+
+for (const abort of [true, false]) test(`a worker holding a released launcher's output blocks cleanup ${abort ? "on abort during drain" : "on drain timeout"}`, { timeout: 30_000 }, async t => {
+  const config = await setup(t);
+  config.pi.pollMs = 60_000;
+  await scenario(config, [{ waitForFile: "spawn-worker" }, { spawn: "unmarked", inheritOutput: true }, { exit: 0 }]);
+  const stateFile = join(config.dataDir, "pi-run.json");
+  const controller = new AbortController();
+  const running = (await openPiRuns(config)).run(request({ pr: false }), controller.signal);
+  try {
+    const [pi] = await until(() => launches(config).catch(() => []), value => value.length > 0);
+    await until(async () => {
+      const saved = JSON.parse(await readFile(stateFile, "utf8"));
+      return saved.activeChild?.[0] === pi.pid && !saved.cleanupUncertain;
+    });
+    await writeFile(join(config.pi.agentDir, "spawn-worker"), "");
+    const [worker] = await until(() => spawned(config), pids => pids.length === 1);
+    await until(() => !alive(pi.pid));
+    if (abort) {
+      controller.abort();
+      // Check before the drain timer can supply an independent reason for retaining the workspace.
+      await until(async () => JSON.parse(await readFile(stateFile, "utf8")).cleanupUncertain, Boolean, 3_000);
+    }
+    const outcome = await running;
+    assert.equal(outcome.status, abort ? "aborted" : "failed");
+    assert.match(outcome.problems.join("\n"), /process tree could not be verified/);
+    const saved = JSON.parse(await readFile(stateFile, "utf8"));
+    assert.ok(saved.cleanupUncertain && alive(worker) && existsSync(saved.workspace));
+  } finally {
+    controller.abort();
+    for (const pid of await spawned(config)) if (alive(pid)) process.kill(pid, "SIGKILL");
+    await running.catch(() => {});
   }
 });
 

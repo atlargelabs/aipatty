@@ -135,7 +135,7 @@ const isMissing = (error: unknown) => (error as NodeJS.ErrnoException).code === 
  * A child's exit code, once its output has ended. A process the child left behind can hold the pipes open for
  * ever: after `drainMs` they are closed here instead.
  */
-function exitOf(child: ChildProcess, onError: (error: Error) => void): Promise<number | null> {
+function exitOf(child: ChildProcess, onError: (error: Error) => void, onDrainTimeout: () => void): Promise<number | null> {
   return new Promise(done => {
     child.once("error", error => {
       onError(error);
@@ -143,6 +143,7 @@ function exitOf(child: ChildProcess, onError: (error: Error) => void): Promise<n
     });
     child.once("exit", code => {
       const timer = setTimeout(() => {
+        onDrainTimeout();
         child.stdout?.destroy();
         child.stderr?.destroy();
         done(code);
@@ -485,9 +486,15 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
 
   /** Save a verified, empty stop before reporting or deleting anything that recovery might need again. */
   const disarmLaunchGuard = async (saved: SavedRun, record: () => Promise<void>) => {
-    if (saved.activeChild && !saved.cleanupUncertain) {
+    const activeChild = saved.activeChild;
+    if (activeChild && !saved.cleanupUncertain) {
       delete saved.activeChild;
-      await record();
+      try {
+        await record();
+      } catch (error) {
+        saved.activeChild = activeChild;
+        throw error;
+      }
     }
   };
 
@@ -806,6 +813,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     };
     const save = () => write().catch(error => console.error(`Pi run ${saved.runId}: could not save its record:`, error));
     let killRequested = false;
+    let verifiedEmptyStop = false;
+    let drainUncertain = false;
     let abandonedChildren = false;
     const abandonment = Promise.withResolvers<null>();
     /** Remember a detached process this host started for the run, before waiting on it. */
@@ -892,17 +901,23 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       if (!recordEstablished) return []; // Nothing could have been launched.
       return stopRun(run.owned, saved.runId, saved.pid, grace, term, write, () => recordDirty, livePids, observe);
     };
+    const disarmStoppedLaunch = async () => {
+      if (verifiedEmptyStop && !released.size && !drainUncertain) {
+        await disarmLaunchGuard(saved, write).catch(error => console.error(`Pi run ${saved.runId}: could not record the verified stop:`, error));
+      }
+    };
     run.kill = () => {
       if (killRequested) return;
       killRequested = true;
-      // Capture the released handles before waiting behind a poll or adoption. A launcher can lose its
-      // ancestry while we wait, and another command cannot open its gate once a stop has been requested.
-      const pending = livePids(released);
+      // Include a released launcher that exited but whose pipes are still open. Do not forget an anchor
+      // simply because it exited while output drained or while the stop waited behind an ownership write.
+      const pending = new Set([...released].flatMap(child => child.pid === undefined ? [] : [child.pid]));
       void withOwnership(async () => {
         for (let attempt = 0; attempt < 2; attempt++) {
           const verified = new Set<number>();
+          let left: Proc[] | undefined;
           try {
-            await stop(attempt === 0 ? graceMs : 0, tree => {
+            left = await stop(attempt === 0 ? graceMs : 0, tree => {
               const live = livePids(released);
               for (const proc of tree) if (live.has(proc.pid)) verified.add(proc.pid);
             });
@@ -914,7 +929,11 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
           const exited = [...pending].filter(pid => !after.has(pid));
           if (exited.some(pid => !verified.has(pid))) break;
           for (const pid of exited) pending.delete(pid);
-          if (!after.size) return;
+          if (!after.size) {
+            verifiedEmptyStop = left?.length === 0;
+            await disarmStoppedLaunch();
+            return;
+          }
         }
         // Keep the workspace when an emergency stop could not verify the tree. If this write fails, the
         // launcher guard was already saved before the command started, and the fallback must not signal.
@@ -936,6 +955,16 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         }
         for (const child of released) if (live(child)) child.kill("SIGKILL");
       }).catch(error => console.error(`Pi run ${saved.runId}: could not stop its children:`, error));
+    };
+    const drainTimedOut = () => {
+      // A detached descendant may still hold an output pipe without being visible in a later scan.
+      // Prevent an in-flight stop from disarming after we destroy the pipe, before this write runs.
+      drainUncertain = true;
+      void withOwnership(async () => {
+        saved.cleanupUncertain = true;
+        await save();
+      });
+      run.kill();
     };
     // The deadline covers the whole run, cloning included.
     const timer = setTimeout(() => {
@@ -977,7 +1006,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       let failure: Error | undefined;
       stdout.on("data", (chunk: Buffer) => { out = (out + chunk).slice(0, 1024 * 1024); });
       stderr.on("data", (chunk: Buffer) => { err = (err + chunk).slice(-8_000); });
-      const exit = exitOf(child, error => { failure = error; });
+      const exit = exitOf(child, error => { failure = error; }, drainTimedOut);
       const adoptionError = await withOwnership(() => adopt(child, release));
       const exitCode = await Promise.race([exit, abandonment.promise]);
       if (adoptionError) throw adoptionError;
@@ -1044,7 +1073,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         ], repo, "pipe");
         launched = true;
         term = () => { child.kill("SIGTERM"); };
-        const exited = exitOf(child, error => { problems.push(`Could not start Pi: ${error.message}`); });
+        const exited = exitOf(child, error => { problems.push(`Could not start Pi: ${error.message}`); }, drainTimedOut);
         // A transcript that cannot be written ends the run: its result could not be checked or kept.
         let logFailed = false;
         const logFailure = (error: Error) => {
@@ -1133,6 +1162,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       });
       return undefined;
     }
+    // If the pipes closed after the verified scan, finish disarming before waiting on GitHub or log cleanup.
+    await withOwnership(disarmStoppedLaunch);
 
     const ok = launched && code === 0 && trace.settled && !trace.aborted && trace.lastStop === "stop"
       && trace.malformed === 0 && trace.oversized === 0 && !problems.length;
