@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream, type WriteStream } from "node:fs";
 import { copyFile, cp, lstat, mkdir, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
+import type { Writable } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
@@ -767,10 +768,14 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       }
     });
     const save = () => write().catch(error => console.error(`Pi run ${saved.runId}: could not save its record:`, error));
+    let killRequested = false;
     /** Remember a detached process this host started for the run, before waiting on it. */
-    const adopt = async (child: ChildProcess): Promise<GroupRecordError | undefined> => {
+    const adopt = async (child: ChildProcess, release: (start: boolean) => void): Promise<GroupRecordError | undefined> => {
       const pid = child.pid;
-      if (pid === undefined) return;
+      if (pid === undefined) {
+        release(false);
+        return;
+      }
       const seenAt = Date.now();
       invalidateFutureCutoffs(run.owned, seenAt);
       // Record the new group before waiting for ps: if the host and leader die during that read, recovery
@@ -779,12 +784,14 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       try {
         await write();
       } catch (error) {
-        // Do not leave an unrecorded command running. Use the child handle, not the unverified group ID.
-        child.kill("SIGKILL");
+        release(false); // EOF lets the launcher exit without running the command or starting descendants.
         run.kill(); // Retry the dirty record and stop any other processes that can be verified.
         return new GroupRecordError(`could not save process group ${pid}: ${message(error)}`);
       }
-      const own = (await listProcesses().catch(() => [])).find(proc => proc.pid === pid);
+      const start = !run.stop && !killRequested;
+      release(start);
+      if (!start) return;
+      const own = (await listProcesses().catch(() => [])).find(proc => proc.pid === pid && proc.ppid === process.pid && proc.pgid === pid);
       const scannedAt = Date.now();
       invalidateFutureCutoffs(run.owned, scannedAt);
       // The process table can contain a replacement for a setup command that exited during the I/O.
@@ -793,30 +800,27 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       }
       await save();
     };
-    /** The children this host started itself and still holds: stopped through their handles when all else fails. */
+    /** The children this host started directly: their live handles also anchor a stop scan. */
     const held = new Set<ChildProcess>();
+    const live = (child: ChildProcess): child is ChildProcess & { pid: number } =>
+      child.pid !== undefined && child.exitCode === null && child.signalCode === null;
+    const livePids = () => new Set([...held].filter(live).map(child => child.pid));
     const stop = async (grace = graceMs) => {
       if (!recordEstablished) return []; // Nothing could have been launched.
-      return stopRun(run.owned, saved.runId, saved.pid, grace, term, write, () => recordDirty);
+      return stopRun(run.owned, saved.runId, saved.pid, grace, term, write, () => recordDirty, livePids);
     };
     let stopping = Promise.resolve();
     run.kill = () => {
+      killRequested = true;
       stopping = stopping.then(async () => {
         try {
           await stop();
         } catch (error) {
-          // The scan or record write failed. Stop what this host started directly, by handle and so by group:
-          // each leads its own. What they started is left to the cleanup, which keeps the slot closed if it fails.
           console.error(`Pi run ${saved.runId}: could not stop its processes by scanning:`, error);
-          for (const child of held) {
-            if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) continue;
-            try {
-              process.kill(-child.pid, "SIGKILL");
-            } catch {
-              child.kill("SIGKILL");
-            }
-          }
         }
+        // Whatever the scan could establish, do not wait forever on a child we can still stop directly.
+        // A child handle is not, by itself, permission to signal every PID in a numeric group.
+        for (const child of held) if (live(child)) child.kill("SIGKILL");
       });
     };
     // The deadline covers the whole run, cloning included.
@@ -832,18 +836,28 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     // The server's own setting must not reach the checkout's tests, which refuse a stray AIPATTY_ variable.
     for (const name of Object.keys(env)) if (name.startsWith("AIPATTY_")) delete env[name];
 
+    /** Start a group without running its command until the group is recorded. EOF (even on a crash) fails closed. */
+    const launch = (file: string, args: string[], cwd: string | undefined, input: "ignore" | "pipe") => {
+      // The shell only waits and execs literal argv; exec preserves the detached leader's PID and group.
+      const child = spawn("/bin/sh", ["-c", 'IFS= read -r ready <&3 && [ "$ready" = run ] && exec "$@" 3<&-',
+        "aipatty-launch", file, ...args], { cwd, env, stdio: [input, "pipe", "pipe", "pipe"], detached: true });
+      const gate = child.stdio[3] as Writable | null;
+      gate?.on("error", () => gate.destroy()); // The child can exit before the writer closes.
+      held.add(child);
+      child.once("close", () => held.delete(child));
+      return { child, stdout: child.stdout!, stderr: child.stderr!, release: (start: boolean) => gate?.end(start ? "run\n" : "") };
+    };
+
     /** Run a setup command as part of the run: in its own process group, recorded, and stopped with the run. */
     const command = async (file: string, args: string[], cwd?: string): Promise<string> => {
       if (run.stop) throw new Error("the run was stopped");
-      const child = spawn(file, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true });
-      held.add(child);
-      child.once("close", () => held.delete(child));
+      const { child, stdout, stderr, release } = launch(file, args, cwd, "ignore");
       let out = "", err = "";
       let failure: Error | undefined;
-      child.stdout.on("data", (chunk: Buffer) => { out = (out + chunk).slice(0, 1024 * 1024); });
-      child.stderr.on("data", (chunk: Buffer) => { err = (err + chunk).slice(-8_000); });
+      stdout.on("data", (chunk: Buffer) => { out = (out + chunk).slice(0, 1024 * 1024); });
+      stderr.on("data", (chunk: Buffer) => { err = (err + chunk).slice(-8_000); });
       const exit = exitOf(child, error => { failure = error; });
-      const adoptionError = await adopt(child);
+      const adoptionError = await adopt(child, release);
       // Stopped while it was being recorded: the stop may have missed it.
       if (run.stop && !adoptionError) run.kill();
       const exitCode = await exit;
@@ -902,15 +916,13 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         if (run.stop) throw new Error("the run was stopped"); // Do not spawn after a stop scan may have started.
         const events = createWriteStream(join(saved.logDir, "events.jsonl"), { mode: 0o600 });
         const errors = createWriteStream(join(saved.logDir, "stderr.log"), { mode: 0o600 });
-        const child = spawn(pi.node, [
+        const { child, stdout, stderr: childStderr, release } = launch(pi.node, [
           pi.cli, "--mode", "json", "--no-session", "--model", request.model, "--thinking", request.thinking,
           // Nothing from the checkout or the agent directory loads by itself: only the pinned delegates extension.
           "--no-approve", "--no-extensions", "-e", pi.extension, "--no-skills", "--no-prompt-templates", "--no-themes",
           "--no-context-files", "--no-mcp", "--append-system-prompt", rules,
-        ], { cwd: repo, env, stdio: ["pipe", "pipe", "pipe"], detached: true });
+        ], repo, "pipe");
         launched = true;
-        held.add(child);
-        child.once("close", () => held.delete(child));
         term = () => { child.kill("SIGTERM"); };
         const exited = exitOf(child, error => { problems.push(`Could not start Pi: ${error.message}`); });
         // A transcript that cannot be written ends the run: its result could not be checked or kept.
@@ -919,8 +931,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
           if (logFailed) return;
           logFailed = true;
           problems.push(`The run's logs could not be written: ${clip(error.message, 300)}`);
-          child.stdout.resume();
-          child.stderr.resume();
+          stdout.resume();
+          childStderr.resume();
           run.kill();
         };
         events.on("error", logFailure);
@@ -938,21 +950,21 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
             });
           };
         };
-        const keepEvent = throttled(child.stdout, events);
-        const keepError = throttled(child.stderr, errors);
+        const keepEvent = throttled(stdout, events);
+        const keepError = throttled(childStderr, errors);
         const split = lineSplitter((line, whole) => {
           trace.line(line, whole);
           if (whole && !repeated(line)) keepEvent(line + "\n");
         });
-        child.stdout.on("data", (chunk: Buffer) => split.write(chunk));
-        child.stderr.on("data", (chunk: Buffer) => {
+        stdout.on("data", (chunk: Buffer) => split.write(chunk));
+        childStderr.on("data", (chunk: Buffer) => {
           stderr = (stderr + chunk.toString()).slice(-8_000);
           keepError(chunk);
         });
-        child.stdin.on("error", () => {});
-        child.stdin.end(prompt);
+        child.stdin!.on("error", () => {});
+        child.stdin!.end(prompt);
         saved.pid = child.pid;
-        const adoptionError = await adopt(child);
+        const adoptionError = await adopt(child, release);
         if (adoptionError) problems.push(`Could not record Pi: ${adoptionError.message}`);
         else if (run.stop) run.kill();
         // Remember the processes the run starts while their parents still live: a delegate leads its own group.

@@ -120,9 +120,9 @@ async function processSnapshot(runId: string) {
 }
 
 /**
- * The live processes that belong to a run: those it remembers (same ID and start time), those carrying its marker,
- * the members of the groups its processes led, and everything reached from them as a child or as a member of the
- * same group. Pi and the delegates extension start their children as group leaders, so an orphan whose parent, or
+ * The live processes that belong to a run: the host's still-held detached children, those it remembers (same ID
+ * and start time), those carrying its marker, and everything reached from them by ancestry or group membership.
+ * Pi and the delegates extension start their children as group leaders, so an orphan whose parent, or
  * whose group leader, died is still found. A process that left both its parent and its group, and hides its
  * environment, is not found.
  *
@@ -135,6 +135,7 @@ async function processSnapshot(runId: string) {
  */
 async function scan(
   owned: Owned, runId: string, recordInvalidation?: () => Promise<unknown>, pendingRecord = false,
+  liveChildren?: () => ReadonlySet<number>,
 ): Promise<ProcessScan> {
   const beganAt = Date.now();
   // Invalidate and save before awaiting ps, in case the clock catches up during the scan or the host dies.
@@ -172,10 +173,15 @@ async function scan(
     // ps gives whole seconds. A process starting in the observation's own second might have started later.
     return seenAt != null && Number.isFinite(started) && started + 1_000 <= seenAt;
   };
+  // Sample the handles after the I/O, and match only this host's direct detached children, not a remembered PGID.
+  const held = liveChildren?.();
   const ours = new Map<number, Proc>();
   for (const proc of procs) {
     if (!candidate(proc)) continue;
-    if (owned.procs.get(proc.pid) === proc.start || isMarked(proc) || (leaderless(proc) && startedBy(proc))) ours.set(proc.pid, proc);
+    const direct = held?.has(proc.pid) && proc.ppid === process.pid && proc.pgid === proc.pid;
+    if (direct || owned.procs.get(proc.pid) === proc.start || isMarked(proc) || (leaderless(proc) && startedBy(proc))) {
+      ours.set(proc.pid, proc);
+    }
   }
   for (let grew = true; grew;) {
     grew = false;
@@ -244,11 +250,12 @@ function signal(pid: number, name: NodeJS.Signals): void {
  * signal goes to a process found, by ID and start time, in a process table read just before, so a process that
  * took over a dead one's ID is not signalled. Returns what is left: the survivors, and the processes that could not
  * be told from the run's, which are not signalled. `record` saves new or invalidated ownership evidence, including
- * a `pendingRecord` that previously failed to save. Rejects if the table cannot be read or the record cannot be saved.
+ * a `pendingRecord` that previously failed to save. `liveChildren` supplies PIDs verified by a live child handle.
+ * Rejects if the table cannot be read or the record cannot be saved.
  */
 export async function stopRun(
   owned: Owned, runId: string, root: number | undefined, graceMs: number, term?: () => void, record?: () => Promise<unknown>,
-  pendingRecord: () => boolean = () => false,
+  pendingRecord: () => boolean = () => false, liveChildren?: () => ReadonlySet<number>,
 ): Promise<Proc[]> {
   // A record write failure blocks cleanup, but must not prevent us from stopping confirmed processes.
   let failedWrite: { error: unknown } | undefined;
@@ -272,7 +279,7 @@ export async function stopRun(
   };
   let stopFailure: { error: unknown } | undefined;
   try {
-    const tree = await recordScan(await scan(owned, runId, save, pendingRecord()));
+    const tree = await recordScan(await scan(owned, runId, save, pendingRecord(), liveChildren));
     const rootStart = root === undefined ? undefined : owned.procs.get(root);
     if (root !== undefined && rootStart !== undefined && tree.some(proc => proc.pid === root && proc.start === rootStart)) {
       // Through the live child handle when there is one, which cannot reach a process that reused the ID.
@@ -287,7 +294,7 @@ export async function stopRun(
     let left: Proc[] = [];
     let unsure: Proc[] = [];
     for (let attempt = 0; attempt < 20; attempt++) {
-      const scanned = await scan(owned, runId, save);
+      const scanned = await scan(owned, runId, save, false, liveChildren);
       ({ ours: left, unsure } = scanned);
       const targets = await recordScan(scanned);
       if (!left.length) break;

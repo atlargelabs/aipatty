@@ -6,6 +6,7 @@ import fs, { mkdir, readdir, readFile, rm, symlink, utimes, writeFile } from "no
 import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import type { Config } from "../src/config.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
@@ -554,7 +555,7 @@ for (const leaderExits of [true, false]) test(`a crash during adoption blocks re
     cp.execFile = (file, ...args) => file === "ps" ? writeFileSync(${JSON.stringify(scanStarted)}, "") : execFile(file, ...args);
     const spawn = cp.spawn;
     cp.spawn = (file, args, options) => {
-      if (file !== ${JSON.stringify(config.pi.git)}) return spawn(file, args, options);
+      if (!options?.detached) return spawn(file, args, options);
       const { PATTY_RUN_ID, ...env } = options.env;
       return spawn(file, args, { ...options, env });
     };
@@ -598,7 +599,7 @@ for (const leaderExits of [true, false]) test(`a crash during adoption blocks re
   }
 });
 
-test("a failed group checkpoint stops the setup command and retries the record", { timeout: 30_000 }, async t => {
+test("a failed group checkpoint prevents the setup command from starting and retries the record", { timeout: 30_000 }, async t => {
   const config = await setup(t);
   config.pi.git = join(config.dataDir, "slow-git");
   const pidFile = join(config.dataDir, "git-pid");
@@ -614,8 +615,10 @@ test("a failed group checkpoint stops the setup command and retries the record",
     if (to === stateFile) {
       const { groups } = JSON.parse(await readFile(from, "utf8"));
       if (groups.length && !pid) {
-        pid = await until(async () => Number(await readFile(pidFile, "utf8").catch(() => "")));
+        pid = groups[0][0];
         assert.deepEqual(groups, [[pid, null]]);
+        assert.ok(alive(pid), "the detached launcher is waiting for permission");
+        await sleep(500); // Give a command that was incorrectly launched time to leave its marker.
         throw new Error("test group checkpoint failure");
       }
       if (groups.some(([pgid, cutoff]: [number, number | null]) => pgid === pid && cutoff === null)) retried = true;
@@ -626,14 +629,59 @@ test("a failed group checkpoint stops the setup command and retries the record",
   try {
     const runs = await openPiRuns(config);
     const outcome = await runs.run(request({ pr: false, timeoutMs: 10_000 }));
-    assert.equal(outcome.status, "failed", "do not keep waiting on the unrecorded command");
+    assert.equal(outcome.status, "failed");
     assert.match(outcome.problems.join("\n"), /could not save process group \d+: test group checkpoint failure/);
-    assert.ok(pid && !alive(pid) && retried, "stop the child and retry the unknown group record");
+    assert.ok(pid && !alive(pid) && retried, "stop the launcher and retry the unknown group record");
+    assert.ok(!existsSync(pidFile), "the actual command never ran");
     assert.ok(!existsSync(stateFile));
   } finally {
     renameMock.mock.restore();
     syncBuiltinESMExports();
     if (pid && alive(pid)) process.kill(pid, "SIGKILL");
+  }
+});
+
+test("a stop finds a held, unmarked setup tree even when adoption could not read ps", { timeout: 30_000 }, async t => {
+  const config = await setup(t);
+  const task = join(config.dataDir, "setup-task.cjs");
+  const pidsFile = join(config.dataDir, "setup-pids.json");
+  await writeFile(task, `
+    const child = require("node:child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"],
+      { detached: true, stdio: "ignore", env: {} });
+    require("node:fs").writeFileSync(${JSON.stringify(pidsFile)}, JSON.stringify([process.pid, child.pid]));
+    setTimeout(() => {}, 60000);
+  `);
+  config.pi.git = join(config.dataDir, "fake-git");
+  await writeFile(config.pi.git, `#!/bin/sh\nunset PATTY_RUN_ID\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(task)}\n`, { mode: 0o700 });
+
+  // Fail only the first process-table read in adoption. Subsequent stop scans must use the held child as a root.
+  const ps = join(config.dataDir, "ps");
+  const failed = JSON.stringify(join(config.dataDir, "ps-failed"));
+  await writeFile(ps, `#!/bin/sh\nif [ ! -f ${failed} ]; then : > ${failed}; exit 1; fi\nexec /bin/ps "$@"\n`, { mode: 0o700 });
+  const path = process.env.PATH;
+  process.env.PATH = `${config.dataDir}:${path ?? ""}`;
+  const controller = new AbortController();
+  let pids: number[] = [];
+  let running: Promise<RunOutcome> | undefined;
+  try {
+    const runs = await openPiRuns(config);
+    running = runs.run(request({ pr: false, timeoutMs: 10_000 }), controller.signal);
+    const text = await until(() => readFile(pidsFile, "utf8").catch(() => ""));
+    pids = JSON.parse(text);
+    const stateFile = join(config.dataDir, "pi-run.json");
+    assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).procs, [], "adoption recorded no exact identities");
+    controller.abort();
+    const outcome = await running;
+    assert.equal(outcome.status, "aborted");
+    assert.deepEqual(outcome.problems, []);
+    assert.ok(pids.every(pid => !alive(pid)), "the held leader and its unmarked child in a separate group stopped");
+    assert.ok(!existsSync(stateFile));
+  } finally {
+    controller.abort();
+    await running?.catch(() => {});
+    if (path === undefined) delete process.env.PATH;
+    else process.env.PATH = path;
+    for (const pid of pids) if (alive(pid)) process.kill(pid, "SIGKILL");
   }
 });
 
