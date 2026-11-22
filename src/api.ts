@@ -8,6 +8,7 @@ import { HttpError, type AgentHost } from "./host.ts";
 import { pageCss, pageHtml, pageJs } from "./page.ts";
 import { messageText, shutdownHeader, streamState, streamUpdate, type StreamFrame } from "./protocol.ts";
 import { transcriptPage } from "./transcript.ts";
+import { upgradeCommand, upgradeHeader, upgradeRequestKey } from "./upgrade-state.ts";
 
 const maxBody = 64 * 1024;
 const defaultPage = 50;
@@ -88,8 +89,7 @@ async function jsonBody(req: IncomingMessage): Promise<Record<string, unknown>> 
   return value as Record<string, unknown>;
 }
 
-async function messageDraft(req: IncomingMessage): Promise<InputSubmissionDraft> {
-  const { content, requestId, whenBusy } = await jsonBody(req);
+function messageDraft({ content, requestId, whenBusy }: Record<string, unknown>): InputSubmissionDraft {
   if (typeof content !== "string" || !content.trim()) throw new HttpError(400, "Expected non-empty content");
   if (requestId !== undefined && (typeof requestId !== "string" || !requestId.trim() || requestId.length > 256)) {
     throw new HttpError(400, "requestId must be a non-empty string of at most 256 characters");
@@ -117,11 +117,14 @@ function requireMethod(req: IncomingMessage, res: ServerResponse, method: string
   throw new HttpError(405, "Method not allowed");
 }
 
+type UpgradeRequest = (conversation: Conversation, requestKey: string) => Promise<string>;
+
 async function handleHttp(
   agent: AgentHost, health: Health, req: IncomingMessage, res: ServerResponse,
-  shutdown?: (res: ServerResponse) => void,
+  serving: () => boolean, shutdown?: (res: ServerResponse) => void, upgrade?: UpgradeRequest,
 ) {
   const { pathname, searchParams } = requestUrl(req);
+  if (pathname !== "/health" && !serving()) throw new HttpError(503, "Upgrade validation in progress");
   if (pathname === "/api/shutdown" && shutdown) {
     requireMethod(req, res, "POST");
     const marker = req.headersDistinct[shutdownHeader];
@@ -185,8 +188,21 @@ async function handleHttp(
   if (!conversation) throw new HttpError(404, "Conversation not found");
 
   if (action === "messages") {
-    const submission = await agent.submit(conversation, await messageDraft(req));
-    sendJson(res, 202, { submissionId: submission.id });
+    const body = await jsonBody(req);
+    const draft = messageDraft(body);
+    const marker = req.headersDistinct[upgradeHeader];
+    if (marker || draft.content === upgradeCommand) {
+      if (marker?.length !== 1 || marker[0] !== "1") throw new HttpError(403, "Use the browser composer or CLI to explicitly request /upgrade");
+      if (draft.content !== upgradeCommand || !draft.requestId || !upgradeRequestKey.test(draft.requestId)
+        || Object.keys(body).some(key => key !== "content" && key !== "requestId")) {
+        throw new HttpError(400, "Expected exactly /upgrade and its request ID");
+      }
+      if (!upgrade) throw new HttpError(409, "Upgrade is not available on this host");
+      sendJson(res, 202, { upgradeId: await upgrade(conversation, draft.requestId) });
+    } else {
+      const submission = await agent.submit(conversation, draft);
+      sendJson(res, 202, { submissionId: submission.id });
+    }
   } else if (action === "abort") {
     await agent.abort(conversation);
     sendJson(res, 200, { ok: true });
@@ -340,6 +356,9 @@ export interface Health {
   commit: string;
   startedAt: string;
   version: string;
+  pid?: number;
+  upgradeProtocol?: number;
+  validation?: { id: string; ready: boolean; reason?: string };
 }
 
 /**
@@ -348,8 +367,8 @@ export interface Health {
  * not linger.
  */
 export async function startApi(agent: AgentHost, health: Health, port: number, {
-  heartbeatMs = defaultHeartbeatMs, onShutdown,
-}: { heartbeatMs?: number; onShutdown?: () => void } = {}) {
+  heartbeatMs = defaultHeartbeatMs, onShutdown, onUpgrade, serving = () => true,
+}: { heartbeatMs?: number; onShutdown?: () => void; onUpgrade?: UpgradeRequest; serving?: () => boolean } = {}) {
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 });
   const streams: Streams = { controllers: new Set(), alive: new WeakSet() };
   const heartbeat = setInterval(() => {
@@ -375,7 +394,7 @@ export async function startApi(agent: AgentHost, health: Health, port: number, {
     sendJson(res, 202, { status: "shutdown-requested" });
   });
   const server = createServer({ requestTimeout: 30_000, headersTimeout: 10_000 }, (req, res) => {
-    void handleHttp(agent, health, req, res, shutdown).catch(error => {
+    void handleHttp(agent, health, req, res, serving, shutdown, onUpgrade).catch(error => {
       if (res.destroyed) return;
       const { status, message } = errorResponse(error);
       if (!req.complete) res.shouldKeepAlive = false;
@@ -387,7 +406,9 @@ export async function startApi(agent: AgentHost, health: Health, port: number, {
     const onError = () => socket.destroy();
     socket.on("error", onError);
     upgrading.add(socket);
-    void handleUpgrade(agent, wss, streams, req, socket, head).catch(error => {
+    const opened = serving() ? handleUpgrade(agent, wss, streams, req, socket, head)
+      : Promise.reject(new HttpError(503, "Upgrade validation in progress"));
+    void opened.catch(error => {
       if (socket.destroyed) return;
       const { status, message } = errorResponse(error);
       const body = JSON.stringify({ error: message });

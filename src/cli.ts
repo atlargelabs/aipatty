@@ -4,8 +4,9 @@ import { on } from "node:events";
 import WebSocket, { type RawData } from "ws";
 import { LOOPBACK, readFaux, readPort } from "./config.ts";
 import type { BranchInfo, SearchMatch } from "./branches.ts";
-import { failureText, messageText, shutdownHeader, type ConversationPage, type StreamFrame } from "./protocol.ts";
+import { failureText, messageText, shutdownHeader, upgradeEntry, type ConversationPage, type StreamFrame } from "./protocol.ts";
 import { branchLine } from "./tools.ts";
+import { upgradeCommand, upgradeHeader } from "./upgrade-state.ts";
 
 /** The conversation path of a branch ID, or the root's. */
 function conversationPath(branch = "root"): string {
@@ -36,6 +37,15 @@ async function request<T>(base: URL, path: string, options?: RequestInit): Promi
 }
 
 async function send(base: URL, content: string, root: string): Promise<void> {
+  if (content === upgradeCommand) {
+    const { upgradeId } = await request<{ upgradeId: string }>(base, `${root}/messages`, {
+      method: "POST", headers: { "Content-Type": "application/json", [upgradeHeader]: "1" },
+      body: JSON.stringify({ content, requestId: randomUUID() }), redirect: "error",
+    });
+    if (typeof upgradeId !== "string") throw new Error("This server does not support /upgrade");
+    console.log(`Upgrade ${upgradeId} accepted. Use log on this branch for the result.`);
+    return;
+  }
   const { submissionId } = await request<{ submissionId: number }>(base, `${root}/messages`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -87,6 +97,8 @@ async function log(base: URL, root: string, limit?: number): Promise<void> {
   let entries = pages.reverse().flatMap(page => page.entries);
   if (limit !== undefined) entries = entries.slice(-limit);
   for (const entry of entries) {
+    const post = upgradeEntry(entry);
+    if (post) console.log(`${limit === undefined ? "" : `[${entry.id}] `}${post.role}: ${post.text}`);
     for (const message of entry.model ?? []) {
       const text = messageText(message);
       if (text) console.log(limit === undefined ? `${message.role}: ${text}` : `[${entry.id}] ${message.role}: ${text}`);
@@ -97,7 +109,7 @@ async function log(base: URL, root: string, limit?: number): Promise<void> {
 const usage = `Usage: aipatty [--port <n>] [--branch <id>] <command>
   health | models | shutdown
   model set [provider] <modelId> | thinking set <level>
-  send "<text>" | abort | log
+  send "<text>" | send "/upgrade" | abort | log
   branches [list] | branches read <id> [--limit <n>] | branches search <id> "<text>"
   fork "<title>" [--at <entryId>] | rename "<title>"
 --branch selects the branch for model, thinking, send, abort, log, fork and rename; default the root.

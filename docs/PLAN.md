@@ -1,8 +1,8 @@
 # aipatty: plan for the minimal agent
 
-aipatty is a personal assistant agent that runs on Steve's Mac mini. The next goal is self-upgrade with a human merge
-and deploy gate: ask aipatty for a change, get a tested PR, merge it, request an upgrade, and see the result in the same
-conversation. The conversation host, branch tree, CLI, web page, and commit-reporting `/health` already exist.
+aipatty is a personal assistant agent that runs on Steve's Mac mini. Its change loop keeps a human merge and
+deploy gate: ask aipatty for a change, get a tested PR, merge it, explicitly request an upgrade, and see the
+result in the same conversation.
 
 ## Decisions
 
@@ -11,7 +11,7 @@ conversation. The conversation host, branch tree, CLI, web page, and commit-repo
 | Base | A small host of our own on the `@earendil-works/pi-durable` library. Not p2 or p3; p2's plugins are reference code only. |
 | Remote access | HTTP and WebSocket on loopback only, one crude web page, and a CLI client. The laptop reaches them through an SSH port forward; the phone's route is not settled (see [Remote access](#remote-access)). No notifications. |
 | Merging | Only Steve merges PRs in `atlargelabs/aipatty`. |
-| Upgrade | Explicit, never automatic. If rollback also fails, Steve uses SSH or remote desktop. |
+| Upgrade | Explicit operator `/upgrade` and a one-shot helper, never automatic. If rollback also fails, Steve uses SSH or remote desktop. |
 | GitHub identity | The `pattycaik` account with write access, behind a ruleset on `main`. Other repos only when Steve directs it. |
 | Coding | Aipatty has pi-durable's built-in tools for inspection, scratch work and `gh`. Work intended for a PR goes to its own pinned Pi CLI in a disposable workspace, with the `delegates` and `pi-review` extensions installed. Pi can write the change directly or through a delegate. Every PR is reviewed by a `crmanager` delegate, and Pi keeps fixing until no important finding remains. |
 | Tree | Branches are independent workstreams. Steve and aipatty can both fork. All branches stay listed. No automatic report-back. |
@@ -23,27 +23,28 @@ conversation. The conversation host, branch tree, CLI, web page, and commit-repo
 
 ## Shape
 
-One Node process runs a pi-durable `Harness` over SQLite. A small supervisor beside it is planned for step 4;
-until then releases are deployed and rolled back manually.
+One Node process runs a pi-durable `Harness` over SQLite. An explicit upgrade starts a detached one-shot helper
+from a pinned release. There is no installed supervisor, launchd job, or always-on polling process.
 
 - **Stack:** TypeScript on Node 26. The Pi packages (`pi-durable`, `pi-ai`, `pi-codemode`, `chord`, `pi-schema`, and
   the `pi-coding-agent` CLI) are pinned at exactly 1.6.0 from npm, all at the same version so the host and the CLI share
   one `pi-ai`. Later bumps are normal reviewed PRs.
 - **Service installation layout:** the recommended root is `~/aipatty` in the service account's own home
   (`ROOT="$HOME/aipatty"`). Another writable absolute path is fine. The first release step creates the root
-  if needed without administrator access. Manual committed-main releases live at `$ROOT/deploy/<sha>`, with
+  if needed without administrator access. Committed-main releases live at `$ROOT/deploy/<sha>`, with
   dependencies installed per release and `$ROOT/deploy/current` pointing at the active one. Keep the
   last-known-good release for rollback.
   - `$ROOT/work/`: working directory of aipatty's own tools, for inspection and scratch, not PR work.
   - `$ROOT/runs/`: disposable workspaces for [`pi` runs](#pi-runs).
-  - `$ROOT/data/`: SQLite, logs, and later upgrade state and MCP configuration and sign-ins.
+  - `$ROOT/data/`: conversation SQLite, Pi run logs, and later MCP configuration and sign-ins.
   - `$ROOT/pi/`: shared Pi sign-in, model cache, delegates settings and jobs.
+  - `$ROOT/upgrade/`: the upgrade owner lock, durable journal, backups, and per-request helper and app logs.
 
   The server-only `--install-dir` derives these four state paths (using `$ROOT/faux` instead of
   `$ROOT/data` in faux mode); each individual directory option takes precedence. Without it the legacy defaults
   remain unchanged. It adds no environment variable or API. Launch from any cwd with
   `node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT"`. State stays outside releases on redeploy and
-  rollback; see [INSTALL.md](INSTALL.md) for the manual procedure and fresh cutover.
+  rollback; see [INSTALL.md](INSTALL.md) for bootstrap, normal operation, and recovery.
 - **Conversations:** one root plus forks. Each has a title and its own model.
 
 ### Pi installation
@@ -103,7 +104,6 @@ changing the setting. See [INSTALL.md](INSTALL.md) for the first pinned deploy a
 | --- | --- |
 | `read`, `write`, `edit`, `bash`, `codemode`, `tool_search` | pi-durable built-ins, working in `work/`. |
 | `pi` | Runs one Pi session on a bounded coding task in a fresh clone and returns the result to the calling branch. One run at a time across all branches. Inside the run Pi may delegate the work, and always delegates the review. |
-| `upgrade` | Asks the supervisor to deploy the latest `main`, when Steve asks for it. Refuses while a `pi` run is active. |
 | `fork_branch`, `list_branches`, `read_branch`, `set_model` | Tree management, plus paging and text search over any branch. |
 | `mcp_status`, `mcp_reload`, `mcp_sign_in` | Later: server state, re-reading `mcp.json`, and OAuth by link. |
 
@@ -165,25 +165,25 @@ Deferred until something needs them: a read-only research mode, concurrent runs,
 
 ## Upgrade and rollback
 
-This section describes the future supervisor, not an implemented or required part of the manual install.
+1. Steve sends exactly `/upgrade` in the originating branch, using the browser composer or CLI. It's an
+   operator command, not a tool a model can call or a phrase interpreted as consent. The host requires an idle
+   harness and reserves the Pi slot across all branches. It journals the unique ID and branch and immediately
+   commits the command with Durable before spawning the helper. No model turn runs for the command or the result.
+2. The helper owns the operation and resolves the configured GitHub origin's `main` to one commit. It stages
+   and checks a clean checkout while the old host serves reads. It will not deploy a Pi checkout or any PR head.
+3. After graceful stop, process exit and exclusive data ownership, it makes a standalone SQLite backup that
+   includes committed WAL frames. It atomically switches `current` and starts the candidate with its scheduler
+   paused and only health exposed. SHA and readiness must match (including the requesting branch) before the
+   commit opens admissions. A pre-commit failure restores the intact old release and database, without copying
+   live files or replaying candidate WAL. Both success and verified rollback report to the original branch.
+4. The journal persists outside SQLite. A failed stage leaves old state and admission intact; an interrupted
+   cutover needs explicit `recover`, which never fetches a new target. A failed rollback preserves evidence and
+   stops. The first legacy bootstrap uses the same helper and rollback code, with exclusive operator maintenance
+   because the old release has no journal or admission gate.
 
-1. Steve says "upgrade" in a branch and aipatty calls the `upgrade` tool. The tool refuses while a Pi run is
-   active and blocks new runs once it accepts. It persists a request ID and the calling branch, hands off to the
-   supervisor, and ends the turn.
-2. The supervisor fetches `main` from the configured origin and resolves it once to a target SHA. Install and check
-   that release separately before stopping the current process. Deploy only committed `main`; never build a release
-   from a Pi workspace or a PR branch.
-3. Stop the current process, copy the SQLite database, and start the target release. Verify `/health` reports the
-   expected SHA and that the host is ready to accept work. A 200 can already mean the saved model is unavailable,
-   so status code alone is insufficient. If staging fails, leave the old release running. If startup or readiness
-   fails, stop the new release, restore the database copy, restart the intact last-known-good release, and verify it
-   too. Keep the copy until the next successful upgrade.
-4. Persist the outcome so the running release can post it once in the requesting branch, including the active SHA
-   and any rollback reason. Resume the existing conversation; if rollback also fails, retain diagnostics for Steve
-   to recover over SSH or remote desktop.
-
-The supervisor is a small launchd daemon that runs as `aipatty`, installed once by an administrator, so it starts
-at boot without a login. It is not replaced by the normal aipatty upgrade.
+This one-shot design supersedes the always-on launchd supervisor. No administrator, daemon, automatic upgrade,
+startup retry, or service registration is required. A future service manager for the app is separate and must
+not respawn the app during an upgrade. See [the runbook](INSTALL.md#upgrade-an-existing-installation).
 
 ## Guard rails
 
@@ -227,10 +227,9 @@ at boot without a login. It is not replaced by the normal aipatty upgrade.
    itself. It opens an issue and a checked PR that a `crmanager` has reviewed. Steve merges and deploys it by
    hand; verify the new SHA and keep talking in the original conversation. At this point aipatty can help build the supervisor.
    The steps are in [INSTALL.md](INSTALL.md).
-4. **Automate explicit upgrade and rollback.** Install the supervisor and replace the manual deploy with the
-   `upgrade` tool. Repeat the end-to-end test and verify the originating branch reports the new SHA.
-   Test a release that fails readiness and confirm the old release and conversation come back with the failure
-   reported. This is the self-upgrade milestone.
+4. **Explicit upgrade and rollback.** Bootstrap from a merged release as in [INSTALL.md](INSTALL.md), then
+   use `/upgrade` to verify the originating branch reports the active SHA. Isolated process tests cover both
+   directions of cutover, failed readiness, and interrupted recovery. No persistent supervisor is installed.
 5. **After self-upgrade:** phone access, MCP configuration and OAuth, the per-branch switch, and Gmail. Add research
    mode, concurrent runs, hooks, or more repos only when needed.
 
@@ -247,8 +246,7 @@ at boot without a login. It is not replaced by the normal aipatty upgrade.
 - **Optional machine provisioning, separately:** if the service account or system tools do not exist, arrange
   their creation or installation with the machine owner; this may need a macOS administrator. The service account
   still creates its own install root. Fix SSH from the laptop to `macmini` (host key verification fails).
-- **Future work for Steve:** install the privileged launchd supervisor described above, not as part of the manual
-  app install. For Gmail later, create the Google Cloud project and OAuth client.
+- **Future work for Steve:** for Gmail later, create the Google Cloud project and OAuth client.
 
 ## Left for aipatty to build
 

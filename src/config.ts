@@ -5,6 +5,7 @@ import { parseArgs } from "node:util";
 
 /** Server settings. */
 export interface Config {
+  installDir?: string;
   dataDir: string;
   port: number;
   /** The pi CLI's login file. */
@@ -47,6 +48,9 @@ const release = fileURLToPath(new URL("../", import.meta.url));
 
 /** The only address the server listens on. Other machines reach it through an SSH port forward. */
 export const LOOPBACK = "127.0.0.1";
+
+/** Non-safelisted marker: an ordinary browser form cannot send it. */
+export const shutdownHeader = "x-aipatty-shutdown";
 
 /** The port the server listens on, and the CLI connects to, unless `--port` says otherwise. */
 export const DEFAULT_PORT = 8790;
@@ -103,6 +107,7 @@ export function readConfig(args: readonly string[] = process.argv.slice(2), env:
   const root = values["install-dir"] === undefined ? undefined : absolutePath(values["install-dir"]);
   const piDir = absolutePath(values["pi-dir"] ?? (root === undefined ? "~/.pi/agent" : join(root, "pi")));
   return {
+    ...(root === undefined ? {} : { installDir: root }),
     dataDir: absolutePath(values["data-dir"] ?? (root === undefined
       ? (faux ? "~/.aipatty/faux" : "~/.aipatty/data") : join(root, faux ? "faux" : "data"))),
     port: readPort(values.port, 0),

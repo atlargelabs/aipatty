@@ -311,6 +311,8 @@ export function outcomeText(outcome: RunOutcome): string {
 export interface PiRuns {
   /** The branch and ID of the run in progress. */
   active(): { runId: string; conversationId: number } | undefined;
+  /** Reserve the same synchronous slot that run() claims, including start and cleanup. */
+  reserveUpgrade(): () => void;
   /**
    * Run Pi once. Rejects at once when another run is active, or when an earlier run could not be cleaned up;
    * otherwise resolves when the run is over and cleaned up.
@@ -721,6 +723,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
   }
 
   let active: ActiveRun | undefined;
+  let upgrading = false;
   let closed = false;
 
   async function execute(request: RunRequest, saved: SavedRun, run: ActiveRun): Promise<RunOutcome | undefined> {
@@ -999,8 +1002,17 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
 
   return {
     active: () => active && { runId: active.saved.runId, conversationId: active.saved.conversationId },
+    reserveUpgrade() {
+      if (closed) throw new Error("aipatty is shutting down");
+      if (upgrading) throw new Error("An upgrade is already pending");
+      if (active) throw new Error(`Pi run ${active.saved.runId} in branch ${active.saved.conversationId} is still active, starting, or cleaning up`);
+      if (stuck) throw new Error(stuck);
+      upgrading = true;
+      return () => { upgrading = false; };
+    },
     async run(request, signal) {
       if (closed) throw new Error("aipatty is shutting down");
+      if (upgrading) throw new Error("An upgrade is pending; new Pi runs are not admitted");
       if (active) {
         const { runId, conversationId } = active.saved;
         throw new Error(`Pi run ${runId}, started from branch ${conversationId}, is still active. Only one run at a time: wait for it, or abort that branch.`);

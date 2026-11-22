@@ -2,8 +2,17 @@ import type { JsonValue } from "@earendil-works/chord/json";
 import { contentText, type Message } from "@earendil-works/pi-ai";
 import type { ConversationView, EntryRecord, LiveState, ModelRef, UsageState } from "@earendil-works/pi-durable";
 
-/** Non-safelisted marker: an ordinary browser form cannot send it. */
-export const shutdownHeader = "x-aipatty-shutdown";
+import { upgradeEntryKind } from "./upgrade-state.ts";
+
+export { shutdownHeader } from "./config.ts";
+
+/** An app event, not a user or model message, and not part of the model context. */
+export function upgradeEntry(entry: EntryRecord): { role: string; text: string } | undefined {
+  const { data } = entry;
+  if (entry.kind !== upgradeEntryKind || !data || typeof data !== "object" || Array.isArray(data)
+    || typeof data.text !== "string") return;
+  return { role: data.type === "request" ? "operator" : "aipatty", text: data.text };
+}
 
 /** A transcript page, in chronological order, and its conversation's current metadata. */
 export interface ConversationPage {

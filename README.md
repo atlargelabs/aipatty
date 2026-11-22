@@ -145,9 +145,10 @@ branch protection described in the runbook.
 Keep committed-main releases in `$ROOT/deploy/<sha>` with a `deploy/current` symlink and launch
 `node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT"`. Explicitly set `PI_CODING_AGENT_DIR="$ROOT/pi"`
 when using the pinned Pi CLI for login or model-cache updates. Set `delegates.reviewExtension` to the absolute
-path through `deploy/current` so it follows deployment and rollback between pinned releases. Stop and wait
-before repointing `current`. Follow [the runbook](docs/INSTALL.md) for first installs, migrating existing settings,
-rollback to releases with an unpinned reviewer, and development without `deploy/current`.
+path through `deploy/current` so it follows deployment and rollback between pinned releases. Follow
+[the runbook](docs/INSTALL.md) for first installs, the PR #18 reviewer setting change, and development without
+`deploy/current`. For an existing service, use the [one-shot upgrade runbook](docs/INSTALL.md#upgrade-an-existing-installation)
+instead of repointing `current` by hand.
 
 The server also takes one environment variable, `AIPATTY_FAUX`: `1` uses the fake model. An empty value counts as unset.
 
@@ -183,6 +184,7 @@ node src/cli.ts models                # list available model IDs and providers
 node src/cli.ts model set <id>        # select a model from that list (optional provider before ID)
 node src/cli.ts thinking set <level>  # off, minimal, low, medium, high, xhigh or max
 node src/cli.ts send "hello"          # send a message and stream the answer
+node src/cli.ts send '/upgrade'       # explicitly deploy committed main in a managed install
 node src/cli.ts abort                 # withdraw queued messages and stop the running turn
 node src/cli.ts shutdown              # request a graceful stop of the whole server
 node src/cli.ts log                   # print the transcript
@@ -207,6 +209,19 @@ scheduling is [blocked by an unavailable model](#configure). Partial answers may
 Active [`pi` runs](#pi-runs) are stopped and reported as interrupted on restart, not replayed. Wait for the server
 process to exit before starting another one on the same data directory.
 
+## Explicit upgrades
+
+After Steve merges a reviewed PR, send exactly `/upgrade` in the chosen idle branch using the web composer
+(confirm the prompt) or `send '/upgrade'` in the CLI. Ordinary messages and model tool calls cannot request it.
+Admission uses the existing trusted loopback/SSH operator boundary, not a personal login. The old app serves
+reads while a detached one-shot helper stages and checks the pinned `main` commit; it refuses new work while
+the request is pending. The originating branch gets one durable app entry with the result, active SHA, and
+any rollback reason. The helper exits; there is no daemon, launchd installation, or automatic deployment.
+
+Before first use, see [legacy bootstrap](docs/INSTALL.md#first-bootstrap-from-a-release-without-the-upgrade-command),
+[diagnostics and recovery](docs/INSTALL.md#diagnose-recover-or-start-manually), and the
+[reviewer setting migration](docs/INSTALL.md#first-deploy-from-a-release-with-an-unpinned-reviewer).
+
 ## From another machine
 
 The server has no login and accepts connections from its own machine only. To use the page or the CLI from a laptop,
@@ -222,7 +237,8 @@ the authentication.
 ## API
 
 - `GET /` the page (and `/app.js`, `/app.css`)
-- `GET /health` (includes the root's saved model, its catalog availability, and the thinking level)
+- `GET /health` (includes release/process identity, the root's saved model, catalog availability, and thinking
+  level). A candidate with `validation` set is not serving normal work, even if this request returns 200.
 - `GET /api/models`
 - `POST /api/shutdown` (no body needed): requires the `X-Aipatty-Shutdown: 1` header so ordinary browser forms
   cannot trigger it. No CORS is enabled. Returns `202 { "status": "shutdown-requested" }` before stopping the
@@ -238,7 +254,9 @@ the authentication.
 - `PUT /api/conversations/:id/thinking` with `{ level }`
 - `GET /api/conversations/:id/search?q=&limit=&before=`: `{ matches: [{ entryId, role, excerpt }], before }`,
   newest first; pass `before` back for the next page
-- `POST /api/conversations/:id/messages` with `{ content, requestId?, whenBusy?: "followUp" | "steer" }`
+- `POST /api/conversations/:id/messages` with `{ content, requestId?, whenBusy?: "followUp" | "steer" }`;
+  the operator `/upgrade` command uses exactly `{ content: "/upgrade", requestId }` and a separate
+  `X-Aipatty-Upgrade: 1` marker, with the same Host and Origin rules. Its 202 names an `upgradeId`, not a submission.
 - `POST /api/conversations/:id/abort` (returns once the conversation is idle)
 - `WS /api/conversations/:id/stream` sends one `state` frame (the newest 50 entries and the live state), then an
   `update` frame per change: the live state plus any `appended` entries, without the window. It falls back to a full

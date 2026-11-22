@@ -2,6 +2,7 @@
  * The crude web page: branch list, transcript, input box, fork, rename, model picker and cost. Served by the API
  * with a strict CSP, so the script is a separate same-origin file and every value is rendered as text.
  */
+import { upgradeCommand, upgradeEntryKind, upgradeHeader } from "./upgrade-state.ts";
 
 export const pageHtml = `<!doctype html>
 <html lang="en">
@@ -99,7 +100,7 @@ async function api(path, options = {}) {
   const init = { ...options };
   if (options.body !== undefined) {
     init.body = JSON.stringify(options.body);
-    init.headers = { "Content-Type": "application/json" };
+    init.headers = { ...options.headers, "Content-Type": "application/json" };
   }
   const response = await fetch(path, init);
   const value = await response.json().catch(() => ({}));
@@ -214,6 +215,9 @@ function entryNode(entry, message) {
 function entryNodes(entries) {
   const nodes = [];
   for (const entry of entries) {
+    if (entry.kind === ${JSON.stringify(upgradeEntryKind)} && typeof entry.data?.text === "string") {
+      nodes.push(entryNode(entry, { role: entry.data.type === "request" ? "operator" : "aipatty", content: entry.data.text }));
+    }
     for (const message of entry.model || []) {
       if (messageText(message)) nodes.push(entryNode(entry, message));
     }
@@ -355,9 +359,13 @@ $("composer").addEventListener("submit", guard(async event => {
   try {
     // Unlike randomUUID, getRandomValues does not need a secure context.
     const requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
-    await api("/api/conversations/" + branch + "/messages", {
-      method: "POST", body: { content, requestId, whenBusy: "followUp" },
+    const upgrade = content === ${JSON.stringify(upgradeCommand)};
+    if (upgrade && (!event.isTrusted || !confirm("Upgrade aipatty to committed main when all branches are idle?"))) return;
+    const accepted = await api("/api/conversations/" + branch + "/messages", {
+      method: "POST", body: upgrade ? { content, requestId } : { content, requestId, whenBusy: "followUp" },
+      headers: upgrade ? { ${JSON.stringify(upgradeHeader)}: "1" } : undefined,
     });
+    if (upgrade) notice("Upgrade " + accepted.upgradeId + " accepted. The result will appear in this branch.");
     if (branch === app.branch && revision === draftRevision) $("input").value = "";
   } finally {
     send.disabled = false;

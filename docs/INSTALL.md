@@ -1,8 +1,8 @@
 # Installing aipatty on the Mac mini
 
-This is build step 3 of [PLAN.md](PLAN.md): install by hand, then prove that aipatty can change itself through a
-reviewed PR. Use a committed `main` release containing `--install-dir`. Deploys and rollback are manual; the
-supervisor is future work (step 4). No installer, migration, or automatic deletion is involved.
+Start with a manually installed, committed `main` release using `--install-dir`. To upgrade it after Steve
+merges a reviewed PR, use the [one-shot upgrade runbook](#upgrade-an-existing-installation). There is no
+installer, launchd job, permanent supervisor, automatic upgrade, or automatic release deletion.
 
 The default recommended service root is `~/aipatty` in the home of the account that will run aipatty. Set
 `ROOT="$HOME/aipatty"` in each shell that runs these commands, so the path is absolute and quoted. Another
@@ -90,11 +90,16 @@ PI_CODING_AGENT_DIR="$ROOT/pi" node "$ROOT/deploy/current/node_modules/@earendil
 
 ## Start
 
-From any working directory, with `ROOT="$HOME/aipatty"` (or your chosen root) set:
+From any working directory, with `ROOT="$HOME/aipatty"` (or your chosen root) set. Use the same port on every
+start, bootstrap, upgrade and recovery; `8790` is the default:
 
 ```sh
-node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT"
+PORT=8790
+node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT" --port "$PORT"
 ```
+
+If this root has an interrupted upgrade, [recover it first](#diagnose-recover-or-start-manually). Do not run an
+older server directly against an uncertain install: it cannot check a journal introduced by a later release.
 
 The option derives `$ROOT/data` (or `$ROOT/faux` in faux mode), `$ROOT/pi`, `$ROOT/work`, and `$ROOT/runs`.
 The database, ownership lock, and run logs live in the data directory; Pi auth, model cache, settings and jobs
@@ -131,25 +136,165 @@ acknowledges the request. Wait for the server process to exit before repointing 
 server. For older releases without the command, or if the API is unreachable, use Ctrl-C in the server terminal
 or send the server `SIGTERM`. These all use the same cleanup; see [CLI shutdown semantics](../README.md#cli).
 
-## First deploy from a release with an unpinned reviewer
+## Upgrade an existing installation
 
-For an existing root, stage the new release with `npm ci --ignore-scripts`, then [stop](#stop) the old
-server and wait for it to exit. Before starting the new release:
+Upgrade v1 supports a standard macOS or Linux account with a dedicated canonical installation root. It requires
+`--install-dir`, a fixed nonzero port, and the derived `data` (or `faux`), `pi`, `work`, and `runs` directories.
+These and `deploy/` must be real directories writable only by the service account, not shared writable paths,
+separate symlinks, or overrides.
+`deploy/current` must be a symlink selecting the running `deploy/<full-sha>` checkout. Do not change
+`AIPATTY_FAUX` or use one root for both real and faux service installs. For older custom installs, use
+[Fresh cutover](#fresh-cutover-from-an-old-installation); the helper does not migrate configuration or state.
 
-1. Note the old `delegates.reviewExtension` value (usually absent). Keep the old reviewer checkout under
-   the Pi directory's `git/github.com/earendil-works/pi-review/` (or the previously configured file) if you
-   may roll back to the old release. Keeping the files does not make the new release use them.
-2. In the same shared `settings.json`, set just `delegates.reviewExtension` to the absolute `deploy/current`
-   reviewer path shown above. Preserve the rest of the delegates configuration, including publication and
-   checks. If the old `pi install` left a `pi-review` entry in `packages`, remove only that entry; no package
-   registration is needed for either release, and you should not uninstall the retained reviewer.
-3. Repoint `current` to the new release, start with the same configuration, and verify its commit with `health`.
+Do not run a service manager/watchdog that respawns the app during this procedure. Disable any such respawn
+before upgrading, especially with a legacy release which cannot read the journal. A future app service manager
+is separate and must coordinate starts with upgrades. Use an ordinary service-account shell; don't run as root,
+change a running release, run concurrent operators, or point the port at a different application.
 
-Between pinned releases, leave the setting unchanged. To roll back to a release older than the pin, stop and
-wait first, then restore the previous `delegates.reviewExtension` value (delete the key if the old release
-used the fallback) before repointing `current` and restarting. PR runs on the old release need that legacy
-reviewer file; if it was not retained, restore it before running PR work there. On returning to a pinned
-release, set the `deploy/current` value again while stopped. No release edits the setting for you.
+### First bootstrap from a release without the upgrade command
+
+This works with the legacy release that has `--install-dir`, the documented loopback shutdown API (including
+`ea33846`), and the exclusive `data/owner.sqlite` lock. Keep the app up for the initial checks. Reserve an
+exclusive maintenance window: finish all turns and Pi cleanup, stop sending messages from every client, and do
+not start Pi or permit any new work until the helper exits. The legacy server cannot enforce this. The helper
+requires idle branches, proves the legacy port and owner file belong to the same process (macOS `lsof` or Linux
+`/proc`), checks its documented launch arguments, and refuses if it sees `pi-run.json`. It rechecks before
+shutdown and after actual process exit. If a run record remains, **do not delete it**; let the old server finish
+its normal run recovery before trying again. Legacy startup through a wrapper, with custom directory arguments,
+or without an inspectable process and the documented API is unsupported.
+
+After Steve has merged the upgrade PR and checked CI, stage committed `main` **without** changing `current` or
+running npm in the new checkout. From the server's service account (use the actual root and port):
+
+```sh
+ROOT="$(cd "$HOME/aipatty" && pwd -P)"
+PORT=8790
+ORIGIN=git@github.com:atlargelabs/aipatty.git
+(
+  set -eu
+  test -n "$ROOT"
+  test -L "$ROOT/deploy/current"
+  STAGE="$(mktemp -d "$ROOT/deploy/.bootstrap-XXXXXX")"
+  git clone --single-branch --branch main --no-tags --no-checkout "$ORIGIN" "$STAGE"
+  SHA="$(git -C "$STAGE" rev-parse --verify 'refs/remotes/origin/main^{commit}')"
+  git -C "$STAGE" checkout --detach "$SHA"
+  git -C "$STAGE" show -s --oneline "$SHA"
+  test ! -e "$ROOT/deploy/$SHA"
+  test ! -L "$ROOT/deploy/$SHA"
+  mv "$STAGE" "$ROOT/deploy/$SHA"
+  printf 'Staged %s\n' "$SHA"
+)
+```
+
+Check that the printed commit includes the reviewed, merged upgrade. Set `SHA` to the printed full commit.
+The helper independently fetches `main` again, requires that exact tip and compares the entire pre-install
+worktree (including ignored paths). If `main` advanced, stage its new tip rather than editing the first checkout.
+Use the same faux setting as the old server (normally unset):
+
+```sh
+SHA='replace-with-the-full-sha-printed-above'
+HELPER="$ROOT/deploy/$SHA/src/upgrade-supervisor.ts"
+node "$HELPER" bootstrap --install-dir "$ROOT" --port "$PORT"
+node "$ROOT/deploy/current/src/cli.ts" --port "$PORT" health
+```
+
+It uses the same install/check, validation, and rollback code as chat, and the old CLI's shutdown protocol.
+A `202` alone does not permit cutover. First result goes to the terminal and `$ROOT/upgrade/`, not a branch.
+Verify the served SHA and existing transcript. If preparation fails, the old app keeps running. Treat every
+staged directory as immutable after use: if the same destination is needed again, inspect and **move the
+inactive directory out of `deploy/`** first; never edit an active or last-known-good release in place.
+
+### First deploy from a release with an unpinned reviewer
+
+If the legacy release predates PR #18, record the previous `delegates.reviewExtension` value (often absent)
+**before** bootstrap. Keep the old reviewer checkout under `$ROOT/pi/git/github.com/earendil-works/pi-review/`
+(or its previously configured file). Leave all settings unchanged during bootstrap: validation deliberately
+makes no PR/model call. After bootstrap succeeds and `health` verifies the new pinned release, **before the
+first PR run**, set just `delegates.reviewExtension` in `$ROOT/pi/settings.json` to the actual absolute path
+`$ROOT/deploy/current/node_modules/@earendil-works/pi-review/review.ts` (expand `$ROOT` in the value; JSON does
+not expand it). Preserve all other settings, especially publication and checks. Do not uninstall the old reviewer.
+
+If bootstrap rolls back, no setting has changed and the legacy reviewer still works. If you later do an
+operator-managed downgrade to a pre-pin release, restore the recorded value (delete the key if previously
+absent) before allowing PR work there. Between pinned releases leave the `deploy/current` setting unchanged;
+it selects the matching reviewer after a switch or rollback. The helper never edits shared Pi settings.
+
+### Normal use from a conversation
+
+After Steve merges the reviewed PR, enter exactly `/upgrade` in the chosen branch and confirm in the web page,
+or use the upgrade-aware CLI (for example over the existing SSH forward):
+
+```sh
+node src/cli.ts --port 8790 --branch 2 send '/upgrade'
+node src/cli.ts --port 8790 --branch 2 log
+```
+
+Omit `--branch` for the root. The host recognizes the command only on the existing operator message path,
+with the explicit upgrader marker and a request ID. Prose, quotes, model and tool output, ordinary unmarked
+submissions, and a repeated ID do not deploy. There is **no model-callable upgrade tool** and no target, repo,
+or command argument. This uses the existing loopback/SSH trust boundary, not authentication of Steve by
+name: another local process or someone with equivalent service-account/forward access can imitate an operator.
+The app and Pi's shell tools still share the service account and are not an OS security boundary.
+
+Wait for all branches to be idle and Pi start/cleanup/recovery to finish. Once accepted, the old app still
+serves reads, but rejects new work (including Pi and other branch mutations) until staging either finishes or
+fails. The helper checks the pinned merge using `npm ci --ignore-scripts`, `npm run check` and `npm test`; it
+never deploys a working tree or bypasses GitHub merge protections. Same SHA is a no-op. Staging errors and
+no-ops leave the old app up and reopen admission. After a switch, refresh the page or reconnect if necessary:
+the result is written once directly to that branch (not attributed to the user or generated by a model).
+
+Readiness means the same process serves the expected SHA from the selected checkout, the SQLite/Durable host
+opened, Pi recovery is clear, and both the root and requesting branch models are in the local catalog with no
+saved work globally blocking scheduling. A plain HTTP 200 is insufficient. The candidate exposes only health
+and cannot run resumed or external work before commit. Upgrade targets must keep the managed startup/validation
+protocol; older releases are supported only as the bootstrap source and rollback destination. This is local
+validation, not a paid model call, an
+OAuth refresh, a network test, or a PR/reviewer run. The operator resolves missing catalog/login or reviewer
+settings as usual. Apply the PR #18 setting change separately if applicable.
+
+### Diagnose, recover, or start manually
+
+`$ROOT/upgrade/journal.json` is the latest operation. Read it for the request ID, old SHA, pinned target, phase
+and outcome; `$ROOT/upgrade/<id>.log` holds the stage, helper and replacement app's output. Standalone SQLite
+backups at `$ROOT/upgrade/<id>.sqlite` include committed WAL frames. Keep the intact old release and the latest
+successful backup; there is no automatic garbage collection. Do not remove locks, a pending journal/backup,
+or the log the running app is still using. Before archiving anything, check it is not referenced by the current
+journal or used by a running process. These are private service data.
+
+Use the following from the service-account shell, with `ROOT`, `PORT` and `HELPER` set as above. For chat
+upgrades, `HELPER` can be the script in the journal's old release; never assume `current` is the known-good
+script while a switch is unfinished. For legacy bootstrap or legacy rollback, keep the staged modern helper,
+even if `current` is legacy.
+
+```sh
+printf '%s\n' "$ROOT/upgrade/journal.json"
+less "$ROOT/upgrade/journal.json"
+ID='replace-with-the-request-id-from-the-journal'
+less "$ROOT/upgrade/$ID.log"
+node "$HELPER" recover --install-dir "$ROOT" --port "$PORT"
+node "$ROOT/deploy/current/src/cli.ts" --port "$PORT" health
+```
+
+- `requested`/`staging`: no switch began. Recovery cancels staging; it does not fetch again. A normal modern
+  start can also cancel orphaned staging. If the old app is down, start it with the original configuration.
+- `stopping`/`switching`/`restoring`/`restored`: don't start either release by hand. The new app refuses an
+  unguarded start. `recover` verifies quiescence and restores the recorded old release as required, never a
+  different or newer SHA. If an old app is still running after a failed handoff, stop that **verified** app
+  with its own CLI (or Ctrl-C in its terminal) and wait for process exit before `recover`. Do not kill a random
+  port listener. On a legacy rollback, continue the no-work maintenance window until recovery returns.
+- `done`: no automatic restart or redeploy follows a later crash. `recover` verifies the pointer and reports
+  the recorded result; that is not a live health probe. If the app is stopped (e.g. reboot or a lost activation
+  after commit), first run `recover` as the guard, then use the [normal start command](#start) on `current`
+  with the original root, port, and faux setting. **Even if `current` is legacy, do this guard check first.**
+  Verify `health` and the transcript once the app is back. Do not restore a pre-upgrade backup over a release
+  that may already have accepted work after commit.
+
+If rollback or recovery itself fails, leave the helper stopped and retain the journal, backup, all SQLite
+sidecars, and releases. Keep respawn disabled. Over SSH or remote desktop, diagnose the named error (e.g. free
+space, permissions, a known process still exiting, or a missing backup). After correcting it, rerun the same
+`recover` command. Do not point `current` by hand, delete `pi-run.json` or the journal to make startup pass,
+or copy over a live SQLite file. If ownership or the backup can't be established, preserve the whole stopped
+root and investigate from a copy before any manual data repair. There is no force/retry loop or second deploy engine.
 
 ## Fresh cutover from an old installation
 
@@ -179,15 +324,7 @@ account's SSH keys and configuration, Git configuration, and `gh` login and sett
 2. The answer names an issue and a PR, the PR's head commit, and says `Review: reviewed`. Check that CI passed on
    that commit and that an actual `crmanager` Pi review ran.
 3. Steve merges the PR.
-4. Deploy by hand: make a release of the new committed `main` as in "First release", without changing the current
-   symlink yet. Follow [Stop](#stop) and wait for the process to exit, then point `$ROOT/deploy/current` at the new
-   release and start it again with the same root. Do not repoint while the server or a review is running: the
-   reviewer setting follows `current`. For the first deploy over an unpinned release, make the
-   [one-time settings change](#first-deploy-from-a-release-with-an-unpinned-reviewer) while stopped.
-   Keep the previous release for rollback; preserve `$ROOT/data`,
-   `$ROOT/pi`, `$ROOT/work`, and `$ROOT/runs` across both redeploy and rollback.
-5. `node src/cli.ts health` reports the new commit, and `node src/cli.ts log` still has the conversation. Send it
-   another message. For manual rollback, follow [Stop](#stop), repoint `current` at the retained release once the
-   process exits, restart with the same root, and verify its SHA and conversation. Keep the same reviewer setting
-   when rolling back between pinned releases; for an older release, restore its previous reviewer setting while
-   stopped as described above. Ensure releases are compatible with the shared state.
+4. Use [first bootstrap](#first-bootstrap-from-a-release-without-the-upgrade-command) once if needed. Otherwise
+   request [`/upgrade`](#normal-use-from-a-conversation) from the branch. Keep the previous release and shared root.
+5. Check `health` for the new commit and `log` for existing history and the upgrade result. Send another message.
+   For a failed cutover use [recovery](#diagnose-recover-or-start-manually), not a live symlink or DB copy.

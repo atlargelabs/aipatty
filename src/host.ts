@@ -8,7 +8,8 @@ import {
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
 import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
-import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
+import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { openNodeSqliteDatabase } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { createToolSearchExtension } from "@earendil-works/pi-durable/tool-search";
 import { createCodingTools } from "@earendil-works/pi-durable/tools";
 import { mkdir } from "node:fs/promises";
@@ -79,14 +80,19 @@ export interface AgentHost {
   assertRunning(): Promise<void>;
   /** Throw 409 unless scheduling runs and the branch's saved model is available. */
   assertAvailable(conversation?: Conversation): Promise<void>;
+  /** Requires no live tasks or pending submissions; blocks all mutations and Pi admission until released. */
+  reserveUpgrade(conversation: Conversation): Promise<() => void>;
+  /** Open scheduling only after the startup guard has committed the chosen release. */
+  activate(): void;
 }
 
 /** Open paused, so an unavailable saved model never executes interrupted work. */
-export async function openHost(config: Config): Promise<AgentHost> {
+export async function openHost(config: Config, options: { paused?: boolean; beforeOpen?: () => void } = {}): Promise<AgentHost> {
   await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
   const release = ownDataDir(config.dataDir);
   try {
-    const agent = await openOwnedHost(config);
+    options.beforeOpen?.();
+    const agent = await openOwnedHost(config, options.paused === true);
     void agent.harness.closed.then(release);
     return agent;
   } catch (error) {
@@ -138,12 +144,23 @@ async function forkPoint(from: Conversation, at: number | undefined, before: num
   return point;
 }
 
-async function openOwnedHost(config: Config): Promise<AgentHost> {
+async function openOwnedHost(config: Config, paused: boolean): Promise<AgentHost> {
   const models = await openModels(config);
   // Before any conversation resumes: stop and clean up a run the previous process left behind.
   const runs = await openPiRuns(config);
   await mkdir(config.workDir, { recursive: true, mode: 0o700 });
-  const storage = await openNodeSqliteStorage(join(config.dataDir, "aipatty.sqlite"));
+  const database = await openNodeSqliteDatabase(join(config.dataDir, "aipatty.sqlite"));
+  const storage = await (async () => {
+    try {
+      // The adapter defaults to WAL/NORMAL. Managed installs also acknowledge writes in an fsynced
+      // journal outside SQLite; those acknowledgements must not outlive the Durable transactions.
+      if (config.installDir && config.port !== 0) await database.exec("PRAGMA synchronous = FULL");
+      return await SqliteStorage.open(database);
+    } catch (error) {
+      await database.close().catch(() => {});
+      throw error;
+    }
+  })();
   const registry = createRegistry();
   const sandbox = new CodemodeSandbox({ memoryLimitBytes: 256 * 1024 * 1024 });
   // The model's own tools work in `work/`, for inspection and scratch files. Work meant for a PR goes through `pi`.
@@ -163,7 +180,11 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
     env: () => new NodeExecutionEnv({ cwd: config.workDir }),
     settings: { afterFailedRun: "withdraw" },
     onReport: report => console.error("pi-durable:", report),
-  }, ctx);
+  }, ctx).catch(async error => {
+    await storage.close(ctx).catch(() => {});
+    await sandbox.close();
+    throw error;
+  });
   try {
     const root = await harness.root(ctx, { agent: config.faux ? { ...newRoot, model: fauxModel } : newRoot });
     const available = (model: ModelRef | null | undefined) => !!model && !!models.getModel(model.provider, model.modelId);
@@ -188,7 +209,12 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
         if (conversation && (await status(conversation)).modelStatus === "unavailable") blocked.add(id);
       }
     }
-    if (!blocked.size) harness.resume();
+    let serving = !paused;
+    let upgrading = false;
+    if (serving && !blocked.size) harness.resume();
+    const admit = () => {
+      if (!serving || upgrading) throw new HttpError(409, "An upgrade is pending; new work is not admitted");
+    };
     // Branches recovered while others were still blocked: their aborted work settles once scheduling resumes.
     const recovered: Conversation[] = [];
 
@@ -275,8 +301,35 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
         .sort((a, b) => a.provider.localeCompare(b.provider) || a.modelId.localeCompare(b.modelId)),
       assertRunning: () => assertRunning(),
       assertAvailable,
+      activate() {
+        if (serving) return;
+        serving = true;
+        if (!blocked.size) harness.resume();
+      },
+      reserveUpgrade(target) {
+        return exclusive(async () => {
+          admit();
+          let release: () => void;
+          try { release = runs.reserveUpgrade(); } catch (error) {
+            throw new HttpError(409, error instanceof Error ? error.message : String(error));
+          }
+          upgrading = true;
+          const unblock = () => { upgrading = false; release(); };
+          try {
+            await assertAvailable();
+            await assertAvailable(target);
+            const { tasks, submissions } = await harness.inspect(ctx);
+            if (tasks.length || submissions.length) throw new HttpError(409, "Wait for all branches to finish before requesting an upgrade");
+            return unblock;
+          } catch (error) {
+            unblock();
+            throw error;
+          }
+        });
+      },
       async setModel({ thinkingLevel, ...next }, target = root, context) {
         await exclusive(async () => {
+          admit();
           if (!models.getModel(next.provider, next.modelId)) {
             throw new HttpError(400, `Unknown model ${next.provider}/${next.modelId}; list available models with 'aipatty models'`);
           }
@@ -307,6 +360,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
       },
       setThinking(level, target = root, context) {
         return exclusive(async () => {
+          admit();
           const thinkingLevel = thinkingLevels.find(value => value === level);
           if (!thinkingLevel) throw new HttpError(400, `Expected a thinking level: ${thinkingLevels.join(", ")}`);
           await target.configure({ thinkingLevel }, ctx);
@@ -324,27 +378,32 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
         return { branches, totalCost: await totalCost() };
       },
       branch,
-      async fork(from, { title, at, before }, context = ctx) {
-        context.abortSignal?.throwIfAborted();
-        const name = validTitle(title);
-        if (!name) throw new HttpError(400, "Expected a title of 1 to 100 characters");
-        const { model, thinking } = await status(from, context);
-        const agent = { thinkingLevel: thinking, ...(model ? { model } : {}) };
-        const init = async (tx: Tx, id: ConversationId) => {
-          (await tx.doc(BranchDoc, id)).title = name;
+      fork(from, { title, at, before }, context = ctx) {
+        return exclusive(async () => {
+          admit();
+          const name = validTitle(title);
+          if (!name) throw new HttpError(400, "Expected a title of 1 to 100 characters");
+          const { model, thinking } = await status(from, context);
+          const agent = { thinkingLevel: thinking, ...(model ? { model } : {}) };
+          const init = async (tx: Tx, id: ConversationId) => {
+            (await tx.doc(BranchDoc, id)).title = name;
+            context.abortSignal?.throwIfAborted();
+          };
+          const point = await forkPoint(from, at, before, context);
           context.abortSignal?.throwIfAborted();
-        };
-        const point = await forkPoint(from, at, before, context);
-        context.abortSignal?.throwIfAborted();
-        const created = point === undefined
-          ? await harness.createConversation({ ownership: { kind: "ownerless" }, agent, init }, context)
-          : await from.fork(point, { ownership: { kind: "ownerless" }, agent, init }, context);
-        return branch(created);
+          const created = point === undefined
+            ? await harness.createConversation({ ownership: { kind: "ownerless" }, agent, init }, context)
+            : await from.fork(point, { ownership: { kind: "ownerless" }, agent, init }, context);
+          return branch(created);
+        }, context);
       },
-      async rename(target, title) {
-        const name = validTitle(title);
-        if (!name) throw new HttpError(400, "Expected a title of 1 to 100 characters");
-        await target.commit(async tx => { (await tx.doc(BranchDoc, target.id)).title = name; }, ctx);
+      rename(target, title) {
+        return exclusive(async () => {
+          admit();
+          const name = validTitle(title);
+          if (!name) throw new HttpError(400, "Expected a title of 1 to 100 characters");
+          await target.commit(async tx => { (await tx.doc(BranchDoc, target.id)).title = name; }, ctx);
+        });
       },
       async search(target, query, { limit = 20, before } = {}) {
         const needle = query.trim().toLowerCase();
@@ -375,6 +434,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
       totalCost,
       submit(target, draft, context) {
         return exclusive(async () => {
+          admit();
           await assertAvailable(target);
           const submission = await target.submit(draft, ctx);
           logFailure(submission);
@@ -383,6 +443,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
       },
       abort(target) {
         return exclusive(async () => {
+          admit();
           await assertRunning(target.id);
           await target.abort(ctx);
         });
