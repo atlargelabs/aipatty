@@ -15,6 +15,7 @@ for (const input of ["relative root", "~/aipatty root", "~", "/opt/aipatty root"
     assert.equal(config.modelsStore, join(root, "pi/models-store.json"));
     assert.equal(config.pi.cli, legacy.pi.cli);
     assert.equal(config.pi.extension, legacy.pi.extension);
+    assert.equal(config.pi.reviewExtension, legacy.pi.reviewExtension);
     const faux = readConfig([`--install-dir=${input}`], { AIPATTY_FAUX: "1" });
     assert.equal(faux.dataDir, join(root, "faux"));
     assert.deepEqual([faux.pi, faux.workDir, faux.runsDir], [config.pi, config.workDir, config.runsDir]);

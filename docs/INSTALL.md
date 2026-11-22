@@ -55,23 +55,18 @@ ROOT="$HOME/aipatty"
    PI_CODING_AGENT_DIR="$ROOT/pi" node "$ROOT/deploy/current/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js" auth login openai
    ```
 
-4. **pi-review**, installed in the same Pi directory for now ([PLAN.md](PLAN.md#pi-extensions)):
-
-   ```sh
-   PI_CODING_AGENT_DIR="$ROOT/pi" node "$ROOT/deploy/current/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js" install git:github.com/earendil-works/pi-review
-   ```
-
-   Then remove the `packages` entry it added to `$ROOT/pi/settings.json`: runs load no packages, and the copy
-   in `$ROOT/pi/git/github.com/earendil-works/pi-review/` is what `delegates` reads. The pinned CLI and
-   `delegates` extension are loaded from the active release; pi-review remains in the Pi directory for now.
-
-5. **`delegates` settings**, in `$ROOT/pi/settings.json`. Its jobs and clones live under `$ROOT/pi/delegates/jobs/`.
-   Checkout settings are not read, so the checks live here:
+4. **`delegates` settings**, in `$ROOT/pi/settings.json`. Its jobs and clones live under `$ROOT/pi/delegates/jobs/`.
+   Checkout settings are not read, so the checks live here. The release's `npm ci` installs the pinned
+   `pi-review`; do not run `pi install` or add it to Pi's `packages` settings. For `reviewExtension`, use the
+   actual absolute value of `$ROOT/deploy/current/node_modules/@earendil-works/pi-review/review.ts`, with the
+   `current` component intact. The example assumes `ROOT=/Users/aipatty/aipatty`; JSON does not expand `$ROOT`
+   or `~`. If you use `--pi-dir`, edit `settings.json` in that directory instead.
 
    ```json
    {
      "delegates": {
        "version": 1,
+       "reviewExtension": "/Users/aipatty/aipatty/deploy/current/node_modules/@earendil-works/pi-review/review.ts",
        "publication": { "repository": "atlargelabs/aipatty", "remote": "origin", "baseBranch": "main", "requiredChecks": [] },
        "environment": {
          "setup": [{ "name": "dependencies", "command": "npm ci --ignore-scripts", "timeoutMs": 600000 }],
@@ -83,6 +78,9 @@ ROOT="$HOME/aipatty"
      }
    }
    ```
+
+   The host checks this path resolves to the running release's pinned file before cloning for a PR run.
+   Only `crmanager` loads the reviewer. Non-PR investigation does not require this setting.
 
 For example, to refresh the shared model cache with the pinned CLI, run:
 
@@ -99,11 +97,18 @@ node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT"
 ```
 
 The option derives `$ROOT/data` (or `$ROOT/faux` in faux mode), `$ROOT/pi`, `$ROOT/work`, and `$ROOT/runs`.
-The database, ownership lock, and run logs live in the data directory; Pi auth, model cache, settings, jobs, and
-installed pi-review live in the Pi directory. Model scratch lives in `work`; disposable Pi workspaces live in `runs`.
-An individual directory option overrides its derived path. Omitting the root leaves the legacy defaults unchanged.
-The option is server-only; it adds no environment variable or API. State is outside the release tree. The server
-already forwards its configured Pi directory to Pi subprocesses; bootstrap commands must set it explicitly as above.
+The database, ownership lock, and run logs live in the data directory; Pi auth, model cache, settings and jobs
+live in the Pi directory. The pinned CLI and both extensions live in the release. Model scratch lives in `work`;
+disposable Pi workspaces live in `runs`. An individual directory option overrides its derived path. Omitting the
+root leaves the legacy defaults unchanged. The option is server-only; it adds no environment variable or API.
+The server forwards its configured Pi directory to Pi subprocesses; bootstrap commands must set it explicitly.
+
+For development or a checkout without `deploy/current`, use the literal absolute path to that checkout's
+`node_modules/@earendil-works/pi-review/review.ts` (from the checkout root, print it with
+`printf '%s\n' "$(pwd -P)/node_modules/@earendil-works/pi-review/review.ts"`). Set `delegates.reviewExtension`
+in the selected Pi directory's `settings.json` (`~/.pi/agent/settings.json` if neither `--install-dir` nor
+`--pi-dir` is given). Prefer a separate `--pi-dir` for development to avoid changing another checkout's or
+service's settings. If launching a different checkout against the same settings, update the path while stopped.
 
 From the laptop, using its own checkout for the CLI:
 
@@ -126,6 +131,26 @@ acknowledges the request. Wait for the server process to exit before repointing 
 server. For older releases without the command, or if the API is unreachable, use Ctrl-C in the server terminal
 or send the server `SIGTERM`. These all use the same cleanup; see [CLI shutdown semantics](../README.md#cli).
 
+## First deploy from a release with an unpinned reviewer
+
+For an existing root, stage the new release with `npm ci --ignore-scripts`, then [stop](#stop) the old
+server and wait for it to exit. Before starting the new release:
+
+1. Note the old `delegates.reviewExtension` value (usually absent). Keep the old reviewer checkout under
+   the Pi directory's `git/github.com/earendil-works/pi-review/` (or the previously configured file) if you
+   may roll back to the old release. Keeping the files does not make the new release use them.
+2. In the same shared `settings.json`, set just `delegates.reviewExtension` to the absolute `deploy/current`
+   reviewer path shown above. Preserve the rest of the delegates configuration, including publication and
+   checks. If the old `pi install` left a `pi-review` entry in `packages`, remove only that entry; no package
+   registration is needed for either release, and you should not uninstall the retained reviewer.
+3. Repoint `current` to the new release, start with the same configuration, and verify its commit with `health`.
+
+Between pinned releases, leave the setting unchanged. To roll back to a release older than the pin, stop and
+wait first, then restore the previous `delegates.reviewExtension` value (delete the key if the old release
+used the fallback) before repointing `current` and restarting. PR runs on the old release need that legacy
+reviewer file; if it was not retained, restore it before running PR work there. On returning to a pinned
+release, set the `deploy/current` value again while stopped. No release edits the setting for you.
+
 ## Fresh cutover from an old installation
 
 While still on the old server with its old configuration, finish any active Pi runs or abort them and wait for
@@ -142,7 +167,7 @@ that it is still gone before starting the new one.
 If recovery cannot clear the record, stop and investigate; do not bypass it by switching roots or deleting old state.
 
 Only then start with a fresh root: do not migrate conversations. Reauthenticate with the pinned CLI as above and
-configure pi-review and delegates in the new Pi directory. Verify `health` reports
+set up delegates (including its pinned reviewer path) in the new Pi directory. Verify `health` reports
 the expected SHA, `node src/cli.ts log` shows an empty transcript, and a send succeeds. Then exercise the actual Pi
 run and review loop below. Only after all of those checks succeed, identify and delete old paths **confirmed** to be
 owned solely by aipatty, if no longer needed. Never blindly delete `~/.pi`: it may contain other state. Preserve the
@@ -156,9 +181,13 @@ account's SSH keys and configuration, Git configuration, and `gh` login and sett
 3. Steve merges the PR.
 4. Deploy by hand: make a release of the new committed `main` as in "First release", without changing the current
    symlink yet. Follow [Stop](#stop) and wait for the process to exit, then point `$ROOT/deploy/current` at the new
-   release and start it again with the same root. Keep the previous release for rollback; preserve `$ROOT/data`,
+   release and start it again with the same root. Do not repoint while the server or a review is running: the
+   reviewer setting follows `current`. For the first deploy over an unpinned release, make the
+   [one-time settings change](#first-deploy-from-a-release-with-an-unpinned-reviewer) while stopped.
+   Keep the previous release for rollback; preserve `$ROOT/data`,
    `$ROOT/pi`, `$ROOT/work`, and `$ROOT/runs` across both redeploy and rollback.
 5. `node src/cli.ts health` reports the new commit, and `node src/cli.ts log` still has the conversation. Send it
    another message. For manual rollback, follow [Stop](#stop), repoint `current` at the retained release once the
-   process exits, restart with the same root, and verify its SHA and conversation. Ensure releases are compatible
-   with the shared state.
+   process exits, restart with the same root, and verify its SHA and conversation. Keep the same reviewer setting
+   when rolling back between pinned releases; for an older release, restore its previous reviewer setting while
+   stopped as described above. Ensure releases are compatible with the shared state.

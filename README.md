@@ -73,10 +73,11 @@ in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits fo
   that stops them adds it to the run's `result.json`; if the call's result was already recorded in its branch by
   then, the branch's cost does not include it.
 
-A run needs `git`, `gh` and a GitHub login for the user the server runs as, the Pi sign-in, and the pi-review
-extension: at `git/github.com/earendil-works/pi-review/review.ts` in the Pi directory (where
-`pi install git:github.com/earendil-works/pi-review` puts it), or wherever `delegates.reviewExtension` in the Pi
-directory's `settings.json` says. A run that must end with a PR is refused when the extension is missing.
+A run needs `git`, `gh`, a GitHub login for the account running the server, and the Pi sign-in. For a PR run,
+`delegates.reviewExtension` in the selected Pi directory's `settings.json` must be an absolute path to the
+running release's `node_modules/@earendil-works/pi-review/review.ts`. The host checks it before cloning; a
+missing path or an older or shared copy is refused. Only the `crmanager` job loads pi-review. Non-PR runs do
+not require this setting. See [the runbook](docs/INSTALL.md) for the exact path and rollout steps.
 
 A run's processes are identified by a remembered PID and start time or by a marker in their environment.
 Discovery also follows their children and other members of their live process groups. A remembered group ID
@@ -99,7 +100,8 @@ Requires Node 26 or newer.
 npm ci --ignore-scripts
 ```
 
-The `delegates` extension is a git dependency, which npm 12 refuses unless `.npmrc` allows it; this checkout's does.
+Both extensions (`delegates` and `pi-review`) are pinned git dependencies installed by `npm ci`. This checkout's
+`.npmrc` allows direct git dependencies on npm 12. Do not register `pi-review` with `pi install`.
 
 ## Run
 
@@ -130,8 +132,8 @@ The defaults in the table apply when `--install-dir` is omitted. With it, the se
 in faux mode), `pi/`, `work/`, and `runs/` under that root. Each individual directory option overrides only its
 corresponding derived path. Paths may be absolute, relative to the starting directory, or start with `~`; quote
 paths containing spaces. Blank paths are rejected. The root option is server-only: there is no new environment
-variable, CLI client option, or API setting. Pi executables and the delegates extension still come from the pinned
-release, not the state root.
+variable, CLI client option, or API setting. The Pi CLI and both extensions come from the running release,
+not the state root.
 
 For a service install, the recommended root is `~/aipatty` in the service account's own home, not a new
 runtime default. Set `ROOT="$HOME/aipatty"` or choose another writable absolute path. The first release step
@@ -142,8 +144,10 @@ branch protection described in the runbook.
 
 Keep committed-main releases in `$ROOT/deploy/<sha>` with a `deploy/current` symlink and launch
 `node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT"`. Explicitly set `PI_CODING_AGENT_DIR="$ROOT/pi"`
-when using the pinned Pi CLI for login, pi-review installation, or model-cache updates. Follow
-[the manual installation and fresh-cutover procedure](docs/INSTALL.md); redeploy and rollback preserve root state.
+when using the pinned Pi CLI for login or model-cache updates. Set `delegates.reviewExtension` to the absolute
+path through `deploy/current` so it follows deployment and rollback between pinned releases. Stop and wait
+before repointing `current`. Follow [the runbook](docs/INSTALL.md) for first installs, migrating existing settings,
+rollback to releases with an unpinned reviewer, and development without `deploy/current`.
 
 The server also takes one environment variable, `AIPATTY_FAUX`: `1` uses the fake model. An empty value counts as unset.
 

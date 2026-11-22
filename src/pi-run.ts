@@ -2,8 +2,8 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream, type WriteStream } from "node:fs";
-import { copyFile, cp, lstat, mkdir, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
-import { join, resolve, sep } from "node:path";
+import { copyFile, cp, lstat, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
@@ -170,6 +170,35 @@ async function readJson<T>(path: string): Promise<T | undefined> {
     throw error;
   }
   return JSON.parse(text) as T;
+}
+
+/** Delegates reads the trusted setting itself. Check it without editing it or using the legacy fallback. */
+async function reviewerProblem(pi: Config["pi"]): Promise<string | undefined> {
+  const missingFile = (error: NodeJS.ErrnoException) => {
+    // Do not mistake permission errors (or other filesystem failures) for a missing install.
+    if (!isMissing(error) && error.code !== "ENOTDIR") throw error;
+    return undefined;
+  };
+  const pinned = await realpath(pi.reviewExtension).catch(missingFile);
+  if (!pinned || !(await stat(pinned).catch(missingFile))?.isFile()) {
+    return `The pinned review extension is missing or not a file at ${pi.reviewExtension}. Run npm ci --ignore-scripts in the running release.`;
+  }
+  const path = join(pi.agentDir, "settings.json");
+  const fix = `Set delegates.reviewExtension in ${path} to an absolute path to ${pi.reviewExtension} `
+    + "(use the absolute deploy/current path for managed releases; see docs/INSTALL.md).";
+  let configured: unknown;
+  try {
+    configured = (await readJson<{ delegates?: { reviewExtension?: unknown } }>(path))?.delegates?.reviewExtension;
+  } catch (error) {
+    return `The review settings could not be read: ${clip(message(error), 200)}. ${fix}`;
+  }
+  if (typeof configured !== "string" || !isAbsolute(configured) || configured !== resolve(configured)) {
+    return `The review extension setting is missing or is not a normalized absolute file path. ${fix}`;
+  }
+  // The stable deploy/current path is usually a symlink; compare the files it selects, not the path spelling.
+  const selected = await realpath(configured).catch(missingFile);
+  if (!selected) return `The configured review extension at ${configured} cannot be resolved. ${fix}`;
+  if (selected !== pinned) return `The configured review extension at ${configured} does not match the running release. ${fix}`;
 }
 
 /**
@@ -778,13 +807,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       // Nothing starts without the record a later process needs to stop it.
       await write();
       if (request.pr) {
-        // The review cannot run without pi-review, and the delegates extension only says so once a review is asked for.
-        const settings = await readJson<{ delegates?: { reviewExtension?: unknown } }>(join(pi.agentDir, "settings.json")).catch(() => undefined);
-        const configured = settings?.delegates?.reviewExtension;
-        const review = typeof configured === "string" ? configured : join(pi.agentDir, "git/github.com/earendil-works/pi-review/review.ts");
-        if (!(await lstat(review).catch(() => undefined))?.isFile()) {
-          problems.push(`The review extension is missing at ${review}, so no PR could be reviewed. Install pi-review there or set delegates.reviewExtension in ${join(pi.agentDir, "settings.json")}.`);
-        }
+        const problem = await reviewerProblem(pi);
+        if (problem) problems.push(problem);
       }
       const repo = join(saved.workspace, "repo");
       let baseSha = "";
