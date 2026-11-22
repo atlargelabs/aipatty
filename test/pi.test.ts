@@ -666,6 +666,7 @@ for (const abort of [false, true]) test(`a failed launcher scan reports its caus
   config.pi.git = join(config.dataDir, "fake-git");
   await writeFile(config.pi.git, `#!/bin/sh\n: > ${JSON.stringify(ran)}\n`, { mode: 0o700 });
   const scanning = join(config.dataDir, "launcher-scan-started");
+  const stopScan = JSON.stringify(join(config.dataDir, "stop-scan-failed"));
   const release = join(config.dataDir, "report-scan-failure");
   await writeFile(join(config.dataDir, "ps"), `#!/bin/sh
     if [ ! -f ${JSON.stringify(scanning)} ]; then
@@ -674,12 +675,14 @@ for (const abort of [false, true]) test(`a failed launcher scan reports its caus
       echo 'test launcher scan failure' >&2
       exit 1
     fi
+    ${abort ? `if [ ! -f ${stopScan} ]; then : > ${stopScan}; sleep 0.15; exit 1; fi` : ""}
     exec /bin/ps "$@"
   `, { mode: 0o700 });
   const path = process.env.PATH;
   process.env.PATH = `${config.dataDir}:${path ?? ""}`;
   const controller = new AbortController();
   let running: Promise<RunOutcome> | undefined;
+  t.mock.method(console, "error", () => {});
   try {
     running = (await openPiRuns(config)).run(request({ pr: false }), controller.signal);
     await until(() => existsSync(scanning));
@@ -692,6 +695,59 @@ for (const abort of [false, true]) test(`a failed launcher scan reports its caus
   } finally {
     await writeFile(release, "");
     await running?.catch(() => {});
+    if (path === undefined) delete process.env.PATH;
+    else process.env.PATH = path;
+  }
+});
+
+test("launcher preflight checkpoints a future cutoff before the clock can catch up", { timeout: 30_000 }, async t => {
+  const config = await setup(t);
+  await scenario(config, [assistant(report({ pr: null, issue: null })), settled]);
+  const stateFile = join(config.dataDir, "pi-run.json");
+  const snapshot = join(config.dataDir, "second-preflight.json");
+  const count = JSON.stringify(join(config.dataDir, "ps-count"));
+  await writeFile(join(config.dataDir, "ps"), `#!/bin/sh
+    n=0
+    if [ -f ${count} ]; then read -r n < ${count}; fi
+    n=$((n + 1))
+    echo "$n" > ${count}
+    if [ "$n" -eq 3 ]; then cp ${JSON.stringify(stateFile)} ${JSON.stringify(snapshot)}; fi
+    exec /bin/ps "$@"
+  `, { mode: 0o700 });
+  let rollbackAtNextRead: number | undefined;
+  const now = Date.now;
+  const clock = t.mock.method(Date, "now", () => {
+    const rollback = rollbackAtNextRead;
+    rollbackAtNextRead = undefined;
+    return rollback ?? now();
+  });
+  const rename = fs.rename;
+  let firstGroup: number | undefined;
+  const renameMock = t.mock.method(fs, "rename", async (...args: Parameters<typeof rename>) => {
+    if (args[1] === stateFile && firstGroup === undefined) {
+      const { groups } = JSON.parse(await readFile(args[0], "utf8"));
+      if (groups.length === 1 && groups[0][1] !== null) {
+        // The next launcher starts just after a clock rollback. Subsequent reads see the clock catch up.
+        firstGroup = groups[0][0];
+        rollbackAtNextRead = groups[0][1] - 1;
+      }
+    }
+    await rename(...args);
+  });
+  syncBuiltinESMExports();
+  const path = process.env.PATH;
+  process.env.PATH = `${config.dataDir}:${path ?? ""}`;
+  try {
+    const outcome = await (await openPiRuns(config)).run(request({ pr: false }));
+    assert.equal(outcome.status, "completed");
+    const before = JSON.parse(await readFile(snapshot, "utf8"));
+    assert.ok(firstGroup);
+    assert.deepEqual(before.groups, [[firstGroup, null]], "preflight starts only after saving the invalidation");
+    assert.equal(before.cleanupUncertain, undefined, "correcting a cutoff does not require opening a launch guard");
+  } finally {
+    clock.mock.restore();
+    renameMock.mock.restore();
+    syncBuiltinESMExports();
     if (path === undefined) delete process.env.PATH;
     else process.env.PATH = path;
   }
@@ -742,15 +798,13 @@ for (const mode of ["observed", "adoption", "stop", "checkpoint"] as const) test
     exec /bin/ps "$@"
   `, { mode: 0o700 });
   const stateFile = join(config.dataDir, "pi-run.json");
-  const rename = fs.rename;
-  let renameMock = mode === "checkpoint" ? t.mock.method(fs, "rename", async (from: Parameters<typeof rename>[0], to: Parameters<typeof rename>[1]) => {
-    if (to === stateFile) {
-      const { cleanupUncertain, procs } = JSON.parse(await readFile(from, "utf8"));
-      if (cleanupUncertain && procs.length) throw new Error("test blocker write failure");
-    }
-    await rename(from, to);
+  const write = fs.writeFile;
+  let storageFailed = false;
+  let writeMock = mode === "checkpoint" ? t.mock.method(fs, "writeFile", async (...args: Parameters<typeof write>) => {
+    if (storageFailed) throw Object.assign(new Error("test file creation failure"), { code: "ENOSPC" });
+    await write(...args);
   }) : undefined;
-  if (renameMock) syncBuiltinESMExports();
+  if (writeMock) syncBuiltinESMExports();
   t.mock.method(console, "error", () => {});
   const path = process.env.PATH;
   process.env.PATH = `${config.dataDir}:${path ?? ""}`;
@@ -773,6 +827,7 @@ for (const mode of ["observed", "adoption", "stop", "checkpoint"] as const) test
       await until(async () => !JSON.parse(await readFile(stateFile, "utf8")).cleanupUncertain);
       const { procs } = JSON.parse(await readFile(stateFile, "utf8"));
       assert.ok(!procs.some(([pid]: [number, string]) => pid === pids[1]), "adoption did not see the worker");
+      storageFailed = mode === "checkpoint";
       controller.abort();
     }
     const outcome = await running;
@@ -785,16 +840,16 @@ for (const mode of ["observed", "adoption", "stop", "checkpoint"] as const) test
       assert.ok(alive(pids[1]) && existsSync(saved.workspace) && existsSync(stateFile), "an empty later scan cannot justify signalling the orphan or deleting its workspace");
     } else if (mode === "checkpoint") {
       assert.ok(pids.every(alive), "do not sever the parent link without a durable cleanup blocker");
-      assert.match(outcome.problems.join("\n"), /test blocker write failure/);
+      assert.match(outcome.problems.join("\n"), /test file creation failure/);
       await assert.rejects(runs.run(request({ pr: false })), /No new run starts/);
       const saved = JSON.parse(await readFile(stateFile, "utf8"));
-      assert.equal(saved.cleanupUncertain, undefined, "the active record could not be updated");
-      assert.ok(existsSync(join(saved.logDir, "cleanup-uncertain")), "the backup blocker does not depend on the active record write");
-      // The abandoned parent can still exit on its own. A later successful but empty scan cannot prove cleanup.
-      await writeFile(letExit, "");
+      assert.equal(saved.cleanupUncertain, undefined, "no write after storage failure recorded the uncertainty");
+      assert.equal(saved.activeChild[0], pids[0], "the recovery guard was armed before launch, not after the storage failure");
+      // The abandoned parent can still exit on its own. Recover after storage and ps work again.
+      await write(letExit, "");
       await until(() => !alive(pids[0]));
-      renameMock!.mock.restore();
-      renameMock = undefined;
+      writeMock!.mock.restore();
+      writeMock = undefined;
       syncBuiltinESMExports();
       if (path === undefined) delete process.env.PATH;
       else process.env.PATH = path;
@@ -816,8 +871,8 @@ for (const mode of ["observed", "adoption", "stop", "checkpoint"] as const) test
   } finally {
     controller.abort();
     await running?.catch(() => {});
-    if (renameMock) {
-      renameMock.mock.restore();
+    if (writeMock) {
+      writeMock.mock.restore();
       syncBuiltinESMExports();
     }
     if (path === undefined) delete process.env.PATH;

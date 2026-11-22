@@ -282,11 +282,12 @@ class ProcessRecordError extends Error {
  * be told from the run's, which are not signalled. `record` saves new or invalidated ownership evidence, including
  * a `pendingRecord` that previously failed to save. The caller must exclude other ownership updates and wait
  * for in-flight writes before calling. `liveChildren` supplies PIDs verified by a live child handle.
- * Rejects if the table cannot be read or the record cannot be saved.
+ * `observe` receives the initial checkpointed tree before any signals. Rejects if the table cannot be read or
+ * the record cannot be saved.
  */
 export async function stopRun(
   owned: Owned, runId: string, root: number | undefined, graceMs: number, term?: () => void, record?: () => Promise<unknown>,
-  pendingRecord: () => boolean = () => false, liveChildren?: () => ReadonlySet<number>,
+  pendingRecord: () => boolean = () => false, liveChildren?: () => ReadonlySet<number>, observe?: (tree: readonly Proc[]) => void,
 ): Promise<Proc[]> {
   // Even a verified process can be the only proof of ownership for surviving group members or descendants.
   // Do not signal anything until the evidence the scan relied on is safely checkpointed.
@@ -315,6 +316,7 @@ export async function stopRun(
   let stopFailure: { error: unknown } | undefined;
   try {
     const { ours: tree } = await checkpointedScan();
+    observe?.(tree);
     const rootStart = root === undefined ? undefined : owned.procs.get(root);
     if (root !== undefined && rootStart !== undefined && tree.some(proc => proc.pid === root && proc.start === rootStart)) {
       // Through the live child handle when there is one, which cannot reach a process that reused the ID.

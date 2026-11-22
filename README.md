@@ -85,9 +85,9 @@ records with only a run-wide timestamp can block cleanup, but require independen
 Finish any pending Pi run recovery before downgrading: older versions cannot read the new recovery record.
 A process that leaves both its parent and its group before it is observed, and hides its environment, may not be
 found. A scan can authorize a signal only after its ownership evidence is saved. If the server cannot verify a
-child's tree after launch or during an emergency stop, it keeps the record and workspace for manual inspection,
-even after restart. For an emergency stop it also leaves a `cleanup-uncertain` file in the run's log directory,
-so a failed update to `pi-run.json` cannot lose the blocker.
+child's tree after launch or during an emergency stop, it keeps the record and workspace for manual inspection.
+The launcher is recorded before the command starts. If an interrupted run's last launcher cannot be verified
+on restart, the workspace stays in place even if the previous host could not record why its stop failed.
 
 ## Page
 
