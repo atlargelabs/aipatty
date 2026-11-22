@@ -811,8 +811,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         before = await listProcesses();
       } catch (error) {
         release(false);
-        if (!run.stop && !killRequested) return new GroupRecordError(`could not read the process table for launcher ${pid}: ${message(error)}`);
-        return;
+        return new GroupRecordError(`could not read the process table for launcher ${pid}: ${message(error)}`);
       }
       const leader = live(child) ? before.find(proc => proc.pid === pid && proc.ppid === process.pid && proc.pgid === pid) : undefined;
       if (run.stop || killRequested || !leader) {
@@ -960,7 +959,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         if (cloned !== baseSha) await command(pi.git, ["checkout", "--quiet", "--detach", baseSha], repo);
       } catch (error) {
         baseSha = "";
-        if (!run.stop) problems.push(`Could not clone ${pi.repo} at ${request.base}: ${clip(message(error), 600)}`);
+        if (!run.stop || error instanceof GroupRecordError) problems.push(`Could not clone ${pi.repo} at ${request.base}: ${clip(message(error), 600)}`);
       }
       if (baseSha && !run.stop) {
         const input = {

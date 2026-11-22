@@ -96,7 +96,8 @@ async function markedPids(runId: string, procs: readonly Proc[]): Promise<Set<nu
 interface ProcessScan {
   ours: Proc[];
   unsure: Proc[];
-  changed: boolean;
+  changedAfterEntry: boolean;
+  invalidatedAtEntry: boolean;
   beganAt: number;
   scannedAt: number;
 }
@@ -141,21 +142,6 @@ export function identifiedTree(procs: readonly Proc[], starts: ReadonlyMap<numbe
   return [...reachable(procs, excludedGroups(procs), proc => starts.get(proc.pid) === proc.start).values()];
 }
 
-async function processSnapshot(
-  owned: Owned, runId: string, record?: () => Promise<unknown>, liveChildren?: () => ReadonlySet<number>,
-) {
-  const first = await listProcesses();
-  const held = liveChildren?.();
-  // A parent can exit while ps reads again or while we scan environments. Keep independently verified
-  // identities now, even if the rest of the scan fails. Only the final table can supply signal targets.
-  const early = reachable(first, excludedGroups(first), proc => heldRoot(proc, held) || owned.procs.get(proc.pid) === proc.start);
-  const learnedEarly = remember(owned, [...early.values()]);
-  if (learnedEarly) await record?.();
-  const before = new Map(first.map(proc => [proc.pid, proc.start]));
-  const marked = await markedPids(runId, first);
-  return { first, before, learnedEarly, marked, procs: await listProcesses() };
-}
-
 /**
  * The live processes that belong to a run: the host's still-held detached children, those it remembers (same ID
  * and start time), those carrying its marker, and everything reached from them by ancestry or group membership.
@@ -179,12 +165,24 @@ async function scan(
   const invalidatedAtEntry = invalidateFutureCutoffs(owned, beganAt);
   const groupsAtEntry = new Map(owned.groups);
   if (invalidatedAtEntry || pendingRecord) await record?.();
-  const { first, before, learnedEarly, marked, procs } = await processSnapshot(owned, runId, record, liveChildren).catch(async error => {
-    if (invalidateFutureCutoffs(owned, Date.now())) await record?.();
+  let first: Proc[], procs: Proc[], marked: Set<number>;
+  let changed = false;
+  try {
+    first = await listProcesses();
+    const held = liveChildren?.();
+    // Keep independently verified ancestry from the first table even when a parent exits before the next.
+    // Finish scanning markers and rechecking identities before a write can make those tables stale.
+    const early = reachable(first, excludedGroups(first), proc => heldRoot(proc, held) || owned.procs.get(proc.pid) === proc.start);
+    changed = remember(owned, [...early.values()]);
+    marked = await markedPids(runId, first);
+    procs = await listProcesses();
+  } catch (error) {
+    // A failed final read still leaves useful evidence from independently verified roots in the first table.
+    if (invalidateFutureCutoffs(owned, Date.now()) || changed) await record?.();
     throw error;
-  });
+  }
   const scannedAt = Date.now();
-  let changed = learnedEarly || invalidatedAtEntry;
+  const before = new Map(first.map(proc => [proc.pid, proc.start]));
   const byPid = new Map(procs.map(proc => [proc.pid, proc]));
   // A root verified by its marker in both tables can also anchor the old relationships. Recheck the resulting
   // identities in the final table before signalling, just as for evidence from a held child.
@@ -219,7 +217,7 @@ async function scan(
   const unsure = procs.filter(proc => candidate(proc) && !ours.has(proc.pid)
     && (owned.unverifiedProcs.get(proc.pid) === proc.start
       || (knownGroup(proc) && (owned.groups.get(proc.pgid) === null || !byPid.has(proc.pgid)))));
-  return { ours: [...ours.values()], unsure, changed, beganAt, scannedAt };
+  return { ours: [...ours.values()], unsure, changedAfterEntry: changed, invalidatedAtEntry, beganAt, scannedAt };
 }
 
 /** The live processes that belong to a run; see `scan`. Rejects when the process table cannot be read. */
@@ -231,9 +229,9 @@ export async function runProcesses(owned: Owned, runId: string): Promise<Proc[]>
 export async function trackRunProcesses(
   owned: Owned, runId: string, record?: () => Promise<unknown>, liveChildren?: () => ReadonlySet<number>,
 ): Promise<boolean> {
-  const { ours, changed, beganAt, scannedAt } = await scan(owned, runId, record, false, liveChildren);
+  const { ours, changedAfterEntry, invalidatedAtEntry, beganAt, scannedAt } = await scan(owned, runId, record, false, liveChildren);
   const learned = remember(owned, ours, beganAt <= scannedAt ? beganAt : undefined);
-  return learned || changed;
+  return learned || changedAfterEntry || invalidatedAtEntry;
 }
 
 /**
@@ -305,18 +303,12 @@ export async function stopRun(
   // scan ended empty: a marked process that detached during the write may have already lost its parent.
   const checkpointedScan = async (): Promise<ProcessScan> => {
     for (let attempt = 0; attempt < 20; attempt++) {
-      let wrote = false;
-      const checkpoint = async () => {
-        wrote = true;
-        await save();
-      };
-      const snapshot = await scan(owned, runId, record && checkpoint, Boolean(failedWrite) || pendingRecord(), liveChildren);
+      const snapshot = await scan(owned, runId, record && save, Boolean(failedWrite) || pendingRecord(), liveChildren);
       const learned = remember(owned, snapshot.ours);
-      if (!record) return snapshot;
-      // Save the new evidence even on the last attempt: a later stop must not mistake it for persisted data.
-      if (learned || snapshot.changed || failedWrite) await checkpoint();
+      if (!record || (!learned && !snapshot.changedAfterEntry && !failedWrite)) return snapshot;
+      // Save even on the last attempt: a later stop must not mistake newly learned identities for saved ones.
+      await save();
       if (failedWrite) throw new ProcessRecordError(failedWrite.error);
-      if (!wrote) return snapshot;
     }
     throw new Error("the process tree kept changing while saving its record");
   };
@@ -331,8 +323,7 @@ export async function stopRun(
       const deadline = Date.now() + graceMs;
       while (Date.now() < deadline) {
         await sleep(100);
-        const current = await listProcesses();
-        if (remember(owned, identifiedTree(current, owned.procs))) await save();
+        const { ours: current } = await checkpointedScan();
         if (!current.some(proc => proc.pid === root && proc.start === rootStart)) break;
       }
     }

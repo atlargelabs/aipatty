@@ -1,7 +1,7 @@
 import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
 import assert from "node:assert/strict";
 import { ChildProcess, execFile, spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import fs, { mkdir, readdir, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
@@ -650,24 +650,38 @@ test("a failed group checkpoint prevents the setup command from starting and ret
   }
 });
 
-test("a failed launcher scan reports its cause without opening the gate", { timeout: 30_000 }, async t => {
+for (const abort of [false, true]) test(`a failed launcher scan reports its cause without opening the gate${abort ? " when an abort races the scan" : ""}`, { timeout: 30_000 }, async t => {
   const config = await setup(t);
   const ran = join(config.dataDir, "git-ran");
   config.pi.git = join(config.dataDir, "fake-git");
   await writeFile(config.pi.git, `#!/bin/sh\n: > ${JSON.stringify(ran)}\n`, { mode: 0o700 });
-  const failed = JSON.stringify(join(config.dataDir, "launcher-scan-failed"));
+  const scanning = join(config.dataDir, "launcher-scan-started");
+  const release = join(config.dataDir, "report-scan-failure");
   await writeFile(join(config.dataDir, "ps"), `#!/bin/sh
-    if [ ! -f ${failed} ]; then : > ${failed}; echo 'test launcher scan failure' >&2; exit 1; fi
+    if [ ! -f ${JSON.stringify(scanning)} ]; then
+      : > ${JSON.stringify(scanning)}
+      while [ ! -f ${JSON.stringify(release)} ]; do sleep 0.02; done
+      echo 'test launcher scan failure' >&2
+      exit 1
+    fi
     exec /bin/ps "$@"
   `, { mode: 0o700 });
   const path = process.env.PATH;
   process.env.PATH = `${config.dataDir}:${path ?? ""}`;
+  const controller = new AbortController();
+  let running: Promise<RunOutcome> | undefined;
   try {
-    const outcome = await (await openPiRuns(config)).run(request({ pr: false }));
-    assert.equal(outcome.status, "failed");
+    running = (await openPiRuns(config)).run(request({ pr: false }), controller.signal);
+    await until(() => existsSync(scanning));
+    if (abort) controller.abort();
+    await writeFile(release, "");
+    const outcome = await running;
+    assert.equal(outcome.status, abort ? "aborted" : "failed");
     assert.match(outcome.problems.join("\n"), /could not read the process table for launcher \d+:[^]*test launcher scan failure/);
     assert.ok(!existsSync(ran) && !existsSync(join(config.dataDir, "pi-run.json")));
   } finally {
+    await writeFile(release, "");
+    await running?.catch(() => {});
     if (path === undefined) delete process.env.PATH;
     else process.env.PATH = path;
   }
@@ -1268,7 +1282,11 @@ test("stop rechecks markers if a parent exits during the last scan's checkpoint"
       terminating = true;
       root.kill("SIGTERM");
     }, async () => {
-      if (worker || !owned.procs.has(launcher.pid!)) return;
+      if (worker) {
+        assert.ok(owned.procs.has(worker), "a fresh marker scan must precede any further checkpoints");
+        return;
+      }
+      if (!owned.procs.has(launcher.pid!)) return;
       // The final scan learned the unmarked held launcher. Its worker is born after the first table, and
       // won't be reached by ancestry in the last table even if it is visible there.
       await writeFile(go, "");
@@ -1280,6 +1298,66 @@ test("stop rechecks markers if a parent exits during the last scan's checkpoint"
   } finally {
     worker ||= Number(await readFile(pidFile, "utf8").catch(() => ""));
     for (const pid of [root.pid!, launcher.pid!, worker]) if (pid && alive(pid)) process.kill(pid, "SIGKILL");
+  }
+});
+
+test("stop checkpoints detached marked processes during the SIGTERM grace period", { timeout: 30_000 }, async t => {
+  const dir = await fixture(t);
+  const startLauncher = join(dir, "start-launcher");
+  const startWorker = join(dir, "start-worker");
+  const launcherPid = join(dir, "launcher-pid");
+  const workerPid = join(dir, "worker-pid");
+  const marker = `test-grace-checkpoint-${process.pid}-${Date.now()}`;
+  const launcher = `
+    const fs = require("node:fs");
+    const timer = setInterval(() => {
+      if (!fs.existsSync(${JSON.stringify(startWorker)})) return;
+      clearInterval(timer);
+      const child = require("node:child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"],
+        { detached: true, stdio: "ignore", env: { PATTY_RUN_ID: ${JSON.stringify(marker)} } });
+      child.unref();
+      fs.writeFileSync(${JSON.stringify(workerPid)}, String(child.pid));
+    }, 20);
+  `;
+  const root = spawn(process.execPath, ["-e", `
+    const fs = require("node:fs");
+    const timer = setInterval(() => {
+      if (!fs.existsSync(${JSON.stringify(startLauncher)})) return;
+      clearInterval(timer);
+      const child = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(launcher)}],
+        { detached: true, stdio: "ignore", env: {} });
+      fs.writeFileSync(${JSON.stringify(launcherPid)}, String(child.pid));
+    }, 20);
+    setTimeout(() => {}, 60000);
+  `], { detached: true, stdio: "ignore", env: {} });
+  const pid = root.pid!;
+  const readPid = async (path: string) => Number(await readFile(path, "utf8").catch(() => ""));
+  let stopping: ReturnType<typeof stopRun> | undefined;
+  let worker = 0;
+  let checkpointed = false;
+  try {
+    const proc = await until(async () => (await listProcesses()).find(proc => proc.pid === pid));
+    const owned = newOwned([[pid, proc!.start]], [[pid, null]]);
+    // Simulate a root taking its time after SIGTERM; no descendants exist before the grace period.
+    stopping = stopRun(owned, marker, pid, 10_000, () => writeFileSync(startLauncher, ""), async () => {
+      if (!worker) {
+        const launched = await readPid(launcherPid);
+        if (launched && owned.procs.has(launched)) {
+          await writeFile(startWorker, "");
+          worker = await until(() => readPid(workerPid));
+          await until(() => !alive(launched));
+        }
+      }
+      if (worker && owned.procs.has(worker)) checkpointed = true;
+    });
+    await Promise.race([until(() => checkpointed, Boolean, 4_000), stopping]);
+    assert.ok(checkpointed && alive(pid), "marker discovery refreshed before the grace period ended and sent SIGKILL");
+    root.kill("SIGTERM");
+    assert.deepEqual(await stopping, []);
+    assert.ok(!alive(worker));
+  } finally {
+    for (const child of [pid, await readPid(launcherPid), await readPid(workerPid)]) if (child && alive(child)) process.kill(child, "SIGKILL");
+    await stopping?.catch(() => {});
   }
 });
 
