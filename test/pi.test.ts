@@ -533,7 +533,11 @@ test("after a crash, the next start stops the surviving processes, cleans up, an
   assert.equal((await (await openPiRuns(config)).settled(107))?.status, "interrupted");
 });
 
-for (const leaderExits of [true, false]) test(`a crash during adoption blocks recovery cleanup without signalling the ${leaderExits ? "orphan" : "unmarked leader or its child"}`, { timeout: 30_000 }, async t => {
+for (const phase of ["preflight", "orphan", "attached"] as const) test(phase === "preflight"
+  ? "a crash during launcher preflight never opens the gate or blocks recovery"
+  : `a crash during adoption blocks recovery cleanup without signalling the ${phase === "orphan" ? "orphan" : "unmarked leader or its child"}`,
+{ timeout: 30_000 }, async t => {
+  const leaderExits = phase === "orphan";
   const config = await setup(t);
   const pidsFile = join(config.dataDir, "setup-pids.json");
   const scanStarted = join(config.dataDir, "scan-started");
@@ -546,7 +550,7 @@ for (const leaderExits of [true, false]) test(`a crash during adoption blocks re
     child.unref();
     ${leaderExits ? "" : "setTimeout(() => {}, 60000);"}
   `, { mode: 0o700 });
-  // Stall the first process-table read in the host only and hide the setup command's environment marker.
+  // Stall the host's pre- or post-launch read and hide the setup command's environment marker.
   const script = `
     import cp from "node:child_process";
     import { writeFileSync } from "node:fs";
@@ -557,7 +561,7 @@ for (const leaderExits of [true, false]) test(`a crash during adoption blocks re
     const exec = promisify(execFile);
     cp.execFile = (...args) => execFile(...args);
     cp.execFile[promisify.custom] = (file, ...args) => {
-      if (file !== "ps" || ++reads === 1) return exec(file, ...args);
+      if (file !== "ps" || (++reads === 1 && ${phase !== "preflight"})) return exec(file, ...args);
       writeFileSync(${JSON.stringify(scanStarted)}, "");
       return new Promise(() => {});
     };
@@ -579,20 +583,26 @@ for (const leaderExits of [true, false]) test(`a crash during adoption blocks re
   };
   let pids: Awaited<ReturnType<typeof readPids>>;
   try {
-    pids = await until(readPids, Boolean);
-    const { leader, survivor } = pids!;
-    await until(() => existsSync(scanStarted) && (!leaderExits || !alive(leader)));
+    if (phase !== "preflight") pids = await until(readPids, Boolean);
+    await until(() => existsSync(scanStarted) && (!leaderExits || !alive(pids!.leader)));
     host.kill("SIGKILL");
     await exited;
     const stateFile = join(config.dataDir, "pi-run.json");
     const saved = JSON.parse(await readFile(stateFile, "utf8"));
-    assert.deepEqual(saved.groups, [[leader, null]], "the group's unknown cutoff was already saved before ps");
+    assert.deepEqual(saved.groups, pids ? [[pids.leader, null]] : [], "the group is checkpointed only after preflight");
     assert.deepEqual(saved.procs, []);
-    assert.equal(saved.cleanupUncertain, true, "an interrupted adoption must also block cleanup of detached workers");
+    assert.equal(saved.cleanupUncertain, pids ? true : undefined, "only an interrupted post-launch adoption can hide detached workers");
 
     t.mock.method(console, "error", () => {});
     config.pi.git = git;
     const recovered = await openPiRuns(config);
+    if (!pids) {
+      assert.equal(await readPids(), undefined, "the gated setup command never ran");
+      assert.equal((await recovered.settled(saved.taskId))?.status, "interrupted");
+      assert.ok(!existsSync(saved.workspace) && !existsSync(stateFile));
+      return;
+    }
+    const { leader, survivor } = pids;
     await assert.rejects(recovered.run(request({ pr: false })), new RegExp(
       `${leaderExits ? 1 : 2} process\\(es\\) could not be stopped, or could not be told from the run's`,
     ));
@@ -693,6 +703,7 @@ for (const mode of ["observed", "adoption", "stop", "checkpoint"] as const) test
   const pidsFile = join(config.dataDir, "setup-pids.json");
   const postLaunch = join(config.dataDir, "post-launch-read");
   const afterExit = join(config.dataDir, "setup-exited");
+  const letExit = join(config.dataDir, "let-setup-exit");
   await writeFile(task, `
     const fs = require("node:fs");
     const start = setInterval(() => {
@@ -702,7 +713,9 @@ for (const mode of ["observed", "adoption", "stop", "checkpoint"] as const) test
         { detached: true, stdio: "ignore", env: {} });
       fs.writeFileSync(${JSON.stringify(pidsFile)}, JSON.stringify([process.pid, child.pid]));
       child.unref();
-      ${mode === "adoption" ? "" : "setTimeout(() => {}, 60000);"}
+      ${mode === "checkpoint" ? `const finish = setInterval(() => {
+        if (fs.existsSync(${JSON.stringify(letExit)})) clearInterval(finish);
+      }, 20);` : mode === "adoption" ? "" : "setTimeout(() => {}, 60000);"}
     }, 20);
   `);
   config.pi.git = join(config.dataDir, "fake-git");
@@ -730,7 +743,7 @@ for (const mode of ["observed", "adoption", "stop", "checkpoint"] as const) test
   `, { mode: 0o700 });
   const stateFile = join(config.dataDir, "pi-run.json");
   const rename = fs.rename;
-  const renameMock = mode === "checkpoint" ? t.mock.method(fs, "rename", async (from: Parameters<typeof rename>[0], to: Parameters<typeof rename>[1]) => {
+  let renameMock = mode === "checkpoint" ? t.mock.method(fs, "rename", async (from: Parameters<typeof rename>[0], to: Parameters<typeof rename>[1]) => {
     if (to === stateFile) {
       const { cleanupUncertain, procs } = JSON.parse(await readFile(from, "utf8"));
       if (cleanupUncertain && procs.length) throw new Error("test blocker write failure");
@@ -775,8 +788,18 @@ for (const mode of ["observed", "adoption", "stop", "checkpoint"] as const) test
       assert.match(outcome.problems.join("\n"), /test blocker write failure/);
       await assert.rejects(runs.run(request({ pr: false })), /No new run starts/);
       const saved = JSON.parse(await readFile(stateFile, "utf8"));
-      assert.equal(saved.cleanupUncertain, undefined);
-      assert.ok(existsSync(saved.workspace));
+      assert.equal(saved.cleanupUncertain, undefined, "the active record could not be updated");
+      assert.ok(existsSync(join(saved.logDir, "cleanup-uncertain")), "the backup blocker does not depend on the active record write");
+      // The abandoned parent can still exit on its own. A later successful but empty scan cannot prove cleanup.
+      await writeFile(letExit, "");
+      await until(() => !alive(pids[0]));
+      renameMock!.mock.restore();
+      renameMock = undefined;
+      syncBuiltinESMExports();
+      if (path === undefined) delete process.env.PATH;
+      else process.env.PATH = path;
+      await assert.rejects((await openPiRuns(config)).run(request({ pr: false })), /process tree could not be verified/);
+      assert.ok(alive(pids[1]) && existsSync(saved.workspace) && existsSync(stateFile));
     } else if (mode === "stop") {
       assert.ok(!alive(pids[0]) && alive(pids[1]), "only the held leader can be stopped without discovering its tree");
       assert.match(outcome.problems.join("\n"), /process tree could not be verified/);

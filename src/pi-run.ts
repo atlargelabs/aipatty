@@ -322,6 +322,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
   const outcomesFile = join(config.dataDir, "pi-outcomes.json");
   const logRoot = join(config.dataDir, "logs", "runs");
   const jobsDir = join(pi.agentDir, "delegates", "jobs");
+  // An independent, presence-only blocker when the active record could not be updated.
+  const cleanupBlocker = (saved: SavedRun) => join(saved.logDir, "cleanup-uncertain");
   await mkdir(logRoot, { recursive: true, mode: 0o700 });
   await mkdir(config.runsDir, { recursive: true, mode: 0o700 });
 
@@ -683,6 +685,10 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
   if (left) {
     const saved = left;
     try {
+      if (!saved.cleanupUncertain && await lstat(cleanupBlocker(saved)).catch(error => { if (!isMissing(error)) throw error; })) {
+        saved.cleanupUncertain = true;
+        pendingRecoveryRecord = true;
+      }
       const key = String(saved.taskId);
       // A run that had already settled keeps its outcome; only its cleanup is finished here. The copy in its log
       // directory is written first, so it can be ahead of the index.
@@ -790,22 +796,11 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         release(false);
         return;
       }
-      const seenAt = Date.now();
-      invalidateFutureCutoffs(run.owned, seenAt);
-      // Checkpoint the new group and block cleanup before opening the gate. A crash or failed scan before
-      // adoption completes could hide a worker that already detached from this group and lost its parent.
-      run.owned.groups.set(pid, null);
-      try {
-        await write(true);
-      } catch (error) {
-        release(false); // EOF lets the launcher exit without running the command or starting descendants.
-        run.kill(); // Retry the dirty record and stop any other processes that can be verified.
-        return new GroupRecordError(`could not save process group ${pid}: ${message(error)}`);
-      }
       if (run.stop || killRequested) {
         release(false);
         return;
       }
+      const seenAt = Date.now();
       let before: Proc[];
       try {
         before = await listProcesses();
@@ -817,6 +812,21 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       if (run.stop || killRequested || !leader) {
         release(false);
         if (!run.stop && !killRequested) return new GroupRecordError(`could not verify the launcher for process group ${pid}`);
+        return;
+      }
+      // Before preflight completes, EOF on the gate is sufficient. Now checkpoint the group and block
+      // cleanup before opening the gate: a crash during adoption could hide an already detached worker.
+      invalidateFutureCutoffs(run.owned, Date.now());
+      run.owned.groups.set(pid, null);
+      try {
+        await write(true);
+      } catch (error) {
+        release(false); // EOF lets the launcher exit without running the command or starting descendants.
+        run.kill(); // Retry the dirty record and stop any other processes that can be verified.
+        return new GroupRecordError(`could not save process group ${pid}: ${message(error)}`);
+      }
+      if (run.stop || killRequested) {
+        release(false);
         return;
       }
       // Exec keeps the verified identity. Keep descendants visible in this read even if a fast command exits.
@@ -851,20 +861,29 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       void withOwnership(async () => {
         if (abandonedChildren) return;
         for (let attempt = 0; attempt < 2; attempt++) {
+          const before = livePids();
           try {
             await stop(attempt === 0 ? graceMs : 0);
           } catch (error) {
             console.error(`Pi run ${saved.runId}: could not stop its processes by scanning:`, error);
+            // A child that exited during the failed scan may have lost its link to an unmarked descendant.
+            const after = livePids();
+            if ([...before].some(pid => !after.has(pid))) break;
           }
           if (!livePids().size) return;
         }
-        // A child handle can stop the child, but its exit could erase the only path to an unmarked descendant.
-        // Once discovery has failed twice, keep this uncertainty even if a later scan finds nothing.
+        // Even if the child exits on its own, an empty recovery scan cannot now prove that cleanup is safe.
+        // Keep a separate blocker before trying the active record, in case its update fails or is interrupted.
         saved.cleanupUncertain = true;
+        await writeFile(cleanupBlocker(saved), "", { flag: "wx", mode: 0o600 }).catch(error => {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+            console.error(`Pi run ${saved.runId}: could not save the backup cleanup blocker:`, error);
+          }
+        });
         try {
           await write();
         } catch (error) {
-          // Do not sever the ancestry without a durable blocker, or wait forever for the child to exit.
+          // Do not sever the ancestry without the active record checkpoint, or wait forever for the child.
           console.error(`Pi run ${saved.runId}: could not save the cleanup blocker:`, error);
           for (const child of held) {
             child.unref();
