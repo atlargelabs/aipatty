@@ -11,7 +11,7 @@ import { promisify } from "node:util";
 import type { Config } from "./config.ts";
 import { instructions, taskPrompt } from "./pi-prompt.ts";
 import { addUsage, githubLink, readReport, RunTrace, usageKey, type JobUsage, type Review } from "./pi-trace.ts";
-import { heldTree, invalidateFutureCutoffs, listProcesses, newOwned, remember, RUN_MARKER, stopRun, trackRunProcesses, type Owned, type Proc } from "./processes.ts";
+import { heldTree, identifiedTree, invalidateFutureCutoffs, listProcesses, newOwned, remember, RUN_MARKER, stopRun, trackRunProcesses, type Owned, type Proc } from "./processes.ts";
 
 const exec = promisify(execFile);
 
@@ -798,14 +798,23 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         run.kill(); // Retry the dirty record and stop any other processes that can be verified.
         return new GroupRecordError(`could not save process group ${pid}: ${message(error)}`);
       }
-      const start = !run.stop && !killRequested;
-      release(start);
-      if (!start) return;
+      if (run.stop || killRequested) {
+        release(false);
+        return;
+      }
+      const before = await listProcesses().catch(() => []);
+      const leader = live(child) ? heldTree(before, new Set([pid])).find(proc => proc.pid === pid) : undefined;
+      if (run.stop || killRequested || !leader) {
+        release(false);
+        if (!run.stop && !killRequested) return new GroupRecordError(`could not verify the launcher for process group ${pid}`);
+        return;
+      }
+      // Exec keeps the verified identity. Keep descendants visible in this read even if a fast command exits.
+      release(true);
       const procs = await listProcesses().catch(() => []);
       const scannedAt = Date.now();
       invalidateFutureCutoffs(run.owned, scannedAt);
-      // Keep descendants already visible in this table. A short setup command may exit before another scan.
-      if (live(child)) remember(run.owned, heldTree(procs, new Set([pid])), seenAt <= scannedAt ? seenAt : undefined);
+      remember(run.owned, [leader, ...identifiedTree(procs, new Map([[pid, leader.start]]))], seenAt <= scannedAt ? seenAt : undefined);
       await save();
     };
     /** The children this host started directly: their live handles also anchor a stop scan. */

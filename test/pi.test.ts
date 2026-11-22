@@ -551,8 +551,16 @@ for (const leaderExits of [true, false]) test(`a crash during adoption blocks re
     import cp from "node:child_process";
     import { writeFileSync } from "node:fs";
     import { syncBuiltinESMExports } from "node:module";
+    import { promisify } from "node:util";
+    let reads = 0;
     const execFile = cp.execFile;
-    cp.execFile = (file, ...args) => file === "ps" ? writeFileSync(${JSON.stringify(scanStarted)}, "") : execFile(file, ...args);
+    const exec = promisify(execFile);
+    cp.execFile = (...args) => execFile(...args);
+    cp.execFile[promisify.custom] = (file, ...args) => {
+      if (file !== "ps" || ++reads === 1) return exec(file, ...args);
+      writeFileSync(${JSON.stringify(scanStarted)}, "");
+      return new Promise(() => {});
+    };
     const spawn = cp.spawn;
     cp.spawn = (file, args, options) => {
       if (!options?.detached) return spawn(file, args, options);
@@ -657,7 +665,9 @@ for (const mode of ["observed", "adoption", "stop", "checkpoint"] as const) test
   // Fail adoption, possibly stop discovery as well, and in the last case the fallback checkpoint.
   const ps = join(config.dataDir, "ps");
   const budget = JSON.stringify(join(config.dataDir, "ps-failure-budget"));
+  const verified = JSON.stringify(join(config.dataDir, "launcher-verified"));
   await writeFile(ps, `#!/bin/sh
+    if [ ! -f ${verified} ]; then : > ${verified}; exec /bin/ps "$@"; fi
     ${mode === "checkpoint" ? "exit 1" : ""}
     ${mode === "observed" ? `while [ ! -s ${JSON.stringify(pidsFile)} ]; do sleep 0.02; done` : ""}
     remaining=${mode === "observed" ? 0 : mode === "stop" ? 3 : 1}
@@ -687,7 +697,8 @@ for (const mode of ["observed", "adoption", "stop", "checkpoint"] as const) test
       await until(async () => JSON.parse(await readFile(stateFile, "utf8")).procs.some(([pid]: [number, string]) => pid === pids[1]));
       process.kill(pids[0], "SIGTERM"); // From here cleanup can no longer establish the child's ancestry.
     } else {
-      assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).procs, [], "adoption recorded no exact identities");
+      const { procs } = JSON.parse(await readFile(stateFile, "utf8"));
+      assert.ok(!procs.some(([pid]: [number, string]) => pid === pids[1]), "adoption did not see the worker");
       controller.abort();
     }
     const outcome = await running;
@@ -737,13 +748,13 @@ for (const failSecondRead of [false, true]) test(`polling keeps an unmarked dele
     import { existsSync, readFileSync, writeFileSync } from "node:fs";
     import { syncBuiltinESMExports } from "node:module";
     import { promisify } from "node:util";
-    let pi, piExited, first = true, failNextPs = false, releaseOnNext = false;
+    let pi, piExited, first = true, adoptionReads = 0, releaseOnNext = false;
     const release = ${JSON.stringify(release)};
     const pidsFile = ${JSON.stringify(pidsFile)};
     const spawn = cp.spawn;
     cp.spawn = (file, args, options) => {
       if (!options?.detached || args[3] !== ${JSON.stringify(config.pi.node)}) return spawn(file, args, options);
-      failNextPs = true;
+      adoptionReads = 2;
       const { PATTY_RUN_ID, ...env } = options.env;
       pi = spawn(file, args, { ...options, env });
       piExited = new Promise(resolve => pi.once("exit", resolve));
@@ -754,9 +765,9 @@ for (const failSecondRead of [false, true]) test(`polling keeps an unmarked dele
     cp.execFile = (...args) => execFile(...args);
     cp.execFile[promisify.custom] = async (file, ...args) => {
       if (file !== "ps" || !pi || !args[0].includes("pid=,ppid=,pgid=,lstart=") || existsSync(release)) return exec(file, ...args);
-      if (failNextPs) {
-        failNextPs = false;
-        throw new Error("test adoption scan failure");
+      if (adoptionReads > 0) {
+        if (--adoptionReads === 0) throw new Error("test adoption scan failure");
+        return exec(file, ...args);
       }
       if (releaseOnNext) {
         writeFileSync(release, "");

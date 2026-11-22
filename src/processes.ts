@@ -141,6 +141,11 @@ export function heldTree(procs: readonly Proc[], held: ReadonlySet<number>): Pro
   return [...reachable(procs, excludedGroups(procs), proc => heldRoot(proc, held)).values()];
 }
 
+/** Expand PIDs whose start times were independently verified, using a new table. */
+export function identifiedTree(procs: readonly Proc[], starts: ReadonlyMap<number, string>): Proc[] {
+  return [...reachable(procs, excludedGroups(procs), proc => starts.get(proc.pid) === proc.start).values()];
+}
+
 async function processSnapshot(
   owned: Owned, runId: string, record?: () => Promise<unknown>, liveChildren?: () => ReadonlySet<number>,
 ) {
@@ -153,7 +158,7 @@ async function processSnapshot(
   if (learnedEarly) await record?.();
   const before = new Map(first.map(proc => [proc.pid, proc.start]));
   const marked = await markedPids(runId, first);
-  return { before, learnedEarly, marked, procs: await listProcesses() };
+  return { first, before, learnedEarly, marked, procs: await listProcesses() };
 }
 
 /**
@@ -179,13 +184,17 @@ async function scan(
   const invalidatedAtEntry = invalidateFutureCutoffs(owned, beganAt);
   const groupsAtEntry = new Map(owned.groups);
   if (invalidatedAtEntry || pendingRecord) await record?.();
-  const { before, learnedEarly, marked, procs } = await processSnapshot(owned, runId, record, liveChildren).catch(async error => {
+  const { first, before, learnedEarly, marked, procs } = await processSnapshot(owned, runId, record, liveChildren).catch(async error => {
     if (invalidateFutureCutoffs(owned, Date.now())) await record?.();
     throw error;
   });
   const scannedAt = Date.now();
   let changed = learnedEarly || invalidatedAtEntry;
   const byPid = new Map(procs.map(proc => [proc.pid, proc]));
+  // A root verified by its marker in both tables can also anchor the old relationships. Recheck the resulting
+  // identities in the final table before signalling, just as for evidence from a held child.
+  const markedTree = reachable(first, excludedGroups(first), proc => marked.has(proc.pid) && byPid.get(proc.pid)?.start === proc.start);
+  changed = remember(owned, [...markedTree.values()]) || changed;
   const liveGroups = new Set(procs.map(proc => proc.pgid));
   // This snapshot cannot rule out groups added or updated by another operation while it was in flight.
   for (const [pgid, cutoff] of groupsAtEntry) {
@@ -297,7 +306,7 @@ export async function stopRun(
       if (!ours.length) return ours;
       const starts = new Map(ours.map(proc => [proc.pid, proc.start]));
       const current = await listProcesses();
-      ours = [...reachable(current, excludedGroups(current), proc => starts.get(proc.pid) === proc.start).values()];
+      ours = identifiedTree(current, starts);
       if (!remember(owned, ours)) return ours;
     }
     throw new Error("the process tree kept changing while saving its record");
@@ -306,14 +315,16 @@ export async function stopRun(
   try {
     const tree = await recordScan(await scan(owned, runId, save, pendingRecord(), liveChildren));
     const rootStart = root === undefined ? undefined : owned.procs.get(root);
-    if (root !== undefined && rootStart !== undefined && tree.some(proc => proc.pid === root && proc.start === rootStart)) {
+    if (!failedWrite && root !== undefined && rootStart !== undefined && tree.some(proc => proc.pid === root && proc.start === rootStart)) {
       // Through the live child handle when there is one, which cannot reach a process that reused the ID.
       if (term) term();
       else signal(root, "SIGTERM");
       const deadline = Date.now() + graceMs;
       while (Date.now() < deadline) {
         await sleep(100);
-        if (!(await listProcesses()).some(proc => proc.pid === root && proc.start === rootStart)) break;
+        const current = await listProcesses();
+        if (remember(owned, identifiedTree(current, owned.procs))) await save();
+        if (!current.some(proc => proc.pid === root && proc.start === rootStart)) break;
       }
     }
     let left: Proc[] = [];
@@ -323,7 +334,10 @@ export async function stopRun(
       ({ ours: left, unsure } = scanned);
       const targets = await recordScan(scanned);
       if (!left.length) break;
-      for (const proc of targets) signal(proc.pid, "SIGKILL");
+      const parents = new Set(targets.map(proc => proc.ppid));
+      const members = new Set(targets.filter(proc => proc.pgid !== proc.pid).map(proc => proc.pgid));
+      // With no durable checkpoint, stop verified leaves first, leaving roots available for recovery.
+      for (const proc of targets) if (!failedWrite || (!parents.has(proc.pid) && !members.has(proc.pid))) signal(proc.pid, "SIGKILL");
       await sleep(150);
     }
     return [...left, ...unsure];
