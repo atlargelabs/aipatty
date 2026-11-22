@@ -96,7 +96,7 @@ async function markedPids(runId: string, procs: readonly Proc[]): Promise<Set<nu
 interface ProcessScan {
   ours: Proc[];
   unsure: Proc[];
-  groupsChanged: boolean;
+  changed: boolean;
   beganAt: number;
   scannedAt: number;
 }
@@ -113,10 +113,42 @@ export function invalidateFutureCutoffs(owned: Owned, at: number): boolean {
   return changed;
 }
 
-async function processSnapshot(runId: string) {
-  const before = new Map((await listProcesses()).map(proc => [proc.pid, proc.start]));
-  const marked = await markedPids(runId, [...before].map(([pid, start]) => ({ pid, ppid: 0, pgid: 0, start })));
-  return { before, marked, procs: await listProcesses() };
+const candidate = (proc: Proc) => proc.pid !== process.pid && proc.pid > 1;
+const heldRoot = (proc: Proc, held?: ReadonlySet<number>) => held?.has(proc.pid) && proc.ppid === process.pid && proc.pgid === proc.pid;
+// Never expand membership through this host's group or the system's groups.
+const excludedGroups = (procs: readonly Proc[]) => new Set([0, 1, procs.find(proc => proc.pid === process.pid)?.pgid ?? hostGroup ?? -1]);
+
+/** Expand independent roots to all their descendants and group members in this snapshot. */
+function reachable(procs: readonly Proc[], skipGroups: ReadonlySet<number>, root: (proc: Proc) => boolean | undefined): Map<number, Proc> {
+  const ours = new Map<number, Proc>();
+  for (const proc of procs) if (candidate(proc) && root(proc)) ours.set(proc.pid, proc);
+  for (let grew = true; grew;) {
+    grew = false;
+    const groups = new Set([...ours.values()].map(proc => proc.pgid).filter(pgid => !skipGroups.has(pgid)));
+    for (const proc of procs) {
+      if (ours.has(proc.pid) || !candidate(proc)) continue;
+      if (ours.has(proc.ppid) || groups.has(proc.pgid)) {
+        ours.set(proc.pid, proc);
+        grew = true;
+      }
+    }
+  }
+  return ours;
+}
+
+async function processSnapshot(
+  owned: Owned, runId: string, record?: () => Promise<unknown>, liveChildren?: () => ReadonlySet<number>,
+) {
+  const first = await listProcesses();
+  const held = liveChildren?.();
+  // A parent can exit while ps reads again or while we scan environments. Keep independently verified
+  // identities now, even if the rest of the scan fails. Only the final table can supply signal targets.
+  const early = reachable(first, excludedGroups(first), proc => heldRoot(proc, held) || owned.procs.get(proc.pid) === proc.start);
+  const learnedEarly = remember(owned, [...early.values()]);
+  if (learnedEarly) await record?.();
+  const before = new Map(first.map(proc => [proc.pid, proc.start]));
+  const marked = await markedPids(runId, first);
+  return { before, learnedEarly, marked, procs: await listProcesses() };
 }
 
 /**
@@ -134,33 +166,31 @@ async function processSnapshot(runId: string) {
  * after the slower environment scan: act on it at once.
  */
 async function scan(
-  owned: Owned, runId: string, recordInvalidation?: () => Promise<unknown>, pendingRecord = false,
+  owned: Owned, runId: string, record?: () => Promise<unknown>, pendingRecord = false,
   liveChildren?: () => ReadonlySet<number>,
 ): Promise<ProcessScan> {
   const beganAt = Date.now();
   // Invalidate and save before awaiting ps, in case the clock catches up during the scan or the host dies.
   const invalidatedAtEntry = invalidateFutureCutoffs(owned, beganAt);
   const groupsAtEntry = new Map(owned.groups);
-  if (invalidatedAtEntry || pendingRecord) await recordInvalidation?.();
-  const { before, marked, procs } = await processSnapshot(runId).catch(async error => {
-    if (invalidateFutureCutoffs(owned, Date.now())) await recordInvalidation?.();
+  if (invalidatedAtEntry || pendingRecord) await record?.();
+  const { before, learnedEarly, marked, procs } = await processSnapshot(owned, runId, record, liveChildren).catch(async error => {
+    if (invalidateFutureCutoffs(owned, Date.now())) await record?.();
     throw error;
   });
   const scannedAt = Date.now();
-  let groupsChanged = invalidatedAtEntry;
+  let changed = learnedEarly || invalidatedAtEntry;
   const byPid = new Map(procs.map(proc => [proc.pid, proc]));
   const liveGroups = new Set(procs.map(proc => proc.pgid));
   // This snapshot cannot rule out groups added or updated by another operation while it was in flight.
   for (const [pgid, cutoff] of groupsAtEntry) {
     if (!liveGroups.has(pgid) && owned.groups.get(pgid) === cutoff) {
       owned.groups.delete(pgid);
-      groupsChanged = true;
+      changed = true;
     }
   }
-  groupsChanged = invalidateFutureCutoffs(owned, scannedAt) || groupsChanged;
-  // Never this process, its group, or the system's.
-  const skipGroups = new Set([0, 1, byPid.get(process.pid)?.pgid ?? -1]);
-  const candidate = (proc: Proc) => proc.pid !== process.pid && proc.pid > 1;
+  changed = invalidateFutureCutoffs(owned, scannedAt) || changed;
+  const skipGroups = excludedGroups(procs);
   // Marked, and still the process that was scanned.
   const isMarked = (proc: Proc) => marked.has(proc.pid) && before.get(proc.pid) === proc.start;
   // A member of a remembered group whose leader is gone. With a live leader the group is the run's only through
@@ -173,31 +203,14 @@ async function scan(
     // ps gives whole seconds. A process starting in the observation's own second might have started later.
     return seenAt != null && Number.isFinite(started) && started + 1_000 <= seenAt;
   };
-  // Sample the handles after the I/O, and match only this host's direct detached children, not a remembered PGID.
+  // Match handles only to this host's direct detached children; recheck early evidence by identity.
   const held = liveChildren?.();
-  const ours = new Map<number, Proc>();
-  for (const proc of procs) {
-    if (!candidate(proc)) continue;
-    const direct = held?.has(proc.pid) && proc.ppid === process.pid && proc.pgid === proc.pid;
-    if (direct || owned.procs.get(proc.pid) === proc.start || isMarked(proc) || (leaderless(proc) && startedBy(proc))) {
-      ours.set(proc.pid, proc);
-    }
-  }
-  for (let grew = true; grew;) {
-    grew = false;
-    const groups = new Set([...ours.values()].map(proc => proc.pgid).filter(pgid => !skipGroups.has(pgid)));
-    for (const proc of procs) {
-      if (ours.has(proc.pid) || !candidate(proc)) continue;
-      if (ours.has(proc.ppid) || groups.has(proc.pgid)) {
-        ours.set(proc.pid, proc);
-        grew = true;
-      }
-    }
-  }
+  const ours = reachable(procs, skipGroups, proc => heldRoot(proc, held) || owned.procs.get(proc.pid) === proc.start
+    || isMarked(proc) || (leaderless(proc) && startedBy(proc)));
   const unsure = procs.filter(proc => candidate(proc) && !ours.has(proc.pid)
     && (owned.unverifiedProcs.get(proc.pid) === proc.start
       || (knownGroup(proc) && (owned.groups.get(proc.pgid) === null || !byPid.has(proc.pgid)))));
-  return { ours: [...ours.values()], unsure, groupsChanged, beganAt, scannedAt };
+  return { ours: [...ours.values()], unsure, changed, beganAt, scannedAt };
 }
 
 /** The live processes that belong to a run; see `scan`. Rejects when the process table cannot be read. */
@@ -207,11 +220,11 @@ export async function runProcesses(owned: Owned, runId: string): Promise<Proc[]>
 
 /** Poll a live run, returning whether its recovery record needs updating. */
 export async function trackRunProcesses(
-  owned: Owned, runId: string, recordInvalidation?: () => Promise<unknown>, liveChildren?: () => ReadonlySet<number>,
+  owned: Owned, runId: string, record?: () => Promise<unknown>, liveChildren?: () => ReadonlySet<number>,
 ): Promise<boolean> {
-  const { ours, groupsChanged, beganAt, scannedAt } = await scan(owned, runId, recordInvalidation, false, liveChildren);
+  const { ours, changed, beganAt, scannedAt } = await scan(owned, runId, record, false, liveChildren);
   const learned = remember(owned, ours, beganAt <= scannedAt ? beganAt : undefined);
-  return learned || groupsChanged;
+  return learned || changed;
 }
 
 /**
@@ -271,9 +284,9 @@ export async function stopRun(
   };
   // Save what changed before signalling: a new group could otherwise be lost on a crash, and a discarded
   // cutoff must not become usable again on restart. Recheck the targets' identities after a write attempt.
-  const recordScan = async ({ ours, groupsChanged }: ProcessScan) => {
+  const recordScan = async ({ ours, changed }: ProcessScan) => {
     const learned = remember(owned, ours);
-    if (!record || (!learned && !groupsChanged)) return ours;
+    if (!record || (!learned && !changed)) return ours;
     await save();
     if (!ours.length) return ours;
     const starts = new Map((await listProcesses()).map(proc => [proc.pid, proc.start]));

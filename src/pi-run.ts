@@ -79,6 +79,8 @@ interface SavedRun {
   groups: [number, number | null][];
   /** Legacy process identities: they can block cleanup, but cannot establish ownership. */
   unverifiedProcs?: [number, string][];
+  /** A held child had to be stopped without a verified process tree; require manual inspection. */
+  cleanupUncertain?: true;
 }
 
 type LegacySavedRun = Omit<SavedRun, "groups" | "unverifiedProcs"> & { groups: number[]; asOf: number };
@@ -496,6 +498,11 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         outcome.usageComplete = false;
         return { clean: false, reconciled };
       }
+      if (saved.cleanupUncertain) {
+        outcome.problems.push("A child was stopped without verifying its process tree; descendants may remain. Inspect the run before removing its record or workspace.");
+        outcome.usageComplete = false;
+        return { clean: false, reconciled };
+      }
       const { jobs, ours } = await findJobs(saved, trace, outcome);
       if (!reconciled) {
         reconcile(trace, outcome, jobs, ours);
@@ -637,7 +644,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         ? typeof run.asOf === "number" && run.groups.every(Number.isSafeInteger)
         : run.groups.every(group => Array.isArray(group) && group.length === 2 && Number.isSafeInteger(group[0])
           && (group[1] === null || (Number.isSafeInteger(group[1]) && group[1] >= 0))))
-      && processIds(run.procs) && (!("unverifiedProcs" in run) || processIds(run.unverifiedProcs));
+      && processIds(run.procs) && (!("unverifiedProcs" in run) || processIds(run.unverifiedProcs))
+      && (!("cleanupUncertain" in run) || run.cleanupUncertain === true);
   };
 
   // A run the previous process left: stop it, clean up, and report its call `interrupted`. It is never run again.
@@ -813,13 +821,18 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     run.kill = () => {
       killRequested = true;
       stopping = stopping.then(async () => {
-        try {
-          await stop();
-        } catch (error) {
-          console.error(`Pi run ${saved.runId}: could not stop its processes by scanning:`, error);
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            await stop(attempt === 0 ? graceMs : 0);
+          } catch (error) {
+            console.error(`Pi run ${saved.runId}: could not stop its processes by scanning:`, error);
+          }
+          if (!livePids().size) return;
         }
-        // Whatever the scan could establish, do not wait forever on a child we can still stop directly.
-        // A child handle is not, by itself, permission to signal every PID in a numeric group.
+        // A child handle can stop the child, but its exit could erase the only path to an unmarked descendant.
+        // Once discovery has failed twice, keep this uncertainty even if a later scan finds nothing.
+        saved.cleanupUncertain = true;
+        await save();
         for (const child of held) if (live(child)) child.kill("SIGKILL");
       });
     };

@@ -83,8 +83,10 @@ environment. If a group has lost its leader, membership alone counts only for pr
 been there when the run last saw an owned member of that same group. Process IDs and groups in older recovery
 records with only a run-wide timestamp can block cleanup, but require independent evidence before signalling.
 Finish any pending Pi run recovery before downgrading: older versions cannot read the new recovery record.
-A process that leaves both its parent and its group, and hides its environment, is not found. No process is
-signalled unless a process table read just before shows it, by ID and start time, to be the run's.
+A process that leaves both its parent and its group before it is observed, and hides its environment, may not be
+found. A process is signalled only when identified by a live child handle or a recent process-table read. If the
+server has to stop a direct child without verifying its process tree, it keeps the record and workspace for
+manual inspection, even after restart.
 
 ## Page
 

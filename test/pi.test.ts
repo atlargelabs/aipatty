@@ -641,7 +641,7 @@ test("a failed group checkpoint prevents the setup command from starting and ret
   }
 });
 
-test("a stop finds a held, unmarked setup tree even when adoption could not read ps", { timeout: 30_000 }, async t => {
+for (const failStop of [false, true]) test(`an unmarked setup tree ${failStop ? "blocks cleanup when stop scans fail" : "is stopped even when adoption could not read ps"}`, { timeout: 30_000 }, async t => {
   const config = await setup(t);
   const task = join(config.dataDir, "setup-task.cjs");
   const pidsFile = join(config.dataDir, "setup-pids.json");
@@ -654,10 +654,16 @@ test("a stop finds a held, unmarked setup tree even when adoption could not read
   config.pi.git = join(config.dataDir, "fake-git");
   await writeFile(config.pi.git, `#!/bin/sh\nunset PATTY_RUN_ID\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(task)}\n`, { mode: 0o700 });
 
-  // Fail only the first process-table read in adoption. Subsequent stop scans must use the held child as a root.
+  // Fail adoption and, in the second case, both discovery attempts before the child-handle fallback.
   const ps = join(config.dataDir, "ps");
-  const failed = JSON.stringify(join(config.dataDir, "ps-failed"));
-  await writeFile(ps, `#!/bin/sh\nif [ ! -f ${failed} ]; then : > ${failed}; exit 1; fi\nexec /bin/ps "$@"\n`, { mode: 0o700 });
+  const budget = JSON.stringify(join(config.dataDir, "ps-failure-budget"));
+  await writeFile(ps, `#!/bin/sh
+    remaining=${failStop ? 3 : 1}
+    if [ -f ${budget} ]; then read -r remaining < ${budget}; fi
+    if [ "$remaining" -gt 0 ]; then echo "$((remaining - 1))" > ${budget}; exit 1; fi
+    exec /bin/ps "$@"
+  `, { mode: 0o700 });
+  t.mock.method(console, "error", () => {});
   const path = process.env.PATH;
   process.env.PATH = `${config.dataDir}:${path ?? ""}`;
   const controller = new AbortController();
@@ -673,9 +679,19 @@ test("a stop finds a held, unmarked setup tree even when adoption could not read
     controller.abort();
     const outcome = await running;
     assert.equal(outcome.status, "aborted");
-    assert.deepEqual(outcome.problems, []);
-    assert.ok(pids.every(pid => !alive(pid)), "the held leader and its unmarked child in a separate group stopped");
-    assert.ok(!existsSync(stateFile));
+    if (failStop) {
+      assert.ok(!alive(pids[0]) && alive(pids[1]), "only the held leader can be stopped without discovering its tree");
+      assert.match(outcome.problems.join("\n"), /stopped without verifying its process tree/);
+      const saved = JSON.parse(await readFile(stateFile, "utf8"));
+      assert.equal(saved.cleanupUncertain, true);
+      const recovered = await openPiRuns(config);
+      await assert.rejects(recovered.run(request({ pr: false })), /stopped without verifying its process tree/);
+      assert.ok(existsSync(saved.workspace) && existsSync(stateFile), "recovery cannot infer cleanup from an empty scan");
+    } else {
+      assert.deepEqual(outcome.problems, []);
+      assert.ok(pids.every(pid => !alive(pid)), "the held leader and its unmarked child in a separate group stopped");
+      assert.ok(!existsSync(stateFile));
+    }
   } finally {
     controller.abort();
     await running?.catch(() => {});
@@ -685,31 +701,53 @@ test("a stop finds a held, unmarked setup tree even when adoption could not read
   }
 });
 
-test("polling records an unmarked delegate from the held Pi handle before Pi exits", { timeout: 30_000 }, async t => {
+for (const failSecondRead of [false, true]) test(`polling keeps an unmarked delegate observed before Pi exits ${failSecondRead ? "even if the second read fails" : "between process-table reads"}`, { timeout: 30_000 }, async t => {
   const config = await setup(t);
   await scenario(config, [{ spawn: true }, { waitForFile: "let-pi-exit" }, assistant(report({ pr: null, issue: null })), settled]);
-  // Hide Pi's marker and fail its adoption read, but leave setup reads and subsequent polls alone.
+  const release = join(config.pi.agentDir, "let-pi-exit");
+  const pidsFile = join(config.pi.agentDir, "fake-pids.txt");
+  // Hide Pi's marker, fail its adoption read, and let Pi exit between the two reads of a poll.
   const script = `
     import cp from "node:child_process";
+    import { existsSync, readFileSync, writeFileSync } from "node:fs";
     import { syncBuiltinESMExports } from "node:module";
     import { promisify } from "node:util";
-    let failNextPs = false;
+    let pi, piExited, first = true, failNextPs = false, releaseOnNext = false;
+    const release = ${JSON.stringify(release)};
+    const pidsFile = ${JSON.stringify(pidsFile)};
     const spawn = cp.spawn;
     cp.spawn = (file, args, options) => {
       if (!options?.detached || args[3] !== ${JSON.stringify(config.pi.node)}) return spawn(file, args, options);
       failNextPs = true;
       const { PATTY_RUN_ID, ...env } = options.env;
-      return spawn(file, args, { ...options, env });
+      pi = spawn(file, args, { ...options, env });
+      piExited = new Promise(resolve => pi.once("exit", resolve));
+      return pi;
     };
     const execFile = cp.execFile;
     const exec = promisify(execFile);
     cp.execFile = (...args) => execFile(...args);
     cp.execFile[promisify.custom] = async (file, ...args) => {
-      if (file === "ps" && failNextPs) {
+      if (file !== "ps" || !pi || !args[0].includes("pid=,ppid=,pgid=,lstart=") || existsSync(release)) return exec(file, ...args);
+      if (failNextPs) {
         failNextPs = false;
         throw new Error("test adoption scan failure");
       }
-      return exec(file, ...args);
+      if (releaseOnNext) {
+        writeFileSync(release, "");
+        await piExited;
+        if (${failSecondRead}) throw new Error("test second scan failure");
+      }
+      const result = await exec(file, ...args);
+      if (first && existsSync(pidsFile)) {
+        const delegatePid = Number(readFileSync(pidsFile, "utf8"));
+        releaseOnNext = result.stdout.split("\\n").some(row => {
+          const [pid, ppid] = row.trim().split(/\\s+/).map(Number);
+          return pid === delegatePid && ppid === pi.pid;
+        });
+      }
+      first = !first;
+      return result;
     };
     syncBuiltinESMExports();
     const { openPiRuns } = await import(${JSON.stringify(join(checkout, "src/pi-run.ts"))});
@@ -721,12 +759,10 @@ test("polling records an unmarked delegate from the held Pi handle before Pi exi
     const [delegatePid] = await until(() => spawned(config), pids => pids.length === 1);
     const [pi] = await launches(config);
     assert.equal(pi.env.PATTY_RUN_ID, undefined);
-    const stateFile = join(config.dataDir, "pi-run.json");
-    await until(async () => JSON.parse(await readFile(stateFile, "utf8")).procs.some(([pid]: [number, string]) => pid === delegatePid));
-    await writeFile(join(config.pi.agentDir, "let-pi-exit"), "");
+    await until(() => existsSync(release));
     assert.equal(await exited, 0);
     assert.ok(!alive(delegatePid), "cleanup can still find the unmarked delegate after its parent has exited");
-    assert.ok(!existsSync(stateFile));
+    assert.ok(!existsSync(join(config.dataDir, "pi-run.json")));
     const outcome = await (await openPiRuns(config)).settled(101);
     assert.equal(outcome?.status, "completed", JSON.stringify(outcome));
   } finally {
