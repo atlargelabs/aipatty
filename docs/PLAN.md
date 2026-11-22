@@ -29,11 +29,12 @@ until then releases are deployed and rolled back manually.
 - **Stack:** TypeScript on Node 26. The Pi packages (`pi-durable`, `pi-ai`, `pi-codemode`, `chord`, `pi-schema`, and
   the `pi-coding-agent` CLI) are pinned at exactly 1.6.0 from npm, all at the same version so the host and the CLI share
   one `pi-ai`. Later bumps are normal reviewed PRs.
-- **Service installation layout:** the service account creates its own private root; the recommended default is
+- **Service installation layout:** the service account must use its own private root; the recommended default is
   `~/aipatty` in its own home: set `ROOT="$HOME/aipatty"`, run `(umask 077 && mkdir -p "$ROOT")`, then
-  `chmod 700 "$ROOT"` (also for a reused dedicated root owned by that account). Another writable absolute path
-  is fine; no administrator provisions the root. Manual committed-main releases live at `$ROOT/deploy/<sha>`,
-  with dependencies installed per release and `$ROOT/deploy/current` pointing at the active one. Keep the
+  `chmod 700 "$ROOT"` (confirm ownership first for a reused root). This sets POSIX mode but does not clear macOS
+  ACLs; verify privacy before using the root for state as described in [INSTALL.md](INSTALL.md). Another writable
+  absolute path is fine; no administrator provisions the root. Manual committed-main releases live at
+  `$ROOT/deploy/<sha>`, with dependencies installed per release and `$ROOT/deploy/current` pointing at the active one. Keep the
   last-known-good release for rollback.
   - `$ROOT/work/`: working directory of aipatty's own tools, for inspection and scratch, not PR work.
   - `$ROOT/runs/`: disposable workspaces for [`pi` runs](#pi-runs).

@@ -135,9 +135,11 @@ release, not the state root.
 
 For a service install, the default recommended root is `~/aipatty` in the service account's own home, not a new
 runtime default. As that account, set `ROOT="$HOME/aipatty"`, create it with `(umask 077 && mkdir -p "$ROOT")`,
-and run `chmod 700 "$ROOT"` to ensure even a reused dedicated root owned by that account is private. Another
-writable absolute path is fine. The manual app install needs no `sudo` or macOS administrator account: an existing
-standard service account and user-accessible Node 26 or newer, Git, and `gh` are prerequisites. Optional machine
+and run `chmod 700 "$ROOT"` for owner-only POSIX mode (confirm ownership first for a reused root). The root must
+be private: `chmod` does not clear macOS ACLs, so verify them before using it for state as described in
+[INSTALL.md](docs/INSTALL.md). Another writable absolute path is fine. The manual app install needs no `sudo` or
+macOS administrator account: an existing standard service account and user-accessible Node 26 or newer, Git,
+and `gh` are prerequisites. Optional machine
 provisioning and GitHub maintainer setup are separate; retain the `pattycaik` service identity and `protect-main`
 branch protection described in the runbook.
 
