@@ -532,6 +532,56 @@ test("after a crash, the next start stops the surviving processes, cleans up, an
   assert.equal((await (await openPiRuns(config)).settled(107))?.status, "interrupted");
 });
 
+test("a crash during adoption leaves an unknown group that blocks recovery cleanup without authorizing a signal", { timeout: 30_000 }, async t => {
+  const config = await setup(t);
+  const pidsFile = join(config.dataDir, "setup-pids.json");
+  const scanStarted = join(config.dataDir, "scan-started");
+  config.pi.git = join(config.dataDir, "fake-git");
+  // The first setup command leaves an unmarked member in its group and exits without waiting for it.
+  await writeFile(config.pi.git, `#!/usr/bin/env node
+    const child = require("node:child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { env: {}, stdio: "ignore" });
+    require("node:fs").writeFileSync(${JSON.stringify(pidsFile)}, JSON.stringify({ leader: process.pid, survivor: child.pid }));
+    child.unref();
+  `, { mode: 0o700 });
+  // Stall the first process-table read in the host only, without leaving a fake ps process behind.
+  const script = `
+    import cp from "node:child_process";
+    import { writeFileSync } from "node:fs";
+    import { syncBuiltinESMExports } from "node:module";
+    const execFile = cp.execFile;
+    cp.execFile = (file, ...args) => file === "ps" ? writeFileSync(${JSON.stringify(scanStarted)}, "") : execFile(file, ...args);
+    syncBuiltinESMExports();
+    const { openPiRuns } = await import(${JSON.stringify(join(checkout, "src/pi-run.ts"))});
+    const runs = await openPiRuns(${JSON.stringify(config)});
+    await runs.run(${JSON.stringify(request({ pr: false }))});`;
+  const host = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: "ignore" });
+  const exited = new Promise(resolve => host.once("exit", resolve));
+  const readPids = () => readFile(pidsFile, "utf8").then(text => text ? JSON.parse(text) as { leader: number; survivor: number } : undefined, () => undefined);
+  let pids: Awaited<ReturnType<typeof readPids>>;
+  try {
+    pids = await until(readPids, Boolean);
+    const { leader, survivor } = pids!;
+    await until(() => existsSync(scanStarted) && !alive(leader));
+    host.kill("SIGKILL");
+    await exited;
+    const stateFile = join(config.dataDir, "pi-run.json");
+    const saved = JSON.parse(await readFile(stateFile, "utf8"));
+    assert.deepEqual(saved.groups, [[leader, null]], "the group's unknown cutoff was already saved before ps");
+    assert.deepEqual(saved.procs, []);
+
+    t.mock.method(console, "error", () => {});
+    const recovered = await openPiRuns(config);
+    await assert.rejects(recovered.run(request({ pr: false })), /1 process\(es\) could not be stopped, or could not be told from the run's/);
+    assert.ok(alive(survivor), "unknown group evidence does not authorize a signal");
+    assert.ok(existsSync(saved.workspace) && existsSync(stateFile), "the survivor blocks cleanup");
+  } finally {
+    host.kill("SIGKILL");
+    await exited;
+    const survivor = (pids ?? await readPids())?.survivor;
+    if (survivor && alive(survivor)) process.kill(survivor, "SIGKILL");
+  }
+});
+
 /** What the fake model answered last. */
 async function lastText(host: AgentHost): Promise<string> {
   const { items } = await (await host.conversation("root"))!.entries({}, 10, undefined, ctx);

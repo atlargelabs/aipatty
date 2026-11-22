@@ -763,17 +763,20 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         throw error;
       }
     });
-    const save = () => write().catch(error => console.error(`Pi run ${saved.runId}: could not save its record:`, error));
+    const save = () => write().then(() => true, error => {
+      console.error(`Pi run ${saved.runId}: could not save its record:`, error);
+      return false;
+    });
     /** Remember a detached process this host started for the run, before waiting on it. */
     const adopt = async (child: ChildProcess) => {
       const pid = child.pid;
       if (pid === undefined) return;
       const seenAt = Date.now();
-      const invalidated = invalidateFutureCutoffs(run.owned, seenAt);
-      // The detached spawn led its own group. Keep its ID as a possible cleanup blocker even if the leader
-      // is gone by the time we read the process table; the group ID alone cannot authorize a signal.
-      if (!run.owned.groups.has(pid)) run.owned.groups.set(pid, null);
-      if (invalidated) await save();
+      invalidateFutureCutoffs(run.owned, seenAt);
+      // Record the new group before waiting for ps: if the host and leader die during that read, recovery
+      // still knows to check for survivors. The group ID alone can block cleanup, but cannot authorize a signal.
+      run.owned.groups.set(pid, null);
+      if (!(await save())) return; // Leave the record dirty for a later write; do not wait on this optional scan.
       const own = (await listProcesses().catch(() => [])).find(proc => proc.pid === pid);
       const scannedAt = Date.now();
       invalidateFutureCutoffs(run.owned, scannedAt);
