@@ -159,8 +159,13 @@ const message = (error: unknown) => error instanceof Error ? error.message : Str
 
 async function writeJson(path: string, value: unknown): Promise<void> {
   const temp = `${path}.${randomUUID()}.tmp`;
-  await writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
-  await rename(temp, path);
+  try {
+    await writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
+    await rename(temp, path);
+  } catch (error) {
+    await rm(temp, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 /** A JSON file's value, or `undefined` when there is no such file. A file that exists and cannot be read throws. */
@@ -631,8 +636,9 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
   let left: SavedRun | undefined;
   let pendingRecoveryRecord = false;
   try {
-    const readAt = Date.now();
+    const readStartedAt = Date.now();
     const saved = await readJson<unknown>(stateFile);
+    const readAt = Math.min(readStartedAt, Date.now());
     // Anything the file holds that is not a run of this data directory, `null` included, is a damaged record.
     if (saved !== undefined && !ownRecord(saved)) throw new Error("it does not describe a run of this data directory");
     if (saved && "asOf" in saved) {
@@ -669,8 +675,11 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         ?? (kept.get(key)?.outcome.runId === saved.runId ? kept.get(key) : undefined);
       const owned = newOwned(saved.procs, saved.groups, saved.unverifiedProcs);
       // What the cleanup learns of the run's processes is kept for the next start, should this one not finish.
-      const record = () => writeJson(stateFile, { ...saved, procs: [...owned.procs], groups: [...owned.groups] });
-      const stop = () => stopRun(owned, saved.runId, saved.pid, graceMs, undefined, record, pendingRecoveryRecord);
+      const record = async () => {
+        await writeJson(stateFile, { ...saved, procs: [...owned.procs], groups: [...owned.groups] });
+        pendingRecoveryRecord = false;
+      };
+      const stop = () => stopRun(owned, saved.runId, saved.pid, graceMs, undefined, record, () => pendingRecoveryRecord);
       const trace = new RunTrace(pi.repo);
       const split = lineSplitter((line, whole) => trace.line(line, whole));
       try {
@@ -766,12 +775,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     const held = new Set<ChildProcess>();
     const stop = async (grace = graceMs) => {
       if (!recordEstablished) return []; // Nothing could have been launched.
-      const left = await stopRun(run.owned, saved.runId, saved.pid, grace, term, write);
-      // A previous poll may have failed to write even if the stop scans found no changes. Try again before
-      // letting cleanup delete anything, without making termination of verified processes depend on the write.
-      await saving.catch(() => {});
-      if (recordDirty) await write();
-      return left;
+      return stopRun(run.owned, saved.runId, saved.pid, grace, term, write, () => recordDirty);
     };
     let stopping = Promise.resolve();
     run.kill = () => {

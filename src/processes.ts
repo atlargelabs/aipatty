@@ -133,11 +133,13 @@ async function processSnapshot(runId: string) {
  * Forgets empty groups and cutoffs invalidated by a clock rollback. The result is from a process table read last,
  * after the slower environment scan: act on it at once.
  */
-async function scan(owned: Owned, runId: string, recordInvalidation?: () => Promise<unknown>): Promise<ProcessScan> {
+async function scan(
+  owned: Owned, runId: string, recordInvalidation?: () => Promise<unknown>, pendingRecord = false,
+): Promise<ProcessScan> {
   const beganAt = Date.now();
   // Invalidate and save before awaiting ps, in case the clock catches up during the scan or the host dies.
   const invalidatedAtEntry = invalidateFutureCutoffs(owned, beganAt);
-  if (invalidatedAtEntry) await recordInvalidation?.();
+  if (invalidatedAtEntry || pendingRecord) await recordInvalidation?.();
   const { before, marked, procs } = await processSnapshot(runId).catch(async error => {
     if (invalidateFutureCutoffs(owned, Date.now())) await recordInvalidation?.();
     throw error;
@@ -241,7 +243,7 @@ function signal(pid: number, name: NodeJS.Signals): void {
  */
 export async function stopRun(
   owned: Owned, runId: string, root: number | undefined, graceMs: number, term?: () => void, record?: () => Promise<unknown>,
-  pendingRecord = false,
+  pendingRecord: () => boolean = () => false,
 ): Promise<Proc[]> {
   // A record write failure blocks cleanup, but must not prevent us from stopping confirmed processes.
   let failedWrite: { error: unknown } | undefined;
@@ -265,11 +267,7 @@ export async function stopRun(
   };
   let stopFailure: { error: unknown } | undefined;
   try {
-    if (pendingRecord) {
-      invalidateFutureCutoffs(owned, Date.now());
-      await save();
-    }
-    const tree = await recordScan(await scan(owned, runId, save));
+    const tree = await recordScan(await scan(owned, runId, save, pendingRecord()));
     const rootStart = root === undefined ? undefined : owned.procs.get(root);
     if (root !== undefined && rootStart !== undefined && tree.some(proc => proc.pid === root && proc.start === rootStart)) {
       // Through the live child handle when there is one, which cannot reach a process that reused the ID.
@@ -296,7 +294,7 @@ export async function stopRun(
     stopFailure = { error };
     throw error;
   } finally {
-    if (failedWrite) {
+    if (failedWrite || pendingRecord()) {
       await save();
       if (failedWrite) {
         const { error } = failedWrite;

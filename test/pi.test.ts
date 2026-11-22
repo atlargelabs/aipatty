@@ -887,9 +887,9 @@ test("a run's processes are found by environment marker and by the groups they l
     assert.ok(!("asOf" in saved));
   }
 
-  const withClock = async <T>(first: number, later: number, run: (reads: () => number) => Promise<T>): Promise<T> => {
+  const withClock = async <T>(times: number[], run: (reads: () => number) => Promise<T>): Promise<T> => {
     let readings = 0;
-    const clock = t.mock.method(Date, "now", () => readings++ === 0 ? first : later);
+    const clock = t.mock.method(Date, "now", () => times[Math.min(readings++, times.length - 1)]);
     try {
       return await run(() => readings);
     } finally {
@@ -899,7 +899,7 @@ test("a run's processes are found by environment marker and by the groups they l
   const cutoff = Date.now() + 1_000;
   const catchingUp = newOwned([], [[leader.pid!, cutoff]]);
   let savedCutoff = false;
-  assert.equal(await withClock(cutoff - 1, cutoff + 1, reads => trackRunProcesses(catchingUp, "another-run", async () => {
+  assert.equal(await withClock([cutoff - 1, cutoff + 1], reads => trackRunProcesses(catchingUp, "another-run", async () => {
     assert.equal(reads(), 1, "persist before waiting for the process snapshot");
     assert.equal(catchingUp.groups.get(leader.pid!), null);
     savedCutoff = true;
@@ -913,18 +913,20 @@ test("a run's processes are found by environment marker and by the groups they l
   // Recovery takes another clock reading when replaying the tool start. The bad timestamp must stay invalid
   // even after the clock catches up during replay, before the first process scan.
   await writeFile(eventsFile, JSON.stringify(delegate("c1", { id: "replay", profile: "crmanager", task: "Review.", cost: 0 })[0].emit) + "\n");
-  await writeFile(stateFile, futureRecord);
-  const recovered = await withClock(cutoff - 1, cutoff + 1, () => openPiRuns(config));
-  await assert.rejects(recovered.run(request({ pr: false })), /1 process\(es\) could not be stopped, or could not be told from the run's/);
-  assert.ok(alive(orphan) && existsSync(workspace));
-  assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).groups, [[leader.pid, null]]);
+  for (const times of [[cutoff - 1, cutoff + 1], [cutoff + 1, cutoff - 1, cutoff + 1]]) {
+    await writeFile(stateFile, futureRecord);
+    const recovered = await withClock(times, () => openPiRuns(config));
+    await assert.rejects(recovered.run(request({ pr: false })), /1 process\(es\) could not be stopped, or could not be told from the run's/);
+    assert.ok(alive(orphan) && existsSync(workspace));
+    assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).groups, [[leader.pid, null]]);
+  }
 
   // If the clock steps back after load and the transcript can't be read, the stop scan must still save the
   // invalidation, even when no owned process is found and recovery exits without finalizing the record.
   await rm(eventsFile);
   await mkdir(eventsFile);
   await writeFile(stateFile, futureRecord);
-  const unreadable = await withClock(cutoff + 1, cutoff - 1, () => openPiRuns(config));
+  const unreadable = await withClock([cutoff + 1, cutoff + 1, cutoff - 1], () => openPiRuns(config));
   await assert.rejects(unreadable.run(request({ pr: false })), /events could not be read/);
   assert.ok(alive(orphan) && existsSync(workspace));
   assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).groups, [[leader.pid, null]]);
@@ -942,9 +944,10 @@ test("a run's processes are found by environment marker and by the groups they l
   });
   syncBuiltinESMExports();
   try {
-    const writeFailed = await withClock(cutoff - 1, cutoff + 1, () => openPiRuns(config));
+    const writeFailed = await withClock([cutoff - 1, cutoff + 1], () => openPiRuns(config));
     await assert.rejects(writeFailed.run(request({ pr: false })), /the process record could not be saved: test state update failure/);
     assert.ok(!alive(verified.pid!) && alive(orphan) && existsSync(workspace));
+    assert.ok(!(await readdir(config.dataDir)).some(name => name.startsWith("pi-run.json.") && name.endsWith(".tmp")));
   } finally {
     renameMock.mock.restore();
     syncBuiltinESMExports();
@@ -958,7 +961,7 @@ test("a run's processes are found by environment marker and by the groups they l
   const fresh = start(["-e", idle], { PATTY_RUN_ID: `${marker}-b` }, true);
   await until(async () => (await listProcesses()).some(proc => proc.pid === fresh.pid));
   const rolledBack = newOwned([], [[fresh.pid!, cutoff]]);
-  assert.equal(await withClock(cutoff, cutoff - 1, () => trackRunProcesses(rolledBack, `${marker}-b`)), true);
+  assert.equal(await withClock([cutoff, cutoff - 1], () => trackRunProcesses(rolledBack, `${marker}-b`)), true);
   assert.ok(rolledBack.procs.has(fresh.pid!), "keep the confirmed identity from the poll");
   assert.equal(rolledBack.groups.get(fresh.pid!), null, "do not restore a future cutoff after a rollback");
   const records: { groups: number[]; alive: boolean }[] = [];
@@ -978,6 +981,17 @@ test("a run's processes are found by environment marker and by the groups they l
   }), /the process record could not be saved: test write failure/);
   assert.ok(writes > 1, "retry the failed record");
   assert.ok(!alive(detached.pid!), "record failure still allows confirmed processes to be stopped");
+
+  const path = process.env.PATH;
+  try {
+    process.env.PATH = join(config.dataDir, "without-ps");
+    await assert.rejects(stopRun(newOwned(), "no-such-run", undefined, 0, undefined, async () => {
+      throw new Error("test pending write failure");
+    }, () => true), { message: /spawn ps ENOENT; the process record could not be saved: test pending write failure/ });
+  } finally {
+    if (path === undefined) delete process.env.PATH;
+    else process.env.PATH = path;
+  }
 
   assert.deepEqual(await stopRun(owned, marker, undefined, 0), []);
   await until(() => !alive(marked.pid!) && !alive(orphan));
