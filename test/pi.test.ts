@@ -685,6 +685,58 @@ test("a stop finds a held, unmarked setup tree even when adoption could not read
   }
 });
 
+test("polling records an unmarked delegate from the held Pi handle before Pi exits", { timeout: 30_000 }, async t => {
+  const config = await setup(t);
+  await scenario(config, [{ spawn: true }, { waitForFile: "let-pi-exit" }, assistant(report({ pr: null, issue: null })), settled]);
+  // Hide Pi's marker and fail its adoption read, but leave setup reads and subsequent polls alone.
+  const script = `
+    import cp from "node:child_process";
+    import { syncBuiltinESMExports } from "node:module";
+    import { promisify } from "node:util";
+    let failNextPs = false;
+    const spawn = cp.spawn;
+    cp.spawn = (file, args, options) => {
+      if (!options?.detached || args[3] !== ${JSON.stringify(config.pi.node)}) return spawn(file, args, options);
+      failNextPs = true;
+      const { PATTY_RUN_ID, ...env } = options.env;
+      return spawn(file, args, { ...options, env });
+    };
+    const execFile = cp.execFile;
+    const exec = promisify(execFile);
+    cp.execFile = (...args) => execFile(...args);
+    cp.execFile[promisify.custom] = async (file, ...args) => {
+      if (file === "ps" && failNextPs) {
+        failNextPs = false;
+        throw new Error("test adoption scan failure");
+      }
+      return exec(file, ...args);
+    };
+    syncBuiltinESMExports();
+    const { openPiRuns } = await import(${JSON.stringify(join(checkout, "src/pi-run.ts"))});
+    const runs = await openPiRuns(${JSON.stringify(config)});
+    await runs.run(${JSON.stringify(request({ pr: false, timeoutMs: 20_000 }))});`;
+  const host = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: "ignore" });
+  const exited = new Promise(resolve => host.once("exit", resolve));
+  try {
+    const [delegatePid] = await until(() => spawned(config), pids => pids.length === 1);
+    const [pi] = await launches(config);
+    assert.equal(pi.env.PATTY_RUN_ID, undefined);
+    const stateFile = join(config.dataDir, "pi-run.json");
+    await until(async () => JSON.parse(await readFile(stateFile, "utf8")).procs.some(([pid]: [number, string]) => pid === delegatePid));
+    await writeFile(join(config.pi.agentDir, "let-pi-exit"), "");
+    assert.equal(await exited, 0);
+    assert.ok(!alive(delegatePid), "cleanup can still find the unmarked delegate after its parent has exited");
+    assert.ok(!existsSync(stateFile));
+    const outcome = await (await openPiRuns(config)).settled(101);
+    assert.equal(outcome?.status, "completed", JSON.stringify(outcome));
+  } finally {
+    host.kill("SIGKILL");
+    await exited;
+    const pids = [...(await launches(config).catch(() => [])).map(pi => pi.pid), ...await spawned(config)];
+    for (const pid of pids) if (alive(pid)) process.kill(pid, "SIGKILL");
+  }
+});
+
 /** What the fake model answered last. */
 async function lastText(host: AgentHost): Promise<string> {
   const { items } = await (await host.conversation("root"))!.entries({}, 10, undefined, ctx);

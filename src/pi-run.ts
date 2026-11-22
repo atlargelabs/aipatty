@@ -970,7 +970,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         // Remember the processes the run starts while their parents still live: a delegate leads its own group.
         let polling: Promise<void> | undefined;
         const poll = adoptionError ? undefined : setInterval(() => {
-          polling ??= trackRunProcesses(run.owned, saved.runId, save)
+          polling ??= trackRunProcesses(run.owned, saved.runId, save, livePids)
             .catch(() => false).then(async changed => {
               if (changed || recordDirty) await save();
             }).finally(() => { polling = undefined; });

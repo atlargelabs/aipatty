@@ -206,8 +206,10 @@ export async function runProcesses(owned: Owned, runId: string): Promise<Proc[]>
 }
 
 /** Poll a live run, returning whether its recovery record needs updating. */
-export async function trackRunProcesses(owned: Owned, runId: string, recordInvalidation?: () => Promise<unknown>): Promise<boolean> {
-  const { ours, groupsChanged, beganAt, scannedAt } = await scan(owned, runId, recordInvalidation);
+export async function trackRunProcesses(
+  owned: Owned, runId: string, recordInvalidation?: () => Promise<unknown>, liveChildren?: () => ReadonlySet<number>,
+): Promise<boolean> {
+  const { ours, groupsChanged, beganAt, scannedAt } = await scan(owned, runId, recordInvalidation, false, liveChildren);
   const learned = remember(owned, ours, beganAt <= scannedAt ? beganAt : undefined);
   return learned || groupsChanged;
 }
