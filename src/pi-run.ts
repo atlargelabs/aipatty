@@ -163,7 +163,11 @@ async function writeJson(path: string, value: unknown): Promise<void> {
     await writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
     await rename(temp, path);
   } catch (error) {
-    await rm(temp, { force: true }).catch(() => {});
+    try {
+      await rm(temp, { force: true });
+    } catch (removeError) {
+      throw new AggregateError([error, removeError], `${message(error)}; could not remove ${temp}: ${message(removeError)}`);
+    }
     throw error;
   }
 }
@@ -761,14 +765,17 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     });
     const save = () => write().catch(error => console.error(`Pi run ${saved.runId}: could not save its record:`, error));
     /** Remember a process this host started for the run, before waiting on it. */
-    const adopt = async (pid: number | undefined) => {
-      if (pid === undefined) return;
+    const adopt = async (child: ChildProcess) => {
+      if (child.pid === undefined) return;
       const seenAt = Date.now();
       if (invalidateFutureCutoffs(run.owned, seenAt)) await save();
-      const own = (await listProcesses().catch(() => [])).find(proc => proc.pid === pid);
+      const own = (await listProcesses().catch(() => [])).find(proc => proc.pid === child.pid);
       const scannedAt = Date.now();
       invalidateFutureCutoffs(run.owned, scannedAt);
-      if (own) remember(run.owned, [own], seenAt <= scannedAt ? seenAt : undefined);
+      // The process table can contain a replacement for a setup command that exited during the I/O.
+      if (own && child.exitCode === null && child.signalCode === null) {
+        remember(run.owned, [own], seenAt <= scannedAt ? seenAt : undefined);
+      }
       await save();
     };
     /** The children this host started itself and still holds: stopped through their handles when all else fails. */
@@ -821,7 +828,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       child.stdout.on("data", (chunk: Buffer) => { out = (out + chunk).slice(0, 1024 * 1024); });
       child.stderr.on("data", (chunk: Buffer) => { err = (err + chunk).slice(-8_000); });
       const exit = exitOf(child, error => { failure = error; });
-      await adopt(child.pid);
+      await adopt(child);
       // Stopped while it was being recorded: the stop may have missed it.
       if (run.stop) run.kill();
       const exitCode = await exit;
@@ -925,7 +932,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         child.stdin.on("error", () => {});
         child.stdin.end(prompt);
         saved.pid = child.pid;
-        await adopt(child.pid);
+        await adopt(child);
         if (run.stop) run.kill();
         // Remember the processes the run starts while their parents still live: a delegate leads its own group.
         let polling: Promise<void> | undefined;

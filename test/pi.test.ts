@@ -985,9 +985,15 @@ test("a run's processes are found by environment marker and by the groups they l
   const path = process.env.PATH;
   try {
     process.env.PATH = join(config.dataDir, "without-ps");
+    const writeFailure = new Error("test pending write failure");
     await assert.rejects(stopRun(newOwned(), "no-such-run", undefined, 0, undefined, async () => {
-      throw new Error("test pending write failure");
-    }, () => true), { message: /spawn ps ENOENT; the process record could not be saved: test pending write failure/ });
+      throw writeFailure;
+    }, () => true), error => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.errors[0].code, "ENOENT");
+      assert.equal(error.errors[1], writeFailure);
+      return true;
+    });
   } finally {
     if (path === undefined) delete process.env.PATH;
     else process.env.PATH = path;
