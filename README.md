@@ -180,6 +180,7 @@ node src/cli.ts model set <id>        # select a model from that list (optional 
 node src/cli.ts thinking set <level>  # off, minimal, low, medium, high, xhigh or max
 node src/cli.ts send "hello"          # send a message and stream the answer
 node src/cli.ts abort                 # withdraw queued messages and stop the running turn
+node src/cli.ts shutdown              # request a graceful stop of the whole server
 node src/cli.ts log                   # print the transcript
 node src/cli.ts branches              # list branches: ID, title, model, own cost, fork point; and the total
 node src/cli.ts branches read <id> [--limit n]     # the newest n messages of a branch (default 50), with entry IDs
@@ -191,7 +192,16 @@ node src/cli.ts rename "<title>"                   # retitle the root (or --bran
 `--branch <id>` before or after the command points `model set`, `thinking set`, `send`, `abort`, `log`, `fork` and
 `rename` at a branch instead of the root.
 
-The CLI connects to `127.0.0.1:8790`. `--port <n>` names another port, for a server started with `--port`.
+The CLI connects to `127.0.0.1:8790`. `--port <n>` names another port, for a server started with `--port`
+(or a matching SSH forward). For example: `aipatty --port 9000 shutdown` (or `node src/cli.ts --port 9000 shutdown`).
+
+`shutdown` is server-wide, takes no branch, and works even when no saved model is available. `Shutdown requested.`
+acknowledges the request, not that cleanup has finished. The server closes its HTTP and WebSocket connections and
+cleans up as for Ctrl-C or `SIGTERM`, without waiting for a conversation to go idle. Unlike `abort`, it doesn't
+withdraw queued messages. Conversations persist, and interrupted conversation work continues on restart unless
+scheduling is [blocked by an unavailable model](#configure). Partial answers may remain in the transcript.
+Active [`pi` runs](#pi-runs) are stopped and reported as interrupted on restart, not replayed. Wait for the server
+process to exit before starting another one on the same data directory.
 
 ## From another machine
 
@@ -210,6 +220,9 @@ the authentication.
 - `GET /` the page (and `/app.js`, `/app.css`)
 - `GET /health` (includes the root's saved model, its catalog availability, and the thinking level)
 - `GET /api/models`
+- `POST /api/shutdown` (no body needed): requires the `X-Aipatty-Shutdown: 1` header so ordinary browser forms
+  cannot trigger it. No CORS is enabled. Returns `202 { "status": "shutdown-requested" }` before stopping the
+  server; it does not wait for cleanup. The same Host and Origin rules below apply.
 - `GET /api/branches`: `{ branches: [{ id, title, parent, model, modelStatus, thinking, busy, cost }], totalCost }`
 - `PUT /api/model` and `PUT /api/thinking`: the root's, as below
 - `GET /api/conversations/:id` (`root` is the root conversation; `?limit=` and `?before=` page backwards); also

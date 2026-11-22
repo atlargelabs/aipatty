@@ -6,7 +6,7 @@ import WebSocket, { WebSocketServer } from "ws";
 import { LOOPBACK } from "./config.ts";
 import { HttpError, type AgentHost } from "./host.ts";
 import { pageCss, pageHtml, pageJs } from "./page.ts";
-import { messageText, streamState, streamUpdate, type StreamFrame } from "./protocol.ts";
+import { messageText, shutdownHeader, streamState, streamUpdate, type StreamFrame } from "./protocol.ts";
 import { transcriptPage } from "./transcript.ts";
 
 const maxBody = 64 * 1024;
@@ -117,8 +117,18 @@ function requireMethod(req: IncomingMessage, res: ServerResponse, method: string
   throw new HttpError(405, "Method not allowed");
 }
 
-async function handleHttp(agent: AgentHost, health: Health, req: IncomingMessage, res: ServerResponse) {
+async function handleHttp(
+  agent: AgentHost, health: Health, req: IncomingMessage, res: ServerResponse,
+  shutdown?: (res: ServerResponse) => void,
+) {
   const { pathname, searchParams } = requestUrl(req);
+  if (pathname === "/api/shutdown" && shutdown) {
+    requireMethod(req, res, "POST");
+    const marker = req.headersDistinct[shutdownHeader];
+    if (marker?.length !== 1 || marker[0] !== "1") throw new HttpError(403, `Expected ${shutdownHeader}: 1`);
+    shutdown(res);
+    return;
+  }
   if (pathname === "/health") {
     requireMethod(req, res, "GET");
     sendJson(res, 200, { ...health, ...await agent.modelStatus() });
@@ -337,7 +347,9 @@ export interface Health {
  * `heartbeatMs` and dropped if it has not answered by the next ping, so a client that vanished without closing does
  * not linger.
  */
-export async function startApi(agent: AgentHost, health: Health, port: number, heartbeatMs = defaultHeartbeatMs) {
+export async function startApi(agent: AgentHost, health: Health, port: number, {
+  heartbeatMs = defaultHeartbeatMs, onShutdown,
+}: { heartbeatMs?: number; onShutdown?: () => void } = {}) {
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 });
   const streams: Streams = { controllers: new Set(), alive: new WeakSet() };
   const heartbeat = setInterval(() => {
@@ -346,8 +358,24 @@ export async function startApi(agent: AgentHost, health: Health, port: number, h
       else if (ws.readyState === WebSocket.OPEN) ws.ping();
     }
   }, heartbeatMs).unref();
+  let shutdownPending = false;
+  const shutdown = onShutdown && ((res: ServerResponse) => {
+    if (shutdownPending) throw new HttpError(409, "Shutdown already requested");
+    shutdownPending = true;
+    const stop = () => {
+      clearTimeout(deadline);
+      res.off("finish", stop).off("close", stop);
+      onShutdown();
+    };
+    // Normally finish hands the acknowledgement to the OS before close() destroys sockets. A disconnected
+    // client or a write stuck behind an earlier pipelined response must not block an accepted shutdown.
+    const deadline = setTimeout(stop, 1_000).unref();
+    res.once("finish", stop).once("close", stop);
+    res.shouldKeepAlive = false;
+    sendJson(res, 202, { status: "shutdown-requested" });
+  });
   const server = createServer({ requestTimeout: 30_000, headersTimeout: 10_000 }, (req, res) => {
-    void handleHttp(agent, health, req, res).catch(error => {
+    void handleHttp(agent, health, req, res, shutdown).catch(error => {
       if (res.destroyed) return;
       const { status, message } = errorResponse(error);
       if (!req.complete) res.shouldKeepAlive = false;

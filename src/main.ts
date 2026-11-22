@@ -25,8 +25,8 @@ async function main(): Promise<void> {
     version: packageJson.version,
   };
   const config = readConfig();
-  const signal = Promise.withResolvers<void>();
-  const stop = () => signal.resolve();
+  const stopping = Promise.withResolvers<void>();
+  const stop = () => stopping.resolve();
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
   try {
@@ -39,9 +39,9 @@ async function main(): Promise<void> {
       }
     });
     try {
-      const api = await startApi(agent, health, config.port);
+      const api = await startApi(agent, health, config.port, { onShutdown: stop });
       console.log(`aipatty listening on ${LOOPBACK}:${api.port}`);
-      await Promise.race([signal.promise, closed]);
+      await Promise.race([stopping.promise, closed]);
       await api.close();
     } finally {
       await agent.close();

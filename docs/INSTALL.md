@@ -112,6 +112,20 @@ ssh -N -L 8790:127.0.0.1:8790 macmini &
 node src/cli.ts health          # compare the commit with the expected release SHA
 ```
 
+## Stop
+
+From the service account, use the active release's CLI:
+
+```sh
+node "$ROOT/deploy/current/src/cli.ts" shutdown
+```
+
+Or run `node src/cli.ts shutdown` from the laptop over the SSH forward above. If using a non-default port,
+pass `--port <n>` to the CLI and use that same port at both ends of the forward. `Shutdown requested.` only
+acknowledges the request. Wait for the server process to exit before repointing `current` or starting another
+server. For older releases without the command, or if the API is unreachable, use Ctrl-C in the server terminal
+or send the server `SIGTERM`. These all use the same cleanup; see [CLI shutdown semantics](../README.md#cli).
+
 ## Fresh cutover from an old installation
 
 While still on the old server with its old configuration, finish any active Pi runs or abort them and wait for
@@ -119,11 +133,12 @@ cleanup to settle. Do not start more runs. Check for a pending `pi-run.json` in 
 directory**: the old runbook used `--data-dir ~/data`, so check `~/data/pi-run.json` in that case, not the new
 `$ROOT/data` or the legacy default unless that was the path actually used.
 
-Stop the old server (Ctrl-C or `SIGTERM`), wait for it to exit, and check that old path again. Shutdown during a
-Pi run deliberately leaves its record and cleanup for recovery on the next start; a fresh root cannot see that
-record. **If `pi-run.json` remains after shutdown, do not delete it or proceed with the cutover.** Restart the old
-server with the same old configuration (including its data, Pi, and runs directories) to finish recovery. Confirm
-the record is gone, then shut down the old server and recheck that it is still gone before starting the new one.
+Stop the old server as above (use Ctrl-C or `SIGTERM` if the old release lacks `shutdown`), wait for it to exit,
+and check that old path again. Shutdown during a Pi run deliberately leaves its record and cleanup for recovery
+on the next start; a fresh root cannot see that record. **If `pi-run.json` remains after shutdown, do not delete it
+or proceed with the cutover.** Restart the old server with the same old configuration (including its data, Pi,
+and runs directories) to finish recovery. Confirm the record is gone, then shut down the old server and recheck
+that it is still gone before starting the new one.
 If recovery cannot clear the record, stop and investigate; do not bypass it by switching roots or deleting old state.
 
 Only then start with a fresh root: do not migrate conversations. Reauthenticate with the pinned CLI as above and
@@ -140,9 +155,10 @@ account's SSH keys and configuration, Git configuration, and `gh` login and sett
    that commit and that an actual `crmanager` Pi review ran.
 3. Steve merges the PR.
 4. Deploy by hand: make a release of the new committed `main` as in "First release", without changing the current
-   symlink yet. Stop the server (Ctrl-C or `SIGTERM`), point `$ROOT/deploy/current` at the new release, and start it
-   again with the same root. Keep the previous release for rollback; preserve `$ROOT/data`, `$ROOT/pi`, `$ROOT/work`,
-   and `$ROOT/runs` across both redeploy and rollback.
+   symlink yet. Follow [Stop](#stop) and wait for the process to exit, then point `$ROOT/deploy/current` at the new
+   release and start it again with the same root. Keep the previous release for rollback; preserve `$ROOT/data`,
+   `$ROOT/pi`, `$ROOT/work`, and `$ROOT/runs` across both redeploy and rollback.
 5. `node src/cli.ts health` reports the new commit, and `node src/cli.ts log` still has the conversation. Send it
-   another message. For manual rollback, stop the server, repoint `current` at the retained release, restart with
-   the same root, and verify its SHA and conversation. Ensure releases are compatible with the shared state.
+   another message. For manual rollback, follow [Stop](#stop), repoint `current` at the retained release once the
+   process exits, restart with the same root, and verify its SHA and conversation. Ensure releases are compatible
+   with the shared state.

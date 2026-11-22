@@ -4,7 +4,7 @@ import { on } from "node:events";
 import WebSocket, { type RawData } from "ws";
 import { LOOPBACK, readFaux, readPort } from "./config.ts";
 import type { BranchInfo, SearchMatch } from "./branches.ts";
-import { failureText, messageText, type ConversationPage, type StreamFrame } from "./protocol.ts";
+import { failureText, messageText, shutdownHeader, type ConversationPage, type StreamFrame } from "./protocol.ts";
 import { branchLine } from "./tools.ts";
 
 /** The conversation path of a branch ID, or the root's. */
@@ -95,7 +95,7 @@ async function log(base: URL, root: string, limit?: number): Promise<void> {
 }
 
 const usage = `Usage: aipatty [--port <n>] [--branch <id>] <command>
-  health | models
+  health | models | shutdown
   model set [provider] <modelId> | thinking set <level>
   send "<text>" | abort | log
   branches [list] | branches read <id> [--limit <n>] | branches search <id> "<text>"
@@ -134,6 +134,12 @@ async function main(): Promise<void> {
     print(await request(base, "/health"));
   } else if (command === "models" && rest.length === 0 && !scoped) {
     print(await request(base, "/api/models"));
+  } else if (command === "shutdown" && rest.length === 0 && !scoped && at === undefined && limitArg === undefined) {
+    const ack = await request<{ status: string } | null>(base, "/api/shutdown", {
+      method: "POST", headers: { [shutdownHeader]: "1" }, redirect: "manual",
+    });
+    if (ack?.status !== "shutdown-requested") throw new Error("Expected a shutdown acknowledgement from the server");
+    console.log("Shutdown requested.");
   } else if (command === "model" && (rest.length === 2 || rest.length === 3) && rest[0] === "set") {
     const model = { provider: rest.length === 3 ? rest[1] : undefined, modelId: rest.at(-1) };
     print(await json(scoped ? `${root}/model` : "/api/model", "PUT", model));
