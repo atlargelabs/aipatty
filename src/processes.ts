@@ -113,8 +113,8 @@ async function markedPids(runId: string, procs: readonly Proc[], variable: strin
  * `unsure` are members of remembered, leaderless groups that were not identified by this evidence. They may
  * be the run's or belong to a new group that reused the ID. They are not signalled and keep cleanup pending.
  *
- * Forgets remembered groups that have no member left. The result is from a process table read last, after the
- * slower environment scan: act on it at once.
+ * For ordinary runs, forgets groups with no visible members. Stage cleanup retains them for an independent check.
+ * The result is from a process table read last, after the slower environment scan: act on it at once.
  */
 async function scan(owned: Owned, runId: string, variable: string): Promise<{ ours: Proc[]; unsure: Proc[] }> {
   const isStage = variable !== RUN_MARKER;
@@ -147,8 +147,10 @@ async function scan(owned: Owned, runId: string, variable: string): Promise<{ ou
     if (attempt === 15) throw new Error("Process table kept changing during staging cleanup; cannot establish quiescence");
   }
   const byPid = new Map(procs.map(proc => [proc.pid, proc]));
-  for (const pgid of owned.groups) {
-    if (!procs.some(proc => proc.pgid === pgid)) owned.groups.delete(pgid);
+  if (!isStage) {
+    for (const pgid of owned.groups) {
+      if (!procs.some(proc => proc.pgid === pgid)) owned.groups.delete(pgid);
+    }
   }
   // Never this process, its group, or the system's.
   const skipGroups = new Set([0, 1, byPid.get(process.pid)?.pgid ?? -1]);
@@ -206,7 +208,7 @@ function signal(pid: number, name: NodeJS.Signals): void {
  * signal goes to a process found, by ID and start time, in a process table read just before, so a process that
  * took over a dead one's ID is not signalled. Returns what is left: the survivors, and the processes that could not
  * be told from the run's, which are not signalled. `record` saves what the run remembers whenever that grows.
- * Rejects when the table cannot be read.
+ * Rejects when the table cannot be read or when stage cleanup cannot confirm a remembered group is gone.
  */
 export async function stopRun(
   owned: Owned, runId: string, root: number | undefined, graceMs: number, term?: () => void, record?: () => Promise<unknown>,
@@ -235,6 +237,20 @@ export async function stopRun(
     if (remember(owned, left)) await record?.();
     for (const proc of left) signal(proc.pid, "SIGKILL");
     await sleep(150);
+  }
+  if (variable !== RUN_MARKER && !left.length && !unsure.length) {
+    // A non-atomic ps read can miss both an unmarked member and its successor. Only the kernel can
+    // confirm the group is gone. A live, inaccessible, or reused group is not authority to signal it.
+    for (const pgid of owned.groups) {
+      const message = `Cannot prove staging process group ${pgid} is gone; leave the private stage in place and investigate`;
+      try { process.kill(-pgid, 0); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw new Error(message, { cause: error });
+        owned.groups.delete(pgid);
+        continue;
+      }
+      throw new Error(message);
+    }
   }
   return [...left, ...unsure];
 }

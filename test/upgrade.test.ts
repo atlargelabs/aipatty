@@ -579,6 +579,62 @@ exec /bin/ps "$@"
   assert.deepEqual(JSON.parse(stdout), [Number(await readFile(pidFile, "utf8"))]);
 });
 
+test("interrupted staging retains a group whose unmarked successor was missed by ps", { timeout }, async t => {
+  const scratch = await mkdtemp(join(tmpdir(), "aipatty-reap-"));
+  t.after(() => rm(scratch, { recursive: true, force: true }));
+  // Synthetic PIDs outside the OS allocation range. Stub ps on both platforms and intercept all signals.
+  const pgid = 2 ** 30, successor = pgid + 2;
+  await writeFile(join(scratch, "ps"), `#!/bin/sh
+case "$1:$3" in
+  -p:-o) : > "$REAP_FIXTURE/identified"; exit 1 ;;
+  -A:pid=,ppid=,pgid=,uid=,stat=,lstart=) ;;
+  *) exit 0 ;; # macOS environment scans: neither group member is marked
+esac
+[ -f "$REAP_FIXTURE/identified" ] || exit 0
+n=0
+if [ -f "$REAP_FIXTURE/reads" ]; then read -r n < "$REAP_FIXTURE/reads"; fi
+n=$((n+1))
+printf '%s\\n' "$n" > "$REAP_FIXTURE/reads"
+# After checking the missing worker, the first stopRun scan sees a leaderless member until
+# the last ps read omits both that exiting process and its newly forked successor.
+if [ "$n" -lt 4 ]; then
+  printf '%s 1 %s %s S Mon Oct 19 11:00:01 2026\\n' ${pgid + 1} ${pgid} "$REAP_UID"
+elif [ "$n" -gt 4 ] && [ "$REAP_VISIBLE" = 1 ]; then
+  printf '%s 1 %s %s S Mon Oct 19 11:00:02 2026\\n' ${successor} ${pgid} "$REAP_UID"
+fi
+`, { mode: 0o700 });
+  for (const visible of [true, false]) {
+    await rm(join(scratch, "identified"), { force: true });
+    await rm(join(scratch, "reads"), { force: true });
+    await exec(process.execPath, ["--input-type=module", "-e", `
+      import assert from "node:assert/strict";
+      import { reapStage } from "./src/upgrade-process.ts";
+      const journal = { version: 1, phase: "staging", id: ${JSON.stringify(randomUUID())},
+        legacy: false, faux: true, port: 8790, old: "a".repeat(40),
+        stageProcess: { pid: ${pgid}, start: "Mon Oct 19 11:00:00 2026" } };
+      let groupExists = true;
+      const probes = [], signals = [];
+      process.kill = (pid, signal) => {
+        if (signal !== 0) signals.push([pid, signal]);
+        else probes.push(pid);
+        if (pid === -${pgid} && groupExists && signal === 0) return true;
+        throw Object.assign(new Error("No such process"), { code: "ESRCH" });
+      };
+      await assert.rejects(reapStage(journal), ${visible ? `/${successor}/` : `/process group ${pgid}/`});
+      assert.deepEqual(signals, [], "group evidence must not authorize signalling an unmarked successor");
+      if (${!visible}) assert.ok(probes.includes(-${pgid}), "an empty ps snapshot is not proof the group is gone");
+
+      // A later recovery can proceed after the kernel confirms that the group is gone.
+      groupExists = false;
+      process.env.REAP_VISIBLE = "0";
+      await reapStage(journal);
+      assert.equal(probes.at(-1), -${pgid});
+      assert.deepEqual(signals, []);
+    `], { cwd: checkout, env: { PATH: `${scratch}:${process.env.PATH}`, REAP_FIXTURE: scratch,
+      REAP_UID: String(process.geteuid!()), REAP_VISIBLE: visible ? "1" : "0" }, timeout: 15_000 });
+  }
+});
+
 test("staging reaps a detached replacement started by its interrupted nested test", { timeout }, async t => {
   const f = await fixture(t);
   f.launch();
