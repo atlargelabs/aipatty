@@ -650,6 +650,29 @@ test("a failed group checkpoint prevents the setup command from starting and ret
   }
 });
 
+test("a failed launcher scan reports its cause without opening the gate", { timeout: 30_000 }, async t => {
+  const config = await setup(t);
+  const ran = join(config.dataDir, "git-ran");
+  config.pi.git = join(config.dataDir, "fake-git");
+  await writeFile(config.pi.git, `#!/bin/sh\n: > ${JSON.stringify(ran)}\n`, { mode: 0o700 });
+  const failed = JSON.stringify(join(config.dataDir, "launcher-scan-failed"));
+  await writeFile(join(config.dataDir, "ps"), `#!/bin/sh
+    if [ ! -f ${failed} ]; then : > ${failed}; echo 'test launcher scan failure' >&2; exit 1; fi
+    exec /bin/ps "$@"
+  `, { mode: 0o700 });
+  const path = process.env.PATH;
+  process.env.PATH = `${config.dataDir}:${path ?? ""}`;
+  try {
+    const outcome = await (await openPiRuns(config)).run(request({ pr: false }));
+    assert.equal(outcome.status, "failed");
+    assert.match(outcome.problems.join("\n"), /could not read the process table for launcher \d+:[^]*test launcher scan failure/);
+    assert.ok(!existsSync(ran) && !existsSync(join(config.dataDir, "pi-run.json")));
+  } finally {
+    if (path === undefined) delete process.env.PATH;
+    else process.env.PATH = path;
+  }
+});
+
 for (const mode of ["observed", "adoption", "stop", "checkpoint"] as const) test(`an unmarked setup tree ${mode === "observed" ? "is recorded during adoption" : `is handled safely on ${mode} failure`}`, { timeout: 30_000 }, async t => {
   const config = await setup(t);
   const task = join(config.dataDir, "setup-task.cjs");
@@ -1212,6 +1235,80 @@ test("a stop checkpoints a detached child that appears during the identity-recor
   } finally {
     if (alive(pid)) parent.kill("SIGKILL");
     if (worker && alive(worker)) process.kill(worker, "SIGKILL");
+  }
+});
+
+test("stop rechecks markers if a parent exits during the last scan's checkpoint", { timeout: 30_000 }, async t => {
+  const dir = await fixture(t);
+  const go = join(dir, "spawn");
+  const pidFile = join(dir, "worker-pid");
+  const marker = `test-post-checkpoint-${process.pid}-${Date.now()}`;
+  const idle = "setTimeout(() => {}, 60000)";
+  const root = spawn(process.execPath, ["-e", idle], { detached: true, stdio: "ignore", env: {} });
+  const rootExited = new Promise(resolve => root.once("exit", resolve));
+  const launcher = spawn(process.execPath, ["-e", `
+    const fs = require("node:fs");
+    const timer = setInterval(() => {
+      if (!fs.existsSync(${JSON.stringify(go)})) return;
+      clearInterval(timer);
+      const child = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(idle)}],
+        { detached: true, stdio: "ignore", env: { PATTY_RUN_ID: ${JSON.stringify(marker)} } });
+      fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));
+      child.unref();
+    }, 20);
+  `], { detached: true, stdio: "ignore", env: {} });
+  const launcherExited = new Promise(resolve => launcher.once("exit", resolve));
+  let worker = 0;
+  try {
+    const pid = root.pid!;
+    const proc = await until(async () => (await listProcesses()).find(proc => proc.pid === pid));
+    const owned = newOwned([[pid, proc!.start]], [[pid, null]]);
+    let terminating = false;
+    const left = await stopRun(owned, marker, pid, 0, () => {
+      terminating = true;
+      root.kill("SIGTERM");
+    }, async () => {
+      if (worker || !owned.procs.has(launcher.pid!)) return;
+      // The final scan learned the unmarked held launcher. Its worker is born after the first table, and
+      // won't be reached by ancestry in the last table even if it is visible there.
+      await writeFile(go, "");
+      await Promise.all([rootExited, launcherExited]);
+      worker = Number(await readFile(pidFile, "utf8"));
+    }, undefined, () => new Set(terminating ? [launcher.pid!] : []));
+    assert.deepEqual(left, []);
+    assert.ok(worker && owned.procs.has(worker) && !alive(worker), "a fresh marker scan found and stopped the orphan");
+  } finally {
+    worker ||= Number(await readFile(pidFile, "utf8").catch(() => ""));
+    for (const pid of [root.pid!, launcher.pid!, worker]) if (pid && alive(pid)) process.kill(pid, "SIGKILL");
+  }
+});
+
+test("a stop exhausted by process churn saves even the last observed child", { timeout: 30_000 }, async t => {
+  const dir = await fixture(t);
+  const table = join(dir, "table");
+  await writeFile(join(dir, "ps"), `#!/bin/sh
+    if [ "$*" = '-A -o pid=,ppid=,pgid=,lstart=' ]; then exec /bin/cat ${JSON.stringify(table)}; fi
+  `, { mode: 0o700 });
+  const root = 1_000_000_000; // Synthetic PIDs outside the operating system's PID range.
+  const start = "Thu Jan  1 00:00:00 2026";
+  const rows = (children: number) => writeFile(table, `${root} 1 ${root} ${start}\n` + Array.from({ length: children }, (_, n) =>
+    `${root + n + 1} ${root} ${root} ${start}\n`).join(""));
+  const owned = newOwned([[root, start]], [[root, null], [root - 1, null]]);
+  await rows(0);
+  const path = process.env.PATH;
+  process.env.PATH = `${dir}:${path ?? ""}`;
+  let writes = 0;
+  let checkpoint: number[] = [];
+  try {
+    await assert.rejects(stopRun(owned, "no-such-run", undefined, 0, undefined, async () => {
+      checkpoint = [...owned.procs.keys()];
+      await rows(++writes); // Another child appears during each checkpoint.
+    }), /the process tree kept changing/);
+    assert.ok(writes > 1);
+    assert.deepEqual([...owned.procs.keys()], checkpoint, "a retry may rely on these in-memory identities only if they were saved");
+  } finally {
+    if (path === undefined) delete process.env.PATH;
+    else process.env.PATH = path;
   }
 });
 

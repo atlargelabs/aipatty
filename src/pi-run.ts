@@ -806,7 +806,14 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         release(false);
         return;
       }
-      const before = await listProcesses().catch(() => []);
+      let before: Proc[];
+      try {
+        before = await listProcesses();
+      } catch (error) {
+        release(false);
+        if (!run.stop && !killRequested) return new GroupRecordError(`could not read the process table for launcher ${pid}: ${message(error)}`);
+        return;
+      }
       const leader = live(child) ? before.find(proc => proc.pid === pid && proc.ppid === process.pid && proc.pgid === pid) : undefined;
       if (run.stop || killRequested || !leader) {
         release(false);

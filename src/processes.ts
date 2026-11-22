@@ -268,6 +268,14 @@ function signal(pid: number, name: NodeJS.Signals): void {
   }
 }
 
+const errorText = (cause: unknown) => cause instanceof Error ? cause.message : String(cause);
+
+class ProcessRecordError extends Error {
+  constructor(cause: unknown) {
+    super(`the process record could not be saved: ${errorText(cause)}`, { cause });
+  }
+}
+
 /**
  * Stop a run's processes. `root` gets SIGTERM first, through `term` when the caller still holds the child, and
  * `graceMs` to stop its own children, as Pi and the delegates extension do; whatever is left is killed. Every
@@ -293,26 +301,30 @@ export async function stopRun(
       failedWrite = { error };
     }
   };
-  // Save what changed before signalling, then take a fresh table to recheck identity and catch descendants
-  // started while we were writing. A signal must not orphan an unmarked child this table can still identify.
-  const recordScan = async ({ ours, changed }: ProcessScan) => {
-    const learned = remember(owned, ours);
-    if (!record || (!learned && !changed && !failedWrite)) return ours;
+  // Any checkpoint can outlast its snapshot. Scan again with markers as well as ancestry, even if the prior
+  // scan ended empty: a marked process that detached during the write may have already lost its parent.
+  const checkpointedScan = async (): Promise<ProcessScan> => {
     for (let attempt = 0; attempt < 20; attempt++) {
-      await save();
-      if (failedWrite || !ours.length) return ours;
-      const starts = new Map(ours.map(proc => [proc.pid, proc.start]));
-      const current = await listProcesses();
-      ours = identifiedTree(current, starts);
-      if (!remember(owned, ours)) return ours;
+      let wrote = false;
+      const checkpoint = async () => {
+        wrote = true;
+        await save();
+      };
+      const snapshot = await scan(owned, runId, record && checkpoint, Boolean(failedWrite) || pendingRecord(), liveChildren);
+      const learned = remember(owned, snapshot.ours);
+      if (!record) return snapshot;
+      // Save the new evidence even on the last attempt: a later stop must not mistake it for persisted data.
+      if (learned || snapshot.changed || failedWrite) await checkpoint();
+      if (failedWrite) throw new ProcessRecordError(failedWrite.error);
+      if (!wrote) return snapshot;
     }
     throw new Error("the process tree kept changing while saving its record");
   };
   let stopFailure: { error: unknown } | undefined;
   try {
-    const tree = await recordScan(await scan(owned, runId, save, pendingRecord(), liveChildren));
+    const { ours: tree } = await checkpointedScan();
     const rootStart = root === undefined ? undefined : owned.procs.get(root);
-    if (!failedWrite && root !== undefined && rootStart !== undefined && tree.some(proc => proc.pid === root && proc.start === rootStart)) {
+    if (root !== undefined && rootStart !== undefined && tree.some(proc => proc.pid === root && proc.start === rootStart)) {
       // Through the live child handle when there is one, which cannot reach a process that reused the ID.
       if (term) term();
       else signal(root, "SIGTERM");
@@ -327,11 +339,9 @@ export async function stopRun(
     let left: Proc[] = [];
     let unsure: Proc[] = [];
     for (let attempt = 0; attempt < 20; attempt++) {
-      const scanned = await scan(owned, runId, save, false, liveChildren);
-      ({ ours: left, unsure } = scanned);
-      const targets = await recordScan(scanned);
-      if (failedWrite || !left.length) break;
-      for (const proc of targets) signal(proc.pid, "SIGKILL");
+      ({ ours: left, unsure } = await checkpointedScan());
+      if (!left.length) break;
+      for (const proc of left) signal(proc.pid, "SIGKILL");
       await sleep(150);
     }
     return [...left, ...unsure];
@@ -343,12 +353,11 @@ export async function stopRun(
       await save();
       if (failedWrite) {
         const { error } = failedWrite;
-        const text = (cause: unknown) => cause instanceof Error ? cause.message : String(cause);
-        const reason = `the process record could not be saved: ${text(error)}`;
-        if (stopFailure) {
-          throw new AggregateError([stopFailure.error, error], `${text(stopFailure.error)}; ${reason}`);
+        const recordFailure = new ProcessRecordError(error);
+        if (stopFailure && !(stopFailure.error instanceof ProcessRecordError)) {
+          throw new AggregateError([stopFailure.error, error], `${errorText(stopFailure.error)}; ${recordFailure.message}`);
         }
-        throw new Error(reason, { cause: error });
+        throw recordFailure;
       }
     }
   }
