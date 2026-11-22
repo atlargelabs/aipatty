@@ -11,7 +11,7 @@ import { promisify } from "node:util";
 import type { Config } from "./config.ts";
 import { instructions, taskPrompt } from "./pi-prompt.ts";
 import { addUsage, githubLink, readReport, RunTrace, usageKey, type JobUsage, type Review } from "./pi-trace.ts";
-import { invalidateFutureCutoffs, listProcesses, newOwned, remember, RUN_MARKER, stopRun, trackRunProcesses, type Owned, type Proc } from "./processes.ts";
+import { heldTree, invalidateFutureCutoffs, listProcesses, newOwned, remember, RUN_MARKER, stopRun, trackRunProcesses, type Owned, type Proc } from "./processes.ts";
 
 const exec = promisify(execFile);
 
@@ -499,7 +499,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         return { clean: false, reconciled };
       }
       if (saved.cleanupUncertain) {
-        outcome.problems.push("A child was stopped without verifying its process tree; descendants may remain. Inspect the run before removing its record or workspace.");
+        outcome.problems.push("A child's process tree could not be verified during shutdown; descendants may remain. Inspect the run before removing its record or workspace.");
         outcome.usageComplete = false;
         return { clean: false, reconciled };
       }
@@ -777,6 +777,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     });
     const save = () => write().catch(error => console.error(`Pi run ${saved.runId}: could not save its record:`, error));
     let killRequested = false;
+    let abandonedChildren = false;
+    const abandonment = Promise.withResolvers<null>();
     /** Remember a detached process this host started for the run, before waiting on it. */
     const adopt = async (child: ChildProcess, release: (start: boolean) => void): Promise<GroupRecordError | undefined> => {
       const pid = child.pid;
@@ -799,13 +801,11 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       const start = !run.stop && !killRequested;
       release(start);
       if (!start) return;
-      const own = (await listProcesses().catch(() => [])).find(proc => proc.pid === pid && proc.ppid === process.pid && proc.pgid === pid);
+      const procs = await listProcesses().catch(() => []);
       const scannedAt = Date.now();
       invalidateFutureCutoffs(run.owned, scannedAt);
-      // The process table can contain a replacement for a setup command that exited during the I/O.
-      if (own && child.exitCode === null && child.signalCode === null) {
-        remember(run.owned, [own], seenAt <= scannedAt ? seenAt : undefined);
-      }
+      // Keep descendants already visible in this table. A short setup command may exit before another scan.
+      if (live(child)) remember(run.owned, heldTree(procs, new Set([pid])), seenAt <= scannedAt ? seenAt : undefined);
       await save();
     };
     /** The children this host started directly: their live handles also anchor a stop scan. */
@@ -821,6 +821,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     run.kill = () => {
       killRequested = true;
       stopping = stopping.then(async () => {
+        if (abandonedChildren) return;
         for (let attempt = 0; attempt < 2; attempt++) {
           try {
             await stop(attempt === 0 ? graceMs : 0);
@@ -832,7 +833,21 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         // A child handle can stop the child, but its exit could erase the only path to an unmarked descendant.
         // Once discovery has failed twice, keep this uncertainty even if a later scan finds nothing.
         saved.cleanupUncertain = true;
-        await save();
+        try {
+          await write();
+        } catch (error) {
+          // Do not sever the ancestry without a durable blocker, or wait forever for the child to exit.
+          console.error(`Pi run ${saved.runId}: could not save the cleanup blocker:`, error);
+          for (const child of held) {
+            child.unref();
+            for (const stream of child.stdio) {
+              if (stream && "unref" in stream && typeof stream.unref === "function") stream.unref();
+            }
+          }
+          abandonedChildren = true;
+          abandonment.resolve(null);
+          return;
+        }
         for (const child of held) if (live(child)) child.kill("SIGKILL");
       });
     };
@@ -873,8 +888,9 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       const adoptionError = await adopt(child, release);
       // Stopped while it was being recorded: the stop may have missed it.
       if (run.stop && !adoptionError) run.kill();
-      const exitCode = await exit;
+      const exitCode = await Promise.race([exit, abandonment.promise]);
       if (adoptionError) throw adoptionError;
+      if (abandonedChildren) throw new Error("a child could not be safely stopped");
       if (failure) throw failure;
       if (exitCode !== 0) throw new Error(tail(err, 6) || `${file} exited with ${exitCode ?? "a signal"}`);
       return out;
@@ -988,9 +1004,16 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
               if (changed || recordDirty) await save();
             }).finally(() => { polling = undefined; });
         }, pollMs);
-        code = await exited;
+        code = await Promise.race([exited, abandonment.promise]);
         clearInterval(poll);
         await polling;
+        if (abandonedChildren) {
+          // Drain the pipes without logging once the run has settled.
+          stdout.removeAllListeners("data");
+          childStderr.removeAllListeners("data");
+          stdout.resume();
+          childStderr.resume();
+        }
         split.end();
         const flushed = (stream: WriteStream) => new Promise<void>(done => {
           if (stream.destroyed) done();

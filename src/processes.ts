@@ -136,6 +136,11 @@ function reachable(procs: readonly Proc[], skipGroups: ReadonlySet<number>, root
   return ours;
 }
 
+/** The processes reached from still-held children in a snapshot read immediately before this call. */
+export function heldTree(procs: readonly Proc[], held: ReadonlySet<number>): Proc[] {
+  return [...reachable(procs, excludedGroups(procs), proc => heldRoot(proc, held)).values()];
+}
+
 async function processSnapshot(
   owned: Owned, runId: string, record?: () => Promise<unknown>, liveChildren?: () => ReadonlySet<number>,
 ) {
@@ -282,15 +287,20 @@ export async function stopRun(
       failedWrite = { error };
     }
   };
-  // Save what changed before signalling: a new group could otherwise be lost on a crash, and a discarded
-  // cutoff must not become usable again on restart. Recheck the targets' identities after a write attempt.
+  // Save what changed before signalling, then take a fresh table to recheck identity and catch descendants
+  // started while we were writing. A signal must not orphan an unmarked child this table can still identify.
   const recordScan = async ({ ours, changed }: ProcessScan) => {
     const learned = remember(owned, ours);
     if (!record || (!learned && !changed)) return ours;
-    await save();
-    if (!ours.length) return ours;
-    const starts = new Map((await listProcesses()).map(proc => [proc.pid, proc.start]));
-    return ours.filter(proc => starts.get(proc.pid) === proc.start);
+    for (let attempt = 0; attempt < 20; attempt++) {
+      await save();
+      if (!ours.length) return ours;
+      const starts = new Map(ours.map(proc => [proc.pid, proc.start]));
+      const current = await listProcesses();
+      ours = [...reachable(current, excludedGroups(current), proc => starts.get(proc.pid) === proc.start).values()];
+      if (!remember(owned, ours)) return ours;
+    }
+    throw new Error("the process tree kept changing while saving its record");
   };
   let stopFailure: { error: unknown } | undefined;
   try {

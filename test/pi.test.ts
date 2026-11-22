@@ -641,7 +641,7 @@ test("a failed group checkpoint prevents the setup command from starting and ret
   }
 });
 
-for (const failStop of [false, true]) test(`an unmarked setup tree ${failStop ? "blocks cleanup when stop scans fail" : "is stopped even when adoption could not read ps"}`, { timeout: 30_000 }, async t => {
+for (const mode of ["observed", "adoption", "stop", "checkpoint"] as const) test(`an unmarked setup tree ${mode === "observed" ? "is recorded during adoption" : `is handled safely on ${mode} failure`}`, { timeout: 30_000 }, async t => {
   const config = await setup(t);
   const task = join(config.dataDir, "setup-task.cjs");
   const pidsFile = join(config.dataDir, "setup-pids.json");
@@ -654,15 +654,24 @@ for (const failStop of [false, true]) test(`an unmarked setup tree ${failStop ? 
   config.pi.git = join(config.dataDir, "fake-git");
   await writeFile(config.pi.git, `#!/bin/sh\nunset PATTY_RUN_ID\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(task)}\n`, { mode: 0o700 });
 
-  // Fail adoption and, in the second case, both discovery attempts before the child-handle fallback.
+  // Fail adoption, possibly stop discovery as well, and in the last case the fallback checkpoint.
   const ps = join(config.dataDir, "ps");
   const budget = JSON.stringify(join(config.dataDir, "ps-failure-budget"));
   await writeFile(ps, `#!/bin/sh
-    remaining=${failStop ? 3 : 1}
+    ${mode === "checkpoint" ? "exit 1" : ""}
+    ${mode === "observed" ? `while [ ! -s ${JSON.stringify(pidsFile)} ]; do sleep 0.02; done` : ""}
+    remaining=${mode === "observed" ? 0 : mode === "stop" ? 3 : 1}
     if [ -f ${budget} ]; then read -r remaining < ${budget}; fi
     if [ "$remaining" -gt 0 ]; then echo "$((remaining - 1))" > ${budget}; exit 1; fi
     exec /bin/ps "$@"
   `, { mode: 0o700 });
+  const stateFile = join(config.dataDir, "pi-run.json");
+  const rename = fs.rename;
+  const renameMock = mode === "checkpoint" ? t.mock.method(fs, "rename", async (from: Parameters<typeof rename>[0], to: Parameters<typeof rename>[1]) => {
+    if (to === stateFile && JSON.parse(await readFile(from, "utf8")).cleanupUncertain) throw new Error("test blocker write failure");
+    await rename(from, to);
+  }) : undefined;
+  if (renameMock) syncBuiltinESMExports();
   t.mock.method(console, "error", () => {});
   const path = process.env.PATH;
   process.env.PATH = `${config.dataDir}:${path ?? ""}`;
@@ -674,27 +683,43 @@ for (const failStop of [false, true]) test(`an unmarked setup tree ${failStop ? 
     running = runs.run(request({ pr: false, timeoutMs: 10_000 }), controller.signal);
     const text = await until(() => readFile(pidsFile, "utf8").catch(() => ""));
     pids = JSON.parse(text);
-    const stateFile = join(config.dataDir, "pi-run.json");
-    assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).procs, [], "adoption recorded no exact identities");
-    controller.abort();
+    if (mode === "observed") {
+      await until(async () => JSON.parse(await readFile(stateFile, "utf8")).procs.some(([pid]: [number, string]) => pid === pids[1]));
+      process.kill(pids[0], "SIGTERM"); // From here cleanup can no longer establish the child's ancestry.
+    } else {
+      assert.deepEqual(JSON.parse(await readFile(stateFile, "utf8")).procs, [], "adoption recorded no exact identities");
+      controller.abort();
+    }
     const outcome = await running;
-    assert.equal(outcome.status, "aborted");
-    if (failStop) {
+    assert.equal(outcome.status, mode === "observed" ? "failed" : "aborted");
+    if (mode === "checkpoint") {
+      assert.ok(pids.every(alive), "do not sever the parent link without a durable cleanup blocker");
+      assert.match(outcome.problems.join("\n"), /test blocker write failure/);
+      await assert.rejects(runs.run(request({ pr: false })), /No new run starts/);
+      const saved = JSON.parse(await readFile(stateFile, "utf8"));
+      assert.equal(saved.cleanupUncertain, undefined);
+      assert.ok(existsSync(saved.workspace));
+    } else if (mode === "stop") {
       assert.ok(!alive(pids[0]) && alive(pids[1]), "only the held leader can be stopped without discovering its tree");
-      assert.match(outcome.problems.join("\n"), /stopped without verifying its process tree/);
+      assert.match(outcome.problems.join("\n"), /process tree could not be verified/);
       const saved = JSON.parse(await readFile(stateFile, "utf8"));
       assert.equal(saved.cleanupUncertain, true);
       const recovered = await openPiRuns(config);
-      await assert.rejects(recovered.run(request({ pr: false })), /stopped without verifying its process tree/);
+      await assert.rejects(recovered.run(request({ pr: false })), /process tree could not be verified/);
       assert.ok(existsSync(saved.workspace) && existsSync(stateFile), "recovery cannot infer cleanup from an empty scan");
     } else {
-      assert.deepEqual(outcome.problems, []);
+      if (mode === "observed") assert.match(outcome.problems.join("\n"), /Could not clone/);
+      else assert.deepEqual(outcome.problems, []);
       assert.ok(pids.every(pid => !alive(pid)), "the held leader and its unmarked child in a separate group stopped");
       assert.ok(!existsSync(stateFile));
     }
   } finally {
     controller.abort();
     await running?.catch(() => {});
+    if (renameMock) {
+      renameMock.mock.restore();
+      syncBuiltinESMExports();
+    }
     if (path === undefined) delete process.env.PATH;
     else process.env.PATH = path;
     for (const pid of pids) if (alive(pid)) process.kill(pid, "SIGKILL");
@@ -1045,6 +1070,42 @@ test("nothing is launched without a saved record, and a record that cannot be re
   assert.match(outcome.problems.join("\n"), /The run's record could not be closed/);
   assert.deepEqual(await runs.settled(101), outcome);
   await assert.rejects(runs.run(request({ pr: false })), /could not be cleaned up[^]*No new run starts until that is resolved/);
+});
+
+test("a stop checkpoints a detached child that appears during the identity-record write", { timeout: 30_000 }, async t => {
+  const dir = await fixture(t);
+  const go = join(dir, "spawn");
+  const pidFile = join(dir, "worker-pid");
+  const parent = spawn(process.execPath, ["-e", `
+    const fs = require("node:fs");
+    const timer = setInterval(() => {
+      if (!fs.existsSync(${JSON.stringify(go)})) return;
+      clearInterval(timer);
+      const child = require("node:child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"],
+        { detached: true, stdio: "ignore", env: {} });
+      fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));
+    }, 20);
+  `], { detached: true, stdio: "ignore", env: {} });
+  const pid = parent.pid!;
+  let worker = 0;
+  try {
+    const proc = await until(async () => (await listProcesses()).find(proc => proc.pid === pid));
+    const owned = newOwned([[pid, proc!.start]], [[pid, null], [Number.MAX_SAFE_INTEGER, null]]);
+    let checkpointed = false;
+    const left = await stopRun(owned, "no-such-run", pid, 1_000, () => parent.kill("SIGTERM"), async () => {
+      if (!worker) {
+        // Forgetting the nonexistent group triggered this save after the scan had already read its tables.
+        await writeFile(go, "");
+        worker = await until(async () => Number(await readFile(pidFile, "utf8").catch(() => "")));
+      }
+      if (owned.procs.has(worker) && alive(pid)) checkpointed = true;
+    });
+    assert.deepEqual(left, []);
+    assert.ok(checkpointed && !alive(worker), "the recheck discovered the worker and saved it before stopping its parent");
+  } finally {
+    if (alive(pid)) parent.kill("SIGKILL");
+    if (worker && alive(worker)) process.kill(worker, "SIGKILL");
+  }
 });
 
 test("a process scan cannot prune groups added or changed while it was in flight", async () => {
