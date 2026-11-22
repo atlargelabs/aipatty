@@ -7,8 +7,7 @@ supervisor is future work (step 4). No installer, migration, or automatic deleti
 The default recommended service root is `~/aipatty` in the home of the account that will run aipatty. Set
 `ROOT="$HOME/aipatty"` in each shell that runs these commands, so the path is absolute and quoted. Another
 writable absolute path is fine; use the same root consistently. This is an install recommendation, not a change
-to the server's no-flag defaults. The root must be private and writable by the service user; it is not a security
-boundary against that user.
+to the server's no-flag defaults. Use a dedicated directory, not the home directory itself.
 
 ## Prerequisites and separate provisioning
 
@@ -23,27 +22,12 @@ boundary against that user.
 
 ## Once, as `aipatty`
 
-All app installation and runtime commands below run as the service account, not as an administrator. Create the
-dedicated root under that account's own home with owner-only POSIX permissions, then verify privacy below;
-the subshell scopes the restrictive umask to `mkdir`:
+Run the commands below as the service account. Set the install root; the first release step creates it along
+with the `deploy/` and `pi/` directories.
 
 ```sh
 ROOT="$HOME/aipatty"
-(umask 077 && mkdir -p "$ROOT")
-chmod 700 "$ROOT"
 ```
-
-For a reused dedicated root, confirm this account owns it before running `chmod`. On macOS, after creation and
-setting owner-only POSIX mode, inspect ownership, permissions, and ACLs before using the root for any state:
-
-```sh
-ls -lde "$ROOT"
-```
-
-Verify the root is owned by this account and private, especially for reused roots or inherited ACLs: `chmod 700`
-does not clear ACLs. If it has unexpected ACL grants, choose a fresh, verified private root that this account can
-create, own, and write without elevated privileges; do not automatically remove ACLs. Do not use the home
-directory itself or a shared directory as the root.
 
 1. **GitHub.** Give the `pattycaik` account an SSH key and sign `gh` in as it:
 

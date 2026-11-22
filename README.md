@@ -133,13 +133,10 @@ paths containing spaces. Blank paths are rejected. The root option is server-onl
 variable, CLI client option, or API setting. Pi executables and the delegates extension still come from the pinned
 release, not the state root.
 
-For a service install, the default recommended root is `~/aipatty` in the service account's own home, not a new
-runtime default. As that account, set `ROOT="$HOME/aipatty"`, create it with `(umask 077 && mkdir -p "$ROOT")`,
-and run `chmod 700 "$ROOT"` for owner-only POSIX mode (confirm ownership first for a reused root). The root must
-be private: `chmod` does not clear macOS ACLs, so verify them before using it for state as described in
-[INSTALL.md](docs/INSTALL.md). Another writable absolute path is fine. The manual app install needs no `sudo` or
-macOS administrator account: an existing standard service account and user-accessible Node 26 or newer, Git,
-and `gh` are prerequisites. Optional machine
+For a service install, the recommended root is `~/aipatty` in the service account's own home, not a new
+runtime default. Set `ROOT="$HOME/aipatty"` or choose another writable absolute path. The first release step
+creates the root if needed. The manual app install needs no `sudo` or macOS administrator account: an existing
+standard service account and user-accessible Node 26 or newer, Git, and `gh` are prerequisites. Optional machine
 provisioning and GitHub maintainer setup are separate; retain the `pattycaik` service identity and `protect-main`
 branch protection described in the runbook.
 

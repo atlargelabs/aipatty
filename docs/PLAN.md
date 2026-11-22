@@ -29,12 +29,10 @@ until then releases are deployed and rolled back manually.
 - **Stack:** TypeScript on Node 26. The Pi packages (`pi-durable`, `pi-ai`, `pi-codemode`, `chord`, `pi-schema`, and
   the `pi-coding-agent` CLI) are pinned at exactly 1.6.0 from npm, all at the same version so the host and the CLI share
   one `pi-ai`. Later bumps are normal reviewed PRs.
-- **Service installation layout:** the service account must use its own private root; the recommended default is
-  `~/aipatty` in its own home: set `ROOT="$HOME/aipatty"`, run `(umask 077 && mkdir -p "$ROOT")`, then
-  `chmod 700 "$ROOT"` (confirm ownership first for a reused root). This sets POSIX mode but does not clear macOS
-  ACLs; verify privacy before using the root for state as described in [INSTALL.md](INSTALL.md). Another writable
-  absolute path is fine; no administrator provisions the root. Manual committed-main releases live at
-  `$ROOT/deploy/<sha>`, with dependencies installed per release and `$ROOT/deploy/current` pointing at the active one. Keep the
+- **Service installation layout:** the recommended root is `~/aipatty` in the service account's own home
+  (`ROOT="$HOME/aipatty"`). Another writable absolute path is fine. The first release step creates the root
+  if needed without administrator access. Manual committed-main releases live at `$ROOT/deploy/<sha>`, with
+  dependencies installed per release and `$ROOT/deploy/current` pointing at the active one. Keep the
   last-known-good release for rollback.
   - `$ROOT/work/`: working directory of aipatty's own tools, for inspection and scratch, not PR work.
   - `$ROOT/runs/`: disposable workspaces for [`pi` runs](#pi-runs).
@@ -236,7 +234,7 @@ at boot without a login. It is not replaced by the normal aipatty upgrade.
 ## Setup responsibilities
 
 - **Manual app install, as the service account:** assume an existing standard `aipatty` account with a writable
-  home and user-accessible Node 26 or newer, Git, and `gh`. Follow [INSTALL.md](INSTALL.md) to create its private
+  home and user-accessible Node 26 or newer, Git, and `gh`. Follow [INSTALL.md](INSTALL.md) to set up its
   `~/aipatty` root, install releases, set up the model sign-in with the release's Pi CLI, configure `pattycaik`'s
   SSH key and `gh` login, and write the [`delegates` settings](#pi-extensions) into its Pi agent directory. None
   of this needs `sudo` or a macOS administrator account. No global Pi install or copy of Steve's dotfiles is needed.
