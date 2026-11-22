@@ -165,7 +165,7 @@ export async function stageRelease(options: {
     // Always run commands in the private checkout, even in bootstrap. Checks never write the staged helper tree.
     for (const [args, ms] of [[ ["ci", "--ignore-scripts"], installMs ], [ ["run", "check"], checkMs ], [ ["test"], installMs ]] as const) {
       note(`Running npm ${args.join(" ")}`);
-      await command("npm", [...args], { cwd: staging, ms, log, signal });
+      await command("npm", [...args], { cwd: staging, env: gitEnv(), ms, log, signal });
     }
     await assertIdle(); // No check descendants may write after the final integrity and durability pass.
     await verifyRelease(staging, sha, signal);

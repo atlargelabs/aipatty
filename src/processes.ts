@@ -62,10 +62,19 @@ async function markedPids(runId: string, procs: readonly Proc[], variable: strin
   const needle = `${variable}=${runId}`;
   const marked = new Set<number>();
   if (process.platform === "linux") {
-    await Promise.all(procs.map(async proc => {
-      const environ = await readFile(`/proc/${proc.pid}/environ`, "utf8").catch(() => "");
-      if (environ.split("\0").includes(needle)) marked.add(proc.pid);
-    }));
+    // Bound descriptors and never interpret a resource/I/O failure as proof of no marker.
+    for (let offset = 0; offset < procs.length; offset += 16) {
+      await Promise.all(procs.slice(offset, offset + 16).map(async proc => {
+        try {
+          if ((await readFile(`/proc/${proc.pid}/environ`, "utf8")).split("\0").includes(needle)) marked.add(proc.pid);
+        } catch (error) {
+          // Gone since ps, or an environment the OS does not disclose (e.g. another user).
+          if (!["ENOENT", "ESRCH", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+            throw new Error(`Could not inspect process ${proc.pid}'s environment`, { cause: error });
+          }
+        }
+      }));
+    }
     return marked;
   }
   // `ps -E` prints the arguments and then the environment. Only the environment counts: a process that merely

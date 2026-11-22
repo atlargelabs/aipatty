@@ -2,7 +2,7 @@ import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
 import { defineDoc, defineDocFamily, type Conversation } from "@earendil-works/pi-durable";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, watch, type FSWatcher } from "node:fs";
+import { closeSync, watch, writeSync, type FSWatcher } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { Config } from "./config.ts";
@@ -185,7 +185,15 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
             return;
           }
           try { await report(agent, paths, j); }
-          catch (error) { console.error(`Could not deliver upgrade ${id}:`, error); }
+          catch (error) {
+            const message = `Could not deliver upgrade ${id}: ${errorText(error)}. The journal still has the result; restart the selected app to retry delivery, not deployment.`;
+            console.error(message);
+            try {
+              const log = openUpgradeLog(paths, id);
+              try { writeSync(log, `${new Date().toISOString()} ${message}\n`); }
+              finally { closeSync(log); }
+            } catch (logError) { console.error(`Could not log delivery failure for ${id}:`, logError); }
+          }
           break;
         } catch (error) {
           if (error instanceof OwnerBusy && Date.now() < deadline) { await sleep(100); continue; }

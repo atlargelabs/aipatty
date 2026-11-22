@@ -923,7 +923,9 @@ test("a remembered leaderless group needs a live member with independent ownersh
   // Model a reused group: the leader exits, leaving two unmarked members in its group.
   const leader = start(["-e", `
     const { spawn } = require("node:child_process");
-    console.log(JSON.stringify([1, 2].map(() => spawn(process.execPath, ["-e", ${JSON.stringify(idle)}], { stdio: "ignore", env: {} }).pid)));
+    // These children must lack this fixture's Pi run marker, not an enclosing stage or Pi run's identity.
+    const env = { ...process.env };
+    console.log(JSON.stringify([1, 2].map(() => spawn(process.execPath, ["-e", ${JSON.stringify(idle)}], { stdio: "ignore", env }).pid)));
     ${idle}`], {}, true);
   const orphans = JSON.parse(await new Promise<string>(resolve => leader.stdout!.once("data", chunk => resolve(String(chunk))))) as number[];
   started.push(...orphans);

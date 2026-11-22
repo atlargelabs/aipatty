@@ -338,7 +338,12 @@ async function main(): Promise<void> {
   if (mode === "stage") return runStage(paths, config, values.id!, scriptRelease);
   const j = await run(paths, { mode, id: values.id, port: config.port, faux: config.faux, scriptRelease });
   const ok = mode === "recover" || j.result?.kind === "upgraded" || j.result?.kind === "noop";
-  if (mode !== "handoff") (ok ? console.log : console.error)(`${resultText(j)}\nLog: ${paths.log(j.id)}`);
+  if (mode !== "handoff") {
+    (ok ? console.log : console.error)(`${resultText(j)}\nLog: ${paths.log(j.id)}`);
+    if (mode === "recover" && j.branch !== undefined && !j.reported) {
+      console.log(`Result for branch ${j.branch} is still marked pending. If it does not appear, restart the selected app to retry delivery without deploying.`);
+    }
+  }
   if (!ok) process.exitCode = 1;
 }
 

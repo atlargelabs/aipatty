@@ -11,6 +11,7 @@ import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
 import type { ConversationPage } from "../src/protocol.ts";
 import { ownDataDir } from "../src/ownership.ts";
+import { RUN_MARKER } from "../src/processes.ts";
 import { backupDb, restoreDb } from "../src/upgrade-db.ts";
 import { upgradeEntryKind, UpgradePaths } from "../src/upgrade-state.ts";
 import { identify, reapStage, stageEnvironment, type UpgradeHealth } from "../src/upgrade-process.ts";
@@ -86,6 +87,9 @@ const { spawn } = require("node:child_process");
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const root = process.env.UPGRADE_FIXTURE;
 const args = process.argv.slice(2).join(" ");
+if (process.env.GIT_INDEX_FILE || process.env.GIT_DIR || process.env.GIT_WORK_TREE) {
+  throw new Error("A staged npm command inherited the host's Git paths");
+}
 writeFileSync(join(root, "npm.pid"), String(process.pid));
 appendFileSync(join(root, "npm.log"), args + "\\n");
 (async () => {
@@ -177,6 +181,7 @@ async function fixture(t: TestContext, legacy = false) {
   }
   const env = {
     ...stageEnvironment(),
+    ...(process.env[RUN_MARKER] ? { [RUN_MARKER]: process.env[RUN_MARKER] } : {}),
     PATH: `${bin}:${process.env.PATH}`, HOME: scratch, AIPATTY_FAUX: "1", UPGRADE_FIXTURE: scratch,
     UPGRADE_FIXTURE_CHECKOUT: checkout, UPGRADE_FIXTURE_DEPS: deps, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", LC_ALL: "C",
   };
@@ -215,6 +220,14 @@ ${probeStart}`));
   await writeFile(supervisorPath, supervisorCode
     .replace("realpathSync, writeSync", "realpathSync, writeSync, writeFileSync")
     .replace(prepareStart, `  writeFileSync(join(process.env.UPGRADE_FIXTURE!, "coordinator.pid"), String(process.pid));\n${prepareStart}`));
+  const upgradeHostPath = join(repo, "src/upgrade-host.ts");
+  const upgradeHostCode = await readFile(upgradeHostPath, "utf8");
+  const reportStart = "  if (j.phase !== \"done\" || j.branch === undefined || j.reported) return;";
+  assert.ok(upgradeHostCode.includes(reportStart));
+  await writeFile(upgradeHostPath, upgradeHostCode.replace(reportStart, `${reportStart}
+  const { existsSync } = await import("node:fs");
+  if (existsSync(join(process.env.UPGRADE_FIXTURE!, "fail-report"))) throw new Error("fixture transcript write failed");
+`));
   const mainPath = join(repo, "src/main.ts");
   const modernMain = await readFile(mainPath, "utf8");
   if (legacy) await writeFile(mainPath, legacyMain);
@@ -245,7 +258,7 @@ ${probeStart}`));
   function launch(sha = old, ...extra: string[]) {
     const entry = hostFile(legacy && sha === old ? paths.current : paths.release(sha));
     const child = spawn(process.execPath, [entry, ...flags, ...extra], {
-      cwd: paths.release(sha), env, stdio: ["ignore", "pipe", "pipe"],
+      cwd: paths.release(sha), env: { ...env, GIT_INDEX_FILE: join(scratch, "host-index") }, stdio: ["ignore", "pipe", "pipe"],
     });
     children.add(child);
     let output = "";
@@ -553,6 +566,29 @@ test("unproven stage cleanup keeps admission closed until explicit recovery deli
   assert.equal((await f.result(j.id)).length, 1);
   assert.equal((await f.healthNow())?.pid, old.child.pid);
   assert.equal((await f.cli("send", "after verified cleanup")).stdout.trim(), "Faux reply: after verified cleanup");
+});
+
+test("a delivery error is discoverable with recover and restart retries the same result without staging", { timeout }, async t => {
+  const f = await fixture(t);
+  const old = f.launch();
+  await f.health(f.old);
+  await f.flag("fail-report");
+  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
+  const journal = await until(() => f.paths.load(), j => j?.phase === "done");
+  await until(() => old.output().includes("fixture transcript write failed"));
+  assert.equal(journal?.result?.kind, "noop");
+  assert.equal(journal?.reported, undefined);
+  assert.match((await f.supervisor(f.old, "recover")).stdout, /still marked pending/);
+  assert.match(await f.log(journal!.id), /restart the selected app to retry delivery/);
+  assert.equal((await f.entries()).filter(entry => entry.kind === upgradeEntryKind).length, 1);
+  await f.cli("shutdown");
+  assert.equal(await old.exited, 0, old.output());
+  await f.unflag("fail-report");
+  f.launch();
+  await f.health(f.old);
+  assert.equal((await f.result(journal!.id)).length, 1);
+  assert.equal(f.paths.load()?.reported, true);
+  assert.equal(f.paths.selected(), f.old);
 });
 
 test("losing the requesting host during staging closes the worker and allows an ordinary restart", { timeout }, async t => {

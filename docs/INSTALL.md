@@ -292,8 +292,10 @@ node "$ROOT/deploy/current/src/cli.ts" --port "$PORT" health
   the recorded result; that is not a live health probe. If the app is stopped (e.g. reboot or a lost activation
   after commit), first run `recover` as the guard, then use the [normal start command](#start) on `current`
   with the original root, port, and faux setting. **Even if `current` is legacy, do this guard check first.**
-  Verify `health` and the transcript once the app is back. Do not restore a pre-upgrade backup over a release
-  that may already have accepted work after commit.
+  Verify `health` and the transcript once the app is back. If the branch result is still missing and `recover`
+  reports it pending, check the log, fix any reported error, then gracefully stop and restart the selected app
+  to retry delivery without deploying. Do not send `/upgrade` just to retry a result. Do not restore a
+  pre-upgrade backup over a release that may already have accepted work after commit.
 
 If rollback or recovery itself fails, leave the helper stopped and retain the journal, backup, all SQLite
 sidecars, and releases. Keep respawn disabled. Over SSH or remote desktop, diagnose the named error (e.g. free
