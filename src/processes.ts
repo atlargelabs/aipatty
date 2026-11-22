@@ -16,20 +16,14 @@ export interface Proc {
 /** The environment variable that marks every process a run starts, as far as the processes pass it on. */
 export const RUN_MARKER = "PATTY_RUN_ID";
 
-/**
- * What a run remembers of its processes: each one's ID and start time, the process groups its processes were in,
- * and when it last saw them (`asOf`, in milliseconds). A group outlives its leader while any member lives. Once it
- * is empty its ID can name a new group, so a leaderless group's members count as the run's only if they had
- * started by `asOf`.
- */
+/** A run's remembered process IDs with start times, and group IDs. Group IDs alone are not proof of ownership. */
 export interface Owned {
   procs: Map<number, string>;
   groups: Set<number>;
-  asOf: number;
 }
 
-export function newOwned(procs: Iterable<[number, string]> = [], groups: Iterable<number> = [], asOf = 0): Owned {
-  return { procs: new Map(procs), groups: new Set(groups), asOf };
+export function newOwned(procs: Iterable<[number, string]> = [], groups: Iterable<number> = []): Owned {
+  return { procs: new Map(procs), groups: new Set(groups) };
 }
 
 async function ps(args: string[]): Promise<string> {
@@ -91,14 +85,11 @@ async function markedPids(runId: string, procs: readonly Proc[]): Promise<Set<nu
 
 /**
  * The live processes that belong to a run: those it remembers (same ID and start time), those carrying its marker,
- * the members of the groups its processes led, and everything reached from them as a child or as a member of the
- * same group. Pi and the delegates extension start their children as group leaders, so an orphan whose parent, or
- * whose group leader, died is still found. A process that left both its parent and its group, and hides its
- * environment, is not found.
+ * and everything reached from them as a child or as a member of the same group. A process that left both its
+ * parent and its group, and hides its environment, is not found unless it was remembered.
  *
- * `unsure` are members of a remembered, leaderless group that started after the run last saw it: a late child of
- * the run's, or a stranger in a group whose ID was reused. They are not the run's to kill, and not proof that the
- * run is gone either.
+ * `unsure` are members of remembered, leaderless groups that were not identified by this evidence. They may
+ * be the run's or belong to a new group that reused the ID. They are not signalled and keep cleanup pending.
  *
  * Forgets remembered groups that have no member left. The result is from a process table read last, after the
  * slower environment scan: act on it at once.
@@ -116,17 +107,12 @@ async function scan(owned: Owned, runId: string): Promise<{ ours: Proc[]; unsure
   const candidate = (proc: Proc) => proc.pid !== process.pid && proc.pid > 1;
   // Marked, and still the process that was scanned.
   const isMarked = (proc: Proc) => marked.has(proc.pid) && before.get(proc.pid) === proc.start;
-  // A member of a remembered group whose leader is gone. With a live leader the group is the run's only through
-  // that leader, which is then remembered itself.
+  // A remembered, leaderless group can flag ambiguity, but cannot seed ownership.
   const leaderless = (proc: Proc) => owned.groups.has(proc.pgid) && !skipGroups.has(proc.pgid) && !byPid.has(proc.pgid);
-  const startedBy = (proc: Proc) => {
-    const started = Date.parse(proc.start);
-    return Number.isFinite(started) && started <= owned.asOf;
-  };
   const ours = new Map<number, Proc>();
   for (const proc of procs) {
     if (!candidate(proc)) continue;
-    if (owned.procs.get(proc.pid) === proc.start || isMarked(proc) || (leaderless(proc) && startedBy(proc))) ours.set(proc.pid, proc);
+    if (owned.procs.get(proc.pid) === proc.start || isMarked(proc)) ours.set(proc.pid, proc);
   }
   for (let grew = true; grew;) {
     grew = false;
@@ -147,20 +133,14 @@ export async function runProcesses(owned: Owned, runId: string): Promise<Proc[]>
   return (await scan(owned, runId)).ours;
 }
 
-/**
- * Add a run's processes, and the groups they are in, to what it remembers. `seenAt` is when they were seen while the
- * run was being watched; a recovery, which may come long after, leaves `asOf` alone. Returns whether a process or
- * group was new.
- */
-export function remember(owned: Owned, procs: readonly Proc[], seenAt?: number): boolean {
+/** Remember a run's processes and their groups. Returns whether a process or group was new. */
+export function remember(owned: Owned, procs: readonly Proc[]): boolean {
   const before = owned.procs.size + owned.groups.size;
   for (const proc of procs) {
     owned.procs.set(proc.pid, proc.start);
-    // The group of a process of the run is the run's, whether or not its leader was ever seen: the run's
-    // processes are started in groups of their own, apart from this process's.
+    // Remember the group even if we never saw its leader. The host's own group is not the run's.
     if (proc.pgid > 1 && proc.pgid !== hostGroup) owned.groups.add(proc.pgid);
   }
-  if (seenAt !== undefined) owned.asOf = Math.max(owned.asOf, seenAt);
   return owned.procs.size + owned.groups.size !== before;
 }
 

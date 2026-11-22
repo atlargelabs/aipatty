@@ -78,9 +78,13 @@ extension: at `git/github.com/earendil-works/pi-review/review.ts` in the Pi dire
 `pi install git:github.com/earendil-works/pi-review` puts it), or wherever `delegates.reviewExtension` in the Pi
 directory's `settings.json` says. A run that must end with a PR is refused when the extension is missing.
 
-A run's processes are found by parent, by the process groups its processes led, and by a marker in their
-environment. A process that leaves both its parent and its group, and hides its environment, is not found. No
-process is signalled unless a process table read just before shows it, by ID and start time, to be the run's.
+A run's processes are identified by a remembered PID and start time or by a marker in their environment.
+Discovery also follows their children and other members of their live process groups. A remembered group ID
+alone can be reused: if the leader is gone and no member can be independently identified, the remaining
+members are not signalled and cleanup stays pending. Inspect the reported PIDs and restart once the ambiguity
+is resolved. Existing `pi-run.json` records are still readable; the legacy `asOf` timestamp is ignored for
+ownership. A process that leaves both its parent and its group and hides its environment is not found unless
+its identity was remembered.
 
 ## Page
 

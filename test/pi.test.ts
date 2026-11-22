@@ -501,7 +501,9 @@ test("after a crash, the next start stops the surviving processes, cleans up, an
   t.after(() => { host.kill("SIGKILL"); });
   await until(async () => (await spawned(config)).length === 1, Boolean, 20_000);
   // Long enough for the host to have recorded the detached child.
-  await until(async () => JSON.parse(await readFile(join(config.dataDir, "pi-run.json"), "utf8")).procs.length >= 2);
+  const checkpoint = await until(async () => JSON.parse(await readFile(join(config.dataDir, "pi-run.json"), "utf8")),
+    saved => saved.procs.length >= 2);
+  assert.equal(checkpoint.asOf, 0, "new records keep the legacy numeric field without an ownership cutoff");
   host.kill("SIGKILL");
   await exited;
   const [pi] = await launches(config);
@@ -802,7 +804,7 @@ test("nothing is launched without a saved record, and a record that cannot be re
   await assert.rejects(runs.run(request({ pr: false })), /could not be cleaned up[^]*No new run starts until that is resolved/);
 });
 
-test("a run's processes are found by environment marker and by the groups they led, not by their arguments", { timeout: 30_000 }, async t => {
+test("a remembered leaderless group needs a live member with independent ownership evidence", { timeout: 30_000 }, async t => {
   const marker = `test-${process.pid}-${Date.now()}`;
   const idle = "setTimeout(() => {}, 600000)";
   const started: number[] = [];
@@ -812,41 +814,52 @@ test("a run's processes are found by environment marker and by the groups they l
     started.push(child.pid!);
     return child;
   };
-  const marked = start(["-e", idle], { PATTY_RUN_ID: marker });
-  // The marker among the arguments, as a search for it would have.
+  // An owned process in a different group, and a bystander with the marker only in its arguments.
+  const marked = start(["-e", idle], { PATTY_RUN_ID: marker }, true);
   const bystander = start(["-e", idle, `PATTY_RUN_ID=${marker}`]);
-  // A detached leader, as a delegate is, whose child stays in its group after the leader is gone.
+  // Model a reused group: the leader exits, leaving two unmarked members in its group.
   const leader = start(["-e", `
-    const child = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(idle)}], { stdio: "ignore", env: {} });
-    console.log(child.pid);
+    const { spawn } = require("node:child_process");
+    console.log(JSON.stringify([1, 2].map(() => spawn(process.execPath, ["-e", ${JSON.stringify(idle)}], { stdio: "ignore", env: {} }).pid)));
     ${idle}`], {}, true);
-  const orphan = Number(await new Promise<string>(resolve => leader.stdout!.once("data", chunk => resolve(String(chunk)))));
-  started.push(orphan);
+  const orphans = JSON.parse(await new Promise<string>(resolve => leader.stdout!.once("data", chunk => resolve(String(chunk))))) as number[];
+  started.push(...orphans);
 
-  const owned = newOwned();
   const table = await until(async () => {
     const procs = await listProcesses();
-    return [marked.pid, bystander.pid, leader.pid, orphan].every(pid => procs.some(proc => proc.pid === pid)) ? procs : undefined;
+    return [marked.pid, bystander.pid, leader.pid, ...orphans].every(pid => procs.some(proc => proc.pid === pid)) ? procs : undefined;
   });
-  // The group is remembered from any of its members, so it need not be the leader that was seen.
-  remember(owned, table!.filter(proc => proc.pid === orphan), Date.now());
+  const owned = newOwned();
+  remember(owned, table!.filter(proc => proc.pid === orphans[0]));
   assert.deepEqual([...owned.groups], [leader.pid]);
-  owned.procs.clear();
+  const groupOnly = newOwned([], owned.groups);
   leader.kill("SIGKILL");
   await until(() => !alive(leader.pid!));
 
-  const found = (await runProcesses(owned, marker)).map(proc => proc.pid);
-  assert.ok(found.includes(marked.pid!), "found by its environment");
-  assert.ok(found.includes(orphan), "found by the group its dead leader led");
-  assert.ok(!found.includes(bystander.pid!), "the marker in an argument is not ownership");
-  assert.ok(!found.includes(process.pid));
+  for (let poll = 0; poll < 3; poll++) {
+    const found = await runProcesses(groupOnly, marker);
+    assert.deepEqual(found.map(proc => proc.pid), [marked.pid], "only the marked process is owned after each poll");
+    remember(groupOnly, found);
+  }
 
-  // A member that started after the run last saw the group may be a late child of the run's, or a stranger in a
-  // group whose ID was reused: it is not killed, and it is not passed over as if the run were gone.
-  const stale = newOwned([], [leader.pid!], Date.now() - 3_600_000);
-  assert.ok(!(await runProcesses(stale, "another-run")).some(proc => proc.pid === orphan));
-  assert.deepEqual((await stopRun(stale, "another-run", undefined, 0)).map(proc => proc.pid), [orphan]);
-  assert.ok(alive(orphan));
+  // On restart, the legacy cutoff covers the members' start times but must not authorize signals to them.
+  const config = await setup(t);
+  const stateFile = join(config.dataDir, "pi-run.json");
+  const workspace = join(config.runsDir, marker);
+  const logDir = join(config.dataDir, "logs/runs", marker);
+  await mkdir(workspace, { recursive: true });
+  await mkdir(logDir, { recursive: true });
+  await writeFile(stateFile, JSON.stringify({
+    runId: marker, conversationId: 1, taskId: 101, pr: false, startedAt: "", workspace, logDir,
+    procs: [], groups: [...owned.groups], asOf: Date.now(),
+  }));
+  t.mock.method(console, "error", () => {});
+  const runs = await openPiRuns(config);
+  assert.ok(orphans.every(alive), "the unverified members are not signalled");
+  await until(() => !alive(marked.pid!));
+  assert.ok(existsSync(workspace), "ambiguity leaves the workspace intact");
+  assert.equal(JSON.parse(await readFile(stateFile, "utf8")).asOf, 0, "the retained record still has the legacy field");
+  await assert.rejects(runs.run(request({ pr: false })), /could not be cleaned up after a restart:[^]*could not be told from the run's/);
 
   // A stop saves what it learns of the tree before it signals anything.
   const learning = newOwned();
@@ -863,8 +876,10 @@ test("a run's processes are found by environment marker and by the groups they l
   assert.deepEqual(recorded, [fresh.pid]);
   assert.ok(aliveWhenRecorded);
 
+  // One member's live PID/start match identifies both, even though the group leader and the marker are gone.
+  assert.deepEqual(new Set((await runProcesses(owned, marker)).map(proc => proc.pid)), new Set(orphans));
   assert.deepEqual(await stopRun(owned, marker, undefined, 0), []);
-  await until(() => !alive(marked.pid!) && !alive(orphan));
+  await until(() => orphans.every(pid => !alive(pid)));
   assert.ok(alive(bystander.pid!));
   // A group with no member left is forgotten, so its ID cannot be matched later.
   await runProcesses(owned, marker);

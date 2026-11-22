@@ -75,7 +75,7 @@ interface SavedRun {
   pid?: number;
   procs: [number, string][];
   groups: number[];
-  /** When the processes were last seen. */
+  /** Legacy cutoff; ignored for ownership. Write 0 so older readers can still parse the record. */
   asOf: number;
 }
 
@@ -641,9 +641,9 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       // directory is written first, so it can be ahead of the index.
       const settledBefore = (await logged(saved.runId, saved.taskId))?.entry
         ?? (kept.get(key)?.outcome.runId === saved.runId ? kept.get(key) : undefined);
-      const owned = newOwned(saved.procs, saved.groups, saved.asOf);
+      const owned = newOwned(saved.procs, saved.groups);
       // What the cleanup learns of the run's processes is kept for the next start, should this one not finish.
-      const record = () => writeJson(stateFile, { ...saved, procs: [...owned.procs], groups: [...owned.groups] });
+      const record = () => writeJson(stateFile, { ...saved, procs: [...owned.procs], groups: [...owned.groups], asOf: 0 });
       const trace = new RunTrace(pi.repo);
       const split = lineSplitter((line, whole) => trace.line(line, whole));
       try {
@@ -707,14 +707,14 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     let saving: Promise<unknown> = Promise.resolve();
     const write = () => saving = saving.catch(() => {}).then(async () => {
       if (!recording) return;
-      await writeJson(stateFile, { ...saved, procs: [...run.owned.procs], groups: [...run.owned.groups], asOf: run.owned.asOf });
+      await writeJson(stateFile, { ...saved, procs: [...run.owned.procs], groups: [...run.owned.groups] });
     });
     const save = () => write().catch(error => console.error(`Pi run ${saved.runId}: could not save its record:`, error));
     /** Remember a process this host started for the run, before waiting on it. */
     const adopt = async (pid: number | undefined) => {
       if (pid === undefined) return;
       const own = (await listProcesses().catch(() => [])).find(proc => proc.pid === pid);
-      if (own) remember(run.owned, [own], Date.now());
+      if (own) remember(run.owned, [own]);
       await save();
     };
     /** The children this host started itself and still holds: stopped through their handles when all else fails. */
@@ -872,9 +872,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         // Remember the processes the run starts while their parents still live: a delegate leads its own group.
         let polling: Promise<void> | undefined;
         const poll = setInterval(() => {
-          const seenAt = Date.now();
           polling ??= runProcesses(run.owned, saved.runId).then(async procs => {
-            if (remember(run.owned, procs, seenAt)) await save();
+            if (remember(run.owned, procs)) await save();
           }).catch(() => {}).finally(() => { polling = undefined; });
         }, pollMs);
         code = await exited;
@@ -988,9 +987,9 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       const saved: SavedRun = {
         runId, conversationId: request.conversationId, taskId: request.taskId, pr: request.pr,
         startedAt: new Date().toISOString(), workspace: join(config.runsDir, runId), logDir: join(logRoot, runId),
-        procs: [], groups: [], asOf: Date.now(),
+        procs: [], groups: [], asOf: 0,
       };
-      const run: ActiveRun = { saved, owned: newOwned([], [], saved.asOf), finalizing: false, kill: () => {}, done: Promise.resolve(undefined) };
+      const run: ActiveRun = { saved, owned: newOwned(), finalizing: false, kill: () => {}, done: Promise.resolve(undefined) };
       active = run;
       const onAbort = () => {
         if (run.finalizing) return;
