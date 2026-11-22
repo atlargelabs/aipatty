@@ -2,16 +2,17 @@ import { getBuiltinModelDataGeneratedAt } from "@earendil-works/pi-ai/providers/
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
+import { once } from "node:events";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { readConfig, readFaux } from "../src/config.ts";
-import { checkout, fixture, fixtureArgs, until } from "./helpers.ts";
+import { checkout, connect, fixture, fixtureArgs, until } from "./helpers.ts";
 
 const exec = promisify(execFile);
 /** The CLI pointed at the server on `url`'s port. */
@@ -88,6 +89,86 @@ test("install root owns actual state outside the release cwd, separates faux, an
   realRestart.child.kill("SIGTERM");
   assert.equal(await realRestart.exit, 0);
   assert.ok(!existsSync(join(cwd, "data")) && !existsSync(join(cwd, "faux")));
+});
+
+test("CLI shutdown acknowledges, closes a live stream and listener, and preserves work for restart", { timeout: 25_000 }, async t => {
+  const dir = await fixture(t);
+  const first = launch(t, dir);
+  const base = await first.url();
+  const cli = cliAt(base);
+  await cli("send", "saved before shutdown");
+  const transcript = (await cli("log")).stdout;
+  const stream = connect(t, base);
+  await stream.opened;
+  const input = "x".repeat(1_200); // Still generating when the shutdown command arrives.
+  const accepted = await fetch(`${base}/api/conversations/root/messages`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content: input }),
+  });
+  assert.equal(accepted.status, 202);
+  const { submissionId } = await accepted.json() as { submissionId: number };
+  await until(() => stream.state()?.live.generation !== undefined);
+
+  const [ack] = await Promise.all([
+    cli("shutdown"), once(stream.ws, "close", { signal: AbortSignal.timeout(8_000) }),
+  ]);
+  assert.equal(ack.stdout, "Shutdown requested.\n");
+  assert.equal(await first.exit, 0, first.stderr());
+  assert.equal(stream.state()?.busy, true);
+  await assert.rejects(cli("health"), /ECONNREFUSED/);
+
+  // The real catalog cannot run the saved faux model. Shutdown must still work with work pending.
+  const blocked = launch(t, dir, {});
+  const blockedCli = cliAt(await blocked.url());
+  assert.equal(JSON.parse((await blockedCli("health")).stdout).modelStatus, "unavailable");
+  assert.equal((await blockedCli("shutdown")).stdout, "Shutdown requested.\n");
+  assert.equal(await blocked.exit, 0, blocked.stderr());
+
+  const resumed = launch(t, dir);
+  const resumedBase = await resumed.url();
+  const replay = connect(t, resumedBase, `?submissionId=${submissionId}`);
+  await replay.opened;
+  const settled = await until(() => replay.frames.find(frame => frame.type === "settled"), frame => frame !== undefined);
+  assert.deepEqual(settled, { type: "settled", submissionId, status: "done", answer: `Faux reply: ${input}` });
+  const resumedCli = cliAt(resumedBase);
+  const log = (await resumedCli("log")).stdout;
+  // Durable can retain the interrupted partial answer as well as the settled answer.
+  assert.ok(log.startsWith(`${transcript}user: ${input}\n`));
+  assert.ok(log.endsWith(`assistant: Faux reply: ${input}\n`));
+  await resumedCli("shutdown");
+  assert.equal(await resumed.exit, 0, resumed.stderr());
+});
+
+test("shutdown requires POST, the CLI marker, and trusted Host and Origin", { timeout: 10_000 }, async t => {
+  const running = launch(t, await fixture(t));
+  const base = await running.url();
+  const marker = { "X-Aipatty-Shutdown": "1" };
+  // node:http sends the exact Host we supply, rather than deriving it from the URL.
+  const probe = (method: string, headers: Record<string, string>) =>
+    new Promise<{ status: number | undefined; headers: IncomingHttpHeaders }>((resolve, reject) => {
+      httpRequest(`${base}/api/shutdown`, { method, headers }, res => {
+        res.resume();
+        res.once("end", () => resolve({ status: res.statusCode, headers: res.headers }));
+        res.once("error", reject);
+      }).on("error", reject).end();
+    });
+  const get = await probe("GET", marker);
+  assert.equal(get.status, 405);
+  assert.equal(get.headers.allow, "POST");
+  const preflight = await probe("OPTIONS", {
+    Origin: "http://foreign.example", "Access-Control-Request-Method": "POST",
+    "Access-Control-Request-Headers": "x-aipatty-shutdown",
+  });
+  assert.equal(preflight.status, 403);
+  assert.equal(preflight.headers["access-control-allow-origin"], undefined);
+  assert.equal((await probe("OPTIONS", marker)).status, 405);
+  assert.equal((await probe("POST", {})).status, 403); // A plain form can omit Origin but cannot send the marker.
+  assert.equal((await probe("POST", { ...marker, Host: `foreign.example:${new URL(base).port}` })).status, 403);
+  assert.equal((await probe("POST", { ...marker, Origin: "http://foreign.example" })).status, 403);
+  assert.equal((await fetch(`${base}/health`)).status, 200);
+  const ack = await fetch(`${base}/api/shutdown`, { method: "POST", headers: { ...marker, Origin: base } });
+  assert.equal(ack.status, 202);
+  assert.deepEqual(await ack.json(), { status: "shutdown-requested" });
+  assert.equal(await running.exit, 0, running.stderr());
 });
 
 test("CLI recovers a saved model the catalog lacks, without a login or model call", { timeout: 15_000 }, async t => {

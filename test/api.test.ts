@@ -1,6 +1,7 @@
 import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { createConnection } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
 import WebSocket from "ws";
@@ -14,7 +15,7 @@ const health = { ok: true as const, commit: "test", startedAt: "now", version: "
 /** Start a faux-model server on a free port over `dir`. */
 async function start(dir: string, heartbeatMs?: number) {
   const host = await openHost(fauxConfig(dir));
-  const api = await startApi(host, health, 0, heartbeatMs);
+  const api = await startApi(host, health, 0, { heartbeatMs });
   let closed = false;
   return {
     base: `http://127.0.0.1:${api.port}`,
@@ -192,6 +193,24 @@ test("invalid requests and foreign origins are rejected", async t => {
   assert.equal(code, 403);
 
   assert.deepEqual(lines(await page(base)), []);
+});
+
+test("an accepted shutdown does not hang behind a stuck response", { timeout: 5_000 }, async t => {
+  const host = await openHost(fauxConfig(await fixture(t)));
+  const stop = Promise.withResolvers<void>();
+  const api = await startApi({ ...host, modelStatus: () => new Promise(() => {}) }, health, 0, { onShutdown: stop.resolve });
+  t.after(async () => { await api.close(); await host.close(); });
+  const authority = `127.0.0.1:${api.port}`;
+  const socket = createConnection({ host: "127.0.0.1", port: api.port });
+  t.after(() => socket.destroy());
+  const closed = once(socket, "close");
+  await once(socket, "connect");
+  // Node must send pipelined responses in order; /health never supplies the first one.
+  socket.write(`GET /health HTTP/1.1\r\nHost: ${authority}\r\n\r\n`
+    + `POST /api/shutdown HTTP/1.1\r\nHost: ${authority}\r\nX-Aipatty-Shutdown: 1\r\nContent-Length: 0\r\n\r\n`);
+  await stop.promise;
+  await api.close();
+  await closed;
 });
 
 test("a stream longer than its window still sends only what changed", { timeout: 20_000 }, async t => {

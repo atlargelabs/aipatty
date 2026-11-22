@@ -2,6 +2,9 @@ import type { JsonValue } from "@earendil-works/chord/json";
 import { contentText, type Message } from "@earendil-works/pi-ai";
 import type { ConversationView, EntryRecord, LiveState, ModelRef, UsageState } from "@earendil-works/pi-durable";
 
+/** Non-safelisted marker: an ordinary browser form cannot send it. */
+export const shutdownHeader = "x-aipatty-shutdown";
+
 /** A transcript page, in chronological order, and its conversation's current metadata. */
 export interface ConversationPage {
   id: number;
