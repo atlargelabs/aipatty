@@ -362,7 +362,7 @@ $("composer").addEventListener("submit", guard(async event => {
     const upgrade = content === ${JSON.stringify(upgradeCommand)};
     if (upgrade && (!event.isTrusted || !confirm("Upgrade aipatty to committed main when all branches are idle?"))) return;
     const accepted = await api("/api/conversations/" + branch + "/messages", {
-      method: "POST", body: upgrade ? { content, requestId } : { content, requestId, whenBusy: "followUp" },
+      method: "POST", body: upgrade ? { command: content, requestId } : { content, requestId, whenBusy: "followUp" },
       headers: upgrade ? { ${JSON.stringify(upgradeHeader)}: "1" } : undefined,
     });
     if (upgrade) notice("Upgrade " + accepted.upgradeId + " accepted. The result will appear in this branch.");

@@ -189,18 +189,17 @@ async function handleHttp(
 
   if (action === "messages") {
     const body = await jsonBody(req);
-    const draft = messageDraft(body);
     const marker = req.headersDistinct[upgradeHeader];
-    if (marker || draft.content === upgradeCommand) {
+    if (marker || body.command === upgradeCommand || body.content === upgradeCommand) {
       if (marker?.length !== 1 || marker[0] !== "1") throw new HttpError(403, "Use the browser composer or CLI to explicitly request /upgrade");
-      if (draft.content !== upgradeCommand || !draft.requestId || !upgradeRequestKey.test(draft.requestId)
-        || Object.keys(body).some(key => key !== "content" && key !== "requestId")) {
+      if (body.command !== upgradeCommand || typeof body.requestId !== "string" || !upgradeRequestKey.test(body.requestId)
+        || Object.keys(body).some(key => key !== "command" && key !== "requestId")) {
         throw new HttpError(400, "Expected exactly /upgrade and its request ID");
       }
       if (!upgrade) throw new HttpError(409, "Upgrade is not available on this host");
-      sendJson(res, 202, { upgradeId: await upgrade(conversation, draft.requestId) });
+      sendJson(res, 202, { upgradeId: await upgrade(conversation, body.requestId) });
     } else {
-      const submission = await agent.submit(conversation, draft);
+      const submission = await agent.submit(conversation, messageDraft(body));
       sendJson(res, 202, { submissionId: submission.id });
     }
   } else if (action === "abort") {

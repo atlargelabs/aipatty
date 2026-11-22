@@ -188,7 +188,9 @@ ORIGIN=git@github.com:atlargelabs/aipatty.git
 
 Check that the printed commit includes the reviewed, merged upgrade. Set `SHA` to the printed full commit.
 The helper independently fetches `main` again, requires that exact tip and compares the entire pre-install
-worktree (including ignored paths). If `main` advanced, stage its new tip rather than editing the first checkout.
+worktree (including ignored paths). It installs and checks in a separate private checkout, then moves the
+checked dependencies into the clean staged release. If `main` advanced, stage its new tip instead of editing
+an existing checkout.
 Use the same faux setting as the old server (normally unset):
 
 ```sh
@@ -275,8 +277,10 @@ node "$HELPER" recover --install-dir "$ROOT" --port "$PORT"
 node "$ROOT/deploy/current/src/cli.ts" --port "$PORT" health
 ```
 
-- `requested`/`staging`: no switch began. Recovery cancels staging; it does not fetch again. A normal modern
-  start can also cancel orphaned staging. If the old app is down, start it with the original configuration.
+- `requested`/`staging`: no switch began. The bounded stage worker cancels its command if its coordinator
+  disappears. Recovery does not refetch; if staging is still draining, wait for its log to settle before
+  retrying `recover`. A normal modern start can also cancel orphaned staging after that. If the old app is
+  down, start it with the original configuration.
 - `stopping`/`switching`/`restoring`/`restored`: don't start either release by hand. The new app refuses an
   unguarded start. `recover` verifies quiescence and restores the recorded old release as required, never a
   different or newer SHA. If an old app is still running after a failed handoff, stop that **verified** app

@@ -10,7 +10,7 @@ import { HttpError, type AgentHost } from "./host.ts";
 import { OwnerBusy } from "./ownership.ts";
 import { openUpgradeLog } from "./upgrade-process.ts";
 import {
-  errorText, exists, finish, idPattern, ownedFile, resultText, sameInstall, syncPath, upgradeEntryKind,
+  errorText, exists, finish, idPattern, ownedFile, resultText, sameInstall, upgradeEntryKind,
   UpgradePaths, type UpgradeJournal,
 } from "./upgrade-state.ts";
 
@@ -18,19 +18,31 @@ const ResultDoc = defineDoc<{ last: string }>({
   kind: "aipatty.upgrade.delivery", version: 1, scope: "session",
   initial: () => ({ last: "" }), checkpointWhen: () => true,
 });
-const RequestDoc = defineDocFamily<{ id: string }, null>({
+const RequestDoc = defineDocFamily<{ id: string; accepted: boolean }, null>({
   kind: "aipatty.upgrade.request", version: 1, scope: "session", family: true,
-  initial: () => ({ id: "" }), checkpointWhen: () => true,
+  initial: () => ({ id: "", accepted: false }), checkpointWhen: () => true,
 });
 
 /** A DB transaction covers both the visible transcript entry and its idempotency marker. */
 async function report(agent: AgentHost, paths: UpgradePaths, j: UpgradeJournal): Promise<void> {
   if (j.phase !== "done" || j.branch === undefined || j.reported) return;
-  const branch = await agent.conversation(String(j.branch));
-  if (!branch) throw new Error(`Upgrade ${j.id}: requesting branch ${j.branch} is missing`);
   const observed = paths.load();
   if (observed?.id !== j.id || observed.phase !== "done") throw new Error("Upgrade journal changed during delivery");
   if (observed.reported) return;
+  const key = `${j.branch}:${j.requestKey}`;
+  const accepted = await agent.harness.snapshot(RequestDoc, key, ctx);
+  if (accepted?.id !== j.id || !accepted.accepted) {
+    if (j.result?.kind !== "cancelled" || (accepted?.id && accepted.id !== j.id)) {
+      throw new Error(`Upgrade ${j.id}: its durable request is missing`);
+    }
+    // The external record can precede SQLite commit. A crash in that window isn't an accepted command.
+    // Retire the key durably so even a later retransmission cannot create a new upgrade from it.
+    await agent.harness.commit(async tx => { (await tx.doc(RequestDoc, key, null)).id = j.id; }, ctx);
+    paths.save({ ...j, reported: true, result: { ...j.result, reason: "Interrupted before the operator command committed; no command was accepted." } });
+    return;
+  }
+  const branch = await agent.conversation(String(j.branch));
+  if (!branch) throw new Error(`Upgrade ${j.id}: requesting branch ${j.branch} is missing`);
   await branch.commit(async tx => {
     const marker = await tx.doc(ResultDoc);
     if (marker.last === j.id) return;
@@ -74,14 +86,18 @@ export function guardStartup(config: Config, source: string, commit: string, chi
       j = paths.load();
       if (!j) throw new Error("Upgrade journal disappeared during startup");
       if (j.phase === "requested" || j.phase === "staging") {
-        assertSelected(paths, source, commit, j.old);
-        j = finish(j, { kind: "cancelled", reason: "Interrupted staging was not retried." });
-        paths.save(j);
+        const unstaged = j.phase === "staging" ? paths.stagingLease(j.id) : undefined;
+        try {
+          assertSelected(paths, source, commit, j.old);
+          j = finish(j, { kind: "cancelled", reason: "Interrupted staging was not retried." });
+          paths.save(j);
+        } finally { unstaged?.(); }
       }
     } finally { unlock(); }
   }
   if (j.phase !== "done") throw new Error(`Unfinished upgrade (${j.phase}): use upgrade-supervisor.ts recover before serving ${paths.db}`);
   assertSelected(paths, source, commit, j.result?.active ?? j.old);
+  paths.syncJournal();
   return { paths, journal: j };
 }
 
@@ -92,24 +108,24 @@ export function committedValidation(startup: StartupState, source: string, commi
   if (j?.id !== journal.id || j.phase !== "done" || j.result?.active !== commit
     || (j.result.kind !== "upgraded" && j.result.kind !== "rolled-back")) return;
   assertSelected(paths, source, commit);
-  syncPath(paths.journal);
-  syncPath(paths.state);
+  paths.syncJournal();
   return { paths, journal: j };
 }
 
 export async function reportStartup(agent: AgentHost, startup: StartupState | undefined, listeningCommit: string): Promise<void> {
   if (!startup) return;
   const { paths, journal } = startup;
-  try {
-    let j = paths.load();
-    if (j?.id !== journal.id || j.phase !== "done") throw new Error("Upgrade journal changed during startup");
-    if (!j.result?.active && !j.reported && j.old === listeningCommit && paths.selected() === listeningCommit) {
-      // An interrupted stage may have been cancelled before any server could be probed. This one is now bound.
-      j = finish(j, { ...j.result!, active: listeningCommit });
-      paths.save(j);
-    }
-    await report(agent, paths, j);
-  } catch (error) { console.error(`Could not deliver upgrade ${journal.id}:`, error); }
+  let j = paths.load();
+  if (j?.id !== journal.id || j.phase !== "done") throw new Error("Upgrade journal changed during startup");
+  if (!j.result?.active && !j.reported && j.old === listeningCommit && paths.selected() === listeningCommit) {
+    // An interrupted stage may have been cancelled before any server could be probed. This one is now bound.
+    j = finish(j, { ...j.result!, active: listeningCommit });
+    paths.save(j);
+  }
+  // If the committed release cannot deliver, do not confirm activation or restore over its DB. The next
+  // explicit start retries the same result, and the helper has already recorded which checkout to start.
+  try { await report(agent, paths, j); }
+  catch (error) { throw new Error(`Could not deliver upgrade ${j.id}: ${errorText(error)}`, { cause: error }); }
 }
 
 export function hostUpgrade(config: Config, agent: AgentHost, source: string, commit: string, stop: () => void) {
@@ -135,8 +151,11 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
           if (j.phase === "requested" || j.phase === "staging"
             || (j.phase === "stopping" && !drainStarted && paths.selected() === commit)) {
             // This same host still owns Durable storage; a dead helper cannot have advanced past stopping.
-            j = finish(j, { kind: "cancelled", active: commit, reason });
-            paths.save(j);
+            const unstaged = j.phase === "staging" ? paths.stagingLease(j.id) : undefined;
+            try {
+              j = finish(j, { kind: "cancelled", active: commit, reason });
+              paths.save(j);
+            } finally { unstaged?.(); }
           }
           if (j.phase !== "done") {
             console.error(`Upgrade ${id} stopped during ${j.phase}; no new work before documented recovery. ${reason}`);
@@ -164,10 +183,6 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
           sameInstall(previous, config);
           if (previous.phase !== "done") throw new HttpError(409, "Another upgrade is pending; see the upgrade journal");
           await report(agent, paths, previous);
-          if (previous.branch === target.id && previous.requestKey === requestKey) {
-            unblock();
-            return previous.id;
-          }
         }
         if (exists(paths.piRun)) throw new HttpError(409, `Pi recovery is pending: ${paths.piRun}`);
         const j: UpgradeJournal = { version: 1, id, port: config.port, faux: config.faux, old: commit,
@@ -176,9 +191,13 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
         // immediate Durable commit). Only then can any helper take ownership, let alone ask the app to stop.
         const accepted = await target.commit(async tx => {
           const request = await tx.doc(RequestDoc, `${target.id}:${requestKey}`, null);
-          if (request.id) return request.id;
+          if (request.id) {
+            if (!request.accepted) throw new HttpError(409, "That upgrade command did not commit. Send a fresh /upgrade if still wanted.");
+            return request.id;
+          }
           paths.save(j);
           request.id = id;
+          request.accepted = true;
           await tx.appendEntry(target.id, {
             kind: upgradeEntryKind, data: { id, type: "request", text: `Requested upgrade (${id}).` },
           });

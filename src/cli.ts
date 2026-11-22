@@ -6,7 +6,7 @@ import { LOOPBACK, readFaux, readPort } from "./config.ts";
 import type { BranchInfo, SearchMatch } from "./branches.ts";
 import { failureText, messageText, shutdownHeader, upgradeEntry, type ConversationPage, type StreamFrame } from "./protocol.ts";
 import { branchLine } from "./tools.ts";
-import { upgradeCommand, upgradeHeader } from "./upgrade-state.ts";
+import { upgradeCommand, upgradeHeader, upgradeProtocol } from "./upgrade-state.ts";
 
 /** The conversation path of a branch ID, or the root's. */
 function conversationPath(branch = "root"): string {
@@ -38,9 +38,12 @@ async function request<T>(base: URL, path: string, options?: RequestInit): Promi
 
 async function send(base: URL, content: string, root: string): Promise<void> {
   if (content === upgradeCommand) {
+    const health = await request<{ upgradeProtocol?: number }>(base, "/health");
+    if (health.upgradeProtocol !== upgradeProtocol) throw new Error("This server does not support /upgrade; see the legacy bootstrap runbook");
     const { upgradeId } = await request<{ upgradeId: string }>(base, `${root}/messages`, {
       method: "POST", headers: { "Content-Type": "application/json", [upgradeHeader]: "1" },
-      body: JSON.stringify({ content, requestId: randomUUID() }), redirect: "error",
+      // A legacy server rejects this body before it could become a model message, even across a restart.
+      body: JSON.stringify({ command: content, requestId: randomUUID() }), redirect: "error",
     });
     if (typeof upgradeId !== "string") throw new Error("This server does not support /upgrade");
     console.log(`Upgrade ${upgradeId} accepted. Use log on this branch for the result.`);

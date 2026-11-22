@@ -251,6 +251,7 @@ export async function confirmActivation(server: ServerChild, j: UpgradeJournal, 
 export async function stopCandidate(server: ServerChild): Promise<void> {
   if (server.child.connected) server.child.disconnect(); // An uncommitted gated instance closes on parent loss.
   await Promise.race([server.exited, sleep(stopMs, undefined, { ref: false }).then(() => {
+    server.child.unref();
     throw new Error("Uncommitted candidate did not exit; stop it manually before attempting recovery");
   })]);
 }

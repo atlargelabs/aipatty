@@ -132,7 +132,7 @@ export function treeExtension(getHost: () => AgentHost) {
       if (args.at === undefined && from.id === api.conversationId && before === undefined) {
         throw new Error("Cannot find this tool call's entry; refusing an unsafe self-fork.");
       }
-      const created = await host.fork(from, { title: args.title, at: args.at, before }, context);
+      const created = await queued(host.fork(from, { title: args.title, at: args.at, before }, context), context);
       const summary = `Created branch ${created.id}, "${created.title}".`;
       if (args.message === undefined) return text(summary);
       try {

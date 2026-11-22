@@ -332,6 +332,27 @@ test("a call cancelled while it waits behind an abort does nothing when its turn
   await say(host, String(fork.id), "in time");
 });
 
+test("abort does not wait on a fork tool which is itself waiting for admission", { timeout: 8_000 }, async t => {
+  const { host } = await server(t);
+  const root = (await host.conversation("root"))!;
+  const fork = host.fork.bind(host);
+  const started = Promise.withResolvers<void>();
+  t.mock.method(host, "fork", async (...args: Parameters<typeof fork>) => {
+    const signal = args[2]?.abortSignal;
+    assert.ok(signal);
+    const cancelled = new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+    started.resolve();
+    await cancelled;
+    // The abort owns admission and waits for this tool. Its cancelled wait must not depend on the line advancing.
+    return fork(...args);
+  });
+  await host.submit(root, { type: "input", content: 'call fork_branch {"title":"must not exist"}' });
+  await started.promise;
+  await host.abort(root);
+  assert.equal((await host.branches()).branches.length, 1);
+  await say(host, "root", "admission still works");
+});
+
 test("fork cancellation during point lookup prevents creation", async t => {
   const { host } = await server(t);
   await say(host, "root", "hello");

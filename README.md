@@ -255,7 +255,7 @@ the authentication.
 - `GET /api/conversations/:id/search?q=&limit=&before=`: `{ matches: [{ entryId, role, excerpt }], before }`,
   newest first; pass `before` back for the next page
 - `POST /api/conversations/:id/messages` with `{ content, requestId?, whenBusy?: "followUp" | "steer" }`;
-  the operator `/upgrade` command uses exactly `{ content: "/upgrade", requestId }` and a separate
+  the operator `/upgrade` command uses exactly `{ command: "/upgrade", requestId }` and a separate
   `X-Aipatty-Upgrade: 1` marker, with the same Host and Origin rules. Its 202 names an `upgradeId`, not a submission.
 - `POST /api/conversations/:id/abort` (returns once the conversation is idle)
 - `WS /api/conversations/:id/stream` sends one `state` frame (the newest 50 entries and the live state), then an

@@ -20,32 +20,67 @@ const exec = promisify(execFile);
 const rootRoute = "/api/conversations/root";
 const timeout = 60_000;
 const legacyMain = `
+import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
 import { execFileSync } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { startApi } from "./api.ts";
+import { parseArgs } from "node:util";
 import { readConfig } from "./config.ts";
 import { openHost } from "./host.ts";
 
-// The pre-upgrade startup and shutdown protocol. No journal guard, admission gate, or validation support.
-const config = readConfig();
+// Frozen subset of ea33846's public protocol and paths, independent of the candidate's API and root defaults.
+// Open a real Durable database and owner lock; production legacy does not consult the upgrade journal.
+const { values } = parseArgs({ options: { "install-dir": { type: "string" }, port: { type: "string" } } });
+const root = values["install-dir"];
+const port = values.port ?? "8790";
+const config = readConfig(["--port", port, "--data-dir", join(root, process.env.AIPATTY_FAUX === "1" ? "faux" : "data"),
+  "--pi-dir", join(root, "pi"), "--work-dir", join(root, "work"), "--runs-dir", join(root, "runs")]);
 const health = { ok: true, commit: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
   startedAt: new Date().toISOString(), version: "legacy" };
 const stop = Promise.withResolvers();
 process.on("SIGTERM", stop.resolve);
 process.on("SIGINT", stop.resolve);
 const agent = await openHost(config);
-const api = await startApi(agent, health, config.port, { onShutdown: stop.resolve });
+const conversation = await agent.conversation("root");
+const api = createServer((req, res) => {
+  const json = (status, data) => res.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify(data));
+  void (async () => {
+    if (req.method === "GET" && req.url === "/health") return json(200, { ...health, ...await agent.modelStatus() });
+    if (req.method === "GET" && req.url === "/api/branches") return json(200, await agent.branches());
+    if (req.method === "POST" && req.url === "/api/shutdown") {
+      if (req.headers["x-aipatty-shutdown"] !== "1") return json(403, { error: "Expected x-aipatty-shutdown: 1" });
+      res.shouldKeepAlive = false;
+      res.once("finish", stop.resolve);
+      return json(202, { status: "shutdown-requested" });
+    }
+    if (req.method === "POST" && req.url === "/api/conversations/root/messages") {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const { content } = JSON.parse(body);
+      if (typeof content !== "string" || !content.trim()) return json(400, { error: "Expected non-empty content" });
+      const submission = await agent.submit(conversation, { type: "input", content });
+      await submission.wait(ctx); // Wait here so the test can seed and settle old work without a stream.
+      return json(202, { submissionId: submission.id });
+    }
+    if (req.method === "GET" && req.url === "/api/conversations/root") {
+      const entries = await conversation.entries({}, 50, undefined, ctx);
+      return json(200, { id: conversation.id, entries: entries.items.toReversed(), before: null });
+    }
+    return json(404, { error: "Not found" });
+  })().catch(error => json(500, { error: String(error) }));
+});
+await new Promise(resolve => api.listen(Number(port), "127.0.0.1", resolve));
 await stop.promise;
-await api.close();
+await new Promise(resolve => { api.close(resolve); api.closeAllConnections(); });
 await agent.close();
 writeFileSync(join(process.env.UPGRADE_FIXTURE, "legacy-closed"), "closing complete");
 while (existsSync(join(process.env.UPGRADE_FIXTURE, "hold-legacy-exit"))) await sleep(25);
 `;
 
 const npmFixture = `#!/usr/bin/env node
-const { appendFileSync, existsSync, symlinkSync } = require("node:fs");
+const { appendFileSync, existsSync, mkdirSync, readdirSync, symlinkSync } = require("node:fs");
 const { join } = require("node:path");
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const root = process.env.UPGRADE_FIXTURE;
@@ -53,7 +88,13 @@ const args = process.argv.slice(2).join(" ");
 appendFileSync(join(root, "npm.log"), args + "\\n");
 (async () => {
   while (existsSync(join(root, "hold-stage"))) await sleep(25);
-  if (args === "ci --ignore-scripts") symlinkSync(process.env.UPGRADE_FIXTURE_DEPS, "node_modules", "dir");
+  if (args === "ci --ignore-scripts") {
+    mkdirSync("node_modules");
+    for (const name of readdirSync(process.env.UPGRADE_FIXTURE_DEPS)) {
+      if (name.startsWith("aipatty-test-")) continue;
+      symlinkSync(join(process.env.UPGRADE_FIXTURE_DEPS, name), join("node_modules", name));
+    }
+  }
   else if (args === "run check" && existsSync(join(root, "fail-check"))) {
     console.error("fixture check failed");
     process.exitCode = 7;
@@ -143,6 +184,13 @@ async function fixture(t: TestContext, legacy = false) {
     while (existsSync(join(directory, "hold-probe"))) await sleep(25);
   }
 ${probeStart}`));
+  const supervisorPath = join(repo, "src/upgrade-supervisor.ts");
+  const supervisorCode = await readFile(supervisorPath, "utf8");
+  const prepareStart = "  let failure: string | undefined;";
+  assert.ok(supervisorCode.includes(prepareStart));
+  await writeFile(supervisorPath, supervisorCode
+    .replace("realpathSync, writeSync", "realpathSync, writeSync, writeFileSync")
+    .replace(prepareStart, `  writeFileSync(join(process.env.UPGRADE_FIXTURE!, "coordinator.pid"), String(process.pid));\n${prepareStart}`));
   const mainPath = join(repo, "src/main.ts");
   const modernMain = await readFile(mainPath, "utf8");
   if (legacy) await writeFile(mainPath, legacyMain);
@@ -209,7 +257,7 @@ ${probeStart}`));
     request(`/api/conversations/${branch}/messages`, { method: "POST", headers: {
       "Content-Type": "application/json", ...(opt.marker ? { "X-Aipatty-Upgrade": opt.marker } : {}),
       ...(opt.origin ? { Origin: opt.origin } : {}),
-    }, body: JSON.stringify({ content, requestId: opt.requestId ?? randomUUID() }) });
+    }, body: JSON.stringify({ ...(opt.marker ? { command: content } : { content }), requestId: opt.requestId ?? randomUUID() }) });
   const fork = async () => {
     const response = await request(rootRoute + "/fork", { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title: "Upgrade branch" }) });
@@ -238,7 +286,11 @@ test("first bootstrap uses legacy shutdown, waits for exit beyond the ACK and pr
   const legacy = f.launch();
   const oldHealth = await f.health(f.old);
   assert.equal(oldHealth?.upgradeProtocol, undefined);
-  await f.cli("send", "before first bootstrap");
+  assert.equal((await f.send("before first bootstrap")).status, 202);
+  await assert.rejects(f.cli("send", "/upgrade"), /does not support \/upgrade/);
+  // Even if a legacy server replaced a modern one after the client's health check, the command body is not input.
+  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 400);
+  assert.ok(!(await f.cli("log")).stdout.includes("/upgrade"));
   const target = await f.next("first one-shot release");
   await f.install(target);
   await f.flag("hold-legacy-exit");
@@ -275,7 +327,7 @@ test("command is explicit, serialized across branches, survives cutover and deli
   assert.equal((await f.send("please upgrade", branch, { marker: "1" })).status, 400);
   assert.equal((await f.request(rootRoute + "/messages", {
     method: "POST", headers: { "Content-Type": "application/json", "X-Aipatty-Upgrade": "1" },
-    body: JSON.stringify({ content: "/upgrade", requestId: randomUUID(), target: "unreviewed" }),
+    body: JSON.stringify({ command: "/upgrade", requestId: randomUUID(), target: "unreviewed" }),
   })).status, 400);
   assert.equal(f.paths.load(), undefined);
   const sha = await f.next("new main");
@@ -357,6 +409,51 @@ test("Pi busy is refused; a no-op or failed stage leaves the same process servin
   assert.equal((await f.cli("send", 'call pi {"task":"after failed stage","pr":false}')).stdout.includes("Fixture Pi completed"), true);
 });
 
+test("a crash before the command transaction leaves no branch result and retires its unaccepted request key", { timeout }, async t => {
+  const f = await fixture(t);
+  const old = f.launch();
+  await f.health(f.old);
+  const branch = await f.fork();
+  await f.cli("shutdown");
+  assert.equal(await old.exited, 0, old.output());
+  const id = randomUUID(), requestKey = randomUUID();
+  f.paths.init();
+  f.paths.save({ version: 1, id, branch, requestKey, old: f.old, port: f.port, faux: true, legacy: false, phase: "requested" });
+  f.launch();
+  await f.health(f.old);
+  const response = await f.send("/upgrade", branch, { marker: "1", requestId: requestKey });
+  assert.equal(response.status, 409);
+  assert.match(await response.text(), /did not commit/);
+  assert.match(f.paths.load()?.result?.reason ?? "", /no command was accepted/);
+  assert.equal((await f.entries(branch)).filter(entry => entry.kind === upgradeEntryKind).length, 0);
+  const fresh = await f.send("/upgrade", branch, { marker: "1" });
+  assert.equal(fresh.status, 202);
+  assert.equal((await f.result(f.paths.load()!.id, branch)).length, 1);
+});
+
+test("a crashed supervisor drains its bounded stage worker before cancelling and unblocking the old app", { timeout }, async t => {
+  const f = await fixture(t);
+  const old = f.launch();
+  await f.health(f.old);
+  const target = await f.next("stage interrupted before deps");
+  await f.flag("hold-stage");
+  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
+  await until(() => existsSync(join(f.scratch, "npm.log")));
+  const j = f.paths.load()!;
+  assert.equal(j.phase, "staging");
+  assert.equal(j.target, target);
+  // This is one of the fixture's own detached coordinators, recorded at its test-only spawn hook.
+  process.kill(Number(await readFile(join(f.scratch, "coordinator.pid"), "utf8")), "SIGKILL");
+  const [result] = await f.result(j.id);
+  assert.match(JSON.stringify(result.data), /cancelled before cutover/);
+  assert.match(await f.log(j.id), /cancelled: staging supervisor disconnected/);
+  assert.equal(f.paths.selected(), f.old);
+  assert.equal(existsSync(f.paths.release(target)), false);
+  assert.equal(existsSync(join(f.paths.deploy, `.stage-${j.id}`)), false);
+  assert.equal((await f.healthNow())?.pid, old.child.pid);
+  assert.equal((await f.cli("send", "still serving")).stdout.trim(), "Faux reply: still serving");
+});
+
 test("bootstrap rejects Pi records, non-main and dirty/ignored input before touching a legacy host", { timeout }, async t => {
   const f = await fixture(t, true);
   const old = f.launch();
@@ -421,7 +518,7 @@ test("first bootstrap can roll back to a legacy app when the candidate serves th
   const f = await fixture(t, true);
   const legacy = f.launch();
   await f.health(f.old);
-  await f.cli("send", "legacy rollback keeps this history");
+  assert.equal((await f.send("legacy rollback keeps this history")).status, 202);
   const target = await f.next("wrong SHA while validating", code => code.replace("      const api = await startApi", `
       if (childId) health.commit = ${JSON.stringify("7".repeat(40))};
       const api = await startApi`));

@@ -152,10 +152,18 @@ export class UpgradePaths {
   }
 
   lease(): () => void {
+    return this.lock(join(this.state, "owner.sqlite"), "Another upgrade or recovery owns this installation");
+  }
+
+  /** Staging commands have an independently bounded owner that drains if the coordinator dies. */
+  stagingLease(id: string): () => void {
+    return this.lock(this.artifact(id, ".stage-owner.sqlite"), `Staging for ${id} is still draining; see its log before recovering`);
+  }
+
+  private lock(lock: string, busy: string): () => void {
     this.init();
-    const lock = join(this.state, "owner.sqlite");
     for (const suffix of ["", "-journal", "-wal", "-shm"]) ownedFile(lock + suffix, false);
-    return ownSqliteLock(lock, "Another upgrade or recovery owns this installation");
+    return ownSqliteLock(lock, busy);
   }
 
   release(sha: string): string {
@@ -203,7 +211,7 @@ export class UpgradePaths {
       || !Number.isInteger(j.port) || j.port < 1 || j.port > 65_535 || typeof j.faux !== "boolean"
       || typeof j.legacy !== "boolean" || !phases.includes(j.phase)
       || (j.branch !== undefined && (!Number.isSafeInteger(j.branch) || j.branch < 1 || j.legacy))
-      || (j.requestKey !== undefined && (j.branch === undefined || typeof j.requestKey !== "string" || !upgradeRequestKey.test(j.requestKey)))
+      || (j.branch === undefined ? j.requestKey !== undefined : typeof j.requestKey !== "string" || !upgradeRequestKey.test(j.requestKey))
       || (j.oldProcess !== undefined && (!j.oldProcess || !Number.isSafeInteger(j.oldProcess.pid) || j.oldProcess.pid < 2
         || typeof j.oldProcess.start !== "string" || !j.oldProcess.start))
       || (j.reason !== undefined && typeof j.reason !== "string")
@@ -221,6 +229,12 @@ export class UpgradePaths {
 
   save(journal: UpgradeJournal): void {
     atomicFile(this.journal, JSON.stringify(journal, null, 2) + "\n");
+  }
+
+  /** Before serving after an observed terminal rename: the previous writer may have died before its fsync. */
+  syncJournal(): void {
+    syncPath(this.journal);
+    syncPath(this.state);
   }
 }
 
