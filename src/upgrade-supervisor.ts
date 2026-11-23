@@ -208,7 +208,7 @@ async function run(paths: UpgradePaths, args: {
       openLog();
       try {
         if (current.phase === "requested" || current.phase === "staging") {
-          if (current.phase === "staging") await reapStage(current);
+          if (current.phase === "staging") await reapStage(paths, current);
           const unstaged = current.phase === "staging" ? paths.stagingLease(current.id) : undefined;
           try {
             await verifySelected(paths, current.old);
@@ -252,7 +252,7 @@ async function run(paths: UpgradePaths, args: {
       await prepare(paths, initial, scriptRelease, log!, stageProcess => { save({ ...initial, stageProcess }); });
       const prepared = paths.load();
       if (prepared?.id !== initial.id || prepared.phase !== "staging" || !prepared.target) throw new Error("Stage worker did not pin a target");
-      await reapStage(prepared);
+      await reapStage(paths, prepared);
       j = prepared;
       const sha = prepared.target;
       await verifySelected(paths, initial.old);
@@ -297,7 +297,7 @@ async function run(paths: UpgradePaths, args: {
         throw error; // Never restore over a possibly committed release.
       }
       if (current.phase === "requested" || current.phase === "staging") {
-        try { await reapStage(current); }
+        try { await reapStage(paths, current); }
         catch (cleanup) {
           note(`STAGE CLEANUP FAILED: ${why}; ${errorText(cleanup)}. Journal retained.`);
           throw cleanup;

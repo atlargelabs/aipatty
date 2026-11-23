@@ -167,7 +167,7 @@ async function fixture(t: TestContext, legacy = false, hostHasGitPaths = false) 
         try {
           unlock = paths.lease();
           const j = paths.load();
-          if (j?.phase === "staging") await reapStage(j);
+          if (j?.phase === "staging") await reapStage(paths, j);
           ownDataDir(paths.data)();
           return true;
         } catch { return false; }
@@ -200,7 +200,7 @@ async function fixture(t: TestContext, legacy = false, hostHasGitPaths = false) 
   const processPath = join(repo, "src/upgrade-process.ts");
   const processCode = await readFile(processPath, "utf8");
   const probeStart = "  const deadline = Date.now() + startupMs;";
-  const reapStart = "export async function reapStage(j: UpgradeJournal): Promise<void> {";
+  const reapStart = "export async function reapStage(paths: UpgradePaths, j: UpgradeJournal): Promise<void> {";
   assert.ok(processCode.includes(probeStart) && processCode.includes(reapStart));
   await writeFile(processPath, processCode.replace(reapStart, `${reapStart}
   const { existsSync } = await import("node:fs");
@@ -580,7 +580,7 @@ exec /bin/ps "$@"
 });
 
 test("interrupted staging retains a group whose unmarked successor was missed by ps", { timeout }, async t => {
-  const scratch = await mkdtemp(join(tmpdir(), "aipatty-reap-"));
+  const scratch = await realpath(await mkdtemp(join(tmpdir(), "aipatty-reap-")));
   t.after(() => rm(scratch, { recursive: true, force: true }));
   // Synthetic PIDs outside the OS allocation range. Stub ps on both platforms and intercept all signals.
   const pgid = 2 ** 30, successor = pgid + 2;
@@ -609,6 +609,9 @@ fi
     await exec(process.execPath, ["--input-type=module", "-e", `
       import assert from "node:assert/strict";
       import { reapStage } from "./src/upgrade-process.ts";
+      import { UpgradePaths } from "./src/upgrade-state.ts";
+      const paths = new UpgradePaths(process.env.REAP_FIXTURE, process.env.REAP_FIXTURE);
+      paths.init();
       const journal = { version: 1, phase: "staging", id: ${JSON.stringify(randomUUID())},
         legacy: false, faux: true, port: 8790, old: "a".repeat(40),
         stageProcess: { pid: ${pgid}, start: "Mon Oct 19 11:00:00 2026" } };
@@ -620,19 +623,83 @@ fi
         if (pid === -${pgid} && groupExists && signal === 0) return true;
         throw Object.assign(new Error("No such process"), { code: "ESRCH" });
       };
-      await assert.rejects(reapStage(journal), ${visible ? `/${successor}/` : `/process group ${pgid}/`});
+      await assert.rejects(reapStage(paths, journal), ${visible ? `/${successor}/` : `/process group ${pgid}/`});
       assert.deepEqual(signals, [], "group evidence must not authorize signalling an unmarked successor");
       if (${!visible}) assert.ok(probes.includes(-${pgid}), "an empty ps snapshot is not proof the group is gone");
 
       // A later recovery can proceed after the kernel confirms that the group is gone.
       groupExists = false;
       process.env.REAP_VISIBLE = "0";
-      await reapStage(journal);
+      await reapStage(paths, journal);
       assert.equal(probes.at(-1), -${pgid});
       assert.deepEqual(signals, []);
     `], { cwd: checkout, env: { PATH: `${scratch}:${process.env.PATH}`, REAP_FIXTURE: scratch,
       REAP_UID: String(process.geteuid!()), REAP_VISIBLE: visible ? "1" : "0" }, timeout: 15_000 });
   }
+});
+
+test("a discovered detached stage group stays pending across recovery processes", { timeout }, async t => {
+  const scratch = await realpath(await mkdtemp(join(tmpdir(), "aipatty-reap-retry-")));
+  const id = randomUUID(), marker = stageMarker(id), worker = 2 ** 30, successor = worker + 1;
+  // Use a real marked PID for Linux /proc inspection. Only this test (via its child handle) can signal it.
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+    detached: true, stdio: "ignore", env: { ...stageEnvironment(), [marker]: "1" },
+  });
+  const closed = new Promise(resolve => child.once("close", resolve));
+  t.after(async () => {
+    child.kill("SIGKILL");
+    await closed;
+    await rm(scratch, { recursive: true, force: true });
+  });
+  assert.ok(child.pid);
+  const pgid = child.pid;
+  await writeFile(join(scratch, "ps"), `#!/bin/sh
+case "$1:$2:$3" in
+  -p:*-o) exit 1 ;;
+  -A:-o:pid=,ppid=,pgid=,uid=,stat=,lstart=)
+    if [ "$REAP_MODE" = discover ] && [ ! -f "$REAP_FIXTURE/seen" ]; then
+      : > "$REAP_FIXTURE/seen"
+      printf '%s 1 %s %s S Mon Oct 19 11:00:01 2026\\n' ${pgid} ${pgid} "$REAP_UID"
+    elif [ "$REAP_MODE" = retry ]; then
+      printf '%s 1 %s %s S Mon Oct 19 11:00:02 2026\\n' ${successor} ${pgid} "$REAP_UID"
+    fi ;;
+  -A:-ww:-o) printf '%s fixture-node\\n' ${pgid} ;;
+  -A:-E:-ww) printf '%s fixture-node %s=1\\n' ${pgid} ${marker} ;;
+esac
+`, { mode: 0o700 });
+  const attempt = (mode: string) => exec(process.execPath, ["--input-type=module", "-e", `
+    import assert from "node:assert/strict";
+    import { reapStage } from "./src/upgrade-process.ts";
+    import { UpgradePaths } from "./src/upgrade-state.ts";
+    const paths = new UpgradePaths(process.env.REAP_FIXTURE, process.env.REAP_FIXTURE);
+    const unlock = paths.lease();
+    const signals = [];
+    process.kill = (pid, signal) => {
+      if (signal !== 0) signals.push([pid, signal]);
+      if (pid === -${pgid} && process.env.REAP_MODE !== "quiet" && signal === 0) return true;
+      throw Object.assign(new Error("No such process"), { code: "ESRCH" });
+    };
+    try {
+      await reapStage(paths, { version: 1, phase: "staging", id: ${JSON.stringify(id)},
+        legacy: false, faux: true, port: 8790, old: "a".repeat(40),
+        stageProcess: { pid: ${worker}, start: "Mon Oct 19 11:00:00 2026" } });
+    } finally {
+      unlock();
+      assert.deepEqual(signals, [], "unverified identities must not be signalled");
+    }
+  `], { cwd: checkout, env: { PATH: `${scratch}:${process.env.PATH}`, REAP_FIXTURE: scratch,
+    REAP_UID: String(process.geteuid!()), REAP_MODE: mode }, timeout: 15_000 });
+
+  // The detached member is marked in the first scan but gone in the final table; persist its group anyway.
+  await assert.rejects(attempt("discover"), new RegExp(`Cannot prove staging process group ${pgid} is gone`));
+  child.kill("SIGKILL");
+  await closed;
+  const paths = new UpgradePaths(scratch, scratch);
+  assert.deepEqual(paths.stageGroups(id), [pgid]);
+  await assert.rejects(attempt("retry"), new RegExp(`Cannot prove staging processes exited \\(${successor}\\)`));
+  assert.deepEqual(paths.stageGroups(id), [pgid]);
+  await attempt("quiet");
+  assert.deepEqual(paths.stageGroups(id), []);
 });
 
 test("staging reaps a detached replacement started by its interrupted nested test", { timeout }, async t => {

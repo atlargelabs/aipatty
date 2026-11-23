@@ -278,9 +278,11 @@ node "$ROOT/deploy/current/src/cli.ts" --port "$PORT" health
 ```
 
 - `requested`/`staging`: no switch began. The bounded stage worker cancels its command if its coordinator
-  disappears; the process group is recorded before any command runs. Recovery verifies it is gone and does
-  not refetch. If it cannot identify or stop that group, leave the private `.stage-<id>` directory and journal
-  in place and inspect the log before running `recover` again. New work is refused until quiescence is proven.
+  disappears; the worker's process group is recorded before any command runs. Recovery also records detached
+  groups it discovers in `$ROOT/upgrade/<id>.stage-groups.json`. It verifies the groups are gone and does not
+  refetch or signal processes on group evidence alone. If it cannot confirm cleanup, keep the private
+  `.stage-<id>` directory, journal and group record, and inspect the log before running `recover` again.
+  New work is refused until quiescence is proven.
   A surviving host can deliver the result and reopen admission after explicit recovery. If it still refuses
   new work after `recover` verifies `done`, gracefully restart the selected app with the original configuration.
   A normal modern start can also cancel orphaned staging.

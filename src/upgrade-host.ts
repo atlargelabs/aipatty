@@ -86,7 +86,7 @@ export async function guardStartup(config: Config, source: string, commit: strin
       j = paths.load();
       if (!j) throw new Error("Upgrade journal disappeared during startup");
       if (j.phase === "requested" || j.phase === "staging") {
-        if (j.phase === "staging") await reapStage(j);
+        if (j.phase === "staging") await reapStage(paths, j);
         const unstaged = j.phase === "staging" ? paths.stagingLease(j.id) : undefined;
         try {
           assertSelected(paths, source, commit, j.old);
@@ -178,7 +178,7 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
           if (j.phase === "requested" || j.phase === "staging"
             || (j.phase === "stopping" && !drainStarted && paths.selected() === commit)) {
             // This same host still owns Durable storage; a dead helper cannot have advanced past stopping.
-            if (j.phase === "staging") await reapStage(j);
+            if (j.phase === "staging") await reapStage(paths, j);
             const unstaged = j.phase === "staging" ? paths.stagingLease(j.id) : undefined;
             try {
               j = finish(j, { kind: "cancelled", active: commit, reason });

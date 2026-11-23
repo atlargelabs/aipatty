@@ -78,17 +78,25 @@ export function stageEnvironment(): NodeJS.ProcessEnv {
   return Object.fromEntries(Object.entries(process.env).filter(([name, value]) => stagePrefix.test(name) && value === "1"));
 }
 
-/** Stage commands inherit the recorded worker's group and marker. Never trust a reused/leaderless group alone. */
-export async function reapStage(j: UpgradeJournal): Promise<void> {
+/** Under the upgrade lease. Keep observed detached groups across attempts, but never trust a group alone. */
+export async function reapStage(paths: UpgradePaths, j: UpgradeJournal): Promise<void> {
   const worker = j.stageProcess;
   if (!worker) return; // Not authorized to spawn commands before its identity is persisted.
   const marker = stageMarker(j.id);
-  const rootIsOurs = (await runProcesses(newOwned(), "1", marker)).some(p => p.pid === worker.pid && p.start === worker.start);
-  if (!rootIsOurs && (await identify(worker.pid))?.start === worker.start) {
+  let recorded = new Set(paths.stageGroups(j.id));
+  const owned = newOwned([], [worker.pid, ...recorded]);
+  const record = async () => {
+    const groups = [...owned.groups].filter(pgid => pgid !== worker.pid);
+    if (groups.length === recorded.size && groups.every(pgid => recorded.has(pgid))) return;
+    paths.saveStageGroups(j.id, groups);
+    recorded = new Set(groups);
+  };
+  const rootIsOurs = (await runProcesses(owned, "1", marker, record)).some(p => p.pid === worker.pid && p.start === worker.start);
+  if (rootIsOurs) owned.procs.set(worker.pid, worker.start);
+  else if ((await identify(worker.pid))?.start === worker.start) {
     throw new Error(`Cannot verify the staging marker on PID ${worker.pid}; inspect before recovering`);
   }
-  const owned = newOwned(rootIsOurs ? [[worker.pid, worker.start]] : [], [worker.pid]);
-  const left = await stopRun(owned, "1", worker.pid, 250, undefined, undefined, marker);
+  const left = await stopRun(owned, "1", worker.pid, 250, undefined, record, marker);
   if (left.length) throw new Error(`Cannot prove staging processes exited (${left.map(p => p.pid).join(", ")}); leave the private stage in place and investigate`);
 }
 

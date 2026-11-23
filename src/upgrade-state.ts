@@ -200,6 +200,22 @@ export class UpgradePaths {
 
   backup(id: string): string { return this.artifact(id, ".sqlite"); }
   log(id: string): string { return this.artifact(id, ".log"); }
+
+  /** Only recovery, under the upgrade lease, writes this record. The stage worker can still pin the journal. */
+  stageGroups(id: string): number[] {
+    const path = this.artifact(id, ".stage-groups.json");
+    if (!ownedFile(path, false)) return [];
+    const groups: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (!Array.isArray(groups) || groups.some(pgid => !Number.isInteger(pgid) || pgid <= 1 || pgid > 0x7fff_ffff)) {
+      throw new Error(`Invalid staging group record: ${path}`);
+    }
+    return groups;
+  }
+
+  saveStageGroups(id: string, groups: number[]): void {
+    atomicFile(this.artifact(id, ".stage-groups.json"), JSON.stringify(groups) + "\n");
+  }
+
   private artifact(id: string, suffix: string): string {
     if (!idPattern.test(id)) throw new Error("Invalid upgrade request ID");
     return join(this.state, id + suffix);

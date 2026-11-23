@@ -116,7 +116,9 @@ async function markedPids(runId: string, procs: readonly Proc[], variable: strin
  * For ordinary runs, forgets groups with no visible members. Stage cleanup retains them for an independent check.
  * The result is from a process table read last, after the slower environment scan: act on it at once.
  */
-async function scan(owned: Owned, runId: string, variable: string): Promise<{ ours: Proc[]; unsure: Proc[] }> {
+async function scan(
+  owned: Owned, runId: string, variable: string, record?: () => Promise<unknown>,
+): Promise<{ ours: Proc[]; unsure: Proc[] }> {
   const isStage = variable !== RUN_MARKER;
   const sampled = new Map<number, string>(), marked = new Map<number, string>();
   const eligible = (proc: Proc) => proc.pid !== process.pid && (!isStage || proc.uid === process.geteuid?.());
@@ -129,6 +131,9 @@ async function scan(owned: Owned, runId: string, variable: string): Promise<{ ou
       if (!observation.unstable.has(p.pid)) sampled.set(p.pid, p.start);
       if (observation.marked.has(p.pid)) marked.set(p.pid, p.start);
     }
+    // A marked process can vanish before the final table read. Save its group as evidence to
+    // check, not authority to signal, even if we can no longer verify the individual process.
+    if (isStage && record && rememberGroups(owned, sample.filter(p => observation.marked.has(p.pid)))) await record();
     procs = await listProcesses();
     // A stage parent can detach a successor and exit during marker inspection. Inspect new identities
     // before declaring it idle. Unrelated system-user churn need not settle; staging doesn't change UID.
@@ -175,23 +180,29 @@ async function scan(owned: Owned, runId: string, variable: string): Promise<{ ou
       }
     }
   }
+  if (isStage && record && rememberGroups(owned, ours.values())) await record();
   return { ours: [...ours.values()], unsure: procs.filter(proc => candidate(proc) && !ours.has(proc.pid) && leaderless(proc)) };
 }
 
 /** The live processes that belong to a run; see `scan`. Rejects when the process table cannot be read. */
-export async function runProcesses(owned: Owned, runId: string, variable = RUN_MARKER): Promise<Proc[]> {
-  return (await scan(owned, runId, variable)).ours;
+export async function runProcesses(owned: Owned, runId: string, variable = RUN_MARKER, record?: () => Promise<unknown>): Promise<Proc[]> {
+  return (await scan(owned, runId, variable, record)).ours;
+}
+
+function rememberGroups(owned: Owned, procs: Iterable<Proc>): boolean {
+  const before = owned.groups.size;
+  for (const proc of procs) {
+    // Remember the group even if we never saw its leader. The host's own group is not the run's.
+    if (proc.pgid > 1 && proc.pgid !== hostGroup) owned.groups.add(proc.pgid);
+  }
+  return owned.groups.size !== before;
 }
 
 /** Remember a run's processes and their groups. Returns whether a process or group was new. */
 export function remember(owned: Owned, procs: readonly Proc[]): boolean {
-  const before = owned.procs.size + owned.groups.size;
-  for (const proc of procs) {
-    owned.procs.set(proc.pid, proc.start);
-    // Remember the group even if we never saw its leader. The host's own group is not the run's.
-    if (proc.pgid > 1 && proc.pgid !== hostGroup) owned.groups.add(proc.pgid);
-  }
-  return owned.procs.size + owned.groups.size !== before;
+  const before = owned.procs.size;
+  for (const proc of procs) owned.procs.set(proc.pid, proc.start);
+  return rememberGroups(owned, procs) || owned.procs.size !== before;
 }
 
 function signal(pid: number, name: NodeJS.Signals): void {
@@ -216,7 +227,7 @@ export async function stopRun(
 ): Promise<Proc[]> {
   // Remember the tree before it comes apart, and have the caller save it: a group found only now would otherwise
   // be forgotten if this process dies with a member of it still alive.
-  const tree = await runProcesses(owned, runId, variable);
+  const tree = await runProcesses(owned, runId, variable, record);
   if (remember(owned, tree)) await record?.();
   const rootStart = root === undefined ? undefined : owned.procs.get(root);
   if (root !== undefined && rootStart !== undefined && tree.some(proc => proc.pid === root && proc.start === rootStart)) {
@@ -232,7 +243,7 @@ export async function stopRun(
   let left: Proc[] = [];
   let unsure: Proc[] = [];
   for (let attempt = 0; attempt < 20; attempt++) {
-    ({ ours: left, unsure } = await scan(owned, runId, variable));
+    ({ ours: left, unsure } = await scan(owned, runId, variable, record));
     if (!left.length) break;
     if (remember(owned, left)) await record?.();
     for (const proc of left) signal(proc.pid, "SIGKILL");
@@ -241,16 +252,20 @@ export async function stopRun(
   if (variable !== RUN_MARKER && !left.length && !unsure.length) {
     // A non-atomic ps read can miss both an unmarked member and its successor. Only the kernel can
     // confirm the group is gone. A live, inaccessible, or reused group is not authority to signal it.
+    const before = owned.groups.size;
+    let pending: Error | undefined;
     for (const pgid of owned.groups) {
       const message = `Cannot prove staging process group ${pgid} is gone; leave the private stage in place and investigate`;
-      try { process.kill(-pgid, 0); }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw new Error(message, { cause: error });
-        owned.groups.delete(pgid);
-        continue;
+      try {
+        process.kill(-pgid, 0);
+        pending ??= new Error(message);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") owned.groups.delete(pgid);
+        else pending ??= new Error(message, { cause: error });
       }
-      throw new Error(message);
     }
+    if (owned.groups.size !== before) await record?.();
+    if (pending) throw pending;
   }
   return [...left, ...unsure];
 }
