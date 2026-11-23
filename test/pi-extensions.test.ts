@@ -1,15 +1,18 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { readConfig } from "../src/config.ts";
-import { checkout, fixture } from "./helpers.ts";
+import { checkout } from "./helpers.ts";
 
 async function setup(t: TestContext) {
-  const dir = await fixture(t);
+  // In production the stage is not under the release's node_modules: test real absolute/virtual resolution.
+  const dir = await mkdtemp(join(tmpdir(), "aipatty-extension-test-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
   const agentDir = join(dir, "agent"), cwd = join(dir, "checkout"), home = join(dir, "home"), temp = join(dir, "temp");
   await Promise.all([agentDir, cwd, home, temp].map(path => mkdir(path)));
   const pi = readConfig(["--pi-dir", agentDir], {}).pi;
@@ -54,9 +57,14 @@ test("bundled Pi loads the pinned web tools, ignores executable discovery, and k
   }
   await writeFile(join(cwd, ".puppeteerrc.cjs"), `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'Puppeteer config ran');`);
   await writeFile(join(cwd, "AGENTS.md"), "unexpected checkout context");
-  // An executable as a stand-in only; a blocked or missing browser never starts it.
-  const extractor = join(dir, "trafilatura");
-  await writeFile(extractor, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\n`, { mode: 0o700 });
+  const extractor = join(dir, "trafilatura"), extractorCalls = join(dir, "extractor-calls");
+  await writeFile(extractor, `#!/bin/sh
+pwd -P >> ${JSON.stringify(extractorCalls)}
+read -r html
+[ "$html" = '<p>fixture HTML</p>' ] && [ "$*" = '--markdown --formatting' ] || exit 8
+[ -z "$FIXTURE_SECRET" ] && [ "$PATTY_RUN_ID" = 'fixture-run' ] || exit 9
+printf '# Fixture Markdown\\n'
+`, { mode: 0o700 });
   const browser = join(dir, "chrome"), browserArgs = join(dir, "browser-args");
   await writeFile(browser, `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(browserArgs)}\nexit 7\n`, { mode: 0o700 });
 
@@ -83,15 +91,20 @@ test("bundled Pi loads the pinned web tools, ignores executable discovery, and k
   await writeFile(join(agentDir, "web-search.json"), JSON.stringify({ provider: "fixture-search", model: "search-model" }));
   await writeFile(join(cwd, "web-search.json"), JSON.stringify({ provider: "must-not-load", model: "bad" }));
 
-  for (const mode of ["missing extractor", "missing Chrome", "stub Chrome"]) {
+  for (const mode of ["missing extractor", "missing egress", "invalid egress", "missing Chrome", "stub Chrome"]) {
     if (mode !== "missing extractor") await writeFile(join(agentDir, "just-web-fetch.json"), JSON.stringify({ extensionsDir: checkoutHooks }));
     const result = await run([pi.extension, pi.webFetchExtension, pi.webSearchExtension, join(checkout, "test/fixtures/pi-extension-smoke.ts")],
       ["--model", "fixture/coding"], { FIXTURE_MARKER: marker, FIXTURE_TOOLS: tools,
         ...(mode !== "missing extractor" ? { PI_WEB_FETCH_TRAFILATURA: extractor } : {}),
-        ...(mode === "stub Chrome" ? { PUPPETEER_EXECUTABLE_PATH: browser } : {}) });
+        ...(mode !== "missing egress" ? { PI_WEB_FETCH_EGRESS_PROXY: mode === "invalid egress" ? "direct://" : "http://127.0.0.1:9" } : {}),
+        ...(mode === "stub Chrome" ? { PUPPETEER_EXECUTABLE_PATH: browser, FIXTURE_CHECK_EXTRACTOR: "1",
+          FIXTURE_SECRET: "do-not-forward", PATTY_RUN_ID: "fixture-run" } : {}) });
     assert.equal(result.code, 0, result.stderr);
     assert.equal(result.stderr, "");
-    const { all, active, prompt } = JSON.parse(await readFile(tools, "utf8")) as { all: string[]; active: string[]; prompt: string };
+    const { all, active, prompt, extraction } = JSON.parse(await readFile(tools, "utf8")) as {
+      all: string[]; active: string[]; prompt: string; extraction?: unknown;
+    };
+    if (mode === "stub Chrome") assert.deepEqual(extraction, { ok: true, markdown: "# Fixture Markdown" });
     for (const name of ["delegate", "web_fetch", "web_search", "url_context"]) assert.equal(all.filter(n => n === name).length, 1, name);
     assert.ok(active.includes("web_fetch") && active.includes("web_search"), active.join(", "));
     assert.ok(!active.includes("url_context"));
@@ -101,10 +114,12 @@ test("bundled Pi loads the pinned web tools, ignores executable discovery, and k
     const fetch = JSON.stringify(outcomes.find(event => event.toolName === "web_fetch"));
     if (mode === "missing extractor") {
       assert.match(fetch, /Set PI_WEB_FETCH_TRAFILATURA/);
+    } else if (mode === "missing egress" || mode === "invalid egress") {
+      assert.match(fetch, /Set PI_WEB_FETCH_EGRESS_PROXY/);
     } else {
       assert.match(fetch, /Blocked navigation to https:\/\/127\.0\.0\.1/);
       if (mode === "missing Chrome") assert.match(fetch, /PUPPETEER_EXECUTABLE_PATH is not executable/);
-      else assert.match(fetch, /Failed to launch the browser process/);
+      else assert.match(fetch, /Browser error:/);
     }
     const search = JSON.stringify(outcomes.find(event => event.toolName === "web_search"));
     assert.match(search, /Fixture search result/);
@@ -117,7 +132,12 @@ test("bundled Pi loads the pinned web tools, ignores executable discovery, and k
   const args = (await readFile(browserArgs, "utf8")).trim().split("\n");
   assert.ok(args.some(arg => arg.startsWith(`--user-data-dir=${env.TMPDIR}`)), args.join(" "));
   assert.ok(!args.includes("--no-sandbox"));
-  assert.equal(requests.length, 3);
+  for (const flag of ["--proxy-server=http://127.0.0.1:9", "--proxy-bypass-list=<-loopback>", "--disable-quic", "--remote-debugging-pipe"]) {
+    assert.ok(args.includes(flag), flag);
+  }
+  // Only the explicit local extraction fixture ran; failed browser/preflight calls never start it.
+  assert.equal(await readFile(extractorCalls, "utf8"), `${await realpath(agentDir)}\n`);
+  assert.equal(requests.length, 5);
   for (const req of requests) {
     assert.equal(req.url, "/responses");
     assert.equal(req.authorization, "Bearer fixture-key");

@@ -1,6 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { extractContent } from "../../src/extensions/web-fetch-runtime.ts";
 
 export default function (pi: ExtensionAPI) {
   const stub = fauxProvider({ provider: "fixture", models: [{ id: "coding" }] });
@@ -17,8 +18,9 @@ export default function (pi: ExtensionAPI) {
       name: "unexpected-bus-hook", matches: ["**"],
       beforeFetch() { writeFileSync(process.env.FIXTURE_MARKER!, "bus hook ran"); },
     });
+    const extraction = process.env.FIXTURE_CHECK_EXTRACTOR ? await extractContent("<p>fixture HTML</p>\n") : undefined;
     writeFileSync(process.env.FIXTURE_TOOLS!, JSON.stringify({
-      all: pi.getAllTools().map(tool => tool.name), active: pi.getActiveTools(), prompt: ctx.getSystemPrompt(),
+      all: pi.getAllTools().map(tool => tool.name), active: pi.getActiveTools(), prompt: ctx.getSystemPrompt(), extraction,
     }));
   });
 }

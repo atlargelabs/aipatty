@@ -77,7 +77,8 @@ ambient extensions and the checkout's settings and executable resources stay dis
 
 - **`just-web-fetch`** (`github.com/stephenchestnut/just-web-fetch`): top-level `web_fetch`. A small, source-checked
   adapter removes its own config, executable hook discovery and event-bus hooks, and uses preinstalled extraction
-  and `puppeteer-core` (no Puppeteer config discovery). npm aliases its legacy peers to the current release's
+  and `puppeteer-core` (no Puppeteer config discovery). Fetch requires a connection-time filtering egress proxy;
+  it never falls back to direct browsing. npm aliases its legacy peers to the current release's
   versions; the bundled loader resolves those imports to the running Pi modules, not a second client or auth store.
 - **`pi-web-search`** (npm): top-level `web_search` and model-scoped `url_context`. Overrides come only from
   `web-search.json` in the trusted Pi agent dir. The tool uses a supported native provider, not a fallback model.

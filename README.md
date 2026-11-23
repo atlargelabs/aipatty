@@ -83,7 +83,8 @@ missing path or an older or shared copy is refused. Only the `crmanager` job loa
 not require this setting. See [the runbook](docs/INSTALL.md) for the exact path and rollout steps.
 
 Web and Claude Code extensions are for the top-level coding run only, not conversations, delegates, or the
-reviewer. Fetch needs operator-installed Chrome/Chromium and trafilatura; managed runs do not load fetch hooks.
+reviewer. Fetch needs operator-installed Chrome/Chromium, trafilatura, and a filtering egress proxy; managed
+runs do not load fetch hooks.
 Search needs a provider/account with native search and can incur separate usage. Claude Code needs its own CLI
 and service-account subscription login. See [optional coding extensions](docs/INSTALL.md#optional-coding-extensions)
 for prerequisites, configuration, and data/usage boundaries.
