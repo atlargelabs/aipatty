@@ -612,7 +612,11 @@ $("composer").addEventListener("submit", guard(async event => {
   }
 }));
 $("input").addEventListener("keydown", event => {
-  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) $("composer").requestSubmit();
+  if (event.key !== "Enter" || event.shiftKey || event.altKey) return;
+  // Safari can report isComposing=false on the Enter that commits an IME candidate.
+  if (event.isComposing || event.keyCode === 229) return;
+  event.preventDefault();
+  if (!event.repeat) $("composer").requestSubmit();
 });
 $("abort").addEventListener("click", guard(() => api("/api/conversations/" + app.branch + "/abort", { method: "POST" })));
 $("fork").addEventListener("click", guard(() => forkAt()));

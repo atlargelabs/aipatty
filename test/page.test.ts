@@ -93,8 +93,8 @@ async function openBrowser(t: TestContext, flags: string[] = []) {
     evaluate,
     navigate: (url: string) => send("Page.navigate", { url }),
     viewport: (width: number, height: number) => send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false }),
-    async key(key: "Enter" | "Escape") {
-      const params = { key, code: key, windowsVirtualKeyCode: key === "Enter" ? 13 : 27 };
+    async key(key: "Enter" | "Escape", modifiers = 0) {
+      const params = { key, code: key, windowsVirtualKeyCode: key === "Enter" ? 13 : 27, modifiers };
       await send("Input.dispatchKeyEvent", { type: "keyDown", ...params, ...(key === "Enter" && { text: "\r" }) });
       await send("Input.dispatchKeyEvent", { type: "keyUp", ...params });
     },
@@ -299,6 +299,47 @@ test("an upgrade's report appears in the open transcript", { skip: !chrome, time
   await root.commit(tx => tx.appendEntry(root.id, { kind: upgradeEntryKind, data: { text: "Upgrade complete." } }), ctx);
   const after = await waitFor(browser, "the upgrade report", value => value.messages.length === 3);
   assert.deepEqual(after.messages, ["on main", "Faux reply: on main", "Upgrade complete."]);
+  assert.deepEqual(browser.errors, []);
+});
+
+test("Enter sends a draft and Shift+Enter inserts a newline in the composer", { skip: !chrome, timeout: 60_000 }, async t => {
+  const host = await openHost(fauxConfig(await fixture(t)));
+  const api = await startApi(host, health, 0);
+  t.after(async () => { await api.close(); await host.close(); });
+  const browser = await openBrowser(t);
+  await browser.navigate(`http://127.0.0.1:${api.port}/`);
+  await waitFor(browser, "the main branch", state => state.current === "Main");
+
+  const input = `document.getElementById('input')`;
+  await browser.evaluate(`${input}.focus(); ${input}.value = 'first';`);
+  await browser.key("Enter", 8); // DevTools uses bit 8 for Shift.
+  assert.equal(await browser.evaluate(`${input}.value`), "first\n");
+
+  // Synthetic keydowns exercise modifier and IME flags without changing the draft.
+  for (const [init, prevented, submitted] of [
+    [{ shiftKey: true, ctrlKey: true, metaKey: true }, false, false],
+    [{ altKey: true }, false, false],
+    [{ isComposing: true }, false, false],
+    [{ keyCode: 229 }, false, false],
+    [{ repeat: true }, true, false],
+    [{ ctrlKey: true }, true, true],
+    [{ metaKey: true }, true, true],
+  ]) {
+    const result = await browser.evaluate(`(() => {
+      const input = ${input};
+      const event = new KeyboardEvent('keydown', { key: 'Enter', cancelable: true, ...${JSON.stringify(init)} });
+      let submitted = false;
+      input.form.requestSubmit = () => { submitted = true; };
+      try { input.dispatchEvent(event); } finally { delete input.form.requestSubmit; }
+      return [event.defaultPrevented, submitted];
+    })()`);
+    assert.deepEqual(result, [prevented, submitted], JSON.stringify(init));
+  }
+
+  await browser.evaluate(`${input}.value += 'second';`);
+  await browser.key("Enter");
+  const after = await waitFor(browser, "the sent multiline draft", state => state.messages.length === 2);
+  assert.equal(after.messages[0], "first\nsecond");
   assert.deepEqual(browser.errors, []);
 });
 
