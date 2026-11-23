@@ -75,7 +75,8 @@ export function addUsage(total: Usage, usage: unknown): void {
   }
 }
 
-function contentText(content: unknown): string {
+/** Visible text from Pi's events, without reasoning, images or tool calls. */
+export function eventText(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content.map(part => record(part) && part.type === "text" && typeof part.text === "string" ? part.text : "").join("");
@@ -252,7 +253,7 @@ export class RunTrace {
         const message = event.message;
         if (!record(message) || message.role !== "assistant") return;
         addUsage(this.usage, message.usage);
-        this.lastText = contentText(message.content);
+        this.lastText = eventText(message.content);
         this.lastStop = typeof message.stopReason === "string" ? message.stopReason : undefined;
         this.lastError = typeof message.errorMessage === "string" ? message.errorMessage : undefined;
         return;
@@ -329,7 +330,7 @@ export class RunTrace {
   private shell(args: unknown, result: Record<string, unknown>): void {
     const command = record(args) && typeof args.command === "string" ? args.command : "";
     if (!/\bgh\s+(pr|issue)\s+create\b/.test(command)) return;
-    for (const url of contentText(result.content).match(/https:\/\/github\.com\/[^\s"'<>)]+/g) ?? []) this.link(url);
+    for (const url of eventText(result.content).match(/https:\/\/github\.com\/[^\s"'<>)]+/g) ?? []) this.link(url);
   }
 
   private link(url: string): void {

@@ -99,7 +99,9 @@ node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT"
 The option derives `$ROOT/data` (or `$ROOT/faux` in faux mode), `$ROOT/pi`, `$ROOT/work`, and `$ROOT/runs`.
 The database, ownership lock, and run logs live in the data directory; Pi auth, model cache, settings and jobs
 live in the Pi directory. The pinned CLI and both extensions live in the release. Model scratch lives in `work`;
-disposable Pi workspaces live in `runs`. An individual directory option overrides its derived path. Omitting the
+disposable Pi workspaces live in `runs`. The browser's run pane reads a bounded excerpt from `data/logs/runs/`
+(or `logs/runs/` under the configured data directory), not the disposable clone. Removing an archive leaves the
+chat intact but removes its replay. An individual directory option overrides its derived path. Omitting the
 root leaves the legacy defaults unchanged. The option is server-only; it adds no environment variable or API.
 The server forwards its configured Pi directory to Pi subprocesses; bootstrap commands must set it explicitly.
 

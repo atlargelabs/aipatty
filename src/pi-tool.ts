@@ -51,7 +51,10 @@ export function piExtension(getRuns: () => PiRuns) {
       return result(await getRuns().run({
         conversationId: api.conversationId, taskId: api.taskId, task: args.task, pr: args.pr ?? true, base, model, thinking,
         timeoutMs: (args.timeoutMinutes ?? defaultMinutes) * 60_000,
-      }, context.abortSignal));
+      }, context.abortSignal, runId => {
+        // Publish only after the slot admits this exact call. Progress is best effort; the final details are durable.
+        void api.details({ runId }, context).catch(() => {});
+      }));
     },
   });
 

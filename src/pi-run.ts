@@ -10,19 +10,17 @@ import { promisify } from "node:util";
 import type { Config } from "./config.ts";
 import { instructions, taskPrompt } from "./pi-prompt.ts";
 import { addUsage, githubLink, readReport, RunTrace, usageKey, type JobUsage, type Review } from "./pi-trace.ts";
+import { readPiRunSnapshot, runLogParts } from "./pi-run-view.ts";
+import type { PiRunSnapshot, RunStatus } from "./protocol.ts";
 import { listProcesses, newOwned, remember, runProcesses, RUN_MARKER, stopRun, type Owned } from "./processes.ts";
 
 const exec = promisify(execFile);
 
-/**
- * How a run ended. `completed` means everything the host can check holds: Pi finished cleanly, and, when a PR was
- * asked for, GitHub has it open against `main`, linked to its issue, and its head commit was reviewed clean.
- */
-export type RunStatus = "completed" | "failed" | "aborted" | "timed_out" | "interrupted";
-
 export interface RunOutcome {
   runId: string;
   status: RunStatus;
+  /** Absent for older runs and runs whose end time wasn't observed. */
+  durationMs?: number;
   summary: string;
   /** Confirmed with `gh`, unless `confirmed` is false: then it is only a link the run printed. */
   pr?: { url: string; number: number; headSha?: string; state?: string; confirmed: boolean };
@@ -315,7 +313,8 @@ export interface PiRuns {
    * Run Pi once. Rejects at once when another run is active, or when an earlier run could not be cleaned up;
    * otherwise resolves when the run is over and cleaned up.
    */
-  run(request: RunRequest, signal?: AbortSignal): Promise<RunOutcome>;
+  run(request: RunRequest, signal?: AbortSignal, onStart?: (runId: string) => void): Promise<RunOutcome>;
+  snapshot(runId: string): Promise<PiRunSnapshot | undefined>;
   /**
    * The outcome of a call whose result the harness did not get from the tool: aborted, or cut off by a restart.
    * Stops the call's run if it is still working, and waits for its cleanup.
@@ -331,7 +330,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
   const pollMs = pi.pollMs ?? defaultPollMs;
   const stateFile = join(config.dataDir, "pi-run.json");
   const outcomesFile = join(config.dataDir, "pi-outcomes.json");
-  const logRoot = join(config.dataDir, "logs", "runs");
+  const logRoot = join(config.dataDir, ...runLogParts);
   const jobsDir = join(pi.agentDir, "delegates", "jobs");
   await mkdir(logRoot, { recursive: true, mode: 0o700 });
   await mkdir(config.runsDir, { recursive: true, mode: 0o700 });
@@ -971,6 +970,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     // `completed` only when everything the host checked holds.
     if (outcome.status === "completed" && outcome.problems.length) outcome.status = "failed";
     outcome.problems = outcome.problems.slice(0, maxItems);
+    outcome.durationMs = Math.max(0, Date.now() - Date.parse(saved.startedAt));
     // Saved by call before the run's record goes: the harness may not have committed the result when this process dies.
     // The outcome is settled now. Whatever fails from here keeps the slot closed, and still returns it.
     let handed = clean;
@@ -999,7 +999,9 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
 
   return {
     active: () => active && { runId: active.saved.runId, conversationId: active.saved.conversationId },
-    async run(request, signal) {
+    snapshot: runId => readPiRunSnapshot(config.dataDir, pi.repo, runId, () =>
+      active?.saved.runId === runId ? Date.parse(active.saved.startedAt) : undefined),
+    async run(request, signal, onStart) {
       if (closed) throw new Error("aipatty is shutting down");
       if (active) {
         const { runId, conversationId } = active.saved;
@@ -1030,6 +1032,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         signal?.removeEventListener("abort", onAbort);
         if (active === run) active = undefined;
       });
+      onStart?.(runId);
       const outcome = await run.done;
       if (!outcome) {
         // The host is stopping. Settle nothing: the harness closes next, and the next start reports the call as

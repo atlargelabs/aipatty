@@ -1,14 +1,17 @@
 import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { mkdir, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { get } from "node:http";
 import { createConnection } from "node:net";
+import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
 import WebSocket from "ws";
 import { startApi } from "../src/api.ts";
 import { openHost } from "../src/host.ts";
-import { messageText, streamUpdate, type ConversationPage } from "../src/protocol.ts";
-import { connect, fauxConfig, fixture, until } from "./helpers.ts";
+import { messageText, piRunApiPath, streamUpdate, type ConversationPage, type PiRunSnapshot } from "../src/protocol.ts";
+import { archivedPiRun, connect, fauxConfig, fixture, until } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
 
@@ -193,6 +196,122 @@ test("invalid requests and foreign origins are rejected", async t => {
   assert.equal(code, 403);
 
   assert.deepEqual(lines(await page(base)), []);
+});
+
+test("a Pi archive projects only bounded visible activity and confirmed result metadata", async t => {
+  const dir = await fixture(t);
+  const { base } = await server(t, dir);
+  const id = "20260101T010101-aaaaaaaa";
+  const hidden = "PRIVATE-FIXTURE-SENTINEL";
+  const text = (text: string) => ({ type: "text", text });
+  const headSha = "1".repeat(40), reviewedSha = "2".repeat(40);
+  const path = await archivedPiRun(dir, id, {
+    status: "failed", durationMs: 12_345, summary: "<img src=x onerror=alert(1)>", logDir: hidden, usage: { env: hidden },
+    issue: { confirmed: true, url: "https://github.com/atlargelabs/aipatty/issues/5?query=ignored" },
+    pr: { confirmed: true, url: "https://github.com/atlargelabs/aipatty/pull/6", headSha },
+    review: { status: "stale", verdict: "correct", sha: reviewedSha, important: 0, lesser: 1, workspace: hidden },
+    problems: ["PR head changed."], remaining: [],
+  }, [
+    "x".repeat(3 * 1024 * 1024),
+    ...Array.from({ length: 30 }, (_, i) => JSON.stringify({ type: "tool_execution_start", toolName: "read", toolCallId: `read-${i}` })),
+    ...[
+      { type: "message_end", message: { role: "user", content: [text(hidden)] } },
+      { type: "message_end", message: { role: "system", content: [text(hidden)] } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "thinking", thinking: hidden }, text("Checking the result.")] } },
+      { type: "tool_execution_start", toolName: "bash", args: { command: hidden, env: hidden } },
+      { type: "tool_execution_end", toolName: "read", result: { content: [text(hidden)] } },
+      { type: "tool_execution_end", toolName: "bash", isError: true, result: { content: [text(`failed checks\n\n[Showing lines 1-2 of 3. Full output: ${hidden}]`)], structuredContent: { output: hidden } } },
+      { type: "tool_execution_end", toolName: "bash", result: { content: [text("large output ".repeat(2_000))] } },
+      { type: "unknown", arbitrary: hidden },
+    ].map(value => JSON.stringify(value)),
+    "{malformed}", '{"type":"message_end","message":',
+  ].join("\n"));
+  for (const name of ["prompt.md", "instructions.md"]) await writeFile(join(path, name), hidden);
+  await writeFile(join(path, "stderr.log"), "x".repeat(25_000) + "diagnostic stderr");
+
+  const url = base + piRunApiPath + id;
+  const response = await fetch(url, { headers: { Origin: base } });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  const body = await response.text();
+  assert.ok(body.length < 30_000);
+  assert.ok(!body.includes(hidden));
+  const view = JSON.parse(body) as PiRunSnapshot;
+  assert.equal(view.status, "failed");
+  assert.equal(view.durationMs, 12_345);
+  assert.equal(view.result?.summary?.text, "<img src=x onerror=alert(1)>");
+  assert.deepEqual(view.result?.issue, { url: "https://github.com/atlargelabs/aipatty/issues/5" });
+  assert.deepEqual(view.result?.pr, { url: "https://github.com/atlargelabs/aipatty/pull/6", headSha });
+  assert.deepEqual(view.result?.review, { status: "stale", verdict: "correct", sha: reviewedSha, important: 0, lesser: 1 });
+  assert.deepEqual(view.result?.problems, [{ text: "PR head changed.", truncated: false }]);
+  assert.equal(view.activity?.truncated, true);
+  assert.equal(view.activity?.incomplete, true);
+  assert.ok(view.activity?.items.some(item => item.kind === "text" && item.output.text === "Checking the result."));
+  assert.deepEqual(view.activity?.items.at(-2), {
+    kind: "tool", name: "bash", status: "error", output: { text: "failed checks", truncated: true },
+  });
+  assert.equal(view.activity?.items.at(-1)?.output?.truncated, true);
+  assert.equal(view.stderr?.truncated, true);
+  assert.match(view.stderr!.text, /diagnostic stderr$/);
+
+  await archivedPiRun(dir, id, {
+    pr: { confirmed: true, url: "https://github.com/other/aipatty/pull/3" },
+    issue: { confirmed: false, url: "https://github.com/atlargelabs/aipatty/issues/6" },
+    review: { status: "unverified", important: "not a count" },
+  });
+  const unverified = await (await fetch(url)).json() as PiRunSnapshot;
+  assert.equal(unverified.result?.pr, undefined);
+  assert.equal(unverified.result?.issue, undefined);
+  assert.deepEqual(unverified.result?.review, { status: "unverified" });
+});
+
+test("Pi snapshots reject traversal, foreign origins and links out of the archive", async t => {
+  const dir = await fixture(t);
+  const { base } = await server(t, dir);
+  const id = "20260101T010101-aaaaaaaa", other = "20260101T010101-bbbbbbbb";
+  const archive = await archivedPiRun(dir, id, {});
+  const prefix = base + piRunApiPath;
+  const privatePath = join(dir, "private-file");
+  await writeFile(privatePath, "only in the private fixture file");
+  await symlink(privatePath, join(archive, "stderr.log"));
+  await symlink(privatePath, join(archive, "events.jsonl"));
+  const view = await (await fetch(prefix + id)).json() as PiRunSnapshot;
+  assert.equal(view.runId, id);
+  assert.equal(view.stderr, undefined);
+  assert.equal(view.activity, undefined);
+  assert.equal((await fetch(prefix + id, { headers: { Origin: "http://foreign.example" } })).status, 403);
+  const rawStatus = (options: Parameters<typeof get>[1]) => new Promise<number | undefined>((resolve, reject) => {
+    get(prefix + id, options, res => { res.resume(); resolve(res.statusCode); }).on("error", reject);
+  });
+  assert.equal(await rawStatus({ headers: { Host: "foreign.example" } }), 403);
+  assert.equal(await rawStatus({ path: piRunApiPath + "stray/../" + id }), 400);
+  assert.equal((await fetch(prefix + id, { method: "POST" })).status, 405);
+  assert.equal((await fetch(prefix + other)).status, 404);
+  for (const suffix of ["../private-file", "%2e%2e%2fprivate-file", `${id}%2fprompt.md`, "not-a-run", `${id}?path=private-file`]) {
+    const rejected = await fetch(prefix + suffix);
+    assert.ok([400, 404].includes(rejected.status), `${suffix}: ${rejected.status}`);
+  }
+
+  const outside = join(dir, "outside");
+  await rename(archive, outside);
+  await symlink(outside, archive);
+  // Even a directory with a matching result record is not an archive if reached through a link.
+  assert.equal((await fetch(prefix + id)).status, 404);
+  await rm(archive);
+  await mkdir(archive);
+  await symlink(join(outside, "result.json"), join(archive, "result.json"));
+  assert.equal((await fetch(prefix + id)).status, 404);
+  await rm(join(archive, "result.json"));
+  await writeFile(join(archive, "events.jsonl"), "{}\n");
+  assert.equal((await fetch(prefix + id)).status, 404, "an orphaned log directory is not a run record");
+  await writeFile(join(archive, "result.json"), '{"outcome":');
+  assert.equal((await fetch(prefix + id)).status, 404, "a malformed result is unavailable, not a server error");
+
+  await rename(dirname(archive), join(dir, "other-runs"));
+  await archivedPiRun(dir, id, {});
+  await rename(dirname(archive), join(dir, "valid-runs"));
+  await symlink(join(dir, "valid-runs"), dirname(archive));
+  assert.equal((await fetch(prefix + id)).status, 404, "the archive root cannot be a symlink either");
 });
 
 test("shutdown is requested once even with a stuck acknowledgement", { timeout: 5_000 }, async t => {
