@@ -5,6 +5,19 @@ import type { ConversationView, EntryRecord, LiveState, ModelRef, UsageState } f
 /** Non-safelisted marker: an ordinary browser form cannot send it. */
 export const shutdownHeader = "x-aipatty-shutdown";
 
+/** The message that asks the server to upgrade itself instead of going to the model. */
+export const upgradeCommand = "/upgrade";
+
+/** The kind of a transcript entry about an upgrade: `data.text` is shown to people and is not model context. */
+export const upgradeEntryKind = "aipatty.upgrade";
+
+/** The text of an upgrade entry. */
+export function upgradeText(entry: Pick<EntryRecord, "kind" | "data">): string | undefined {
+  const { data } = entry;
+  if (entry.kind !== upgradeEntryKind || !data || typeof data !== "object" || Array.isArray(data)) return undefined;
+  return typeof data.text === "string" ? data.text : undefined;
+}
+
 /** A transcript page, in chronological order, and its conversation's current metadata. */
 export interface ConversationPage {
   id: number;

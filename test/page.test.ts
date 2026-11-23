@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { startApi } from "../src/api.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
+import { upgradeEntryKind } from "../src/protocol.ts";
 import { checkout, fauxConfig, fixture, realConfig, until } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
@@ -152,6 +153,22 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
   await browser.navigate("about:blank");
   await browser.navigate(`${base}/#${side.id}`);
   await waitFor(browser, "the branch named in the fragment", value => value.title === "Side" && value.messages.length === 4);
+  assert.deepEqual(browser.errors, []);
+});
+
+test("an upgrade's report appears in the open transcript", { skip: !chrome, timeout: 60_000 }, async t => {
+  const host = await openHost(fauxConfig(await fixture(t)));
+  const api = await startApi(host, health, 0);
+  t.after(async () => { await api.close(); await host.harness.close(ctx); });
+  await say(host, "root", "on main");
+  const browser = await openBrowser(t);
+  await browser.navigate(`http://127.0.0.1:${api.port}/`);
+  await waitFor(browser, "the main branch", value => value.messages.length === 2);
+
+  const root = (await host.conversation("root"))!;
+  await root.commit(tx => tx.appendEntry(root.id, { kind: upgradeEntryKind, data: { text: "Upgrade complete." } }), ctx);
+  const after = await waitFor(browser, "the upgrade report", value => value.messages.length === 3);
+  assert.deepEqual(after.messages, ["on main", "Faux reply: on main", "Upgrade complete."]);
   assert.deepEqual(browser.errors, []);
 });
 

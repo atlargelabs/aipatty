@@ -145,8 +145,9 @@ branch protection described in the runbook.
 Keep committed-main releases in `$ROOT/deploy/<sha>` with a `deploy/current` symlink and launch
 `node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT"`. Explicitly set `PI_CODING_AGENT_DIR="$ROOT/pi"`
 when using the pinned Pi CLI for login or model-cache updates. Set `delegates.reviewExtension` to the absolute
-path through `deploy/current` so it follows deployment and rollback between pinned releases. Stop and wait
-before repointing `current`. Follow [the runbook](docs/INSTALL.md) for first installs, migrating existing settings,
+path through `deploy/current` so it follows deployment and rollback between pinned releases. Deploy later
+releases with [`/upgrade`](#upgrade); by hand, stop and wait before repointing `current`. Follow
+[the runbook](docs/INSTALL.md) for first installs, migrating existing settings,
 rollback to releases with an unpinned reviewer, and development without `deploy/current`.
 
 The server also takes one environment variable, `AIPATTY_FAUX`: `1` uses the fake model. An empty value counts as unset.
@@ -183,6 +184,7 @@ node src/cli.ts models                # list available model IDs and providers
 node src/cli.ts model set <id>        # select a model from that list (optional provider before ID)
 node src/cli.ts thinking set <level>  # off, minimal, low, medium, high, xhigh or max
 node src/cli.ts send "hello"          # send a message and stream the answer
+node src/cli.ts upgrade               # deploy the latest main in a managed install; the result appears in the log
 node src/cli.ts abort                 # withdraw queued messages and stop the running turn
 node src/cli.ts shutdown              # request a graceful stop of the whole server
 node src/cli.ts log                   # print the transcript
@@ -193,8 +195,8 @@ node src/cli.ts fork "<title>" [--at <entryId>]    # fork the root (or --branch 
 node src/cli.ts rename "<title>"                   # retitle the root (or --branch <id>)
 ```
 
-`--branch <id>` before or after the command points `model set`, `thinking set`, `send`, `abort`, `log`, `fork` and
-`rename` at a branch instead of the root.
+`--branch <id>` before or after the command points `model set`, `thinking set`, `send`, `abort`, `log`, `fork`,
+`rename` and `upgrade` at a branch instead of the root.
 
 The CLI connects to `127.0.0.1:8790`. `--port <n>` names another port, for a server started with `--port`
 (or a matching SSH forward). For example: `aipatty --port 9000 shutdown` (or `node src/cli.ts --port 9000 shutdown`).
@@ -206,6 +208,16 @@ withdraw queued messages. Conversations persist, and interrupted conversation wo
 scheduling is [blocked by an unavailable model](#configure). Partial answers may remain in the transcript.
 Active [`pi` runs](#pi-runs) are stopped and reported as interrupted on restart, not replayed. Wait for the server
 process to exit before starting another one on the same data directory.
+
+## Upgrade
+
+In a [service install](#configure), typing `/upgrade` in a branch on the page, or running the CLI's `upgrade`,
+deploys the latest committed `main`. It goes to the server, not the model, and is refused while any branch is busy. A one-shot
+supervisor script stages the release beside the running one, then stops the server, backs up the database and
+starts the new release. Every release checks its own health as it starts; `health` lists any `problems`. A new
+release that exits or reports a problem is replaced by the old one with the database restored. The outcome, with
+the reason for a failure, is posted in the branch that asked. Nothing is installed and nothing runs between
+upgrades. See [the runbook](docs/INSTALL.md#upgrade) for the files it keeps and what to do after an interruption.
 
 ## From another machine
 
@@ -222,7 +234,8 @@ the authentication.
 ## API
 
 - `GET /` the page (and `/app.js`, `/app.css`)
-- `GET /health` (includes the root's saved model, its catalog availability, and the thinking level)
+- `GET /health` (includes the process ID, the root's saved model, its catalog availability, the thinking level,
+  and `problems`: what the startup health check found, empty when healthy)
 - `GET /api/models`
 - `POST /api/shutdown` (no body needed): requires the `X-Aipatty-Shutdown: 1` header so ordinary browser forms
   cannot trigger it. No CORS is enabled. Returns `202 { "status": "shutdown-requested" }` before stopping the
@@ -238,7 +251,9 @@ the authentication.
 - `PUT /api/conversations/:id/thinking` with `{ level }`
 - `GET /api/conversations/:id/search?q=&limit=&before=`: `{ matches: [{ entryId, role, excerpt }], before }`,
   newest first; pass `before` back for the next page
-- `POST /api/conversations/:id/messages` with `{ content, requestId?, whenBusy?: "followUp" | "steer" }`
+- `POST /api/conversations/:id/messages` with `{ content, requestId?, whenBusy?: "followUp" | "steer" }`. The
+  content `/upgrade` starts an [upgrade](#upgrade) instead: `202 { "upgrade": "started" }`, or 409 when the server
+  is busy or not a managed install
 - `POST /api/conversations/:id/abort` (returns once the conversation is idle)
 - `WS /api/conversations/:id/stream` sends one `state` frame (the newest 50 entries and the live state), then an
   `update` frame per change: the live state plus any `appended` entries, without the window. It falls back to a full

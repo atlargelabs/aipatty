@@ -1,8 +1,8 @@
 # Installing aipatty on the Mac mini
 
-This is build step 3 of [PLAN.md](PLAN.md): install by hand, then prove that aipatty can change itself through a
-reviewed PR. Use a committed `main` release containing `--install-dir`. Deploys and rollback are manual; the
-supervisor is future work (step 4). No installer, migration, or automatic deletion is involved.
+This is build steps 3 and 4 of [PLAN.md](PLAN.md): install by hand, prove that aipatty can change itself through a
+reviewed PR, and from then on deploy with [`/upgrade`](#upgrade). The first release that has `/upgrade` is deployed
+by hand. No installer, migration, or automatic deletion is involved.
 
 The default recommended service root is `~/aipatty` in the home of the account that will run aipatty. Set
 `ROOT="$HOME/aipatty"` in each shell that runs these commands, so the path is absolute and quoted. Another
@@ -131,6 +131,56 @@ acknowledges the request. Wait for the server process to exit before repointing 
 server. For older releases without the command, or if the API is unreachable, use Ctrl-C in the server terminal
 or send the server `SIGTERM`. These all use the same cleanup; see [CLI shutdown semantics](../README.md#cli).
 
+## Upgrade
+
+With the server started as in [Start](#start), from a release that has the command, ask for an upgrade in any
+branch: type `/upgrade` in the page, or run `node src/cli.ts upgrade` (add `--branch <id>` for a branch other than
+the root).
+It is refused while any branch is busy or a Pi run is active; wait or abort first.
+
+The server starts a one-shot supervisor, which fetches the tip of `main` into `$ROOT/deploy/<sha>` and runs
+`npm ci --ignore-scripts` while the old server keeps running, then stops the old server, backs up the database,
+repoints `current` and starts the new release. The new release checks itself as it starts. One of these lines then
+appears in the branch that asked:
+
+- `Upgrade complete. Now running <new>; was <old>.`
+- `Already up to date: <sha> is the latest main.`
+- `Upgrade failed before anything changed. Still running <old>.` with the reason: the release could not be fetched
+  or installed. The old server never stopped.
+- `Upgrade to <new> failed and was rolled back. Running <old> again.` with the reason and the end of the new
+  server's output. The database is back as the old release left it.
+
+After an upgrade or a rollback the server runs in the background, detached from the terminal that started the
+first one. Stop it with the CLI as in [Stop](#stop) and start it by hand as before; nothing starts it at boot.
+
+Everything the upgrade keeps is in `$ROOT/upgrade/`:
+
+| File | What it is |
+| --- | --- |
+| `upgrade.log` | What the supervisor did, with times. |
+| `server.log` | The output of the servers the supervisor started. |
+| `backup.sqlite` | The database as the old release left it at the last switch. Replaced by the next upgrade. |
+| `pending.json` | Present only between the switch and the new release passing its health check. |
+| `result.json` | An outcome waiting for a running server to post it. |
+
+**If an upgrade is interrupted**, for example the machine restarts during the switch, nothing may be running.
+[Start](#start) the server as usual. It finds `pending.json`, restores the backup, points `current` back at the old
+release, starts that release in the background and exits with a line saying so. The same can be run by hand, with
+no server running:
+
+```sh
+node "$ROOT/deploy/<old sha>/src/upgrade-supervisor.ts" recover --install-dir "$ROOT"
+```
+
+**If the rollback fails too**, nothing is running and `upgrade.log` and `server.log` say why. `current` already
+points at the old release; fix the cause and [start](#start) it.
+
+`node src/cli.ts health` lists under `problems` what the startup health check found; an empty list is healthy. A
+release started by hand runs with its problems listed, so they can be fixed. A release started by an upgrade must
+have none. Old releases stay in `$ROOT/deploy/`; delete the ones you no longer want, keeping `current` and the one
+before it. The [reviewer setting](#first-deploy-from-a-release-with-an-unpinned-reviewer) follows `current` and
+needs no change between pinned releases.
+
 ## First deploy from a release with an unpinned reviewer
 
 For an existing root, stage the new release with `npm ci --ignore-scripts`, then [stop](#stop) the old
@@ -179,7 +229,8 @@ account's SSH keys and configuration, Git configuration, and `gh` login and sett
 2. The answer names an issue and a PR, the PR's head commit, and says `Review: reviewed`. Check that CI passed on
    that commit and that an actual `crmanager` Pi review ran.
 3. Steve merges the PR.
-4. Deploy by hand: make a release of the new committed `main` as in "First release", without changing the current
+4. Deploy with [`/upgrade`](#upgrade). From a release that predates the command, deploy by hand once: make a
+   release of the new committed `main` as in "First release", without changing the current
    symlink yet. Follow [Stop](#stop) and wait for the process to exit, then point `$ROOT/deploy/current` at the new
    release and start it again with the same root. Do not repoint while the server or a review is running: the
    reviewer setting follows `current`. For the first deploy over an unpinned release, make the
