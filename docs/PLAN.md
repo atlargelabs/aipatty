@@ -67,17 +67,28 @@ bumping Pi, verify that the active and rollback releases can both use the shared
 
 ### Pi extensions
 
-Pi runs use two extensions, and only these two:
+Pi runs use release-pinned extensions. The top-level CLI loads them only by explicit absolute `-e` paths; Pi's
+ambient extensions and the checkout's settings and executable resources stay disabled:
 
 - **`delegates`** (`github.com/stephenchestnut/delegates`): the `delegate` and `delegate_parallel` tools, with the
   `thinker`, `thinktank`, `worker`, `prmanager` and `crmanager` profiles. The run loads it with `-e`.
 - **`pi-review`** (`github.com/earendil-works/pi-review`): the `/review` command. The run does not load it.
   `delegates` loads it inside a `crmanager` job and runs `/review` there without its interactive UI.
 
-Both are direct git dependencies pinned to full commit SHAs in `package.json` and the lockfile. Each release
-installs its own copies with `npm ci --ignore-scripts`; rolling back aipatty rolls both extensions back too.
-`pi-review` uses the known working upstream revision `f1de050504936046c0f85b21fec0e0a93ef394eb`. Its
-peers reuse Pi 1.6.0, including `pi-tui`, which the CLI already requires at exactly 1.6.0.
+- **`just-web-fetch`** (`github.com/stephenchestnut/just-web-fetch`): top-level `web_fetch`. A small, source-checked
+  adapter removes its own config, executable hook discovery and event-bus hooks, and uses preinstalled extraction
+  and `puppeteer-core` (no Puppeteer config discovery). npm aliases its legacy peers to the current release's
+  versions; the bundled loader resolves those imports to the running Pi modules, not a second client or auth store.
+- **`pi-web-search`** (npm): top-level `web_search` and model-scoped `url_context`. Overrides come only from
+  `web-search.json` in the trusted Pi agent dir. The tool uses a supported native provider, not a fallback model.
+- **`pi-claude-code`** (`github.com/earendil-works/pi-claude-code`): experimental, top-level opt-in with
+  `model: "claude-code/<model-id>"`. An async extension factory validates the CLI login and discovers and registers
+  the requested account model before Pi selects it. OpenAI defaults and reviewer behavior do not change.
+
+The three additions do not load in durable conversations or delegate jobs. `package.json` and the lockfile pin
+full Git SHAs or exact npm versions. Each release installs its own copies with `npm ci --ignore-scripts`;
+rollback rolls the extensions back too. See [INSTALL.md](INSTALL.md#optional-coding-extensions) for optional
+provisioning and usage boundaries.
 
 `delegates` reads its settings from the service account's `settings.json` in the Pi agent directory, not from the
 checkout:
@@ -124,7 +135,7 @@ the tool result, and operator logs remain available.
 2. **Launch:** use the pinned CLI in one-shot JSON mode (`--mode json --no-session`). Collect structured events and
    stderr separately. Use `openai/gpt-6.2-sol` unless the call names another model. Disable automatic loading of
    checkout settings and executable resources, extensions, and MCP, then load the pinned
-   [`delegates` extension](#pi-extensions) explicitly. Aipatty can ask Pi to delegate particular work or leave
+   [top-level extensions](#pi-extensions) explicitly. Aipatty can ask Pi to delegate particular work or leave
    that to Pi; the tool does not map a task to a profile.
    Give Pi the git-hygiene skill and issue workflow: every change has an issue, a task branch, and a PR linking the
    issue, and Pi runs `npm run check` and `npm test` before it pushes. Pi passes the same rules to any writable
@@ -229,10 +240,10 @@ from a release that predates `/upgrade`, which is one more manual deploy. See
 1. **Done: skeleton and tree.** Durable SQLite conversations, restart/resume, subscription login, loopback API,
    CLI and web page, per-branch models and cost, and `/health` reporting the commit.
 2. **Done: the Pi tool.** [CI](#guard-rails), the Pi packages at 1.6.0 with the [pinned Pi CLI](#pi-installation)
-   and pinned `delegates` and `pi-review` [extensions](#pi-extensions), pi-durable's coding tools, codemode and tool search in
+   and [extensions](#pi-extensions), pi-durable's coding tools, codemode and tool search in
    `work/`, and the [run contract](#pi-runs) with the git/issue workflow. Tested with a fake CLI: a second run
    refused, missing auth or model, malformed output, false success, abort, child cleanup, restart, the launch
-   loading only the pinned extension, delegate usage charged once, delegate clones removed, and a result not
+   loading only the explicit release entries, delegate usage charged once, delegate clones removed, and a result not
    reported as reviewed when its review is missing, has important findings, or covers a different SHA from the PR
    head. Step 3 is the live end-to-end proof of the review and deploy loop.
 3. **Install on the mini and prove the loop by hand.** From the laptop over SSH, ask aipatty for a small change to

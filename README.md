@@ -33,9 +33,12 @@ Work meant for a PR goes through the `pi` tool. Each call runs one session of th
 in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits for it.
 
 - **One at a time.** A second call, from any branch, is refused while a run is active.
-- **Launch.** The CLI runs in one-shot JSON mode with no session. It loads the pinned `delegates` extension and
-  nothing else: no settings, extensions, skills, context files or MCP servers from the checkout or by discovery.
-  It shares the server's Pi directory, and so its sign-in and its `delegates` settings.
+- **Launch.** The CLI runs in one-shot JSON mode with no session. It explicitly loads the release's pinned
+  `delegates`, `just-web-fetch` (managed `web_fetch`) and `pi-web-search` (`web_search`, plus `url_context` on
+  supported models). The default stays `openai/gpt-6.2-sol`. An explicit `model: "claude-code/<model-id>"`
+  opts that run into the experimental Claude Code provider; there is no automatic Claude discovery or fallback
+  on OpenAI runs. Nothing loads by discovery: no checkout settings, extensions, skills, context files or MCP
+  servers. Pi shares the server's Pi directory, sign-in and `delegates` settings.
 - **Rules.** Pi is told the git and issue workflow: an issue, a task branch and a PR that links the issue;
   `npm run check` and `npm test` before every push; a `crmanager` review of the final commit, repeated until it
   has no P0 or P1 finding; and that only Steve merges.
@@ -79,6 +82,12 @@ running release's `node_modules/@earendil-works/pi-review/review.ts`. The host c
 missing path or an older or shared copy is refused. Only the `crmanager` job loads pi-review. Non-PR runs do
 not require this setting. See [the runbook](docs/INSTALL.md) for the exact path and rollout steps.
 
+Web and Claude Code extensions are for the top-level coding run only, not conversations, delegates, or the
+reviewer. Fetch needs operator-installed Chrome/Chromium and trafilatura; managed runs do not load fetch hooks.
+Search needs a provider/account with native search and can incur separate usage. Claude Code needs its own CLI
+and service-account subscription login. See [optional coding extensions](docs/INSTALL.md#optional-coding-extensions)
+for prerequisites, configuration, and data/usage boundaries.
+
 A run's processes are identified by a remembered PID and start time or by a marker in their environment.
 Discovery also follows their children and other members of their live process groups. A remembered group ID
 alone can be reused: if the leader is gone and no member can be independently identified, the remaining
@@ -112,8 +121,9 @@ Requires Node 26 or newer.
 npm ci --ignore-scripts
 ```
 
-Both extensions (`delegates` and `pi-review`) are pinned git dependencies installed by `npm ci`. This checkout's
-`.npmrc` allows direct git dependencies on npm 12. Do not register `pi-review` with `pi install`.
+The CLI and extensions are pinned in the release's dependencies and lockfile. This checkout's `.npmrc` allows
+only direct git dependencies. Do not use a global Pi install or register these extensions with `pi install` or
+Pi's `packages` settings.
 
 ## Run
 
@@ -144,7 +154,7 @@ The defaults in the table apply when `--install-dir` is omitted. With it, the se
 in faux mode), `pi/`, `work/`, and `runs/` under that root. Each individual directory option overrides only its
 corresponding derived path. Paths may be absolute, relative to the starting directory, or start with `~`; quote
 paths containing spaces. Blank paths are rejected. The root option is server-only: there is no new environment
-variable, CLI client option, or API setting. The Pi CLI and both extensions come from the running release,
+variable, CLI client option, or API setting. The Pi CLI and its pinned extensions come from the running release,
 not the state root.
 
 For a service install, the recommended root is `~/aipatty` in the service account's own home, not a new
