@@ -25,6 +25,7 @@ export interface UpgradeResult {
 }
 
 export interface ProcessIdentity { pid: number; start: string }
+export interface StageEvidence { groups: number[]; procs: [number, string][] }
 
 export interface UpgradeJournal {
   version: 1;
@@ -207,18 +208,21 @@ export class UpgradePaths {
   log(id: string): string { return this.artifact(id, ".log"); }
 
   /** Under the stage groups lease. No record yet means the worker's recorded PGID is still pending. */
-  stageGroups(id: string): number[] | undefined {
-    const path = this.artifact(id, ".stage-groups.json");
+  stageEvidence(id: string): StageEvidence | undefined {
+    const path = this.artifact(id, ".stage-evidence.json");
     if (!ownedFile(path, false)) return;
-    const groups: unknown = JSON.parse(readFileSync(path, "utf8"));
-    if (!Array.isArray(groups) || groups.some(pgid => !Number.isInteger(pgid) || pgid <= 1 || pgid > 0x7fff_ffff)) {
-      throw new Error(`Invalid staging group record: ${path}`);
+    const record = JSON.parse(readFileSync(path, "utf8")) as StageEvidence;
+    const validPid = (pid: unknown) => typeof pid === "number" && Number.isInteger(pid) && pid > 1 && pid <= 0x7fff_ffff;
+    if (!record || !Array.isArray(record.groups) || !record.groups.every(validPid)
+      || !Array.isArray(record.procs) || record.procs.some(p => !Array.isArray(p) || p.length !== 2
+        || !validPid(p[0]) || typeof p[1] !== "string" || !p[1])) {
+      throw new Error(`Invalid staging process evidence: ${path}`);
     }
-    return groups;
+    return record;
   }
 
-  saveStageGroups(id: string, groups: number[]): void {
-    atomicFile(this.artifact(id, ".stage-groups.json"), JSON.stringify(groups) + "\n");
+  saveStageEvidence(id: string, record: StageEvidence): void {
+    atomicFile(this.artifact(id, ".stage-evidence.json"), JSON.stringify(record) + "\n");
   }
 
   private artifact(id: string, suffix: string): string {

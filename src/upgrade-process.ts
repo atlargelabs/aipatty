@@ -78,16 +78,13 @@ export function stageEnvironment(): NodeJS.ProcessEnv {
   return Object.fromEntries(Object.entries(process.env).filter(([name, value]) => stagePrefix.test(name) && value === "1"));
 }
 
-/** The worker and reaper share group-only evidence until the kernel confirms absence. Hold the groups lease. */
-function stageOwnership(paths: UpgradePaths, id: string, workerGroup: number) {
-  let recorded = new Set(paths.stageGroups(id) ?? [workerGroup]);
-  const owned = newOwned([], recorded);
-  const record = async () => {
-    const groups = [...owned.groups];
-    if (groups.length === recorded.size && groups.every(pgid => recorded.has(pgid))) return;
-    paths.saveStageGroups(id, groups);
-    recorded = new Set(groups);
-  };
+/** The worker and reaper share blocking evidence, never signal authority. Hold the groups lease. */
+function stageOwnership(paths: UpgradePaths, id: string, workerGroup: number, root?: ProcessIdentity) {
+  const previous = paths.stageEvidence(id);
+  const owned = newOwned([], previous?.groups ?? [workerGroup]);
+  const suspects = new Map(previous?.procs);
+  owned.stage = { suspects, root };
+  const record = async () => paths.saveStageEvidence(id, { groups: [...owned.groups], procs: [...suspects] });
   return { owned, record };
 }
 
@@ -98,7 +95,7 @@ export async function reapStage(paths: UpgradePaths, j: UpgradeJournal): Promise
   const marker = stageMarker(j.id);
   const unlock = paths.stageGroupsLease(j.id);
   try {
-    const { owned, record } = stageOwnership(paths, j.id, worker.pid);
+    const { owned, record } = stageOwnership(paths, j.id, worker.pid, worker);
     const rootIsOurs = (await runProcesses(owned, "1", marker, record)).some(p => p.pid === worker.pid && p.start === worker.start);
     if (rootIsOurs) owned.procs.set(worker.pid, worker.start);
     else if ((await identify(worker.pid))?.start === worker.start) {

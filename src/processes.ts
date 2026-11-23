@@ -21,6 +21,8 @@ export const RUN_MARKER = "PATTY_RUN_ID";
 export interface Owned {
   procs: Map<number, string>;
   groups: Set<number>;
+  // Stage evidence can block cleanup but is never signal authority. The journaled root is only a seed for it.
+  stage?: { suspects: Map<number, string>; root?: { pid: number; start: string }; last?: Map<number, Proc> };
 }
 
 export function newOwned(procs: Iterable<[number, string]> = [], groups: Iterable<number> = []): Owned {
@@ -142,17 +144,23 @@ async function scan(
   const eligible = (proc: Proc) => proc.pid !== process.pid && (!isStage || proc.uid === process.geteuid?.());
   // The live stage worker is the leader of its own group. Only its idle check uses this evidence.
   const workerChild = (proc: Proc) => worker && proc.pid !== process.pid && (proc.pgid === process.pid || proc.ppid === process.pid);
-  const tree = (procs: Proc[]) => ownedTree(procs, proc => workerChild(proc)
-    || owned.procs.get(proc.pid) === proc.start || marked.get(proc.pid) === proc.start);
+  const authorized = (procs: Proc[]) => ownedTree(procs, proc =>
+    owned.procs.get(proc.pid) === proc.start || marked.get(proc.pid) === proc.start);
+  const evidence = (procs: Proc[]) => ownedTree(procs, proc => workerChild(proc)
+    || owned.procs.get(proc.pid) === proc.start || marked.get(proc.pid) === proc.start
+    || owned.stage?.suspects.get(proc.pid) === proc.start
+    || (owned.stage?.root?.pid === proc.pid && owned.stage.root.start === proc.start));
   const trackStage = async (found: Map<number, Proc>) => {
-    if (!isStage || !record) return false;
-    const before = owned.groups.size;
-    // Retain verified identities in memory so an unmarked child remains known if it calls setsid().
-    // The stage recorder writes only groups, which never seed individual process ownership.
-    remember(owned, [...found.values()]);
-    if (owned.groups.size === before) return false;
-    await record();
-    return true;
+    if (!record || !owned.stage) return false;
+    let changed = rememberGroups(owned, found.values());
+    for (const { pid, start } of found.values()) {
+      if (owned.stage.suspects.get(pid) !== start) {
+        owned.stage.suspects.set(pid, start);
+        changed = true;
+      }
+    }
+    if (changed) await record();
+    return changed;
   };
   let workerBusy = false;
   const snapshot = async () => {
@@ -165,7 +173,7 @@ async function scan(
   let confirmedQuiet = false;
   for (let attempt = 0;; attempt++) {
     // Save any group already established by ancestry or a known identity before fallible marker reads.
-    if (isStage && record) await trackStage(tree(previous));
+    if (owned.stage) await trackStage(evidence(previous));
     const observation = await markedPids(runId, sample, variable);
     for (const p of sample) {
       if (!observation.unstable.has(p.pid)) sampled.set(p.pid, p.start);
@@ -173,20 +181,23 @@ async function scan(
     }
     // A process, marked or reached by ancestry, can vanish before the final table and leave an
     // unmarked successor. Remember evidence from this table too, but never signal from this snapshot.
-    const previouslyOwned = isStage && record ? tree(previous) : undefined;
+    const previouslyOwned = owned.stage ? evidence(previous) : undefined;
     if (previouslyOwned) await trackStage(previouslyOwned);
     procs = await snapshot();
     previous = procs;
     // A stage parent can detach a successor and exit during marker inspection. Inspect new identities
     // before declaring it idle. Unrelated system-user churn need not settle; staging doesn't change UID.
     if (!isStage) break;
-    const newGroups = record && await trackStage(tree(procs));
+    // Only this post-inspection PID/start comparison can promote marked ancestry to signal authority.
+    // In particular, the preliminary snapshot's group and children might have belonged to a reused PID.
+    if (owned.stage) for (const p of authorized(procs).values()) owned.procs.set(p.pid, p.start);
+    const newEvidence = owned.stage && await trackStage(evidence(procs));
     sample = procs.filter(p => eligible(p) && sampled.get(p.pid) !== p.start);
     if (!sample.length) {
       const live = new Map(procs.map(p => [p.pid, p.start]));
       const disappeared = [...marked].filter(([pid, start]) => live.get(pid) !== start);
       const lostChild = previouslyOwned && [...previouslyOwned.values()].some(p => live.get(p.pid) !== p.start);
-      if (!newGroups && !disappeared.length && !lostChild && (confirmedQuiet || marked.size)) break;
+      if (!newEvidence && !disappeared.length && !lostChild && (confirmedQuiet || marked.size)) break;
       // ps is not atomic: a parent can exit after enumeration but before its row is read, and its
       // new child may be missing from that same snapshot. Confirm apparent quiet with a fresh scan;
       // also refresh the table after persisting any group evidence found in the last read.
@@ -207,8 +218,10 @@ async function scan(
   const skipGroups = new Set([0, 1, byPid.get(process.pid)?.pgid ?? -1]);
   // A remembered, leaderless group can flag ambiguity, but cannot seed ownership.
   const leaderless = (proc: Proc) => owned.groups.has(proc.pgid) && !skipGroups.has(proc.pgid) && !byPid.has(proc.pgid);
-  const ours = tree(procs);
-  const unsure = procs.filter(proc => proc.pid !== process.pid && proc.pid > 1 && !ours.has(proc.pid) && leaderless(proc));
+  const ours = authorized(procs);
+  if (owned.stage) owned.stage.last = byPid;
+  const unsure = procs.filter(proc => proc.pid !== process.pid && proc.pid > 1 && !ours.has(proc.pid)
+    && (leaderless(proc) || owned.stage?.suspects.get(proc.pid) === proc.start));
   return { ours: [...ours.values()], unsure, workerBusy };
 }
 
@@ -236,7 +249,7 @@ export function remember(owned: Owned, procs: readonly Proc[]): boolean {
 async function confirmStageGroupsGone(owned: Owned, record?: () => Promise<unknown>, workerGroup?: number): Promise<void> {
   // A non-atomic ps read can miss both an unmarked member and its successor. Only the kernel can
   // confirm the group is gone. A live, inaccessible, or reused group is not authority to signal it.
-  const before = owned.groups.size;
+  const before = owned.groups.size + (owned.stage?.suspects.size ?? 0);
   let pending: Error | undefined;
   for (const pgid of owned.groups) {
     if (pgid === workerGroup) continue;
@@ -249,7 +262,17 @@ async function confirmStageGroupsGone(owned: Owned, record?: () => Promise<unkno
       else pending ??= new Error(message, { cause: error });
     }
   }
-  if (owned.groups.size !== before) await record?.();
+  if (owned.stage) for (const [pid, start] of owned.stage.suspects) {
+    const current = owned.stage.last?.get(pid);
+    if (current && current.start !== start) { owned.stage.suspects.delete(pid); continue; }
+    const message = `Cannot prove staging PID ${pid} exited; leave the private stage in place and investigate`;
+    try { process.kill(pid, 0); pending ??= new Error(message); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") owned.stage.suspects.delete(pid);
+      else pending ??= new Error(message, { cause: error });
+    }
+  }
+  if (owned.groups.size + (owned.stage?.suspects.size ?? 0) !== before) await record?.();
   if (pending) throw pending;
 }
 
@@ -292,9 +315,7 @@ export async function stopRun(
     const deadline = Date.now() + graceMs;
     while (Date.now() < deadline) {
       await sleep(100);
-      const procs = await listProcesses();
-      if (variable !== RUN_MARKER && record
-        && remember(owned, [...ownedTree(procs, proc => owned.procs.get(proc.pid) === proc.start).values()])) await record();
+      const procs = owned.stage ? (await scan(owned, runId, variable, record)).ours : await listProcesses();
       if (!procs.some(proc => proc.pid === root && proc.start === rootStart)) break;
     }
   }
