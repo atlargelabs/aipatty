@@ -53,7 +53,7 @@ async function runStage(paths: UpgradePaths, config: Config, id: string, scriptR
       bootstrap: j.legacy ? scriptRelease : undefined,
       pinned: target => { paths.save({ ...j, target }); },
       note: text => { writeSync(log!, `${new Date().toISOString()} ${text}\n`); },
-      assertIdle: () => assertStageIdle(id),
+      assertIdle: () => assertStageIdle(paths, id),
     });
   } catch (error) {
     if (process.connected) await sendParent(errorText(error)).catch(() => {});

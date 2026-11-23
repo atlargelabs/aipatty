@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { LOOPBACK, DEFAULT_PORT, shutdownHeader } from "./config.ts";
 import { ownDataDir, OwnerBusy } from "./ownership.ts";
-import { listProcesses, newOwned, processEntryUnavailable, runProcesses, stopRun } from "./processes.ts";
+import { assertStageWorkerIdle, newOwned, processEntryUnavailable, runProcesses, stopRun } from "./processes.ts";
 import { command } from "./upgrade-release.ts";
 import { ownedFile, upgradeChildEnv, upgradeProtocol, type ProcessIdentity, type UpgradeJournal, type UpgradePaths } from "./upgrade-state.ts";
 
@@ -78,34 +78,44 @@ export function stageEnvironment(): NodeJS.ProcessEnv {
   return Object.fromEntries(Object.entries(process.env).filter(([name, value]) => stagePrefix.test(name) && value === "1"));
 }
 
+/** The worker and reaper share group-only evidence until the kernel confirms absence. Hold the groups lease. */
+function stageOwnership(paths: UpgradePaths, id: string, workerGroup: number) {
+  let recorded = new Set(paths.stageGroups(id) ?? [workerGroup]);
+  const owned = newOwned([], recorded);
+  const record = async () => {
+    const groups = [...owned.groups];
+    if (groups.length === recorded.size && groups.every(pgid => recorded.has(pgid))) return;
+    paths.saveStageGroups(id, groups);
+    recorded = new Set(groups);
+  };
+  return { owned, record };
+}
+
 /** Under the upgrade lease. Keep observed detached groups across attempts, but never trust a group alone. */
 export async function reapStage(paths: UpgradePaths, j: UpgradeJournal): Promise<void> {
   const worker = j.stageProcess;
   if (!worker) return; // Not authorized to spawn commands before its identity is persisted.
   const marker = stageMarker(j.id);
-  let recorded = new Set(paths.stageGroups(j.id));
-  const owned = newOwned([], [worker.pid, ...recorded]);
-  const record = async () => {
-    const groups = [...owned.groups].filter(pgid => pgid !== worker.pid);
-    if (groups.length === recorded.size && groups.every(pgid => recorded.has(pgid))) return;
-    paths.saveStageGroups(j.id, groups);
-    recorded = new Set(groups);
-  };
-  const rootIsOurs = (await runProcesses(owned, "1", marker, record)).some(p => p.pid === worker.pid && p.start === worker.start);
-  if (rootIsOurs) owned.procs.set(worker.pid, worker.start);
-  else if ((await identify(worker.pid))?.start === worker.start) {
-    throw new Error(`Cannot verify the staging marker on PID ${worker.pid}; inspect before recovering`);
-  }
-  const left = await stopRun(owned, "1", worker.pid, 250, undefined, record, marker);
-  if (left.length) throw new Error(`Cannot prove staging processes exited (${left.map(p => p.pid).join(", ")}); leave the private stage in place and investigate`);
+  const unlock = paths.stageGroupsLease(j.id);
+  try {
+    const { owned, record } = stageOwnership(paths, j.id, worker.pid);
+    const rootIsOurs = (await runProcesses(owned, "1", marker, record)).some(p => p.pid === worker.pid && p.start === worker.start);
+    if (rootIsOurs) owned.procs.set(worker.pid, worker.start);
+    else if ((await identify(worker.pid))?.start === worker.start) {
+      throw new Error(`Cannot verify the staging marker on PID ${worker.pid}; inspect before recovering`);
+    }
+    const left = await stopRun(owned, "1", worker.pid, 250, undefined, record, marker);
+    if (left.length) throw new Error(`Cannot prove staging processes exited (${left.map(p => p.pid).join(", ")}); leave the private stage in place and investigate`);
+  } finally { unlock(); }
 }
 
 /** The stage worker itself is still the live group leader when it publishes or removes its private checkout. */
-export async function assertStageIdle(id: string): Promise<void> {
-  const hasGroupMember = async () => (await listProcesses()).some(p => p.pid !== process.pid && p.pgid === process.pid);
-  if (await hasGroupMember() || (await runProcesses(newOwned(), "1", stageMarker(id))).length || await hasGroupMember()) {
-    throw new Error("Staging still has subprocesses");
-  }
+export async function assertStageIdle(paths: UpgradePaths, id: string): Promise<void> {
+  const unlock = paths.stageGroupsLease(id);
+  try {
+    const { owned, record } = stageOwnership(paths, id, process.pid);
+    await assertStageWorkerIdle(owned, stageMarker(id), record);
+  } finally { unlock(); }
 }
 
 function assertOwnerFiles(paths: UpgradePaths): void {
