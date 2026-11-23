@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { join } from "node:path";
-import { githubLink } from "./pi-trace.ts";
+import { eventText, githubLink } from "./pi-trace.ts";
 import { piRunId, runStatuses, type PiRunActivity, type PiRunSnapshot, type PiRunText } from "./protocol.ts";
 
 export const runLogParts = ["logs", "runs"] as const;
@@ -88,20 +88,10 @@ function outcomeOf(raw: Record<string, unknown>, repo: string): NonNullable<PiRu
     issue: issue ? { url: issue } : undefined,
     review: status ? {
       status, verdict: oneOf(review?.verdict, ["correct", "needs attention", "unknown"] as const), sha: sha(review?.sha),
-      important: count(review?.important) ?? 0, lesser: count(review?.lesser) ?? 0,
+      important: count(review?.important), lesser: count(review?.lesser),
     } : undefined,
     problems: items(problems), remaining: items(remaining), listsTruncated: problems.length > maxItems || remaining.length > maxItems,
   };
-}
-
-/** Only visible text blocks; never stringify content (which can include images, reasoning and other fields). */
-function visibleText(content: unknown) {
-  if (!Array.isArray(content)) return undefined;
-  const text = content.map(part => {
-    const block = object(part);
-    return block?.type === "text" && typeof block.text === "string" ? block.text : "";
-  }).join("");
-  return text || undefined;
 }
 
 function activityOf(log: PiRunText): NonNullable<PiRunSnapshot["activity"]> {
@@ -125,8 +115,9 @@ function activityOf(log: PiRunText): NonNullable<PiRunSnapshot["activity"]> {
       incomplete = true;
       continue;
     }
-    if (event.type === "message_end" && object(event.message)?.role === "assistant") {
-      const output = clip(visibleText(object(event.message)?.content), 2_000);
+    if (event.type === "message_end") {
+      const message = object(event.message);
+      const output = message?.role === "assistant" ? clip(eventText(message.content), 2_000) : undefined;
       if (output) keep({ kind: "text", output });
     }
     if (event.type !== "tool_execution_start" && event.type !== "tool_execution_end") continue;
@@ -137,7 +128,7 @@ function activityOf(log: PiRunText): NonNullable<PiRunSnapshot["activity"]> {
     } else {
       const result = object(event.result);
       // Shell output is useful for following checks. Do not expose other tools' returned files, arguments or details.
-      const text = name === "bash" ? visibleText(result?.content) : undefined;
+      const text = name === "bash" ? eventText(result?.content) : undefined;
       // Pi can append a note with the path it spilled to; the pane does not expose or read that path.
       const body = text?.replace(/\n\n\[Showing [^\n]*\. Full output: [^\n]*\]/g, "");
       const output = clip(body, 4_000);

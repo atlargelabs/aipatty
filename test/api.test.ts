@@ -257,10 +257,12 @@ test("a Pi archive projects only bounded visible activity and confirmed result m
   await archivedPiRun(dir, id, {
     pr: { confirmed: true, url: "https://github.com/other/aipatty/pull/3" },
     issue: { confirmed: false, url: "https://github.com/atlargelabs/aipatty/issues/6" },
+    review: { status: "unverified", important: "not a count" },
   });
   const unverified = await (await fetch(url)).json() as PiRunSnapshot;
   assert.equal(unverified.result?.pr, undefined);
   assert.equal(unverified.result?.issue, undefined);
+  assert.deepEqual(unverified.result?.review, { status: "unverified" });
 });
 
 test("Pi snapshots reject traversal, foreign origins and links out of the archive", async t => {

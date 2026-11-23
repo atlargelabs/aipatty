@@ -160,6 +160,7 @@ function messageText(message) {
 }
 
 function isPiCall(block) { return block.type === "toolCall" && block.name === "pi"; }
+function isToolRound(message) { return message.role === "assistant" && message.stopReason === "toolUse"; }
 function isPiResult(message) { return message.role === "toolResult" && message.toolName === "pi"; }
 function runIdOf(details) {
   return typeof details?.runId === "string" && piRunId.test(details.runId) ? details.runId : undefined;
@@ -181,22 +182,24 @@ function runButton(label, source) {
 }
 
 function messageNodes(entry, message) {
-  if (message.role !== "assistant" || !message.content?.some(isPiCall)) {
+  if (!isToolRound(message) || !message.content.some(isPiCall)) {
     const text = document.createTextNode(messageText(message));
     const id = isPiResult(message) ? runIdOf(message.details) : undefined;
     return id ? [runButton("Open Pi run", { id, durationMs: message.durationMs }), document.createTextNode("\\n"), text] : [text];
   }
   const nodes = [];
-  const seen = new Set();
+  const ids = new Map();
+  for (const block of message.content) {
+    if (block.type === "toolCall") ids.set(block.id, (ids.get(block.id) || 0) + 1);
+  }
   for (const block of message.content) {
     let node;
     if (isPiCall(block)) {
       const title = taskTitle(block.arguments?.task);
-      // Durable executes only the first call with a given ID in a round.
-      if (seen.has(block.id)) node = "→ pi (duplicate call ID)";
+      // Duplicate IDs in one round are ambiguous; only the result's own run ID can address it.
+      if (ids.get(block.id) > 1) node = "→ pi (duplicate call ID; open the run from its result)";
       else node = runButton("Open Pi run" + (title ? " · " + title : ""), { entry, callId: block.id, title });
     } else node = blockText(block);
-    if (block.type === "toolCall") seen.add(block.id);
     if (!node) continue;
     if (nodes.length) nodes.push(document.createTextNode("\\n"));
     nodes.push(typeof node === "string" ? document.createTextNode(node) : node);
@@ -219,12 +222,12 @@ function resolveRun(source) {
         return { id: runIdOf(message.details), durationMs: message.durationMs, settled: true };
       }
       // If a later round reused a provider's ID, it can't be the result of this call.
-      if (message.role === "assistant" && message.content.some(block => block.type === "toolCall" && block.id === callId)) return {};
+      if (isToolRound(message) && message.content.some(block => block.type === "toolCall" && block.id === callId)) return {};
     }
   }
   if (entry.conversationId !== app.branch) return {};
   const slot = app.live.tools?.find(slot => slot.name === "pi" && slot.callId === callId);
-  return { id: runIdOf(slot?.details) };
+  return { id: runIdOf(slot?.details), pending: slot && slot.status !== "done" };
 }
 
 let openedRun;
@@ -280,11 +283,12 @@ async function refreshRun() {
   const open = openedRun;
   const refresh = $("pi-run-refresh");
   if (!open || refresh.disabled) return;
-  const { id, durationMs, settled } = resolveRun(open.source);
+  const { id, durationMs, settled, pending } = resolveRun(open.source);
   const message = $("pi-run-message");
   if (!id) {
     message.textContent = settled ? "This request did not start a Pi run. See the tool result in chat."
-      : "No run is available for this call yet. If it starts, use Refresh to see it.";
+      : pending ? "No run is available for this call yet. If it starts, use Refresh to see it."
+      : "No Pi run record is available for this call.";
     return;
   }
   // Once selected, the pane stays on that exact run, even if the live tool slot disappears or the chat resyncs.
@@ -336,7 +340,7 @@ function renderRun(snapshot, durationMs) {
       const review = result.review;
       add("p", "Review: " + review.status + (review.verdict ? " · verdict: " + review.verdict : "")
         + "\\nReviewed SHA: " + (review.sha ?? "unknown")
-        + "\\nFindings: " + review.important + " important, " + review.lesser + " lesser");
+        + "\\nFindings: " + (review.important ?? "unknown") + " important, " + (review.lesser ?? "unknown") + " lesser");
     }
     for (const [label, items] of [["Problems", result.problems], ["Remaining", result.remaining]]) {
       if (!items.length) continue;
@@ -457,7 +461,7 @@ function entryNodes(entries) {
       nodes.push(entryNode(entry, { role: "upgrade", content: entry.data.text }));
     }
     for (const message of entry.model || []) {
-      if (message.role === "assistant" && message.content.some(isPiCall)
+      if (isToolRound(message) && message.content.some(isPiCall)
           || isPiResult(message) && runIdOf(message.details) || messageText(message)) nodes.push(entryNode(entry, message));
     }
   }

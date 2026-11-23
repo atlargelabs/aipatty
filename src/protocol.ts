@@ -46,7 +46,7 @@ export interface PiRunSnapshot {
     summary?: PiRunText;
     pr?: { url: string; headSha?: string };
     issue?: { url: string };
-    review?: RunOutcome["review"];
+    review?: Omit<RunOutcome["review"], "important" | "lesser"> & { important?: number; lesser?: number };
     problems: PiRunText[];
     remaining: PiRunText[];
     listsTruncated: boolean;

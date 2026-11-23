@@ -171,11 +171,13 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   t.after(async () => { await api.close(); await host.close(); });
   const root = (await host.conversation("root"))!;
   const first = "20260101T010101-aaaaaaaa", second = "20260101T020202-bbbbbbbb", missing = "20260101T030303-cccccccc";
+  const duplicate = "20260101T040404-dddddddd";
   const markup = '<img src="x" onerror="window.bad = true">';
   await archivedPiRun(dir, first, { summary: "First archive " + markup }, JSON.stringify({
     type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Visible activity" }] },
   }) + "\n");
   await archivedPiRun(dir, second, { summary: "Second archive", status: "failed", durationMs: 65_000 });
+  await archivedPiRun(dir, duplicate, { summary: "Duplicate-ID archive" });
   const call = (task: string, id: string) => fauxToolCall("pi", { task }, { id });
   const exchange = (tx: Tx, toolName: string, toolCallId: string, text: string, runId?: string) =>
     tx.appendEntry(root.id, { kind: "test", model: [{
@@ -199,7 +201,11 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
     await tx.appendEntry(root.id, { kind: "test", model: [fauxAssistantMessage([call("Missing archive", "missing"), call("Refused", "first")], { stopReason: "toolUse" })] });
     await exchange(tx, "pi", "missing", "old result", missing);
     await exchange(tx, "pi", "first", `Pi run ${first} is still active. Only one run at a time.`);
-    for (let i = 0; i < 45; i++) await tx.appendEntry(root.id, { kind: "test", model: [{ role: "user", content: `filler ${i}`, timestamp: 0 }] });
+    await tx.appendEntry(root.id, { kind: "test", model: [fauxAssistantMessage([call("Unfinished task", "never")], { stopReason: "aborted" })] });
+    await tx.appendEntry(root.id, { kind: "test", model: [fauxAssistantMessage([call("Ambiguous A", "duplicate"), call("Ambiguous B", "duplicate")], { stopReason: "toolUse" })] });
+    await exchange(tx, "pi", "duplicate", "Refused duplicate");
+    await exchange(tx, "pi", "duplicate", "duplicate result", duplicate);
+    for (let i = 0; i < 41; i++) await tx.appendEntry(root.id, { kind: "test", model: [{ role: "user", content: `filler ${i}`, timestamp: 0 }] });
   }, ctx);
 
   const browser = await openBrowser(t);
@@ -219,7 +225,7 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
     catch { assert.fail(`Expected ${text} in the pane; found ${await paneText()}; errors: ${browser.errors.join(", ")}`); }
   };
   // The first result has its own control even though its call isn't on this page yet.
-  assert.equal(await browser.evaluate(`document.querySelectorAll('.toolResult .pi-call').length`), 2);
+  assert.equal(await browser.evaluate(`document.querySelectorAll('.toolResult .pi-call').length`), 3);
   await browser.evaluate(`document.querySelector('.toolResult .pi-call').click()`);
   await shows("First archive");
   await browser.evaluate(`document.querySelector('#pi-run-close').click(); window.kept = document.querySelector('#entries .entry'); document.querySelector('#older').click()`);
@@ -247,6 +253,10 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   await shows("archive unavailable");
   await click("Refused");
   await shows("did not start a Pi run");
+  // A partial aborted message and ambiguous calls aren't controls; the real result still opens its own run.
+  assert.equal(await browser.evaluate(`document.querySelector('#entries').textContent.includes('Unfinished task')`), true);
+  await browser.evaluate(`[...document.querySelectorAll('.toolResult')].find(entry => entry.textContent.includes('duplicate result')).querySelector('.pi-call').click()`);
+  await shows("Duplicate-ID archive");
 
   // A branch change closes the pane. A reload of the fork reads the original exchange, not the later reused ID.
   await browser.evaluate(`document.querySelector('[data-branch="${side.id}"]').click()`);
