@@ -33,7 +33,7 @@ export function piExtension(getRuns: () => PiRuns) {
       task: str({ minLength: 1, maxLength: 60_000, description: "The complete task and its context" }),
       pr: opt(bool({ description: "Whether the run must end with a reviewed PR; default true. False investigates and reports, publishing nothing" })),
       base: opt(str({ minLength: 1, maxLength: 200, description: "Branch, tag or commit to start from; default main" })),
-      model: opt(str({ minLength: 1, maxLength: 200, description: `Pi's model as provider/id; default ${defaultModel}` })),
+      model: opt(str({ minLength: 1, maxLength: 200, description: `Pi's model as provider/id; default ${defaultModel}. Use claude-code/<model-id> only when explicitly requested.` })),
       thinking: opt(str({ description: "Thinking level: off, minimal, low, medium, high, xhigh or max; default high" })),
       timeoutMinutes: opt(int({ minimum: 1, maximum: maxMinutes, description: `Stop the run after this long; default ${defaultMinutes}` })),
     }),

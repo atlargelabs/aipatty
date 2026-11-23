@@ -282,11 +282,16 @@ test("legacy server settings and AIPATTY_FAUX as the only environment setting", 
     node: process.execPath,
     cli: join(checkout, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"),
     extension: join(checkout, "node_modules/pi-delegates/src/index.ts"),
+    webFetchExtension: join(checkout, "src/extensions/just-web-fetch.ts"),
+    webSearchExtension: join(checkout, "node_modules/pi-web-search/src/index.ts"),
+    claudeCodeExtension: join(checkout, "src/extensions/claude-code.ts"),
     reviewExtension: join(checkout, "node_modules/@earendil-works/pi-review/review.ts"),
     agentDir: join(homedir(), ".pi/agent"),
     repo: "atlargelabs/aipatty", repoUrl: "git@github.com:atlargelabs/aipatty.git", git: "git", gh: "gh",
   });
-  assert.ok(existsSync(pi.cli) && existsSync(pi.extension) && existsSync(pi.reviewExtension), "the pinned CLI and extensions are installed");
+  for (const entry of [pi.cli, pi.extension, pi.webFetchExtension, pi.webSearchExtension, pi.claudeCodeExtension, pi.reviewExtension]) {
+    assert.ok(existsSync(entry), `missing pinned entry: ${entry}`);
+  }
   const dirs = readConfig(["--pi-dir", "~/elsewhere", "--work-dir", "~/w", "--runs-dir=/tmp/r"], {});
   assert.deepEqual([dirs.pi.agentDir, dirs.workDir, dirs.runsDir], [join(homedir(), "elsewhere"), join(homedir(), "w"), "/tmp/r"]);
   const { authFile, modelsStore, port } = readConfig(["--pi-dir", "~/elsewhere", "--port=0"], {});

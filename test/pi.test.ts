@@ -111,12 +111,20 @@ const launches = async (config: Config) => (await readFile(join(config.pi.agentD
 const spawned = async (config: Config) => (await readFile(join(config.pi.agentDir, "fake-pids.txt"), "utf8").catch(() => ""))
   .trim().split("\n").filter(Boolean).map(Number);
 
-test("an install-root run forwards its Pi directory and loads only the pinned delegates extension in a disposable clone", async t => {
+const explicitExtensions = (argv: string[]) => argv.filter((_, index) => ["-e", "--extension"].includes(argv[index - 1]));
+
+test("an install-root run forwards its Pi directory and loads only the pinned coding extensions in a disposable clone", async t => {
   const config = await setup(t, true);
   assert.equal(config.pi.agentDir, join(config.dataDir, "../pi"));
   await github(config, openPr);
   await scenario(config, [...review("c1", "job-review"), assistant(report()), settled]);
   const runs = await openPiRuns(config);
+  const searchOverride = process.env.PI_WEB_SEARCH_CONFIG;
+  process.env.PI_WEB_SEARCH_CONFIG = "checkout-web-search.json";
+  t.after(() => {
+    if (searchOverride === undefined) delete process.env.PI_WEB_SEARCH_CONFIG;
+    else process.env.PI_WEB_SEARCH_CONFIG = searchOverride;
+  });
   const outcome = await runs.run(request({ task: "Add the thing.\nSecond line.", model: "openai/gpt-6.2-astra", thinking: "low" }));
   assert.equal(outcome.status, "completed", JSON.stringify(outcome));
 
@@ -124,13 +132,15 @@ test("an install-root run forwards its Pi directory and loads only the pinned de
   assert.equal(more.length, 0);
   const { argv } = launch;
   assert.deepEqual(argv.slice(0, 8), ["--mode", "json", "--no-session", "--model", "openai/gpt-6.2-astra", "--thinking", "low", "--no-approve"]);
-  // Exactly one extension, by absolute path into the release, and nothing discovered.
-  assert.deepEqual(argv.filter((arg, index) => argv[index - 1] === "-e" || argv[index - 1] === "--extension"), [config.pi.extension]);
+  assert.deepEqual(explicitExtensions(argv), [config.pi.extension, config.pi.webFetchExtension, config.pi.webSearchExtension]);
+  assert.ok(!argv.includes("--provider"));
   for (const flag of ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-mcp"]) {
     assert.ok(argv.includes(flag), flag);
   }
   assert.ok(!argv.some(arg => ["--approve", "-a", "--skill", "--session", "--continue"].includes(arg)));
   assert.equal(launch.env.PI_CODING_AGENT_DIR, config.pi.agentDir);
+  assert.equal(launch.env.PI_WEB_SEARCH_CONFIG, undefined);
+  assert.equal(launch.env.PATTY_CLAUDE_CODE_MODEL, undefined);
   assert.equal(launch.env.PATTY_RUN_ID, outcome.runId);
   assert.deepEqual(Object.keys(launch.env).filter(name => name.startsWith("AIPATTY_")), []);
 
@@ -150,6 +160,19 @@ test("an install-root run forwards its Pi directory and loads only the pinned de
   assert.equal(typeof replay?.durationMs, "number");
   assert.equal(replay?.result?.pr?.headSha, head);
   assert.equal(replay?.result?.review?.sha, head);
+});
+
+test("only an explicit Claude Code request adds the Claude provider and constrains model selection", async t => {
+  const config = await setup(t);
+  await scenario(config, [assistant(report({ issue: null, pr: null })), settled]);
+  const outcome = await (await openPiRuns(config)).run(request({ pr: false, model: "claude-code/fixture-sonnet" }));
+  assert.equal(outcome.status, "completed", JSON.stringify(outcome));
+  const [launch] = await launches(config);
+  assert.deepEqual(explicitExtensions(launch.argv), [config.pi.extension, config.pi.webFetchExtension, config.pi.webSearchExtension,
+    config.pi.claudeCodeExtension]);
+  assert.equal(launch.argv[launch.argv.indexOf("--provider") + 1], "claude-code");
+  assert.equal(launch.argv[launch.argv.indexOf("--model") + 1], "fixture-sonnet");
+  assert.equal(launch.env.PATTY_CLAUDE_CODE_MODEL, "fixture-sonnet");
 });
 
 test("the result is confirmed with gh, and delegate spend is charged once", async t => {

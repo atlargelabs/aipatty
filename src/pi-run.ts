@@ -3,7 +3,7 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream, type WriteStream } from "node:fs";
 import { copyFile, cp, lstat, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { delimiter, isAbsolute, join, resolve, sep } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
@@ -779,6 +779,9 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     };
     // The server's own setting must not reach the checkout's tests, which refuse a stray AIPATTY_ variable.
     for (const name of Object.keys(env)) if (name.startsWith("AIPATTY_")) delete env[name];
+    // pi-web-search must resolve its config from the trusted Pi agent dir, never a checkout-relative override.
+    delete env.PI_WEB_SEARCH_CONFIG;
+    delete env.PATTY_CLAUDE_CODE_MODEL;
 
     /** Run a setup command as part of the run: in its own process group, recorded, and stopped with the run. */
     const command = async (file: string, args: string[], cwd?: string): Promise<string> => {
@@ -840,12 +843,16 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         await writeFile(join(saved.logDir, "prompt.md"), prompt, { mode: 0o600 });
         const events = createWriteStream(join(saved.logDir, "events.jsonl"), { mode: 0o600 });
         const errors = createWriteStream(join(saved.logDir, "stderr.log"), { mode: 0o600 });
+        const claude = request.model.startsWith("claude-code/") ? request.model.slice("claude-code/".length) : undefined;
         const child = spawn(pi.node, [
-          pi.cli, "--mode", "json", "--no-session", "--model", request.model, "--thinking", request.thinking,
-          // Nothing from the checkout or the agent directory loads by itself: only the pinned delegates extension.
-          "--no-approve", "--no-extensions", "-e", pi.extension, "--no-skills", "--no-prompt-templates", "--no-themes",
-          "--no-context-files", "--no-mcp", "--append-system-prompt", rules,
-        ], { cwd: repo, env, stdio: ["pipe", "pipe", "pipe"], detached: true });
+          pi.cli, "--mode", "json", "--no-session", "--model", claude ?? request.model, "--thinking", request.thinking,
+          // Only pinned release extensions, never resources or executable settings discovered in the checkout.
+          "--no-approve", "--no-extensions", "-e", pi.extension, "-e", pi.webFetchExtension, "-e", pi.webSearchExtension,
+          "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-mcp", "--append-system-prompt", rules,
+          ...(claude === undefined ? [] : ["--provider", "claude-code", "-e", pi.claudeCodeExtension]),
+        ], { cwd: repo, env: claude === undefined ? env : {
+          ...env, PATTY_CLAUDE_CODE_MODEL: claude, PATH: env.PATH?.split(delimiter).filter(isAbsolute).join(delimiter),
+        }, stdio: ["pipe", "pipe", "pipe"], detached: true });
         launched = true;
         held.add(child);
         child.once("close", () => held.delete(child));

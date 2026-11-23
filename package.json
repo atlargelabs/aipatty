@@ -9,14 +9,25 @@
   "dependencies": {
     "@earendil-works/chord": "1.6.0",
     "@earendil-works/pi-ai": "1.6.0",
+    "@earendil-works/pi-claude-code": "git+https://github.com/earendil-works/pi-claude-code.git#d5b5e04c314d3452d357174d16d10dda34daa2d2",
     "@earendil-works/pi-codemode": "1.6.0",
     "@earendil-works/pi-coding-agent": "1.6.0",
     "@earendil-works/pi-durable": "1.6.0",
     "@earendil-works/pi-review": "git+https://github.com/earendil-works/pi-review.git#f1de050504936046c0f85b21fec0e0a93ef394eb",
     "@earendil-works/pi-schema": "1.6.0",
+    "just-web-fetch": "git+https://github.com/stephenchestnut/just-web-fetch.git#a933b90b8af36c98f9cc45aa748cddb7f1bbb525",
     "pi-delegates": "git+https://github.com/stephenchestnut/delegates.git#a66e6d83dcc0cf534802a59f76aa03d088446efd",
+    "pi-web-search": "1.7.0",
     "proper-lockfile": "4.1.2",
     "ws": "8.21.0"
+  },
+  "overrides": {
+    "just-web-fetch": {
+      "@mariozechner/pi-coding-agent": "npm:@earendil-works/pi-coding-agent@1.6.0",
+      "@mariozechner/pi-tui": "npm:@earendil-works/pi-tui@1.6.0",
+      "@sinclair/typebox": "npm:typebox@1.4.7",
+      "puppeteer": "npm:puppeteer-core@25.18.1"
+    }
   },
   "devDependencies": { "@types/node": "^25.0.0", "@types/proper-lockfile": "^4.1.4", "@types/ws": "^8.18.1", "typescript": "^5.9.3" }
 }

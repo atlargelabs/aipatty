@@ -27,8 +27,12 @@ export interface PiConfig {
   node: string;
   /** The pinned Pi CLI of this release. */
   cli: string;
-  /** The pinned delegates extension of this release, the only extension the top-level run loads. */
+  /** The pinned delegates extension of this release. */
   extension: string;
+  /** Top-level only: the managed just-web-fetch adapter, pinned pi-web-search, and opt-in Claude Code adapter. */
+  webFetchExtension: string;
+  webSearchExtension: string;
+  claudeCodeExtension: string;
   /** The pinned pi-review entry point of this release, loaded only by crmanager. */
   reviewExtension: string;
   /** The Pi agent directory the CLI shares with the server: sign-in, model cache, delegates settings and jobs. */
@@ -118,6 +122,9 @@ export function readConfig(args: readonly string[] = process.argv.slice(2), env:
       node: process.execPath,
       cli: join(release, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"),
       extension: join(release, "node_modules/pi-delegates/src/index.ts"),
+      webFetchExtension: join(release, "src/extensions/just-web-fetch.ts"),
+      webSearchExtension: join(release, "node_modules/pi-web-search/src/index.ts"),
+      claudeCodeExtension: join(release, "src/extensions/claude-code.ts"),
       reviewExtension: join(release, "node_modules/@earendil-works/pi-review/review.ts"),
       agentDir: piDir,
       repo: "atlargelabs/aipatty",

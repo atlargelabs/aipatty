@@ -98,7 +98,7 @@ node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT"
 
 The option derives `$ROOT/data` (or `$ROOT/faux` in faux mode), `$ROOT/pi`, `$ROOT/work`, and `$ROOT/runs`.
 The database, ownership lock, and run logs live in the data directory; Pi auth, model cache, settings and jobs
-live in the Pi directory. The pinned CLI and both extensions live in the release. Model scratch lives in `work`;
+live in the Pi directory. The pinned CLI and extensions live in the release. Model scratch lives in `work`;
 disposable Pi workspaces live in `runs`. The browser's run pane reads a bounded excerpt from `data/logs/runs/`
 (or `logs/runs/` under the configured data directory), not the disposable clone. Removing an archive leaves the
 chat intact but removes its replay. An individual directory option overrides its derived path. Omitting the
@@ -118,6 +118,40 @@ From the laptop, using its own checkout for the CLI:
 ssh -N -L 8790:127.0.0.1:8790 macmini &
 node src/cli.ts health          # compare the commit with the expected release SHA
 ```
+
+## Optional coding extensions
+
+Each release brings its own pinned `just-web-fetch`, `pi-web-search` and `pi-claude-code` via
+`npm ci --ignore-scripts`. Rollback uses the previous release's versions. Do not register them with `pi install`,
+Pi's `packages` settings, or delegate profiles. The top-level `pi` tool supplies absolute `-e` paths to its
+release's entries. Ambient extension and checkout resource discovery stay off. These tools are not available
+in aipatty's durable conversations, delegate jobs, or `crmanager` reviews.
+
+- **`web_fetch`:** provision Chrome/Chromium for the service account. The tool looks in standard install
+  locations or uses `PUPPETEER_EXECUTABLE_PATH` (a trusted absolute executable path). Install `trafilatura`
+  separately, for example with `uv tool install trafilatura` or into a service-owned Python virtual environment.
+  Set `PI_WEB_FETCH_TRAFILATURA` in the server's environment to the absolute path of that executable. The managed
+  tool never invokes `uvx`, `pipx`, or another on-demand installer inside a run; no browser is downloaded during
+  install or use. Missing prerequisites fail only the tool call. The adapter ignores `just-web-fetch.json` and
+  disables all fetch hook directories and event-bus registration. It keeps Chrome's sandbox and upstream
+  private-address and redirect checks, which are not a network sandbox. Use egress controls if private network
+  exclusion must be guaranteed. Complete extracts are temporary files in the Pi agent dir; archived tool events
+  may retain web content.
+- **`web_search`:** uses the coding model if supported, or an explicitly configured search model in the trusted
+  Pi agent dir (`$ROOT/pi/web-search.json` for a root install, or the selected `--pi-dir`). That file accepts
+  `{"provider":"<provider>","model":"<model-id>"}`; `PI_WEB_SEARCH_CONFIG` is ignored in managed runs. The
+  extension sends queries and any supplied URLs to the selected provider using its Pi auth and routing. Native
+  search and `url_context` availability depend on the model, provider and account. A working chat subscription
+  does not guarantee native search. There is no fallback or automatic sign-in; search may incur separate usage
+  outside the run's reported model cost. Do not send private URLs, code or credentials as queries.
+- **Claude Code (experimental):** only an explicit `model: "claude-code/<model-id>"` in a top-level `pi` call enables
+  it. The operator must provision Claude Code on the service account's `PATH` (or set an absolute
+  `PI_CLAUDE_CODE_COMMAND`) and sign it in under that account with a supported Claude subscription. Aipatty does
+  not install or log in to Claude Code, copy its credentials into Pi, or opt in to usage credits. Explicit Claude
+  runs perform CLI status and account model discovery before sending a task. Discovery may contact Claude's
+  catalog and feature-flag services but sends no task prompt. The requested exact Pi model ID must be in that
+  catalog; a missing CLI, login or model fails without switching models. An account's usage/overage policy still
+  applies. OpenAI remains the default, with no Claude contact on ordinary runs.
 
 ## Stop
 
