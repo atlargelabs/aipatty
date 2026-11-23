@@ -7,7 +7,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { LOOPBACK, DEFAULT_PORT, shutdownHeader } from "./config.ts";
 import { ownDataDir, OwnerBusy } from "./ownership.ts";
 import { command } from "./upgrade-release.ts";
-import { ownedFile, upgradeChildEnv, upgradeProtocol, type ProcessIdentity, type UpgradeJournal, type UpgradePaths } from "./upgrade-state.ts";
+import { errorText, ownedFile, upgradeChildEnv, upgradeProtocol, type ProcessIdentity, type UpgradeJournal, type UpgradePaths } from "./upgrade-state.ts";
 
 const stopMs = 20_000;
 const startupMs = 30_000;
@@ -29,44 +29,61 @@ export function openUpgradeLog(paths: UpgradePaths, id: string): number {
   return openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW, 0o600);
 }
 
+export class UnverifiedListener extends Error {}
+class InvalidLocalResponse extends UnverifiedListener {}
+
 function localJson(port: number, path: string, method: string, agent: Agent | false, useSocket?: (socket: Socket) => boolean) {
   return new Promise<{ code: number; value: unknown }>((resolve, reject) => {
+    const failed = (error: NodeJS.ErrnoException) => {
+      // An absent or unreachable HTTP listener is not proof of identity; local inspection failures must propagate.
+      const code = error.code ?? "";
+      reject(["ECONNREFUSED", "ECONNRESET", "EPIPE", "ETIMEDOUT", "ABORT_ERR"].includes(code) || code.startsWith("HPE_")
+        ? new UnverifiedListener(error.message, { cause: error }) : error);
+    };
     const req = request({ host: LOOPBACK, port, path, method, agent,
       headers: method === "POST" ? { [shutdownHeader]: "1" } : undefined, signal: AbortSignal.timeout(probeMs) }, res => {
       let body = "";
       res.setEncoding("utf8");
       res.on("data", chunk => {
         body += chunk;
-        if (body.length > 4_000_000) req.destroy(new Error("Unexpectedly large local HTTP response"));
+        if (body.length > 4_000_000) req.destroy(new UnverifiedListener("Unexpectedly large local HTTP response"));
       });
-      res.on("error", reject);
+      res.on("error", failed);
       res.on("end", () => {
-        try { resolve({ code: res.statusCode ?? 0, value: JSON.parse(body) }); } catch (error) { reject(error); }
+        const code = res.statusCode ?? 0;
+        try { resolve({ code, value: JSON.parse(body) }); }
+        catch (error) {
+          reject(error instanceof SyntaxError ? new InvalidLocalResponse(`Invalid JSON from ${path} (HTTP ${code})`, { cause: error }) : error);
+        }
       });
     });
-    req.on("error", reject);
+    req.on("error", failed);
     req.on("socket", next => {
-      if (useSocket && !useSocket(next)) req.destroy(new Error("Legacy server connection changed"));
+      if (useSocket && !useSocket(next)) req.destroy(new UnverifiedListener("Legacy server connection changed"));
       else req.end();
     });
   });
 }
 
-class InvalidHealthResponse extends Error {}
-
 export async function getHealth(port: number): Promise<UpgradeHealth> {
-  const { code, value } = await localJson(port, "/health", "GET", false).catch(error => {
-    if (error instanceof SyntaxError) throw new InvalidHealthResponse("Invalid JSON from /health", { cause: error });
-    throw error;
-  });
+  const { code, value } = await localJson(port, "/health", "GET", false);
   if (code !== 200 || !value || typeof value !== "object" || Array.isArray(value)) {
-    throw new InvalidHealthResponse(`Invalid health response (HTTP ${code})`);
+    throw new InvalidLocalResponse(`Invalid health response (HTTP ${code})`);
   }
   return value as UpgradeHealth;
 }
 
+async function inspectPs(pid: number, format: string, wide = false): Promise<string> {
+  try {
+    return (await command("ps", [...(wide ? ["-ww"] : []), "-p", String(pid), "-o", format],
+      { env: psEnv, ms: probeMs, exitCodes: [0, 1], rejectStderr: true })).trim();
+  } catch (error) {
+    throw new Error(`Could not inspect process ${pid} with ps: ${errorText(error)}`, { cause: error });
+  }
+}
+
 export async function identify(pid: number): Promise<ProcessIdentity | undefined> {
-  const row = (await command("ps", ["-p", String(pid), "-o", "stat=,lstart="], { env: psEnv, ms: probeMs, exitCodes: [0, 1] })).trim();
+  const row = await inspectPs(pid, "stat=,lstart=");
   const match = /^(\S+)\s+(.+)$/.exec(row);
   if (match) return match[1].startsWith("Z") ? undefined : { pid, start: match[2] };
   // If ps did not find the process, distinguish absence from failure to inspect a still-live PID.
@@ -108,39 +125,39 @@ function linuxListeningInodes(port: number): Set<string> {
     .map(line => line.trim().split(/\s+/)).filter(row => row[1] === address && row[3] === "0A").map(row => row[9]));
 }
 
-export class LegacyInspectionError extends Error {}
-
 function requiredProcEntry<T>(path: string, read: (path: string) => T): T {
   try { return read(path); }
-  catch (error) { throw new LegacyInspectionError(`Could not inspect ${path} during legacy ownership check: ${String(error)}`, { cause: error }); }
+  catch (error) { throw new Error(`Could not inspect ${path} during legacy ownership check: ${errorText(error)}`, { cause: error }); }
 }
 
-function procEntry<T>(path: string, read: (path: string) => T): T | undefined {
+function procEntry<T>(path: string, read: (path: string) => T, skipInaccessible = false): T | undefined {
   try { return read(path); }
   catch (error) {
-    if (["ENOENT", "ESRCH", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) return undefined;
-    throw new LegacyInspectionError(`Could not inspect ${path} during legacy ownership check`, { cause: error });
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ESRCH" || (skipInaccessible && (code === "EACCES" || code === "EPERM"))) return undefined;
+    throw new Error(`Could not inspect ${path} during legacy ownership check: ${errorText(error)}`, { cause: error });
   }
 }
 
 async function legacyOwner(paths: UpgradePaths, j: UpgradeJournal): Promise<ProcessIdentity> {
   const lock = join(paths.data, "owner.sqlite");
   try { assertOwnerFiles(paths); }
-  catch (error) { throw new LegacyInspectionError(`Could not inspect ${lock} during legacy ownership check: ${String(error)}`, { cause: error }); }
+  catch (error) { throw new Error(`Could not inspect ${lock} during legacy ownership check: ${errorText(error)}`, { cause: error }); }
   let pids: number[];
   if (process.platform === "linux") {
     const sockets = linuxListeningInodes(j.port);
     pids = requiredProcEntry("/proc", path => readdirSync(path)).filter(value => /^\d+$/.test(value)).map(Number).filter(pid => {
       const dir = `/proc/${pid}/fd`;
-      const fds = procEntry(dir, path => readdirSync(path));
+      // Unrelated processes may be inaccessible. Once a PID matches, do not ignore permission failures.
+      const fds = procEntry(dir, path => readdirSync(path), true);
       if (!fds) return false;
-      const links = fds.map(fd => procEntry(`${dir}/${fd}`, path => readlinkSync(path)) ?? "");
+      const links = fds.map(fd => procEntry(`${dir}/${fd}`, path => readlinkSync(path), true) ?? "");
       return links.includes(lock) && links.some(link => sockets.has(/^socket:\[(\d+)\]$/.exec(link)?.[1] ?? ""));
     });
   } else {
     const lsof = async (args: string[]) => {
       try { return await command("/usr/sbin/lsof", ["-nP", "-Fp", ...args], { ms: 3_000, exitCodes: [0, 1], rejectStderr: true }); }
-      catch (error) { throw new LegacyInspectionError(`lsof failed during legacy ownership check: ${String(error)}`, { cause: error }); }
+      catch (error) { throw new Error(`lsof failed during legacy ownership check: ${errorText(error)}`, { cause: error }); }
     };
     const listening = [...new Set((await lsof([`-iTCP@${LOOPBACK}:${j.port}`, "-sTCP:LISTEN"])).split("\n")
       .filter(line => /^p\d+$/.test(line)).map(line => Number(line.slice(1))))];
@@ -150,9 +167,10 @@ async function legacyOwner(paths: UpgradePaths, j: UpgradeJournal): Promise<Proc
       if ((await lsof(["-a", "-p", String(pid), "--", lock])).split("\n").includes(`p${pid}`)) pids.push(pid);
     }
   }
-  if (pids.length !== 1) throw new Error("Could not match one legacy listener to this installation's owner.sqlite");
+  if (pids.length !== 1) throw new UnverifiedListener("Could not match one legacy listener to this installation's owner.sqlite");
   const [pid] = pids;
   const identity = await identify(pid);
+  if (!identity) throw new UnverifiedListener(`Legacy listener ${pid} exited during verification`);
   const argv = [["--install-dir", paths.root, "--port", String(j.port)], ["--port", String(j.port), "--install-dir", paths.root]];
   if (j.port === DEFAULT_PORT) argv.push(["--install-dir", paths.root]);
   const scripts = [join(paths.current, "src/main.ts"), join(paths.release(j.old), "src/main.ts")];
@@ -162,21 +180,25 @@ async function legacyOwner(paths: UpgradePaths, j: UpgradeJournal): Promise<Proc
     const [node, script, ...rest] = (cmd ?? "").split("\0").slice(0, -1);
     matches = /(?:^|\/)node$/.test(node) && scripts.includes(script) && argv.some(args => JSON.stringify(args) === JSON.stringify(rest));
   } else {
-    const line = (await command("ps", ["-ww", "-p", String(pid), "-o", "command="], { ms: probeMs })).trim();
+    const line = await inspectPs(pid, "command=", true);
+    if (!line) {
+      if (!(await identify(pid))) throw new UnverifiedListener(`Legacy listener ${pid} exited during verification`);
+      throw new Error(`Cannot inspect command line for process ${pid}`);
+    }
     // ps prints the arguments joined with spaces. Compare only the documented launch forms, not a shell parse.
     const node = /^(\S*\/node|node) /.exec(line)?.[0];
     matches = !!node && scripts.some(script => argv.some(args => line.slice(node.length) === [script, ...args].join(" ")));
   }
-  if (!identity || !matches || (await identify(pid))?.start !== identity.start) {
-    throw new Error("Legacy upgrade requires the documented absolute main.ts launch, --install-dir, and no other overrides");
+  if (!matches || (await identify(pid))?.start !== identity.start) {
+    throw new UnverifiedListener("Legacy upgrade requires the documented absolute main.ts launch, --install-dir, and no other overrides");
   }
   try {
     ownDataDir(paths.data)();
   } catch (error) {
     if (error instanceof OwnerBusy) return identity;
-    throw new LegacyInspectionError(`Could not check the exclusive lock on ${lock}: ${String(error)}`, { cause: error });
+    throw new Error(`Could not check the exclusive lock on ${lock}: ${errorText(error)}`, { cause: error });
   }
-  throw new Error("Legacy listener is not holding the exclusive conversation owner lock");
+  throw new UnverifiedListener("Legacy listener is not holding the exclusive conversation owner lock");
 }
 
 /** Verify and shut down on the very same HTTP connection (never reconnect to a replaced listener). */
@@ -189,14 +211,14 @@ export async function legacyConnection(paths: UpgradePaths, j: UpgradeJournal) {
     const health = await call("/health");
     const value = health.value as UpgradeHealth | null;
     if (health.code !== 200 || value?.ok !== true || value.commit !== j.old || value.upgradeProtocol !== undefined
-      || value.modelStatus !== "available") throw new Error("Legacy /health did not verify the expected SHA and available root model");
+      || value.modelStatus !== "available") throw new UnverifiedListener("Legacy /health did not verify the expected SHA and available root model");
     const branches = await call("/api/branches");
     const list = (branches.value as { branches?: { busy?: boolean }[] } | null)?.branches;
     if (branches.code !== 200 || !Array.isArray(list) || !list.length || list.some(branch => branch?.busy !== false)) {
-      throw new Error("Legacy server has active work or could not verify idle branches");
+      throw new UnverifiedListener("Legacy server has active work or could not verify idle branches");
     }
     const again = await legacyOwner(paths, j);
-    if (again.pid !== identity.pid || again.start !== identity.start) throw new Error("Legacy listener changed");
+    if (again.pid !== identity.pid || again.start !== identity.start) throw new UnverifiedListener("Legacy listener changed");
     return {
       identity,
       close: () => agent.destroy(),
@@ -250,7 +272,7 @@ export async function probeServer(server: ServerChild, j: UpgradeJournal, sha: s
     let health: UpgradeHealth | undefined;
     try { health = await getHealth(j.port); }
     catch (error) {
-      if (error instanceof InvalidHealthResponse) throw error;
+      if (error instanceof InvalidLocalResponse) throw error;
       lastError = error;
     }
     if (health) {
@@ -272,13 +294,22 @@ export async function probeServer(server: ServerChild, j: UpgradeJournal, sha: s
 /** This is after commit: failure can require a manual start, never a destructive rollback. */
 export async function confirmActivation(server: ServerChild, j: UpgradeJournal, sha: string): Promise<void> {
   const deadline = Date.now() + 10_000;
+  let lastProbeError: unknown;
   do {
     if (server.error) break;
-    const health = await getHealth(j.port).catch(() => undefined);
-    if (health?.ok === true && health.commit === sha && health.pid === server.child.pid && !health.validation) return;
+    try {
+      const health = await getHealth(j.port);
+      if (!server.error && health.ok === true && health.commit === sha && health.pid === server.child.pid && !health.validation) return;
+    } catch (error) { lastProbeError = error; }
+    if (server.error) break;
     await sleep(100);
   } while (Date.now() < deadline);
-  throw new Error(`${sha} was committed, but did not confirm activation. Check the log and start the selected release if stopped; do not restore over it.`);
+  const detail = [
+    lastProbeError !== undefined && `Last /health probe: ${errorText(lastProbeError)}`,
+    server.error && errorText(server.error),
+  ].filter(Boolean).join("; ");
+  throw new Error(`${sha} was committed, but did not confirm activation${detail ? ` (${detail})` : ""}. `
+    + "Check the log and start the selected release if stopped; do not restore over it.", { cause: server.error ?? lastProbeError });
 }
 
 export async function stopCandidate(server: ServerChild): Promise<void> {

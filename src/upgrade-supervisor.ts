@@ -10,7 +10,7 @@ import { readConfig, type Config } from "./config.ts";
 import { backupDb, restoreDb } from "./upgrade-db.ts";
 import {
   confirmActivation, detachServer, getHealth, identify, launchServer, legacyConnection, openUpgradeLog, probeServer,
-  LegacyInspectionError, quiescent, sendParent, stopCandidate, type ServerChild,
+  quiescent, sendParent, stopCandidate, UnverifiedListener, type ServerChild,
 } from "./upgrade-process.ts";
 import { InterruptedStageError, publishRelease, stageRelease, verifyRelease, type StageOutput } from "./upgrade-release.ts";
 import {
@@ -149,8 +149,8 @@ async function run(paths: UpgradePaths, args: {
     return j;
   };
   const verifyOld = async (current: UpgradeJournal, pid?: number): Promise<string | undefined> => {
+    if (paths.selected() !== current.old) return;
     try {
-      if (paths.selected() !== current.old) return;
       if (current.legacy) {
         const old = await legacyConnection(paths, current);
         old.close();
@@ -161,7 +161,7 @@ async function run(paths: UpgradePaths, args: {
       }
       return current.old;
     } catch (error) {
-      if (error instanceof LegacyInspectionError) throw error;
+      if (!(error instanceof UnverifiedListener)) throw error;
       return;
     }
   };

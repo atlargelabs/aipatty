@@ -760,6 +760,32 @@ test("interrupted legacy bootstrap leaves the old app running and requires ackno
   await assert.rejects(f.supervisor(target, "recover", "--ack-interrupted-stage", id), /during legacy ownership check/);
   assert.equal(f.paths.load()?.phase, "staging");
   await f.unflag(inspectionFailure);
+  await writeFile(join(f.scratch, "bin", "ps"), `#!/bin/sh
+case "$*" in
+  *stat=,lstart=) kind=identity ;;
+  *command=) kind=command ;;
+esac
+if [ -e "$UPGRADE_FIXTURE/fail-ps-$kind" ]; then
+  echo "fixture ps $kind diagnostic" >&2
+  exit 2
+fi
+if [ -e "$UPGRADE_FIXTURE/empty-ps-$kind" ]; then exit 1; fi
+exec /bin/ps "$@"
+`, { mode: 0o700 });
+  const pending = f.paths.load();
+  const psFailures: [string, RegExp][] = [["fail-ps-identity", /with ps: .*fixture ps identity diagnostic/],
+    ["empty-ps-identity", /Cannot identify process/]];
+  if (process.platform === "darwin") psFailures.push(["fail-ps-command", /with ps: .*fixture ps command diagnostic/],
+    ["empty-ps-command", /Cannot inspect command line for process/]);
+  for (const [flag, diagnostic] of psFailures) {
+    await f.flag(flag);
+    await assert.rejects(f.supervisor(target, "recover", "--ack-interrupted-stage", id), diagnostic);
+    assert.match(await f.log(id), diagnostic);
+    assert.deepEqual(f.paths.load(), pending);
+    assert.equal(f.paths.selected(), f.old);
+    assert.ok(existsSync(f.paths.stage(id)));
+    await f.unflag(flag);
+  }
   const ownerFile = join(f.paths.data, "owner.sqlite");
   await chmod(ownerFile, 0o660);
   try {
@@ -769,6 +795,23 @@ test("interrupted legacy bootstrap leaves the old app running and requires ackno
   assert.match((await f.supervisor(target, "recover", "--ack-interrupted-stage", id)).stdout, /Operator acknowledged interrupted staging/);
   assert.ok(existsSync(f.paths.stage(id)));
   assert.ok(await f.health(f.old));
+});
+
+test("legacy staging acknowledgement permits a stopped listener without reporting it active", { timeout }, async t => {
+  const f = await fixture(t, true);
+  const old = f.launch();
+  await f.health(f.old);
+  await f.cli("shutdown");
+  assert.equal(await old.exited, 0, old.output());
+  const id = randomUUID();
+  f.paths.init();
+  await mkdir(f.paths.stage(id));
+  f.paths.save({ version: 1, id, old: f.old, port: f.port, faux: true, legacy: true, phase: "staging" });
+  const result = await f.supervisor(f.old, "recover", "--ack-interrupted-stage", id);
+  assert.match(result.stdout, /No active server was verified/);
+  assert.equal(f.paths.load()?.phase, "done");
+  assert.equal(f.paths.selected(), f.old);
+  assert.ok(existsSync(f.paths.stage(id)));
 });
 
 test("legacy ownership surfaces lsof diagnostics instead of reporting no matching listener", { timeout, skip: process.platform !== "darwin" }, async t => {
@@ -874,6 +917,53 @@ test("a candidate's invalid HTTP health response is kept in the rollback result"
   assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
   assert.match(JSON.stringify((await f.result(f.paths.load()!.id))[0].data), /Upgrade rolled back.*Invalid health response \(HTTP 500\)/);
   assert.equal(f.paths.selected(), f.old);
+});
+
+test("post-commit activation keeps the final HTTP health error without rolling back", { timeout }, async t => {
+  const f = await fixture(t, true);
+  const old = f.launch();
+  await f.health(f.old);
+  const api = join(f.repo, "src/api.ts"), code = await readFile(api, "utf8");
+  const health = "sendJson(res, 200, { ...health, ...await agent.modelStatus() });";
+  assert.ok(code.includes(health));
+  await writeFile(api, code.replace(health, `
+    if (serving() && (await import("node:fs")).existsSync(process.env.UPGRADE_FIXTURE + "/fail-activation-health")) {
+      sendJson(res, 500, { error: "fixture activation health error" });
+    } else ${health}`));
+  const target = await f.next("health fails only after activation");
+  await f.install(target);
+  await f.flag("fail-activation-health");
+  const diagnostic = /was committed, but did not confirm activation.*Last \/health probe: Invalid health response \(HTTP 500\).*do not restore/s;
+  try {
+    await assert.rejects(f.supervisor(target, "bootstrap"), diagnostic);
+    const journal = f.paths.load()!;
+    assert.equal(journal.phase, "done");
+    assert.deepEqual(journal.result, { kind: "upgraded", active: target });
+    assert.equal(f.paths.selected(), target);
+    assert.match(await f.log(journal.id), diagnostic);
+  } finally { await f.unflag("fail-activation-health"); }
+  await f.health(target);
+  assert.equal(await old.exited, 0, old.output());
+});
+
+test("post-commit activation reports the replacement's actual exit without rolling back", { timeout }, async t => {
+  const f = await fixture(t, true);
+  const old = f.launch();
+  await f.health(f.old);
+  const deleteValidation = "        delete health.validation;";
+  const target = await f.next("candidate exits during activation", code => {
+    assert.ok(code.includes(deleteValidation));
+    return code.replace(deleteValidation, `        if (childId) process.exit(23);\n${deleteValidation}`);
+  });
+  await f.install(target);
+  const diagnostic = /was committed, but did not confirm activation.*Server exited \(23\).*do not restore/s;
+  await assert.rejects(f.supervisor(target, "bootstrap"), diagnostic);
+  const journal = f.paths.load()!;
+  assert.equal(journal.phase, "done");
+  assert.deepEqual(journal.result, { kind: "upgraded", active: target });
+  assert.equal(f.paths.selected(), target);
+  assert.match(await f.log(journal.id), diagnostic);
+  assert.equal(await old.exited, 0, old.output());
 });
 
 test("first bootstrap can roll back to a legacy app when the candidate serves the wrong SHA", { timeout }, async t => {
