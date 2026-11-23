@@ -1020,9 +1020,17 @@ test("an outcome settled before the harness committed it survives a restart, and
   // The rebuilt index was saved: another restart still has the outcome.
   assert.equal((await (await openPiRuns(config)).settled(105))?.runId, outcome.runId);
 
+  // The old bounded index need not include a legacy archive. The durable task still identifies its result,
+  // even when the hook supplies a branch ID that old archives did not store.
+  await rm(legacyIndex);
+  const archive = join(outcome.logDir, "result.json");
+  const current = await readFile(archive, "utf8");
+  await writeFile(archive, JSON.stringify({ outcome, reconciled: true, taskId: 105 }));
+  assert.deepEqual(await (await openPiRuns(config)).settled(105, 5), outcome);
+  await writeFile(archive, current);
+
   // The process died after the run's own copy of the result was written and before the index and the record caught
   // up: the settled result stands, and is not replaced by an interruption.
-  await rm(legacyIndex);
   await writeFile(checkpointFile(config, outcome.runId), JSON.stringify({
     runId: outcome.runId, conversationId: 5, taskId: 105, pr: true, startedAt: "", procs: [], groups: [], asOf: 0,
     workspace: join(config.runsDir, outcome.runId), logDir: outcome.logDir,
@@ -1155,6 +1163,21 @@ test("conflicting legacy and per-run records are left intact rather than choosin
   assert.ok(existsSync(saved.workspace));
   assert.equal(await runs.settled(101), undefined);
   assert.equal(await runs.settled(102), undefined);
+});
+
+test("a known unreadable transcript with no saved outcome explains recovery failure to just that task", async t => {
+  const config = await setup(t);
+  const saved = await savedRun(config, "20260101T000000-deadbeef", 1, 101);
+  await mkdir(join(saved.logDir, "events.jsonl"));
+  t.mock.method(console, "error", () => {});
+  const runs = await openPiRuns(config);
+  await assert.rejects(runs.settled(101, 1), /its events could not be read[^]*No new run starts on branch 1/);
+  assert.equal(await runs.settled(102, 1), undefined, "an unrelated call on the same branch isn't this task");
+  assert.equal(await runs.settled(101, 2), undefined);
+  assert.ok(existsSync(saved.workspace));
+  assert.deepEqual(await pendingRecords(config), [`${saved.runId}.json`]);
+  await scenario(config, [assistant(report({ issue: null, pr: null })), settled]);
+  assert.equal((await runs.run(request({ conversationId: 2, taskId: 103, pr: false }))).status, "completed");
 });
 
 test("restart completes cleanup after a spend checkpoint without counting the same delegate twice", async t => {

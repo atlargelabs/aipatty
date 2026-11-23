@@ -416,8 +416,12 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     await indexOutcome(saved);
     await rm(join(saved.logDir, "reconciled.json"), { force: true }).catch(() => {});
   };
+  // Durable task IDs are unique in the store. Old singleton archives name only the task; check the branch
+  // as well when both the caller and the archive know it.
+  const matchesBranch = (entry: Kept, conversationId?: number) =>
+    conversationId === undefined || entry.conversationId === undefined || entry.conversationId === conversationId;
   const isCall = (copy: Archived | undefined, taskId: number, conversationId?: number): copy is Archived =>
-    copy?.taskId === taskId && (conversationId === undefined || copy.conversationId === conversationId);
+    copy?.taskId === taskId && matchesBranch(copy, conversationId);
   const settledOutcome = async (taskId: number, conversationId?: number) => {
     const held = conversationId === undefined ? [...heldBranches.values()].find(hold => hold.taskId === taskId)
       : heldBranches.get(conversationId);
@@ -431,7 +435,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         if (!isCall(copy, taskId, conversationId)) throw new Error("the indexed archive does not describe this call");
         return copy.outcome;
       }
-      if (legacy && (conversationId === undefined || legacy.conversationId === undefined || legacy.conversationId === conversationId)) return legacy.outcome;
+      if (legacy && matchesBranch(legacy, conversationId)) return legacy.outcome;
     } catch (error) {
       damaged = true;
       console.error(`Pi runs: could not read the indexed outcome of task ${taskId}: ${message(error)}`);
@@ -446,8 +450,10 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       if (found) throw new Error(`More than one Pi archive matches task ${taskId}.`);
       found = copy.outcome;
     }
-    if (damaged && !found) throw new Error(`Could not locate a Pi archive for task ${taskId} after its outcome index failed. Check ${logRoot}.`);
-    return found;
+    if (found) return found;
+    if (held?.taskId === taskId) throw new Error(held.reason);
+    if (damaged) throw new Error(`Could not locate a Pi archive for task ${taskId} after its outcome index failed. Check ${logRoot}.`);
+    return undefined;
   };
 
   /**
@@ -783,8 +789,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     };
     try {
       const old = kept.get(String(saved.taskId));
-      const final = await logged(saved.runId, saved) ?? (old?.outcome.runId === saved.runId
-        && (old.conversationId === undefined || old.conversationId === saved.conversationId) ? old : undefined);
+      const final = await logged(saved.runId, saved) ?? (old?.outcome.runId === saved.runId && matchesBranch(old, saved.conversationId)
+        ? old : undefined);
       outcome = final?.outcome;
       const pending = final ? undefined : await logged(saved.runId, saved, "reconciled.json");
       // If events can't be replayed for cleanup, still deliver spend saved before the interruption.
