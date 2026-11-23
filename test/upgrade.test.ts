@@ -156,7 +156,9 @@ async function fixture(t: TestContext, legacy = false, hostHasGitPaths = false) 
   const commits = new Set<string>();
   t.after(async () => {
     // Wake a fixture process held at a barrier even when a test fails. Don't signal by PID from /health.
-    for (const name of ["hold-stage", "hold-stage-child", "hold-pi", "hold-legacy-exit", "hold-probe"]) await rm(join(scratch, name), { force: true });
+    for (const name of ["hold-stage", "hold-stage-child", "hold-pi", "hold-legacy-exit", "hold-probe", "hold-legacy-probe"]) {
+      await rm(join(scratch, name), { force: true });
+    }
     await writeFile(join(scratch, "let-nested-finish"), "");
     for (const child of children) child.kill("SIGTERM");
     // Successful cutover's child belongs to the one-shot helper, not this test. Use the local graceful protocol.
@@ -217,16 +219,23 @@ exec /usr/sbin/lsof "$@"
   const processPath = join(repo, "src/upgrade-process.ts");
   const processCode = await readFile(processPath, "utf8");
   const probeStart = "  const deadline = Date.now() + startupMs;";
-  assert.ok(processCode.includes(probeStart));
+  const legacyBranches = '    const branches = await call("/api/branches");';
+  assert.ok(processCode.includes(probeStart) && processCode.includes(legacyBranches));
   const tcpFile = 'requiredProcEntry("/proc/net/tcp",';
   assert.ok(processCode.includes(tcpFile));
   await writeFile(processPath, processCode
-    .replace("closeSync, constants, openSync", "closeSync, constants, existsSync, openSync")
+    .replace("closeSync, constants, openSync", "closeSync, constants, existsSync, openSync, writeFileSync")
     .replace(tcpFile, `requiredProcEntry(existsSync(join(process.env.UPGRADE_FIXTURE!, "fail-proc-net-tcp"))
       ? join(process.env.UPGRADE_FIXTURE!, "missing-proc-net-tcp") : "/proc/net/tcp",`)
-    .replace('command("/usr/sbin/lsof",', 'command(join(process.env.UPGRADE_FIXTURE!, "bin", "lsof"),').replace(probeStart, `
+    .replace('command("/usr/sbin/lsof",', 'command(join(process.env.UPGRADE_FIXTURE!, "bin", "lsof"),')
+    .replace(legacyBranches, `${legacyBranches}
+    const directory = process.env.UPGRADE_FIXTURE!;
+    if (existsSync(join(directory, "hold-legacy-probe"))) {
+      writeFileSync(join(directory, "legacy-probe-started"), "");
+      while (existsSync(join(directory, "hold-legacy-probe"))) await sleep(25);
+    }`)
+    .replace(probeStart, `
   if (gated && sha === j.target) {
-    const { existsSync, writeFileSync } = await import("node:fs");
     const directory = process.env.UPGRADE_FIXTURE!;
     writeFileSync(join(directory, "helper.pid"), String(process.pid));
     while (existsSync(join(directory, "hold-probe"))) await sleep(25);
@@ -1039,8 +1048,8 @@ test("an interrupted switch closes the gated candidate; startup refuses the unce
   assert.ok(existsSync(backup));
 });
 
-for (const [fault, ready] of [["corrupt", false], ["missing", false], ["missing", true]] as const) {
-  test(`a ${fault} cutover journal disconnects the ${ready ? "ready" : "unready"} candidate without restoring`, { timeout }, async t => {
+for (const [fault, ready] of [["corrupt", false], ["missing", false], ["missing", true], ["changed branch", true], ["changed request key", true]] as const) {
+  test(`a cutover journal fault (${fault}) disconnects the ${ready ? "ready" : "unready"} candidate without restoring`, { timeout }, async t => {
     const f = await fixture(t);
     f.launch();
     await f.health(f.old);
@@ -1054,29 +1063,82 @@ for (const [fault, ready] of [["corrupt", false], ["missing", false], ["missing"
     const j = f.paths.load()!;
     const helper = Number(await readFile(join(f.scratch, "helper.pid"), "utf8"));
     const backup = await readFile(f.paths.backup(j.id));
-    if (fault === "corrupt") await writeFile(f.paths.journal, "not valid JSON");
-    else await rm(f.paths.journal);
-    await f.unflag("hold-probe");
-    await until(() => identify(helper), value => !value);
-    await until(() => identify(candidate!.pid!), value => !value);
-    assert.equal(await f.healthNow(), undefined);
-    assert.equal(f.paths.selected(), target);
-    assert.deepEqual(await readFile(f.paths.backup(j.id)), backup);
-    const diagnostic = fault === "corrupt" ? /not valid JSON|Unexpected token/ : /Missing upgrade journal/;
-    assert.match(await f.log(j.id), diagnostic);
-    if (fault === "missing") {
-      assert.equal(f.paths.load(), undefined);
-      const restart = f.launch(target);
-      assert.equal(await restart.exited, 1, restart.output());
-      assert.match(restart.output(), /Missing upgrade journal: .*Cutover backup exists/);
+    const corrupted = "not valid JSON";
+    try {
+      if (fault === "corrupt") await writeFile(f.paths.journal, corrupted);
+      else if (fault === "missing") await rm(f.paths.journal);
+      else if (fault === "changed branch") f.paths.save({ ...j, branch: j.branch! + 1 });
+      else f.paths.save({ ...j, requestKey: randomUUID() });
+      const replacement = fault === "missing" ? undefined : await readFile(f.paths.journal, "utf8");
+      await f.unflag("hold-probe");
+      await until(() => identify(helper), value => !value);
+      await until(() => identify(candidate!.pid!), value => !value);
+      assert.equal(await f.healthNow(), undefined);
+      assert.equal(f.paths.selected(), target);
+      assert.deepEqual(await readFile(f.paths.backup(j.id)), backup);
+      const diagnostic = fault === "corrupt" ? /not valid JSON|Unexpected token/
+        : fault === "missing" ? /Missing upgrade journal/ : /Upgrade journal changed/;
+      assert.match(await f.log(j.id), diagnostic);
+      if (replacement !== undefined) assert.equal(await readFile(f.paths.journal, "utf8"), replacement);
+      else {
+        assert.equal(f.paths.load(), undefined);
+        const restart = f.launch(target);
+        assert.equal(await restart.exited, 1, restart.output());
+        assert.match(restart.output(), /Missing upgrade journal: .*Cutover backup exists/);
+      }
+    } finally {
+      // Put back the known-good phase in this private fixture, then use the actual recovery path.
+      f.paths.save(j);
     }
-    // Put back the known-good phase in this private fixture, then use the actual recovery path.
-    f.paths.save(j);
     await f.supervisor(target, "recover");
     await f.health(f.old);
     assert.equal((await f.result(j.id)).length, 1);
   });
 }
+
+test("recovery of an already listening legacy rollback refuses a corrupt or missing journal after probing", { timeout }, async t => {
+  const f = await fixture(t, true);
+  const original = f.launch();
+  await f.health(f.old);
+  await f.cli("shutdown");
+  assert.equal(await original.exited, 0, original.output());
+  const id = randomUUID();
+  const target = await f.next("interrupted legacy rollback");
+  f.paths.init();
+  const release = ownDataDir(f.paths.data);
+  try { await backupDb(f.paths, id); } finally { release(); }
+  const backup = await readFile(f.paths.backup(id));
+  const journal = { version: 1, id, old: f.old, target, port: f.port, faux: true, legacy: true, phase: "restored" } as const;
+  f.paths.save(journal);
+  const running = f.launch();
+  await f.health(f.old);
+  const corrupt = "not valid JSON";
+  for (const fault of ["corrupt", "missing"] as const) {
+    await f.flag("hold-legacy-probe");
+    const diagnostic = fault === "corrupt" ? /not valid JSON|Unexpected token/ : /Missing upgrade journal/;
+    const rejected = assert.rejects(f.supervisor(f.old, "recover"), diagnostic);
+    try {
+      try {
+        await until(() => existsSync(join(f.scratch, "legacy-probe-started")));
+        if (fault === "corrupt") await writeFile(f.paths.journal, corrupt);
+        else await rm(f.paths.journal);
+      } finally { await f.unflag("hold-legacy-probe"); }
+      await rejected;
+      if (fault === "corrupt") assert.equal(await readFile(f.paths.journal, "utf8"), corrupt);
+      else assert.equal(f.paths.load(), undefined);
+      assert.equal(f.paths.selected(), f.old);
+      assert.deepEqual(await readFile(f.paths.backup(id)), backup);
+      assert.ok(await identify(running.child.pid!));
+    } finally {
+      f.paths.save(journal);
+      await f.unflag("legacy-probe-started");
+    }
+  }
+  assert.match((await f.supervisor(f.old, "recover")).stdout, /Upgrade rolled back/);
+  assert.deepEqual(f.paths.load()?.result, { kind: "rolled-back", active: f.old,
+    reason: "Interrupted cutover; the pinned candidate was not retried." });
+  assert.ok(await identify(running.child.pid!));
+});
 
 test("SQLite backup includes uncheckpointed committed WAL, and restore discards an abandoned candidate WAL", { timeout }, async t => {
   const scratch = await realpath(await mkdtemp(join(tmpdir(), "aipatty-upgrade-wal-")));

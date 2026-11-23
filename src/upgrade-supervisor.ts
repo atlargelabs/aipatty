@@ -5,7 +5,7 @@ import { closeSync, mkdirSync, realpathSync, rmSync, writeSync } from "node:fs";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
-import { parseArgs } from "node:util";
+import { isDeepStrictEqual, parseArgs } from "node:util";
 import { readConfig, type Config } from "./config.ts";
 import { backupDb, restoreDb } from "./upgrade-db.ts";
 import {
@@ -150,12 +150,12 @@ async function run(paths: UpgradePaths, args: {
     if (!j) throw new Error(`No upgrade journal at ${paths.journal}`);
     return j;
   };
-  const readJournal = () => {
+  const readJournal = (expected = requireJournal()) => {
     const persisted = paths.load();
     if (!persisted) throw new Error(`Missing upgrade journal: ${paths.journal}`);
-    const expected = requireJournal();
-    if (persisted.id !== expected.id || persisted.old !== expected.old || persisted.target !== expected.target) {
-      throw new Error(`Upgrade journal request changed: ${paths.journal}`);
+    // Compare the whole journal as stored, ignoring JSON formatting and omitted undefined properties.
+    if (!isDeepStrictEqual(persisted, JSON.parse(JSON.stringify(expected)))) {
+      throw new Error(`Upgrade journal changed: ${paths.journal}`);
     }
     return persisted;
   };
@@ -176,26 +176,22 @@ async function run(paths: UpgradePaths, args: {
       return;
     }
   };
-  const done = (before: UpgradeJournal, status: NonNullable<UpgradeJournal["result"]>) => {
-    const next = save(finish(before, status));
+  const commitValidated = (before: UpgradeJournal, status: NonNullable<UpgradeJournal["result"]>) => {
+    const persisted = readJournal(before);
+    if (paths.selected() !== (status.active ?? before.old)) {
+      throw new Error(`Upgrade selection changed during validation: ${paths.journal}`);
+    }
+    const next = save(finish(persisted, status));
     // Work is committed already; an error appending diagnostics must not trigger a rollback.
     note(resultText(next));
     return next;
-  };
-
-  const commitValidated = (before: UpgradeJournal, status: NonNullable<UpgradeJournal["result"]>) => {
-    const persisted = readJournal();
-    if (persisted.phase !== before.phase || paths.selected() !== status.active) {
-      throw new Error(`Upgrade journal phase or selection changed during validation: ${paths.journal}`);
-    }
-    return done(persisted, status);
   };
 
   async function rollback(current: UpgradeJournal, why: string): Promise<UpgradeJournal> {
     note(`Restoring ${current.old}: ${why}`);
     await verifyRelease(paths.release(current.old), current.old);
     if (current.phase === "restored" && current.legacy && await verifyOld(current)) {
-      return done(current, { kind: "rolled-back", active: current.old, reason: current.reason ?? why });
+      return commitValidated(current, { kind: "rolled-back", active: current.old, reason: current.reason ?? why });
     }
     const free = await quiescent(paths, current.port, current.phase === "stopping" ? current.oldProcess : undefined);
     try {
@@ -255,7 +251,7 @@ async function run(paths: UpgradePaths, args: {
       try {
         if (current.phase === "requested") {
           await verifySelected(paths, current.old);
-          return done(current, { kind: "cancelled", active: await verifyOld(current), reason: "Interrupted request was not staged." });
+          return commitValidated(current, { kind: "cancelled", active: await verifyOld(current), reason: "Interrupted request was not staged." });
         }
         if (current.phase === "staging") {
           // Matching acknowledgement is the operator's attestation after maintenance, not a process probe.
@@ -263,7 +259,7 @@ async function run(paths: UpgradePaths, args: {
           const unlockStage = paths.stagingLease(current.id);
           try {
             await verifySelected(paths, current.old);
-            return done(current, { kind: "cancelled", active: await verifyOld(current),
+            return commitValidated(current, { kind: "cancelled", active: await verifyOld(current),
               reason: `Operator acknowledged interrupted staging. The private stage was not reused or removed: ${paths.stage(current.id)}.` });
           } finally { unlockStage(); }
         }
@@ -321,9 +317,10 @@ async function run(paths: UpgradePaths, args: {
       await verifySelected(paths, initial.old);
       noPi(paths);
       if (sha === initial.old) {
-        const active = await verifyOld(initial, parent?.pid);
+        const current = requireJournal();
+        const active = await verifyOld(current, parent?.pid);
         if (!active) throw new Error("The selected release matches main but the old server could not be verified");
-        return done(requireJournal(), { kind: "noop", active });
+        return commitValidated(current, { kind: "noop", active });
       }
       const legacy = initial.legacy ? await legacyConnection(paths, initial) : undefined;
       try {
@@ -373,7 +370,7 @@ async function run(paths: UpgradePaths, args: {
           note(message);
           throw new Error(message, { cause: error });
         }
-        return done(current, { kind: "failed", active: await verifyOld(current, parent?.pid), reason: why });
+        return commitValidated(current, { kind: "failed", active: await verifyOld(current, parent?.pid), reason: why });
       }
       try {
         if (candidate) await stopCandidate(candidate);
