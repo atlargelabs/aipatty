@@ -975,16 +975,16 @@ test("post-commit activation reports the replacement's actual exit without rolli
   assert.equal(await old.exited, 0, old.output());
 });
 
-test("first bootstrap can roll back to a legacy app when the candidate serves the wrong SHA", { timeout }, async t => {
+test("first bootstrap rolls back and identifies a wrong candidate PID even when its SHA matches", { timeout }, async t => {
   const f = await fixture(t, true);
   const legacy = f.launch();
   await f.health(f.old);
   assert.equal((await f.send("legacy rollback keeps this history")).status, 202);
-  const target = await f.next("wrong SHA while validating", code => code.replace("      const api = await startApi", `
-      if (childId) health.commit = ${JSON.stringify("7".repeat(40))};
+  const target = await f.next("wrong PID while validating", code => code.replace("      const api = await startApi", `
+      if (childId) health.pid = 1;
       const api = await startApi`));
   await f.install(target);
-  await assert.rejects(f.supervisor(target, "bootstrap"), /Upgrade rolled back.*Readiness identity mismatch/s);
+  await assert.rejects(f.supervisor(target, "bootstrap"), /Upgrade rolled back.*Readiness identity mismatch: expected PID \d+, received 1/s);
   assert.equal(await legacy.exited, 0, legacy.output());
   assert.equal((await f.health(f.old))?.upgradeProtocol, undefined);
   assert.equal(f.paths.selected(), f.old);
@@ -1039,17 +1039,18 @@ test("an interrupted switch closes the gated candidate; startup refuses the unce
   assert.ok(existsSync(backup));
 });
 
-for (const fault of ["corrupt", "missing"] as const) {
-  test(`a ${fault} cutover journal disconnects the validation child without restoring`, { timeout }, async t => {
+for (const [fault, ready] of [["corrupt", false], ["missing", false], ["missing", true]] as const) {
+  test(`a ${fault} cutover journal disconnects the ${ready ? "ready" : "unready"} candidate without restoring`, { timeout }, async t => {
     const f = await fixture(t);
     f.launch();
     await f.health(f.old);
-    const target = await f.next("candidate health will fail", code => code.replace("      const api = await startApi", `
+    const target = await f.next(`candidate validation ready=${ready}`, ready ? undefined : code => code.replace("      const api = await startApi", `
       if (childId) health.validation = { id: childId, ready: false, reason: "fixture validation failure" };
       const api = await startApi`));
     await f.flag("hold-probe");
     assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
     const candidate = await f.health(target, true);
+    assert.equal(candidate?.validation?.ready, ready);
     const j = f.paths.load()!;
     const helper = Number(await readFile(join(f.scratch, "helper.pid"), "utf8"));
     const backup = await readFile(f.paths.backup(j.id));
@@ -1063,7 +1064,12 @@ for (const fault of ["corrupt", "missing"] as const) {
     assert.deepEqual(await readFile(f.paths.backup(j.id)), backup);
     const diagnostic = fault === "corrupt" ? /not valid JSON|Unexpected token/ : /Missing upgrade journal/;
     assert.match(await f.log(j.id), diagnostic);
-    if (fault === "missing") assert.equal(f.paths.load(), undefined);
+    if (fault === "missing") {
+      assert.equal(f.paths.load(), undefined);
+      const restart = f.launch(target);
+      assert.equal(await restart.exited, 1, restart.output());
+      assert.match(restart.output(), /Missing upgrade journal: .*Cutover backup exists/);
+    }
     // Put back the known-good phase in this private fixture, then use the actual recovery path.
     f.paths.save(j);
     await f.supervisor(target, "recover");

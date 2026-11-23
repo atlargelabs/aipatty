@@ -150,6 +150,15 @@ async function run(paths: UpgradePaths, args: {
     if (!j) throw new Error(`No upgrade journal at ${paths.journal}`);
     return j;
   };
+  const readJournal = () => {
+    const persisted = paths.load();
+    if (!persisted) throw new Error(`Missing upgrade journal: ${paths.journal}`);
+    const expected = requireJournal();
+    if (persisted.id !== expected.id || persisted.old !== expected.old || persisted.target !== expected.target) {
+      throw new Error(`Upgrade journal request changed: ${paths.journal}`);
+    }
+    return persisted;
+  };
   const verifyOld = async (current: UpgradeJournal, pid?: number): Promise<string | undefined> => {
     if (paths.selected() !== current.old) return;
     try {
@@ -172,6 +181,14 @@ async function run(paths: UpgradePaths, args: {
     // Work is committed already; an error appending diagnostics must not trigger a rollback.
     note(resultText(next));
     return next;
+  };
+
+  const commitValidated = (before: UpgradeJournal, status: NonNullable<UpgradeJournal["result"]>) => {
+    const persisted = readJournal();
+    if (persisted.phase !== before.phase || paths.selected() !== status.active) {
+      throw new Error(`Upgrade journal phase or selection changed during validation: ${paths.journal}`);
+    }
+    return done(persisted, status);
   };
 
   async function rollback(current: UpgradeJournal, why: string): Promise<UpgradeJournal> {
@@ -203,7 +220,7 @@ async function run(paths: UpgradePaths, args: {
         legacy.close();
         if (legacy.identity.pid !== old.child.pid) throw new Error("Rollback listener isn't the old process we launched");
       }
-      const verified = done(current, { kind: "rolled-back", active: current.old, reason: current.reason ?? why });
+      const verified = commitValidated(current, { kind: "rolled-back", active: current.old, reason: current.reason ?? why });
       detachServer(old);
       if (!current.legacy) await confirmActivation(old, current, current.old);
       return verified;
@@ -329,21 +346,18 @@ async function run(paths: UpgradePaths, args: {
         paths.select(sha);
       } finally { free(); }
       note(`Starting ${sha} in validation mode`);
-      candidate = launchServer(paths, requireJournal(), sha, true);
-      await probeServer(candidate, requireJournal(), sha, true);
-      const verified = done(requireJournal(), { kind: "upgraded", active: sha });
+      const switching = requireJournal();
+      candidate = launchServer(paths, switching, sha, true);
+      await probeServer(candidate, switching, sha, true);
+      const verified = commitValidated(switching, { kind: "upgraded", active: sha });
       detachServer(candidate);
       await confirmActivation(candidate, verified, sha);
       return verified;
     } catch (error) {
       const why = errorText(error);
       let current: UpgradeJournal;
-      try {
-        const persisted = paths.load();
-        if (!persisted) throw new Error(`Missing upgrade journal: ${paths.journal}`);
-        if (persisted.id !== requireJournal().id) throw new Error(`Upgrade journal request changed: ${paths.journal}`);
-        current = persisted;
-      } catch (inspection) {
+      try { current = readJournal(); }
+      catch (inspection) {
         // An in-memory phase is not authority to restore. The finally block still disconnects any candidate.
         const message = `Upgrade failed: ${why}. Cannot verify the journal: ${errorText(inspection)}. Selection and backup left intact.`;
         note(message);

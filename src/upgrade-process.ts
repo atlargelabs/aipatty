@@ -7,7 +7,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { LOOPBACK, DEFAULT_PORT, shutdownHeader } from "./config.ts";
 import { ownDataDir, OwnerBusy } from "./ownership.ts";
 import { command } from "./upgrade-release.ts";
-import { errorText, ownedFile, shaPattern, upgradeChildEnv, upgradeProtocol, type ProcessIdentity, type UpgradeJournal, type UpgradePaths } from "./upgrade-state.ts";
+import { errorText, idPattern, ownedFile, shaPattern, upgradeChildEnv, upgradeProtocol, type ProcessIdentity, type UpgradeJournal, type UpgradePaths } from "./upgrade-state.ts";
 
 const stopMs = 20_000;
 const startupMs = 30_000;
@@ -264,6 +264,20 @@ export function launchServer(paths: UpgradePaths, j: UpgradeJournal, sha: string
   } finally { closeSync(log); }
 }
 
+function identityMismatch(health: UpgradeHealth, sha: string, child?: ChildProcess): string[] {
+  const mismatch: string[] = [];
+  if (health.ok !== true) mismatch.push("ok is not true");
+  if (health.commit !== sha) {
+    const actual = typeof health.commit === "string" && shaPattern.test(health.commit) ? health.commit : "unknown";
+    mismatch.push(`expected SHA ${sha}, received ${actual}`);
+  }
+  if (child && health.pid !== child.pid) {
+    const actual = Number.isSafeInteger(health.pid) ? health.pid : "unknown";
+    mismatch.push(`expected PID ${child.pid}, received ${actual}`);
+  }
+  return mismatch;
+}
+
 export async function probeServer(server: ServerChild, j: UpgradeJournal, sha: string, gated: boolean): Promise<void> {
   const deadline = Date.now() + startupMs;
   let lastError: unknown;
@@ -276,10 +290,16 @@ export async function probeServer(server: ServerChild, j: UpgradeJournal, sha: s
       lastError = error;
     }
     if (health) {
-      if (health.ok !== true || health.commit !== sha || (gated && (health.pid !== server.child.pid
-        || health.upgradeProtocol !== upgradeProtocol || health.validation?.id !== j.id))) {
-        throw new Error(`Readiness identity mismatch: expected ${sha}, received ${health.commit ?? "unknown"}`);
+      const mismatch = identityMismatch(health, sha, gated ? server.child : undefined);
+      if (gated && health.upgradeProtocol !== upgradeProtocol) {
+        const actual = Number.isSafeInteger(health.upgradeProtocol) ? health.upgradeProtocol : "unknown";
+        mismatch.push(`expected protocol ${upgradeProtocol}, received ${actual}`);
       }
+      if (gated && health.validation?.id !== j.id) {
+        const actual = typeof health.validation?.id === "string" && idPattern.test(health.validation.id) ? health.validation.id : "unknown";
+        mismatch.push(`expected validation request ${j.id}, received ${actual}`);
+      }
+      if (mismatch.length) throw new Error(`Readiness identity mismatch: ${mismatch.join(", ")}`);
       if (health.modelStatus !== "available" || (gated && health.validation?.ready !== true)) {
         throw new Error(health.validation?.reason ?? "Server is listening but its saved model is unavailable");
       }
@@ -299,16 +319,7 @@ export async function confirmActivation(server: ServerChild, j: UpgradeJournal, 
     if (server.error) break;
     try {
       const health = await getHealth(j.port);
-      const mismatch: string[] = [];
-      if (health.ok !== true) mismatch.push("ok is not true");
-      if (health.commit !== sha) {
-        const actual = typeof health.commit === "string" && shaPattern.test(health.commit) ? health.commit : "unknown";
-        mismatch.push(`expected SHA ${sha}, received ${actual}`);
-      }
-      if (health.pid !== server.child.pid) {
-        const actual = Number.isSafeInteger(health.pid) ? health.pid : "unknown";
-        mismatch.push(`expected PID ${server.child.pid}, received ${actual}`);
-      }
+      const mismatch = identityMismatch(health, sha, server.child);
       if (health.validation) mismatch.push("validation is still present");
       if (!mismatch.length && !server.error) return;
       lastProbeError = mismatch.length ? new Error(`HTTP 200 but ${mismatch.join(", ")}`) : undefined;

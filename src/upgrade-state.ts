@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
-  closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync,
+  closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync,
   rmSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
@@ -138,9 +138,15 @@ export class UpgradePaths {
       const state = inspect(paths.state);
       if (!state) continue;
       // Never follow a replacement state symlink. An ordinary sibling directory without a journal
-      // is not an installation; inspection errors other than absence still propagate.
+      // is not an installation, but a cutover backup without its journal leaves the DB uncertain.
       if (state.isSymbolicLink()) ownedDir(paths.state);
-      if (!state.isDirectory() || !exists(paths.journal)) continue;
+      if (!state.isDirectory()) continue;
+      if (!exists(paths.journal)) {
+        if (readdirSync(paths.state).some(name => name.endsWith(".sqlite") && idPattern.test(name.slice(0, -".sqlite".length)))) {
+          throw new Error(`Missing upgrade journal: ${paths.journal}. Cutover backup exists; refuse startup until investigated.`);
+        }
+        continue;
+      }
       ownedDir(paths.state);
       const configured = UpgradePaths.forConfig(config);
       if (configured.root !== root) throw new Error(`Use the journal's installation root: ${root}`);
