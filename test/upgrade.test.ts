@@ -307,7 +307,8 @@ ${startHelper}`));
   }
   const supervisor = (sha: string, mode: "bootstrap" | "recover", ...options: string[]) => {
     const cwd = paths.release(sha);
-    return exec(process.execPath, [join(cwd, "src/upgrade-supervisor.ts"), mode, ...flags, ...options], { cwd, env, timeout: 35_000 });
+    const nodeArgs = existsSync(join(scratch, "loose-stage-umask")) ? ["--import=data:text/javascript,process.umask(0o002)"] : [];
+    return exec(process.execPath, [...nodeArgs, join(cwd, "src/upgrade-supervisor.ts"), mode, ...flags, ...options], { cwd, env, timeout: 35_000 });
   };
   const cli = (...args: string[]) => exec(process.execPath, [join(checkout, "src/cli.ts"), "--port", String(port), ...args], { env, timeout: 10_000 });
   async function healthNow() {
@@ -365,6 +366,7 @@ test("first bootstrap uses legacy shutdown, waits for exit beyond the ACK and pr
   assert.ok(!(await f.cli("log")).stdout.includes("/upgrade"));
   const target = await f.next("first one-shot release");
   await f.install(target);
+  await f.flag("loose-stage-umask"); // The stage worker must protect Git and dependency files despite the inherited umask.
   await f.flag("hold-legacy-exit");
   const upgrading = f.supervisor(target, "bootstrap");
   void upgrading.catch(() => {});
@@ -919,32 +921,39 @@ test("a candidate's invalid HTTP health response is kept in the rollback result"
   assert.equal(f.paths.selected(), f.old);
 });
 
-test("post-commit activation keeps the final HTTP health error without rolling back", { timeout }, async t => {
-  const f = await fixture(t, true);
-  const old = f.launch();
-  await f.health(f.old);
-  const api = join(f.repo, "src/api.ts"), code = await readFile(api, "utf8");
-  const health = "sendJson(res, 200, { ...health, ...await agent.modelStatus() });";
-  assert.ok(code.includes(health));
-  await writeFile(api, code.replace(health, `
+for (const mismatch of [false, true]) {
+  const kind = mismatch ? "latest mismatched HTTP 200" : "final HTTP 500";
+  test(`post-commit activation reports the ${kind} without rolling back`, { timeout }, async t => {
+    const f = await fixture(t, true);
+    const old = f.launch();
+    await f.health(f.old);
+    const api = join(f.repo, "src/api.ts"), code = await readFile(api, "utf8");
+    const health = "sendJson(res, 200, { ...health, ...await agent.modelStatus() });";
+    assert.ok(code.includes(health));
+    await writeFile(api, code.replace(health, `
     if (serving() && (await import("node:fs")).existsSync(process.env.UPGRADE_FIXTURE + "/fail-activation-health")) {
-      sendJson(res, 500, { error: "fixture activation health error" });
-    } else ${health}`));
-  const target = await f.next("health fails only after activation");
-  await f.install(target);
-  await f.flag("fail-activation-health");
-  const diagnostic = /was committed, but did not confirm activation.*Last \/health probe: Invalid health response \(HTTP 500\).*do not restore/s;
-  try {
-    await assert.rejects(f.supervisor(target, "bootstrap"), diagnostic);
-    const journal = f.paths.load()!;
-    assert.equal(journal.phase, "done");
-    assert.deepEqual(journal.result, { kind: "upgraded", active: target });
-    assert.equal(f.paths.selected(), target);
-    assert.match(await f.log(journal.id), diagnostic);
-  } finally { await f.unflag("fail-activation-health"); }
-  await f.health(target);
-  assert.equal(await old.exited, 0, old.output());
-});
+      // In the mismatch case the HTTP 500 must be superseded by the next observed state.
+      if (!${mismatch} || activationProbeCount++ === 0) sendJson(res, 500, { error: "fixture activation health error" });
+      else sendJson(res, 200, { ...health, pid: 1, validation: { id: "fixture", ready: true } });
+    } else ${health}`) + "\nlet activationProbeCount = 0;\n");
+    const target = await f.next(`health fails only after activation (${kind})`);
+    await f.install(target);
+    await f.flag("fail-activation-health");
+    const diagnostic = mismatch
+      ? /was committed, but did not confirm activation.*Last \/health probe: HTTP 200 but expected PID \d+, received 1, validation is still present.*do not restore/s
+      : /was committed, but did not confirm activation.*Last \/health probe: Invalid health response \(HTTP 500\).*do not restore/s;
+    try {
+      await assert.rejects(f.supervisor(target, "bootstrap"), diagnostic);
+      const journal = f.paths.load()!;
+      assert.equal(journal.phase, "done");
+      assert.deepEqual(journal.result, { kind: "upgraded", active: target });
+      assert.equal(f.paths.selected(), target);
+      assert.match(await f.log(journal.id), diagnostic);
+    } finally { await f.unflag("fail-activation-health"); }
+    await f.health(target);
+    assert.equal(await old.exited, 0, old.output());
+  });
+}
 
 test("post-commit activation reports the replacement's actual exit without rolling back", { timeout }, async t => {
   const f = await fixture(t, true);
@@ -1030,32 +1039,38 @@ test("an interrupted switch closes the gated candidate; startup refuses the unce
   assert.ok(existsSync(backup));
 });
 
-test("a broken journal still disconnects the validation child without admitting work or clobbering the backup", { timeout }, async t => {
-  const f = await fixture(t);
-  f.launch();
-  await f.health(f.old);
-  const target = await f.next("candidate health will fail", code => code.replace("      const api = await startApi", `
+for (const fault of ["corrupt", "missing"] as const) {
+  test(`a ${fault} cutover journal disconnects the validation child without restoring`, { timeout }, async t => {
+    const f = await fixture(t);
+    f.launch();
+    await f.health(f.old);
+    const target = await f.next("candidate health will fail", code => code.replace("      const api = await startApi", `
       if (childId) health.validation = { id: childId, ready: false, reason: "fixture validation failure" };
       const api = await startApi`));
-  await f.flag("hold-probe");
-  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
-  const candidate = await f.health(target, true);
-  const j = f.paths.load()!;
-  const helper = Number(await readFile(join(f.scratch, "helper.pid"), "utf8"));
-  await writeFile(f.paths.journal, "not valid JSON");
-  await f.unflag("hold-probe");
-  await until(() => identify(helper), value => !value);
-  await until(() => identify(candidate!.pid!), value => !value);
-  assert.equal(await f.healthNow(), undefined);
-  assert.equal(f.paths.selected(), target);
-  assert.ok(existsSync(f.paths.backup(j.id)));
-  assert.match(await f.log(j.id), /not valid JSON|Unexpected token/);
-  // Put back the known-good phase in this private fixture, then use the actual recovery path.
-  f.paths.save(j);
-  await f.supervisor(target, "recover");
-  await f.health(f.old);
-  assert.equal((await f.result(j.id)).length, 1);
-});
+    await f.flag("hold-probe");
+    assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
+    const candidate = await f.health(target, true);
+    const j = f.paths.load()!;
+    const helper = Number(await readFile(join(f.scratch, "helper.pid"), "utf8"));
+    const backup = await readFile(f.paths.backup(j.id));
+    if (fault === "corrupt") await writeFile(f.paths.journal, "not valid JSON");
+    else await rm(f.paths.journal);
+    await f.unflag("hold-probe");
+    await until(() => identify(helper), value => !value);
+    await until(() => identify(candidate!.pid!), value => !value);
+    assert.equal(await f.healthNow(), undefined);
+    assert.equal(f.paths.selected(), target);
+    assert.deepEqual(await readFile(f.paths.backup(j.id)), backup);
+    const diagnostic = fault === "corrupt" ? /not valid JSON|Unexpected token/ : /Missing upgrade journal/;
+    assert.match(await f.log(j.id), diagnostic);
+    if (fault === "missing") assert.equal(f.paths.load(), undefined);
+    // Put back the known-good phase in this private fixture, then use the actual recovery path.
+    f.paths.save(j);
+    await f.supervisor(target, "recover");
+    await f.health(f.old);
+    assert.equal((await f.result(j.id)).length, 1);
+  });
+}
 
 test("SQLite backup includes uncheckpointed committed WAL, and restore discards an abandoned candidate WAL", { timeout }, async t => {
   const scratch = await realpath(await mkdtemp(join(tmpdir(), "aipatty-upgrade-wal-")));

@@ -7,7 +7,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { LOOPBACK, DEFAULT_PORT, shutdownHeader } from "./config.ts";
 import { ownDataDir, OwnerBusy } from "./ownership.ts";
 import { command } from "./upgrade-release.ts";
-import { errorText, ownedFile, upgradeChildEnv, upgradeProtocol, type ProcessIdentity, type UpgradeJournal, type UpgradePaths } from "./upgrade-state.ts";
+import { errorText, ownedFile, shaPattern, upgradeChildEnv, upgradeProtocol, type ProcessIdentity, type UpgradeJournal, type UpgradePaths } from "./upgrade-state.ts";
 
 const stopMs = 20_000;
 const startupMs = 30_000;
@@ -299,7 +299,19 @@ export async function confirmActivation(server: ServerChild, j: UpgradeJournal, 
     if (server.error) break;
     try {
       const health = await getHealth(j.port);
-      if (!server.error && health.ok === true && health.commit === sha && health.pid === server.child.pid && !health.validation) return;
+      const mismatch: string[] = [];
+      if (health.ok !== true) mismatch.push("ok is not true");
+      if (health.commit !== sha) {
+        const actual = typeof health.commit === "string" && shaPattern.test(health.commit) ? health.commit : "unknown";
+        mismatch.push(`expected SHA ${sha}, received ${actual}`);
+      }
+      if (health.pid !== server.child.pid) {
+        const actual = Number.isSafeInteger(health.pid) ? health.pid : "unknown";
+        mismatch.push(`expected PID ${server.child.pid}, received ${actual}`);
+      }
+      if (health.validation) mismatch.push("validation is still present");
+      if (!mismatch.length && !server.error) return;
+      lastProbeError = mismatch.length ? new Error(`HTTP 200 but ${mismatch.join(", ")}`) : undefined;
     } catch (error) { lastProbeError = error; }
     if (server.error) break;
     await sleep(100);

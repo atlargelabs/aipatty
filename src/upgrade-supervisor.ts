@@ -49,6 +49,8 @@ async function runStage(paths: UpgradePaths, config: Config, id: string, scriptR
     process.once("message", value => resolve(value === "prepare"));
   });
   if (!authorized) throw new Error("Stage worker was not authorized");
+  // Git and npm must not create group-writable files in the private checkout, even with a shared account umask.
+  process.umask(0o077);
   const unlock = paths.stagingLease(id);
   let log: number | undefined;
   let result: StageResult;
@@ -335,7 +337,18 @@ async function run(paths: UpgradePaths, args: {
       return verified;
     } catch (error) {
       const why = errorText(error);
-      const current = paths.load() ?? requireJournal();
+      let current: UpgradeJournal;
+      try {
+        const persisted = paths.load();
+        if (!persisted) throw new Error(`Missing upgrade journal: ${paths.journal}`);
+        if (persisted.id !== requireJournal().id) throw new Error(`Upgrade journal request changed: ${paths.journal}`);
+        current = persisted;
+      } catch (inspection) {
+        // An in-memory phase is not authority to restore. The finally block still disconnects any candidate.
+        const message = `Upgrade failed: ${why}. Cannot verify the journal: ${errorText(inspection)}. Selection and backup left intact.`;
+        note(message);
+        throw new Error(message, { cause: inspection });
+      }
       if (current.phase === "done") {
         note(why);
         throw error; // Never restore over a possibly committed release.
