@@ -22,6 +22,14 @@ const RequestDoc = defineDocFamily<{ id: string; accepted: boolean }, null>({
   kind: "aipatty.upgrade.request", version: 1, scope: "session", family: true,
   initial: () => ({ id: "", accepted: false }), checkpointWhen: () => true,
 });
+const requestDocKey = (j: UpgradeJournal) => `${j.branch}:${j.requestKey}`;
+
+/** A candidate must still be able to deliver the result before the coordinator commits it. */
+export async function assertAcceptedRequest(agent: AgentHost, j: UpgradeJournal): Promise<void> {
+  if (j.branch === undefined) return;
+  const accepted = await agent.harness.snapshot(RequestDoc, requestDocKey(j), ctx);
+  if (accepted?.id !== j.id || !accepted.accepted) throw new Error(`Upgrade ${j.id}: its durable request is missing`);
+}
 
 /** A DB transaction covers both the visible transcript entry and its idempotency marker. */
 async function report(agent: AgentHost, paths: UpgradePaths, j: UpgradeJournal): Promise<void> {
@@ -29,7 +37,7 @@ async function report(agent: AgentHost, paths: UpgradePaths, j: UpgradeJournal):
   const observed = paths.load();
   if (observed?.id !== j.id || observed.phase !== "done") throw new Error("Upgrade journal changed during delivery");
   if (observed.reported) return;
-  const key = `${j.branch}:${j.requestKey}`;
+  const key = requestDocKey(j);
   const accepted = await agent.harness.snapshot(RequestDoc, key, ctx);
   if (accepted?.id !== j.id || !accepted.accepted) {
     if (j.result?.kind !== "cancelled" || (accepted?.id && accepted.id !== j.id)) {
@@ -227,7 +235,13 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
             return request.id;
           }
           journalAttempted = true;
-          paths.save(j);
+          try { paths.save(j); }
+          catch (error) {
+            // Under the lease, seeing the previous journal (or continued absence) proves the attempted
+            // atomic rename did not happen. If that read is uncertain, keep admission closed.
+            try { if (paths.load()?.id === previous?.id) journalAttempted = false; } catch { /* fail closed */ }
+            throw error;
+          }
           request.id = id;
           request.accepted = true;
           await tx.appendEntry(target.id, {

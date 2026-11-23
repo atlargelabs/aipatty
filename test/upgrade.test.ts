@@ -110,11 +110,14 @@ appendFileSync(join(root, "npm.log"), args + "\\n");
     });
     process.exitCode = await new Promise(resolve => child.once("exit", code => resolve(code ?? 9)));
   } else if (args === "test" && existsSync(join(root, "hold-stage-child"))) {
+    const failedTest = existsSync(join(root, "failed-test"));
     const child = spawn(process.execPath, ["-e", 'const path = process.argv[1]; const fs = require("node:fs"); '
       + 'const timer = setInterval(() => { if (!fs.existsSync(path)) clearInterval(timer); }, 25); '
-      + 'setTimeout(() => clearInterval(timer), 30_000).unref();', join(root, "hold-stage-child")], { stdio: "ignore" });
+      + 'setTimeout(() => clearInterval(timer), 30_000).unref();', join(root, "hold-stage-child")],
+      { stdio: "ignore", detached: failedTest });
     child.unref();
     writeFileSync(join(root, "stage-child.pid"), String(child.pid));
+    if (failedTest) process.exitCode = 7;
   } else if (args !== "run check" && args !== "test") process.exitCode = 8;
 })();
 `;
@@ -237,11 +240,16 @@ ${sendCompletion}`));
   const upgradeHostPath = join(repo, "src/upgrade-host.ts");
   const upgradeHostCode = await readFile(upgradeHostPath, "utf8");
   const reportStart = "  if (j.phase !== \"done\" || j.branch === undefined || j.reported) return;";
-  assert.ok(upgradeHostCode.includes(reportStart));
+  const saveRequest = "try { paths.save(j); }";
+  assert.ok(upgradeHostCode.includes(reportStart) && upgradeHostCode.includes(saveRequest));
   await writeFile(upgradeHostPath, upgradeHostCode.replace(reportStart, `${reportStart}
   const { existsSync } = await import("node:fs");
   if (existsSync(join(process.env.UPGRADE_FIXTURE!, "fail-report"))) throw new Error("fixture transcript write failed");
-`));
+`).replace(saveRequest, `try {
+  const { existsSync } = await import("node:fs");
+  if (existsSync(join(process.env.UPGRADE_FIXTURE!, "fail-journal-write"))) throw new Error("fixture journal write failed before rename");
+  paths.save(j);
+}`));
   const mainPath = join(repo, "src/main.ts");
   const modernMain = await readFile(mainPath, "utf8");
   if (legacy) await writeFile(mainPath, legacyMain);
@@ -484,6 +492,21 @@ test("a crash before the command transaction leaves no branch result and retires
   assert.equal((await f.result(f.paths.load()!.id, branch)).length, 1);
 });
 
+test("a journal write failure before the request rename does not close admission", { timeout }, async t => {
+  const f = await fixture(t);
+  f.launch();
+  await f.health(f.old);
+  await f.flag("fail-journal-write");
+  const response = await f.send("/upgrade", "root", { marker: "1" });
+  assert.equal(response.status, 409);
+  assert.match(await response.text(), /fixture journal write failed before rename/);
+  assert.equal(f.paths.load(), undefined);
+  assert.equal((await f.cli("send", "still serving")).stdout.trim(), "Faux reply: still serving");
+  await f.unflag("fail-journal-write");
+  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
+  assert.match(JSON.stringify((await f.result(f.paths.load()!.id))[0].data), /Upgrade not needed/);
+});
+
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 const fixturePid = async (f: Fixture, name: string) => Number(await readFile(join(f.scratch, `${name}.pid`), "utf8"));
 
@@ -595,6 +618,22 @@ for (const interruption of ["omit-stage-result", "hold-stage-child"] as const) {
     if (interruption === "hold-stage-child") assert.ok(await identify(await fixturePid(f, "stage-child")));
   });
 }
+
+test("npm test can exit normally with a failure while a detached test process still runs", { timeout }, async t => {
+  const f = await fixture(t);
+  const old = f.launch();
+  await f.health(f.old);
+  const target = await f.next("test runner failed with an orphaned fixture");
+  await f.flag("hold-stage-child");
+  await f.flag("failed-test");
+  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
+  const { id } = f.paths.load()!;
+  await until(() => old.output().includes("Interrupted staging"));
+  assert.match(await f.log(id), /Test command did not confirm successful teardown: npm test exited 7/);
+  await assertInterrupted(f, id, target);
+  assert.ok(await identify(await fixturePid(f, "stage-child")));
+  assert.equal((await f.send("new work")).status, 409);
+});
 
 test("a delivery error is discoverable with recover and restart retries the same result without staging", { timeout }, async t => {
   const f = await fixture(t);
@@ -747,6 +786,25 @@ test("HTTP 200 without branch readiness is rolled back with the old DB and resul
   using db = new DatabaseSync(f.paths.db, { readOnly: true });
   assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE name = 'candidate_only'").get(), undefined);
   assert.ok(existsSync(f.paths.backup(id)));
+});
+
+test("candidate readiness rolls back if the durable upgrade request cannot be read", { timeout }, async t => {
+  const f = await fixture(t);
+  f.launch();
+  await f.health(f.old);
+  await f.cli("send", "history before upgrade");
+  // Simulate an incompatible candidate that cannot read the accepted RequestDoc. The original release can.
+  const host = join(f.repo, "src/upgrade-host.ts");
+  const code = await readFile(host, "utf8");
+  assert.ok(code.includes('kind: "aipatty.upgrade.request"'));
+  await writeFile(host, code.replace('kind: "aipatty.upgrade.request"', 'kind: "fixture.incompatible.upgrade.request"'));
+  const target = await f.next("candidate cannot see accepted request");
+  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
+  const { id } = f.paths.load()!;
+  assert.match(JSON.stringify((await f.result(id))[0].data), /Upgrade rolled back.*durable request is missing/);
+  assert.equal(f.paths.load()?.target, target);
+  assert.equal(f.paths.selected(), f.old);
+  assert.match((await f.cli("log")).stdout, /Faux reply: history before upgrade/);
 });
 
 test("first bootstrap can roll back to a legacy app when the candidate serves the wrong SHA", { timeout }, async t => {

@@ -4,7 +4,7 @@ import {
   cpSync, lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync,
 } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
-import { exists, ownedDir, ownedFile, shaPattern, syncPath, type UpgradePaths } from "./upgrade-state.ts";
+import { errorText, exists, ownedDir, ownedFile, shaPattern, syncPath, type UpgradePaths } from "./upgrade-state.ts";
 
 const gitMs = 90_000;
 const installMs = 10 * 60_000;
@@ -187,7 +187,15 @@ export async function stageRelease(options: {
   // Always run commands in the private checkout, even in bootstrap. Checks never write the staged helper tree.
   for (const [args, ms] of [[ ["ci", "--ignore-scripts", "--include=dev"], installMs ], [ ["run", "check"], checkMs ], [ ["test"], installMs ]] as const) {
     note(`Running npm ${args.join(" ")}`);
-    await command("npm", [...args], { cwd: staging, env: gitEnv(), ms, log, signal });
+    try { await command("npm", [...args], { cwd: staging, env: gitEnv(), ms, log, signal }); }
+    catch (error) {
+      // The suite starts detached helpers and servers. npm can exit normally with a failure after a test
+      // worker crashed or failed teardown. A nonzero test exit cannot certify that its fixtures stopped.
+      if (args[0] === "test" && !(error instanceof InterruptedStageError)) {
+        throw new InterruptedStageError(`Test command did not confirm successful teardown: ${errorText(error)}`, { cause: error });
+      }
+      throw error;
+    }
   }
   await verifyRelease(staging, sha, signal);
   ownedFile(join(staging, "src/upgrade-supervisor.ts"));

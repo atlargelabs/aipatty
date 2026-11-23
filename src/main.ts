@@ -5,7 +5,7 @@ import packageJson from "../package.json" with { type: "json" };
 import { startApi, type Health } from "./api.ts";
 import { LOOPBACK, readConfig } from "./config.ts";
 import { openHost } from "./host.ts";
-import { committedValidation, guardStartup, hostUpgrade, reportStartup } from "./upgrade-host.ts";
+import { assertAcceptedRequest, committedValidation, guardStartup, hostUpgrade, reportStartup } from "./upgrade-host.ts";
 import { gitEnv } from "./upgrade-release.ts";
 import { errorText, upgradeChildEnv, upgradeProtocol } from "./upgrade-state.ts";
 
@@ -71,6 +71,7 @@ async function main(): Promise<void> {
           // No model call, no queued work, and no Pi recovery run during validation.
           await agent.assertAvailable();
           if (startup?.journal.branch !== undefined) {
+            await assertAcceptedRequest(agent, startup.journal);
             const branch = await agent.conversation(String(startup.journal.branch));
             if (!branch) throw new Error("The requesting conversation is missing");
             await agent.assertAvailable(branch);
