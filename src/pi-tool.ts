@@ -65,8 +65,13 @@ export function piExtension(getRuns: () => PiRuns) {
   const afterPi = hook(ToolTask, {
     async afterTool(call, written, api) {
       if (call.name !== "pi" || call.parent || !written.diagnostics?.some(diagnostic => ended.has(diagnostic.code ?? ""))) return undefined;
-      const outcome = await getRuns().settled(api.taskId, api.conversationId);
-      return outcome ? result(outcome) : undefined;
+      try {
+        const outcome = await getRuns().settled(api.taskId, api.conversationId);
+        return outcome ? result(outcome) : undefined;
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        return { ...written, isError: true, output: [...(written.output ?? []), { type: "text", text: `Pi outcome recovery failed: ${reason}` }] };
+      }
     },
   });
 

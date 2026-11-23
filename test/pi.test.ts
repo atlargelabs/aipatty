@@ -542,8 +542,10 @@ test("a branch reserves its Pi slot synchronously during startup, rejects same-b
     new RegExp(`Pi run ${id} is still active on branch 3`));
   assert.equal(runs.hasActive(), true);
   await until(() => existsSync(flag(config, "fake-launches.jsonl")));
-  assert.equal(await runs.settled(102), undefined, "settling the refused call does not stop the admitted one");
-  assert.equal((await runs.settled(101))?.status, "aborted");
+  assert.equal(await runs.settled(102, 3), undefined, "settling the refused call does not stop the admitted one");
+  assert.equal(await runs.settled(101, 4), undefined, "a different branch cannot settle the admitted call");
+  assert.equal(runs.hasActive(), true);
+  assert.equal((await runs.settled(101, 3))?.status, "aborted");
   assert.equal((await first).status, "aborted");
   assert.equal(runs.hasActive(), false);
   assert.deepEqual(await pendingRecords(config), []);
@@ -596,7 +598,8 @@ test("abort and timeout stop Pi and its delegates' processes, keep the logs, and
   // A job directory that is a link is never followed, whatever its manifest says.
   const victim = join(config.dataDir, "victim");
   await mkdir(join(victim, "workspace"), { recursive: true });
-  await writeFile(join(victim, "job.json"), JSON.stringify({ id: "linked", ownerSession: "fake-session", workspace: { source: "/" } }));
+  const sessionId = "abort-test-session";
+  await writeFile(join(victim, "job.json"), JSON.stringify({ id: "linked", ownerSession: sessionId, workspace: { source: "/" } }));
   await mkdir(jobs, { recursive: true });
   await symlink(victim, join(jobs, "linked"));
 
@@ -609,7 +612,7 @@ test("abort and timeout stop Pi and its delegates' processes, keep the logs, and
   await writeFile(join(jobs, "ancient", "job.json"), "{ damaged");
   await utimes(join(jobs, "ancient", "job.json"), new Date(0), new Date(0));
 
-  await scenario(config, steps);
+  await scenario(config, steps, { sessionId });
   const controller = new AbortController();
   const aborted = runs.run(request(), controller.signal);
   await until(async () => (await spawned(config)).length === 2);
@@ -618,7 +621,7 @@ test("abort and timeout stop Pi and its delegates' processes, keep the logs, and
 
   // A run that ignores SIGTERM is killed, and a timeout reports any PR the run had already published.
   await github(config, openPr);
-  await scenario(config, [...delegate("c0", { id: "job-pr", profile: "prmanager", task: "Publish.", cost: 0, prUrl }), ...steps], { ignoreTerm: true });
+  await scenario(config, [...delegate("c0", { id: "job-pr", profile: "prmanager", task: "Publish.", cost: 0, prUrl }), ...steps], { ignoreTerm: true, sessionId });
   const timedOut = await check(await runs.run(request({ timeoutMs: 3_000 })), "timed_out");
   assert.equal(timedOut.pr?.confirmed, true);
   assert.equal(timedOut.review.status, "missing");
@@ -834,7 +837,7 @@ test("concurrent finishes preserve both archives and charge each actual branch o
   await writeFile(flag(config, "finish"), "go");
   for (const submission of submissions) assert.equal((await submission.wait(ctx)).status, "done");
   assert.deepEqual(await pendingRecords(config), []);
-  const calls = [];
+  const calls: { conversationId: number; taskId: number; outcome: RunOutcome; cost: number }[] = [];
   const started = await launches(config);
   for (const [target, name, cost] of cases) {
     assert.equal((await host.branch(target)).cost, cost + 0.5);
@@ -856,9 +859,18 @@ test("concurrent finishes preserve both archives and charge each actual branch o
   const reopened = await openHost(config);
   t.after(() => reopened.close());
   for (const { conversationId, taskId, outcome, cost } of calls) {
-    assert.deepEqual(await reopened.runs.settled(taskId), outcome);
+    assert.deepEqual(await reopened.runs.settled(taskId, conversationId), outcome);
     const target = (await reopened.conversation(String(conversationId)))!;
     assert.equal((await reopened.branch(target)).cost, cost);
+  }
+  // Even a damaged pointer, or one that points to the other task, can't swap results or hide a valid archive.
+  t.mock.method(console, "error", () => {});
+  for (const [i, corrupt] of ["{ malformed", JSON.stringify(calls[0].outcome.runId)].entries()) {
+    const { conversationId, taskId, outcome } = calls[i];
+    const index = taskIndex(config, taskId);
+    await writeFile(index, corrupt);
+    assert.deepEqual(await reopened.runs.settled(taskId, conversationId), outcome);
+    assert.equal(await readFile(index, "utf8"), corrupt, "preserve the corrupt pointer for inspection");
   }
   assert.equal(await reopened.totalCost(), 2);
   assert.equal((await launches(config)).length, 2);
@@ -1167,6 +1179,26 @@ test("restart completes cleanup after a spend checkpoint without counting the sa
   assert.deepEqual(await pendingRecords(config), []);
   assert.ok(!existsSync(join(job, "workspace")));
   assert.ok(!existsSync(checkpoint));
+});
+
+test("a delegate manifest I/O failure leaves the checkpoint for recovery and does not delete the clone", async t => {
+  const config = await setup(t);
+  const dir = join(config.pi.agentDir, "delegates/jobs/bad-read");
+  await mkdir(join(dir, "workspace"), { recursive: true });
+  await mkdir(join(dir, "job.json")); // A read error rather than a parse error: the scan might be incomplete.
+  t.mock.method(console, "error", () => {});
+  await scenario(config, [assistant(report({ issue: null, pr: null })), settled]);
+  const runs = await openPiRuns(config);
+  const result = await runs.run(request({ pr: false }));
+  assert.equal(result.status, "failed");
+  assert.equal(result.usageComplete, false);
+  assert.match(result.problems.join("\n"), /Delegate job bad-read could not be read/);
+  assert.deepEqual(await pendingRecords(config), [`${result.runId}.json`]);
+  assert.ok(existsSync(join(dir, "workspace")));
+  await rm(join(dir, "job.json"), { recursive: true });
+  const reopened = await openPiRuns(config);
+  assert.deepEqual(await pendingRecords(config), []);
+  assert.equal((await reopened.settled(101))?.status, "failed");
 });
 
 test("nothing is launched without a saved record, and a record that cannot be removed holds only its branch", async t => {

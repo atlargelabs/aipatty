@@ -81,6 +81,8 @@ interface SavedRun {
 interface Kept {
   outcome: RunOutcome;
   reconciled: boolean;
+  /** Absent in legacy outcomes, keyed only by the durable task. */
+  conversationId?: number;
 }
 
 interface ActiveRun {
@@ -360,14 +362,15 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
   };
 
   const validRunId = (id: unknown): id is string => typeof id === "string" && /^[0-9A-Za-z][\w-]*$/.test(id);
-  type Archived = Kept & { taskId: number; conversationId?: number };
+  type Archived = Kept & { taskId: number };
   const isKept = (value: unknown): value is Kept => {
     const entry = value as Kept | null;
     const outcome = entry?.outcome;
     return typeof entry?.reconciled === "boolean" && !!outcome && validRunId(outcome.runId)
       && runStatuses.some(status => status === outcome.status) && typeof outcome.summary === "string"
       && typeof outcome.review?.status === "string" && Object.hasOwn(reviewText, outcome.review.status)
-      && Number.isFinite(outcome.usage?.cost?.total) && Array.isArray(outcome.remaining) && Array.isArray(outcome.problems);
+      && Number.isFinite(outcome.usage?.cost?.total) && Array.isArray(outcome.remaining) && Array.isArray(outcome.problems)
+      && (entry.conversationId === undefined || Number.isSafeInteger(entry.conversationId));
   };
   /** The copy in a run's log directory, if it is that run's and that call's. */
   const logged = async (runId: string, saved?: SavedRun, file = "result.json"): Promise<Archived | undefined> => {
@@ -396,7 +399,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     for (const runId of (await readdir(logRoot)).sort().slice(-outcomesKept)) {
       if (!validRunId(runId)) continue;
       const copy = await logged(runId).catch(() => undefined);
-      if (copy) kept.set(String(copy.taskId), { outcome: copy.outcome, reconciled: copy.reconciled });
+      if (copy) kept.set(String(copy.taskId), copy);
     }
     await writeJson(outcomesFile, Object.fromEntries(kept));
     console.error(`Pi runs: ${outcomesFile} could not be read (${message(error)}); copied to ${aside} and rebuilt from the run logs.`);
@@ -412,24 +415,37 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     await indexOutcome(saved);
     await rm(join(saved.logDir, "reconciled.json"), { force: true }).catch(() => {});
   };
+  const isCall = (copy: Archived | undefined, taskId: number, conversationId?: number): copy is Archived =>
+    copy?.taskId === taskId && (conversationId === undefined || copy.conversationId === conversationId);
   const settledOutcome = async (taskId: number, conversationId?: number) => {
     const held = conversationId === undefined ? [...heldBranches.values()].find(hold => hold.taskId === taskId)
       : heldBranches.get(conversationId);
     if (held?.taskId === taskId && held.outcome) return held.outcome;
+    const legacy = kept.get(String(taskId));
     try {
       const id = await readJson<unknown>(outcomeIndex(taskId));
-      if (id !== undefined) {
-        const copy = validRunId(id) ? await logged(id) : undefined;
-        if (copy?.taskId !== taskId || (conversationId !== undefined && copy.conversationId !== undefined && copy.conversationId !== conversationId)) {
-          throw new Error("the indexed archive does not describe this call");
-        }
-        return copy.outcome;
+      if (id === undefined) {
+        return conversationId === undefined || legacy?.conversationId === undefined || legacy.conversationId === conversationId
+          ? legacy?.outcome : undefined;
       }
+      const copy = validRunId(id) ? await logged(id) : undefined;
+      if (!isCall(copy, taskId, conversationId)) throw new Error("the indexed archive does not describe this call");
+      return copy.outcome;
     } catch (error) {
       console.error(`Pi runs: could not read the indexed outcome of task ${taskId}: ${message(error)}`);
-      return undefined;
     }
-    return kept.get(String(taskId))?.outcome;
+    // The pointer is only an index. If it is damaged, look for exactly this call's primary archive without
+    // overwriting evidence or choosing by recency. The normal lookup (including a refused call) needn't scan.
+    let found: RunOutcome | undefined;
+    for (const dir of await readdir(logRoot, { withFileTypes: true })) {
+      if (!dir.isDirectory() || !validRunId(dir.name)) continue;
+      const copy = await logged(dir.name).catch(() => undefined);
+      if (!isCall(copy, taskId, conversationId)) continue;
+      if (found) throw new Error(`More than one Pi archive matches task ${taskId}.`);
+      found = copy.outcome;
+    }
+    if (!found) throw new Error(`Could not locate a Pi archive for task ${taskId} after its outcome index failed. Check ${logRoot}.`);
+    return found;
   };
 
   /**
@@ -451,7 +467,9 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         if (job && typeof job === "object") jobs.set(id, job);
         // A job the run reported is the run's, with or without a manifest: its logs are kept and its clone goes.
         else if (trace.countedJobs.has(id)) jobs.set(id, {});
-      } catch {
+      } catch (error) {
+        // An I/O failure could leave the scan incomplete. Don't mark spend reconciled or clear the record.
+        if (!(error instanceof SyntaxError)) throw new Error(`Delegate job ${id} could not be read: ${message(error)}`);
         // Recency is not ownership: another Pi can be writing a job now. Without a reported ID or readable
         // provenance, leave the manifest, logs and clone untouched and do not include its spend in this run.
         if (trace.countedJobs.has(id)) jobs.set(id, {});
@@ -750,7 +768,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     let outcome: RunOutcome | undefined;
     try {
       const old = kept.get(String(saved.taskId));
-      const final = await logged(saved.runId, saved) ?? (old?.outcome.runId === saved.runId ? old : undefined);
+      const final = await logged(saved.runId, saved) ?? (old?.outcome.runId === saved.runId
+        && (old.conversationId === undefined || old.conversationId === saved.conversationId) ? old : undefined);
       outcome = final?.outcome;
       const pending = final ? undefined : await logged(saved.runId, saved, "reconciled.json");
       const split = lineSplitter((line, whole) => trace.line(line, whole));
