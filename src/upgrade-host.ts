@@ -8,9 +8,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 import type { Config } from "./config.ts";
 import { HttpError, type AgentHost } from "./host.ts";
 import { OwnerBusy } from "./ownership.ts";
-import { openUpgradeLog, reapStage } from "./upgrade-process.ts";
+import { openUpgradeLog } from "./upgrade-process.ts";
 import {
-  errorText, exists, finish, idPattern, ownedFile, resultText, sameInstall, upgradeEntryKind,
+  errorText, exists, finish, idPattern, interruptedStage, ownedFile, resultText, sameInstall, upgradeEntryKind,
   UpgradePaths, type UpgradeJournal,
 } from "./upgrade-state.ts";
 
@@ -79,23 +79,21 @@ export async function guardStartup(config: Config, source: string, commit: strin
     if (exists(paths.piRun)) throw new Error("Pi recovery is present; refusing validation without touching that run");
     return { paths, journal: j };
   }
-  if (j.phase === "requested" || j.phase === "staging") {
-    // No side effects on pointer or DB are allowed in either phase. A dead helper must not wedge the old release.
+  if (j.phase === "requested") {
+    // This phase precedes worker authorization. No staged commands or cutover need to be recovered.
     const unlock = paths.lease();
     try {
       j = paths.load();
       if (!j) throw new Error("Upgrade journal disappeared during startup");
-      if (j.phase === "requested" || j.phase === "staging") {
-        if (j.phase === "staging") await reapStage(paths, j);
-        const unstaged = j.phase === "staging" ? paths.stagingLease(j.id) : undefined;
-        try {
-          assertSelected(paths, source, commit, j.old);
-          j = finish(j, { kind: "cancelled", reason: "Interrupted staging was not retried." });
-          paths.save(j);
-        } finally { unstaged?.(); }
+      sameInstall(j, config);
+      if (j.phase === "requested") {
+        assertSelected(paths, source, commit, j.old);
+        j = finish(j, { kind: "cancelled", reason: "Interrupted request was not staged." });
+        paths.save(j);
       }
     } finally { unlock(); }
   }
+  if (j.phase === "staging") throw new Error(interruptedStage(paths, j.id));
   if (j.phase !== "done") throw new Error(`Unfinished upgrade (${j.phase}): use upgrade-supervisor.ts recover before serving ${paths.db}`);
   assertSelected(paths, source, commit, j.result?.active ?? j.old);
   paths.syncJournal();
@@ -139,6 +137,7 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
     } catch (error) { throw new HttpError(409, errorText(error)); }
     const unblock = await agent.reserveUpgrade(target);
     let handed = false;
+    let journalAttempted = false;
     let drainStarted = false;
     const id = randomUUID();
     let recoveryWatch: FSWatcher | undefined;
@@ -166,29 +165,25 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
       } catch (error) { cannotWatch(error); }
     };
     const settleHandoff = async (reason: string, observeRecovery = true) => {
-      // Reap the recorded group before settling; a bounded wait is only for a racing explicit recover or
-      // the stage worker finishing its own cleanup. There is no recurring background upgrade job.
+      // A bounded wait is only for the journal lease. Interrupted staging cannot self-settle.
       const deadline = Date.now() + 30_000;
       for (;;) {
         let unlock: (() => void) | undefined;
         try {
           unlock = paths.lease();
           let j = paths.load();
-          if (j?.id !== id) break;
-          if (j.phase === "requested" || j.phase === "staging"
-            || (j.phase === "stopping" && !drainStarted && paths.selected() === commit)) {
+          if (j?.id !== id) throw new Error(`Missing or changed upgrade journal for ${id}`);
+          sameInstall(j, config);
+          if (j.phase === "requested" || (j.phase === "stopping" && !drainStarted)) {
             // This same host still owns Durable storage; a dead helper cannot have advanced past stopping.
-            if (j.phase === "staging") await reapStage(paths, j);
-            const unstaged = j.phase === "staging" ? paths.stagingLease(j.id) : undefined;
-            try {
-              j = finish(j, { kind: "cancelled", active: commit, reason });
-              paths.save(j);
-            } finally { unstaged?.(); }
+            assertSelected(paths, source, commit, j.old);
+            j = finish(j, { kind: "cancelled", active: commit, reason });
+            paths.save(j);
           }
-          if (j.phase !== "done") {
-            console.error(`Upgrade ${id} stopped during ${j.phase}; no new work before documented recovery. ${reason}`);
-            return;
-          }
+          if (j.phase === "staging") throw new Error(interruptedStage(paths, id));
+          if (j.phase !== "done") throw new Error(`Upgrade ${id} stopped during ${j.phase}; no new work before documented recovery. ${reason}`);
+          assertSelected(paths, source, commit, j.result?.active ?? j.old);
+          paths.syncJournal();
           try { await report(agent, paths, j); }
           catch (error) {
             const message = `Could not deliver upgrade ${id}: ${errorText(error)}. The journal still has the result; restart the selected app to retry delivery, not deployment.`;
@@ -203,14 +198,10 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
         } catch (error) {
           if (error instanceof OwnerBusy && Date.now() < deadline) { await sleep(100); continue; }
           console.error(`Could not settle upgrade ${id}:`, error);
-          const j = paths.load();
-          if (j?.id === id && j.phase !== "done") {
-            // Never reopen while the stage may still have writers or the DB/current can be uncertain.
-            // A successful explicit pre-cutover recover can release this same host without a restart.
-            if (observeRecovery && (j.phase === "requested" || j.phase === "staging")) watchRecovery();
-            return;
-          }
-          break;
+          // Reopen only after checking a terminal journal under the lease. A later explicit recovery can
+          // release this same host without a restart; fs.watch is just a hint to retry those checks.
+          if (observeRecovery) watchRecovery();
+          return;
         } finally { unlock?.(); }
       }
       unblock();
@@ -235,6 +226,7 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
             if (!request.accepted) throw new HttpError(409, "That upgrade command did not commit. Send a fresh /upgrade if still wanted.");
             return request.id;
           }
+          journalAttempted = true;
           paths.save(j);
           request.id = id;
           request.accepted = true;
@@ -276,7 +268,8 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
         return id;
       } finally { closeSync(log); }
     } catch (error) {
-      if (!handed) await settleHandoff(`Could not start the upgrade helper: ${errorText(error)}`);
+      if (!journalAttempted) unblock();
+      else if (!handed) await settleHandoff(`Could not start the upgrade helper: ${errorText(error)}`);
       throw error instanceof HttpError ? error : new HttpError(409, errorText(error));
     }
   };

@@ -176,10 +176,12 @@ Deferred until something needs them: a read-only research mode, concurrent runs,
    paused and only health exposed. SHA and readiness must match (including the requesting branch) before the
    commit opens admissions. A pre-commit failure restores the intact old release and database, without copying
    live files or replaying candidate WAL. Both success and verified rollback report to the original branch.
-4. The journal persists outside SQLite. A failed stage leaves old state and admission intact; an interrupted
-   cutover needs explicit `recover`, which never fetches a new target. A failed rollback preserves evidence and
-   stops. The first legacy bootstrap uses the same helper and rollback code, with exclusive operator maintenance
-   because the old release has no journal or admission gate.
+4. The journal persists outside SQLite. An ordinary failed check reopens old admission. An interrupted stage
+   leaves the old selection and data untouched, but blocks new work until the operator verifies the stage
+   processes are gone and acknowledges the recorded request. Only the coordinator can publish. An interrupted
+   cutover instead uses `recover` to restore the recorded old release; it never fetches a new target. A failed
+   rollback preserves evidence and stops. Legacy bootstrap uses the same helper and rollback code, with exclusive
+   operator maintenance because the old release has no journal or admission gate.
 
 This one-shot design supersedes the always-on launchd supervisor. No administrator, daemon, automatic upgrade,
 startup retry, or service registration is required. A future service manager for the app is separate and must

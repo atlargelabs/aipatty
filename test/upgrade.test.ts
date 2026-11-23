@@ -11,10 +11,10 @@ import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
 import type { ConversationPage } from "../src/protocol.ts";
 import { ownDataDir } from "../src/ownership.ts";
-import { newOwned, RUN_MARKER, runProcesses } from "../src/processes.ts";
+import { RUN_MARKER } from "../src/processes.ts";
 import { backupDb, restoreDb } from "../src/upgrade-db.ts";
 import { upgradeEntryKind, UpgradePaths } from "../src/upgrade-state.ts";
-import { identify, reapStage, stageEnvironment, stageMarker, type UpgradeHealth } from "../src/upgrade-process.ts";
+import { identify, type UpgradeHealth } from "../src/upgrade-process.ts";
 import { checkout, until } from "./helpers.ts";
 
 const exec = promisify(execFile);
@@ -94,7 +94,7 @@ writeFileSync(join(root, "npm.pid"), String(process.pid));
 appendFileSync(join(root, "npm.log"), args + "\\n");
 (async () => {
   while (existsSync(join(root, "hold-stage"))) await sleep(25);
-  if (args === "ci --ignore-scripts") {
+  if (args === "ci --ignore-scripts --include=dev") {
     mkdirSync("node_modules");
     for (const name of readdirSync(process.env.UPGRADE_FIXTURE_DEPS)) {
       if (name.startsWith("aipatty-test-")) continue;
@@ -109,6 +109,12 @@ appendFileSync(join(root, "npm.log"), args + "\\n");
       env: { ...process.env, UPGRADE_NESTED_TEST: root }, stdio: "inherit",
     });
     process.exitCode = await new Promise(resolve => child.once("exit", code => resolve(code ?? 9)));
+  } else if (args === "test" && existsSync(join(root, "hold-stage-child"))) {
+    const child = spawn(process.execPath, ["-e", 'const path = process.argv[1]; const fs = require("node:fs"); '
+      + 'const timer = setInterval(() => { if (!fs.existsSync(path)) clearInterval(timer); }, 25); '
+      + 'setTimeout(() => clearInterval(timer), 30_000).unref();', join(root, "hold-stage-child")], { stdio: "ignore" });
+    child.unref();
+    writeFileSync(join(root, "stage-child.pid"), String(child.pid));
   } else if (args !== "run check" && args !== "test") process.exitCode = 8;
 })();
 `;
@@ -146,7 +152,8 @@ async function fixture(t: TestContext, legacy = false, hostHasGitPaths = false) 
   const commits = new Set<string>();
   t.after(async () => {
     // Wake a fixture process held at a barrier even when a test fails. Don't signal by PID from /health.
-    for (const name of ["hold-stage", "hold-pi", "hold-legacy-exit", "hold-probe", "hold-reap"]) await rm(join(scratch, name), { force: true });
+    for (const name of ["hold-stage", "hold-stage-child", "hold-pi", "hold-legacy-exit", "hold-probe"]) await rm(join(scratch, name), { force: true });
+    await writeFile(join(scratch, "let-nested-finish"), "");
     for (const child of children) child.kill("SIGTERM");
     // Successful cutover's child belongs to the one-shot helper, not this test. Use the local graceful protocol.
     try {
@@ -162,12 +169,12 @@ async function fixture(t: TestContext, legacy = false, hostHasGitPaths = false) 
         // Confirm even the helper-launched processes, which aren't this test's ChildProcess handles, have exited.
         const { stdout } = await exec("ps", ["-A", "-ww", "-o", "stat=,command="], { timeout: 2_000 });
         if (stdout.split("\n").some(line => !line.trimStart().startsWith("Z") && line.includes(scratch)
-          && /\/src\/(main|upgrade-supervisor)\.ts /.test(line))) return false;
+          && /\/src\/(main|upgrade-supervisor)\.ts |\/bin\/npm |\/hold-stage-child$/.test(line))) return false;
         let unlock: (() => void) | undefined;
         try {
           unlock = paths.lease();
           const j = paths.load();
-          if (j?.phase === "staging") await reapStage(paths, j);
+          if (j?.phase === "staging") paths.stagingLease(j.id)();
           ownDataDir(paths.data)();
           return true;
         } catch { return false; }
@@ -180,9 +187,8 @@ async function fixture(t: TestContext, legacy = false, hostHasGitPaths = false) 
     await mkdir(dir, { recursive: true, mode: 0o700 });
   }
   const env = {
-    ...stageEnvironment(),
     ...(process.env[RUN_MARKER] ? { [RUN_MARKER]: process.env[RUN_MARKER] } : {}),
-    PATH: `${bin}:${process.env.PATH}`, HOME: scratch, AIPATTY_FAUX: "1", UPGRADE_FIXTURE: scratch,
+    PATH: `${bin}:${process.env.PATH}`, HOME: scratch, NODE_ENV: "production", AIPATTY_FAUX: "1", UPGRADE_FIXTURE: scratch,
     UPGRADE_FIXTURE_CHECKOUT: checkout, UPGRADE_FIXTURE_DEPS: deps, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", LC_ALL: "C",
   };
   const git = (...args: string[]) => exec("git", ["-c", "user.name=test", "-c", "user.email=test@example.invalid", ...args], { cwd: repo, env });
@@ -192,6 +198,13 @@ async function fixture(t: TestContext, legacy = false, hostHasGitPaths = false) 
   await writeFile(join(repo, ".gitignore"), "/node_modules\n");
   await writeFile(join(repo, "fixture-pi.mjs"), piFixture);
   await writeFile(join(bin, "npm"), npmFixture, { mode: 0o700 });
+  await writeFile(join(bin, "lsof"), `#!/bin/sh
+if [ -e "$UPGRADE_FIXTURE/fail-lsof" ]; then
+  echo 'fixture lsof diagnostic' >&2
+  exit 1
+fi
+exec /usr/sbin/lsof "$@"
+`, { mode: 0o700 });
   const configPath = join(repo, "src/config.ts");
   const config = (await readFile(configPath, "utf8"))
     .replace('"git@github.com:atlargelabs/aipatty.git"', JSON.stringify(repo))
@@ -200,12 +213,8 @@ async function fixture(t: TestContext, legacy = false, hostHasGitPaths = false) 
   const processPath = join(repo, "src/upgrade-process.ts");
   const processCode = await readFile(processPath, "utf8");
   const probeStart = "  const deadline = Date.now() + startupMs;";
-  const reapStart = "export async function reapStage(paths: UpgradePaths, j: UpgradeJournal): Promise<void> {";
-  assert.ok(processCode.includes(probeStart) && processCode.includes(reapStart));
-  await writeFile(processPath, processCode.replace(reapStart, `${reapStart}
-  const { existsSync } = await import("node:fs");
-  if (existsSync(join(process.env.UPGRADE_FIXTURE!, "hold-reap"))) throw new Error("fixture cannot prove stage quiescence");
-`).replace(probeStart, `
+  assert.ok(processCode.includes(probeStart));
+  await writeFile(processPath, processCode.replace('command("/usr/sbin/lsof",', 'command(join(process.env.UPGRADE_FIXTURE!, "bin", "lsof"),').replace(probeStart, `
   if (gated && sha === j.target) {
     const { existsSync, writeFileSync } = await import("node:fs");
     const directory = process.env.UPGRADE_FIXTURE!;
@@ -215,11 +224,16 @@ async function fixture(t: TestContext, legacy = false, hostHasGitPaths = false) 
 ${probeStart}`));
   const supervisorPath = join(repo, "src/upgrade-supervisor.ts");
   const supervisorCode = await readFile(supervisorPath, "utf8");
-  const prepareStart = "  let failure: string | undefined;";
-  assert.ok(supervisorCode.includes(prepareStart));
+  const prepareStart = "  let target: string | undefined, result:";
+  const sendCompletion = "  await sendParent({ id, ...result });";
+  assert.ok(supervisorCode.includes(prepareStart) && supervisorCode.includes(sendCompletion));
   await writeFile(supervisorPath, supervisorCode
-    .replace("realpathSync, writeSync", "realpathSync, writeSync, writeFileSync")
-    .replace(prepareStart, `  writeFileSync(join(process.env.UPGRADE_FIXTURE!, "coordinator.pid"), String(process.pid));\n${prepareStart}`));
+    .replace("realpathSync, rmSync, writeSync", "realpathSync, rmSync, writeSync, writeFileSync, existsSync")
+    .replace(prepareStart, `  writeFileSync(join(process.env.UPGRADE_FIXTURE!, "coordinator.pid"), String(process.pid));
+  writeFileSync(join(process.env.UPGRADE_FIXTURE!, "worker.pid"), String(child.pid));
+${prepareStart}`)
+    .replace(sendCompletion, `  if (existsSync(join(process.env.UPGRADE_FIXTURE!, "omit-stage-result"))) return;
+${sendCompletion}`));
   const upgradeHostPath = join(repo, "src/upgrade-host.ts");
   const upgradeHostCode = await readFile(upgradeHostPath, "utf8");
   const reportStart = "  if (j.phase !== \"done\" || j.branch === undefined || j.reported) return;";
@@ -272,9 +286,9 @@ ${probeStart}`));
     });
     return { child, exited, output: () => output };
   }
-  const supervisor = (sha: string, mode: "bootstrap" | "recover") => {
+  const supervisor = (sha: string, mode: "bootstrap" | "recover", ...options: string[]) => {
     const cwd = paths.release(sha);
-    return exec(process.execPath, [join(cwd, "src/upgrade-supervisor.ts"), mode, ...flags], { cwd, env, timeout: 35_000 });
+    return exec(process.execPath, [join(cwd, "src/upgrade-supervisor.ts"), mode, ...flags, ...options], { cwd, env, timeout: 35_000 });
   };
   const cli = (...args: string[]) => exec(process.execPath, [join(checkout, "src/cli.ts"), "--port", String(port), ...args], { env, timeout: 10_000 });
   async function healthNow() {
@@ -350,7 +364,7 @@ test("first bootstrap uses legacy shutdown, waits for exit beyond the ACK and pr
   assert.equal((await f.entries()).filter(entry => entry.kind === upgradeEntryKind).length, 0);
   const j = f.paths.load()!;
   assert.ok(existsSync(f.paths.backup(j.id)));
-  assert.match(await f.log(j.id), /npm ci --ignore-scripts[\s\S]+npm run check[\s\S]+npm test/);
+  assert.match(await f.log(j.id), /npm ci --ignore-scripts --include=dev[\s\S]+npm run check[\s\S]+npm test/);
 });
 
 test("command is explicit, serialized across branches, survives cutover and delivers once even if the ack is lost", { timeout }, async t => {
@@ -470,7 +484,23 @@ test("a crash before the command transaction leaves no branch result and retires
   assert.equal((await f.result(f.paths.load()!.id, branch)).length, 1);
 });
 
-test("a crashed supervisor drains its bounded stage worker before cancelling and unblocking the old app", { timeout }, async t => {
+type Fixture = Awaited<ReturnType<typeof fixture>>;
+const fixturePid = async (f: Fixture, name: string) => Number(await readFile(join(f.scratch, `${name}.pid`), "utf8"));
+
+async function assertInterrupted(f: Fixture, id: string, target: string) {
+  const journal = f.paths.load();
+  assert.equal(journal?.id, id);
+  assert.equal(journal?.phase, "staging");
+  assert.equal(journal?.target, target);
+  assert.equal(journal?.result, undefined);
+  assert.equal(f.paths.selected(), f.old);
+  assert.equal(existsSync(f.paths.release(target)), false);
+  assert.equal(existsSync(f.paths.backup(id)), false);
+  assert.ok(existsSync(f.paths.stage(id)));
+  await assert.rejects(f.supervisor(f.old, "recover"), /Interrupted staging.*ack-interrupted-stage/);
+}
+
+test("a crashed coordinator leaves the old app up and retains the interrupted stage without signalling npm", { timeout }, async t => {
   const f = await fixture(t);
   const old = f.launch();
   await f.health(f.old);
@@ -478,40 +508,17 @@ test("a crashed supervisor drains its bounded stage worker before cancelling and
   await f.flag("hold-stage");
   assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
   await until(() => existsSync(join(f.scratch, "npm.log")));
-  const j = f.paths.load()!;
-  assert.equal(j.phase, "staging");
-  assert.equal(j.target, target);
-  // This is one of the fixture's own detached coordinators, recorded at its test-only spawn hook.
-  process.kill(Number(await readFile(join(f.scratch, "coordinator.pid"), "utf8")), "SIGKILL");
-  const [result] = await f.result(j.id);
-  assert.match(JSON.stringify(result.data), /cancelled before cutover/);
-  assert.match(await f.log(j.id), /npm ci --ignore-scripts/);
-  assert.equal(f.paths.selected(), f.old);
-  assert.equal(existsSync(f.paths.release(target)), false);
-  const npm = Number(await readFile(join(f.scratch, "npm.pid"), "utf8"));
-  assert.equal(await identify(npm), undefined);
+  const { id } = f.paths.load()!;
+  // The PIDs are the fixture's own workers, recorded at its test-only spawn hook and held at barriers.
+  process.kill(await fixturePid(f, "coordinator"), "SIGKILL");
+  await until(() => old.output().includes("Interrupted staging"));
+  const worker = await fixturePid(f, "worker");
+  await until(() => identify(worker), value => !value);
+  await assertInterrupted(f, id, target);
+  assert.ok(await identify(await fixturePid(f, "npm")));
   assert.equal((await f.healthNow())?.pid, old.child.pid);
-  assert.equal((await f.cli("send", "still serving")).stdout.trim(), "Faux reply: still serving");
-});
-
-test("a killed stage worker's live command is reaped by the surviving coordinator before staging settles", { timeout }, async t => {
-  const f = await fixture(t);
-  const old = f.launch();
-  await f.health(f.old);
-  const target = await f.next("worker killed mid-install");
-  await f.flag("hold-stage");
-  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
-  await until(() => existsSync(join(f.scratch, "npm.log")));
-  const j = f.paths.load()!;
-  const npm = Number(await readFile(join(f.scratch, "npm.pid"), "utf8"));
-  assert.ok(await identify(npm));
-  process.kill(j.stageProcess!.pid, "SIGKILL");
-  const [result] = await f.result(j.id);
-  assert.match(JSON.stringify(result.data), /failed before cutover.*Stage worker exited/);
-  assert.equal(await identify(npm), undefined);
-  assert.equal(f.paths.selected(), f.old);
-  assert.equal(existsSync(f.paths.release(target)), false);
-  assert.equal((await f.healthNow())?.pid, old.child.pid);
+  assert.equal((await f.send("new work")).status, 409);
+  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 409);
 });
 
 if (process.env.UPGRADE_NESTED_TEST) {
@@ -531,259 +538,63 @@ if (process.env.UPGRADE_NESTED_TEST) {
   });
 }
 
-for (const hideSuccessor of [false, true]) test(`staging checks a detached successor ${hideSuccessor ? "missed by a non-atomic process snapshot" : "created between process table reads"}`, { timeout }, async t => {
-  const scratch = await mkdtemp(join(tmpdir(), "aipatty-scan-"));
-  const marker = stageMarker(randomUUID());
-  const pidFile = join(scratch, "successor.pid");
-  t.after(async () => {
-    const pid = Number(await readFile(pidFile, "utf8").catch(() => ""));
-    if (pid > 1 && (await runProcesses(newOwned(), "1", marker)).some(p => p.pid === pid)) process.kill(pid, "SIGKILL");
-    await rm(scratch, { recursive: true, force: true });
-  });
-  await writeFile(join(scratch, "detach.cjs"), `
-const { spawn } = require("node:child_process");
-const { writeFileSync } = require("node:fs");
-const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
-  detached: true, stdio: "ignore", env: { ...process.env, ${marker}: "1" },
-});
-child.unref();
-writeFileSync(process.env.SCAN_FIXTURE + "/successor.pid", String(child.pid));
-`);
-  await writeFile(join(scratch, "ps"), `#!/bin/sh
-if [ "$3" = "pid=,ppid=,pgid=,uid=,stat=,lstart=" ]; then
-  if [ ! -f "$SCAN_FIXTURE/sampled" ]; then
-    touch "$SCAN_FIXTURE/sampled"
-  elif [ ! -f "$SCAN_FIXTURE/successor.pid" ]; then
-    "$SCAN_NODE" "$SCAN_FIXTURE/detach.cjs"
-    if [ "$SCAN_HIDE" = 1 ]; then
-      IFS= read -r successor < "$SCAN_FIXTURE/successor.pid"
-      /bin/ps "$@" > "$SCAN_FIXTURE/table" &
-      observer=$!
-      wait "$observer" || exit $?
-      while read -r pid row; do
-        if [ "$pid" != "$observer" ] && [ "$pid" != "$successor" ]; then printf '%s %s\\n' "$pid" "$row"; fi
-      done < "$SCAN_FIXTURE/table"
-      exit 0
-    fi
-  fi
-fi
-exec /bin/ps "$@"
-`, { mode: 0o700 });
-  const { stdout } = await exec(process.execPath, ["--input-type=module", "-e", `
-    const { newOwned, runProcesses } = await import("./src/processes.ts");
-    console.log(JSON.stringify((await runProcesses(newOwned(), "1", process.argv[1])).map(p => p.pid)));
-  `, marker], {
-    cwd: checkout, env: { ...process.env, PATH: `${scratch}:${process.env.PATH}`, SCAN_FIXTURE: scratch, SCAN_NODE: process.execPath,
-      SCAN_HIDE: hideSuccessor ? "1" : "0" }, timeout: 15_000,
-  });
-  assert.deepEqual(JSON.parse(stdout), [Number(await readFile(pidFile, "utf8"))]);
-});
-
-test("interrupted staging retains a group whose unmarked successor was missed by ps", { timeout }, async t => {
-  const scratch = await realpath(await mkdtemp(join(tmpdir(), "aipatty-reap-")));
-  t.after(() => rm(scratch, { recursive: true, force: true }));
-  // Synthetic PIDs outside the OS allocation range. Stub ps on both platforms and intercept all signals.
-  const pgid = 2 ** 30, successor = pgid + 2;
-  await writeFile(join(scratch, "ps"), `#!/bin/sh
-case "$1:$3" in
-  -p:-o) : > "$REAP_FIXTURE/identified"; exit 1 ;;
-  -A:pid=,ppid=,pgid=,uid=,stat=,lstart=) ;;
-  *) exit 0 ;; # macOS environment scans: neither group member is marked
-esac
-[ -f "$REAP_FIXTURE/identified" ] || exit 0
-n=0
-if [ -f "$REAP_FIXTURE/reads" ]; then read -r n < "$REAP_FIXTURE/reads"; fi
-n=$((n+1))
-printf '%s\\n' "$n" > "$REAP_FIXTURE/reads"
-# After checking the missing worker, the first stopRun scan sees a leaderless member until
-# the last ps read omits both that exiting process and its newly forked successor.
-if [ "$n" -lt 4 ]; then
-  printf '%s 1 %s %s S Mon Oct 19 11:00:01 2026\\n' ${pgid + 1} ${pgid} "$REAP_UID"
-elif [ "$n" -gt 4 ] && [ "$REAP_VISIBLE" = 1 ]; then
-  printf '%s 1 %s %s S Mon Oct 19 11:00:02 2026\\n' ${successor} ${pgid} "$REAP_UID"
-fi
-`, { mode: 0o700 });
-  for (const visible of [true, false]) {
-    await rm(join(scratch, "identified"), { force: true });
-    await rm(join(scratch, "reads"), { force: true });
-    await exec(process.execPath, ["--input-type=module", "-e", `
-      import assert from "node:assert/strict";
-      import { reapStage } from "./src/upgrade-process.ts";
-      import { UpgradePaths } from "./src/upgrade-state.ts";
-      const paths = new UpgradePaths(process.env.REAP_FIXTURE, process.env.REAP_FIXTURE);
-      paths.init();
-      const journal = { version: 1, phase: "staging", id: ${JSON.stringify(randomUUID())},
-        legacy: false, faux: true, port: 8790, old: "a".repeat(40),
-        stageProcess: { pid: ${pgid}, start: "Mon Oct 19 11:00:00 2026" } };
-      let groupExists = true;
-      const probes = [], signals = [];
-      process.kill = (pid, signal) => {
-        if (signal !== 0) signals.push([pid, signal]);
-        else probes.push(pid);
-        if (pid === -${pgid} && groupExists && signal === 0) return true;
-        throw Object.assign(new Error("No such process"), { code: "ESRCH" });
-      };
-      await assert.rejects(reapStage(paths, journal), ${visible ? `/${successor}/` : `/process group ${pgid}/`});
-      assert.deepEqual(signals, [], "group evidence must not authorize signalling an unmarked successor");
-      if (${!visible}) assert.ok(probes.includes(-${pgid}), "an empty ps snapshot is not proof the group is gone");
-
-      // A later recovery can proceed after the kernel confirms that the group is gone.
-      groupExists = false;
-      process.env.REAP_VISIBLE = "0";
-      await reapStage(paths, journal);
-      assert.equal(probes.at(-1), -${pgid});
-      assert.deepEqual(signals, []);
-    `], { cwd: checkout, env: { PATH: `${scratch}:${process.env.PATH}`, REAP_FIXTURE: scratch,
-      REAP_UID: String(process.geteuid!()), REAP_VISIBLE: visible ? "1" : "0" }, timeout: 15_000 });
-  }
-});
-
-for (const source of ["worker", "ancestry", "setsid", "env-failure", "reap-env-failure", "pid-reuse"]) test(`a stage group found during ${source} stays pending across recovery processes`, { timeout }, async t => {
-  const scratch = await realpath(await mkdtemp(join(tmpdir(), "aipatty-reap-retry-")));
-  const id = randomUUID(), marker = stageMarker(id), successor = 2 ** 30 + 1;
-  let worker = 2 ** 30;
-  // Use a real marked PID for Linux /proc inspection. Only this test (via its child handle) can signal it.
-  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
-    detached: true, stdio: "ignore", env: { ...stageEnvironment(), [marker]: "1" },
-  });
-  const closed = new Promise(resolve => child.once("close", resolve));
-  t.after(async () => {
-    child.kill("SIGKILL");
-    await closed;
-    await rm(scratch, { recursive: true, force: true });
-  });
-  assert.ok(child.pid);
-  const marked = child.pid, pgid = source === "worker" ? marked : worker + 2;
-  const workerCheck = source === "worker" || source === "setsid" || source === "env-failure";
-  const childPid = 2 ** 30 + 3;
-  const retryPid = source === "env-failure" ? childPid : successor;
-  const retryError = new RegExp(`Cannot prove staging processes exited \\(${retryPid}\\)`);
-  const groupError = `Cannot prove staging process group ${pgid} is gone`;
-  await writeFile(join(scratch, "ps"), `#!/bin/sh
-case "$1:$2:$3" in
-  -p:*-o) exit 1 ;;
-  -A:-o:pid=,ppid=,pgid=,uid=,stat=,lstart=)
-    if [ "$REAP_MODE" = ${source} ] && [ ! -f "$REAP_FIXTURE/seen" ]; then
-      : > "$REAP_FIXTURE/seen"
-      case "$REAP_MODE" in
-        env-failure)
-          printf '%s %s %s %s S Mon Oct 19 11:00:02 2026\\n' ${childPid} "$REAP_WORKER" ${pgid} "$REAP_UID" ;;
-        reap-env-failure)
-          printf '%s 1 %s %s S Mon Oct 19 11:00:00 2026\\n' ${worker} ${worker} "$REAP_UID"
-          printf '%s %s %s %s S Mon Oct 19 11:00:02 2026\\n' ${childPid} ${worker} ${pgid} "$REAP_UID" ;;
-        pid-reuse)
-          printf '%s 1 %s %s S Mon Oct 19 11:00:01 2026\\n' ${marked} ${pgid} "$REAP_UID"
-          printf '%s 1 %s %s S Mon Oct 19 11:00:03 2026\\n' ${successor} ${pgid} "$REAP_UID" ;;
-        *)
-          printf '%s 1 %s %s S Mon Oct 19 11:00:01 2026\\n' ${marked} ${source === "ancestry" ? worker : marked} "$REAP_UID"
-          if [ "$REAP_MODE" = ancestry ] || [ "$REAP_MODE" = setsid ]; then
-            printf '%s %s %s %s S Mon Oct 19 11:00:02 2026\\n' ${pgid} ${marked} ${source === "ancestry" ? pgid : marked} "$REAP_UID"
-          fi ;;
-      esac
-    elif [ "$REAP_MODE" = setsid ]; then
-      # Same child, but orphaned and now the leader of its own group.
-      printf '%s 1 %s %s S Mon Oct 19 11:00:02 2026\\n' ${pgid} ${pgid} "$REAP_UID"
-    elif [ "$REAP_MODE" = retry ] || [ "$REAP_MODE" = pid-reuse ]; then
-      if [ "$REAP_MODE" = pid-reuse ] && [ ! -f "$REAP_FIXTURE/reused" ]; then
-        : > "$REAP_FIXTURE/reused"
-        printf '%s 1 %s %s S Mon Oct 19 11:00:04 2026\\n' ${marked} ${marked} "$REAP_UID"
-      fi
-      # A previously recorded unmarked child can change groups between attempts, not just within a scan.
-      printf '%s 1 %s %s S Mon Oct 19 11:00:0%s 2026\\n' ${retryPid} ${source === "env-failure" ? childPid : pgid} "$REAP_UID" ${source === "env-failure" ? 2 : 3}
-    fi ;;
-  -A:-ww:-o) printf '%s fixture-node\\n' ${marked} ;;
-  -A:-E:-ww)
-    case "$REAP_MODE" in *env-failure) echo 'Fixture environment failure' >&2; exit 1 ;; esac
-    printf '%s fixture-node %s=1\\n' ${marked} ${marker} ;;
-esac
-`, { mode: 0o700 });
-  const attempt = (mode: string) => exec(process.execPath, ["--input-type=module", "-e", `
-    import assert from "node:assert/strict";
-    import fs from "node:fs/promises";
-    import { syncBuiltinESMExports } from "node:module";
-    import { assertStageIdle, reapStage } from "./src/upgrade-process.ts";
-    import { UpgradePaths } from "./src/upgrade-state.ts";
-    process.env.REAP_WORKER = String(process.pid);
-    if (process.env.REAP_MODE.endsWith("env-failure") && process.platform === "linux") {
-      const read = fs.readFile;
-      fs.readFile = (path, ...args) => String(path).startsWith("/proc/")
-        ? Promise.reject(Object.assign(new Error("Fixture environment failure"), { code: "EIO" })) : read(path, ...args);
-      syncBuiltinESMExports();
-    }
-    const paths = new UpgradePaths(process.env.REAP_FIXTURE, process.env.REAP_FIXTURE);
-    const unlock = paths.lease();
-    const signals = [];
-    process.kill = (pid, signal) => {
-      if (signal !== 0) signals.push([pid, signal]);
-      if (pid === -${pgid} && process.env.REAP_MODE !== "quiet" && signal === 0) return true;
-      throw Object.assign(new Error("No such process"), { code: "ESRCH" });
-    };
-    try {
-      const id = ${JSON.stringify(id)};
-      if (${workerCheck} && process.env.REAP_MODE === ${JSON.stringify(source)}) await assertStageIdle(paths, id);
-      else await reapStage(paths, { version: 1, phase: "staging", id,
-        legacy: false, faux: true, port: 8790, old: "a".repeat(40),
-        stageProcess: { pid: ${worker}, start: "Mon Oct 19 11:00:00 2026" } });
-    } finally {
-      unlock();
-      assert.deepEqual(signals, [], "unverified identities must not be signalled");
-    }
-  `], { cwd: checkout, env: { PATH: `${scratch}:${process.env.PATH}`, REAP_FIXTURE: scratch,
-    REAP_UID: String(process.geteuid!()), REAP_MODE: mode }, timeout: 15_000 });
-
-  const first = attempt(source);
-  if (workerCheck) worker = first.child.pid!;
-  const expected = source.endsWith("env-failure") ? /Fixture environment failure/
-    : source === "setsid" ? /Staging still has subprocesses/ : source === "pid-reuse" ? retryError : new RegExp(groupError);
-  await assert.rejects(first, expected);
-  child.kill("SIGKILL");
-  await closed;
-  const paths = new UpgradePaths(scratch, scratch);
-  assert.ok(paths.stageEvidence(id)?.groups.includes(pgid));
-  await assert.rejects(attempt("retry"), retryError);
-  if (source === "env-failure") assert.ok(paths.stageEvidence(id)?.groups.includes(childPid));
-  await attempt("quiet");
-  assert.deepEqual(paths.stageEvidence(id), { groups: [], procs: [] });
-});
-
-test("staging reaps a detached replacement started by its interrupted nested test", { timeout }, async t => {
-  const f = await fixture(t);
-  f.launch();
-  await f.health(f.old);
-  await f.next("target running the nested process fixture as npm test");
-  await f.flag("nest-test");
-  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
-  try {
-    const nested = await until(async () => {
-      try { return JSON.parse(await readFile(join(f.scratch, "nested-server.json"), "utf8")) as { pid: number }; }
-      catch { return undefined; }
-    }, Boolean, 15_000);
-    const j = f.paths.load()!;
-    assert.ok(await identify(nested!.pid));
-    process.kill(j.stageProcess!.pid, "SIGKILL");
-    assert.match(JSON.stringify((await f.result(j.id))[0].data), /failed before cutover/);
-    assert.equal(await identify(nested!.pid), undefined);
-    assert.equal(f.paths.selected(), f.old);
-  } finally { await f.flag("let-nested-finish"); }
-});
-
-test("unproven stage cleanup keeps admission closed until explicit recovery delivers the result", { timeout }, async t => {
+test("a killed worker leaves detached checks alone; only maintenance acknowledgement can reopen admission", { timeout }, async t => {
   const f = await fixture(t);
   const old = f.launch();
   await f.health(f.old);
-  await f.next("target whose stage cannot prove cleanup");
-  await f.flag("hold-reap");
+  const target = await f.next("target running the nested process fixture as npm test");
+  await f.flag("nest-test");
   assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
-  const j = f.paths.load()!;
-  await until(() => old.output().includes("Could not settle upgrade"));
-  assert.equal(f.paths.load()?.phase, "staging");
-  assert.equal((await f.send("should not be admitted")).status, 409);
-  await f.unflag("hold-reap");
-  assert.match((await f.supervisor(f.old, "recover")).stdout, /cancelled before cutover/);
-  assert.equal((await f.result(j.id)).length, 1);
-  assert.equal((await f.healthNow())?.pid, old.child.pid);
+  const nested = await until(async () => {
+    try { return JSON.parse(await readFile(join(f.scratch, "nested-server.json"), "utf8")) as { pid: number }; }
+    catch { return undefined; }
+  }, Boolean, 15_000);
+  const { id } = f.paths.load()!;
+  process.kill(await fixturePid(f, "worker"), "SIGKILL");
+  await until(() => old.output().includes("Interrupted staging"));
+  assert.match(await f.log(id), /Stage worker exited \(SIGKILL\)/);
+  await assertInterrupted(f, id, target);
+  assert.ok(await identify(nested!.pid), "neither recovery nor the coordinator signals a detached test process");
+  const npm = await fixturePid(f, "npm");
+  assert.ok(await identify(npm));
+  await assert.rejects(f.supervisor(f.old, "recover", "--ack-interrupted-stage", randomUUID()), /pending staging request ID/);
+  assert.equal((await f.send("new work")).status, 409);
+  await f.flag("let-nested-finish");
+  await until(() => identify(npm), value => !value); // The test's owner waited for nested teardown.
+  await until(() => identify(nested!.pid), value => !value);
+  await assertInterrupted(f, id, target); // Even proven quiet by the test, plain retry cannot clear staging.
+  const unlock = f.paths.stagingLease(id);
+  try {
+    await assert.rejects(f.supervisor(f.old, "recover", "--ack-interrupted-stage", id), /still holds its lease/);
+  } finally { unlock(); }
+  assert.match((await f.supervisor(f.old, "recover", "--ack-interrupted-stage", id)).stdout, /Operator acknowledged interrupted staging/);
+  assert.equal((await f.result(id)).length, 1);
+  assert.equal((await f.health(f.old))?.pid, old.child.pid);
+  assert.ok(existsSync(f.paths.stage(id)));
   assert.equal((await f.cli("send", "after verified cleanup")).stdout.trim(), "Faux reply: after verified cleanup");
+  await f.unflag("nest-test");
+  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
+  assert.notEqual(f.paths.load()?.id, id);
+  await f.health(target);
+  assert.ok(existsSync(f.paths.stage(id)), "new upgrade does not reuse or clean an acknowledged stage");
 });
+
+for (const interruption of ["omit-stage-result", "hold-stage-child"] as const) {
+  test(`clean exit alone cannot commit staging (${interruption})`, { timeout }, async t => {
+    const f = await fixture(t);
+    const old = f.launch();
+    await f.health(f.old);
+    const target = await f.next(interruption);
+    await f.flag(interruption);
+    assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
+    const { id } = f.paths.load()!;
+    await until(() => old.output().includes("Interrupted staging"));
+    assert.match(await f.log(id), interruption === "omit-stage-result" ? /without a completion response/ : /group still has members/);
+    await assertInterrupted(f, id, target);
+    assert.equal(await readFile(join(f.paths.stage(id), "label"), "utf8"), interruption);
+    if (interruption === "hold-stage-child") assert.ok(await identify(await fixturePid(f, "stage-child")));
+  });
+}
 
 test("a delivery error is discoverable with recover and restart retries the same result without staging", { timeout }, async t => {
   const f = await fixture(t);
@@ -808,7 +619,7 @@ test("a delivery error is discoverable with recover and restart retries the same
   assert.equal(f.paths.selected(), f.old);
 });
 
-test("losing the requesting host during staging closes the worker and allows an ordinary restart", { timeout }, async t => {
+test("losing the requesting host during staging requires maintenance acknowledgement before startup", { timeout }, async t => {
   const f = await fixture(t);
   const old = f.launch();
   await f.health(f.old);
@@ -816,17 +627,66 @@ test("losing the requesting host during staging closes the worker and allows an 
   await f.flag("hold-stage");
   assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
   await until(() => existsSync(join(f.scratch, "npm.log")));
-  const j = f.paths.load()!;
+  const { id } = f.paths.load()!;
   old.child.kill("SIGKILL");
   await old.exited;
-  try { await until(() => f.paths.load()?.phase === "done"); }
-  catch (error) { throw new Error(`${JSON.stringify(f.paths.load())}\n${await f.log(j.id)}`, { cause: error }); }
+  const worker = await fixturePid(f, "worker"), helper = await fixturePid(f, "coordinator"), npm = await fixturePid(f, "npm");
+  await until(() => identify(helper), value => !value);
+  await until(() => identify(worker), value => !value);
+  const refused = f.launch();
+  assert.equal(await refused.exited, 1, refused.output());
+  assert.match(refused.output(), /Interrupted staging.*ack-interrupted-stage/);
+  await assertInterrupted(f, id, target);
+  assert.ok(await identify(npm));
+  await f.unflag("hold-stage");
+  await until(() => identify(npm), value => !value);
+  await f.supervisor(f.old, "recover", "--ack-interrupted-stage", id);
   f.launch();
   await f.health(f.old);
-  const [result] = await f.result(j.id);
-  assert.match(JSON.stringify(result.data), /failed before cutover.*Requesting host exited during staging/);
+  const [result] = await f.result(id);
+  assert.match(JSON.stringify(result.data), /cancelled before cutover.*Operator acknowledged interrupted staging/);
+  assert.ok(existsSync(f.paths.stage(id)));
+});
+
+test("interrupted legacy bootstrap leaves the old app running and requires acknowledgement before another bootstrap", { timeout }, async t => {
+  const f = await fixture(t, true);
+  const old = f.launch();
+  await f.health(f.old);
+  const target = await f.next("interrupted bootstrap");
+  await f.install(target);
+  await f.flag("hold-stage");
+  const failed = assert.rejects(f.supervisor(target, "bootstrap"), /Interrupted staging.*Stage worker exited \(SIGKILL\)/s);
+  await until(() => existsSync(join(f.scratch, "npm.log")));
+  const { id } = f.paths.load()!;
+  process.kill(await fixturePid(f, "worker"), "SIGKILL");
+  await failed;
+  assert.equal(f.paths.load()?.phase, "staging");
   assert.equal(f.paths.selected(), f.old);
-  assert.equal(existsSync(f.paths.release(target)), false);
+  assert.equal(existsSync(join(f.paths.release(target), "node_modules")), false);
+  assert.equal(existsSync(f.paths.backup(id)), false);
+  assert.equal(old.child.exitCode, null);
+  assert.equal(existsSync(join(f.scratch, "legacy-closed")), false);
+  await assert.rejects(f.supervisor(target, "bootstrap"), /upgrade is unfinished/);
+  await assert.rejects(f.supervisor(target, "recover"), /Interrupted staging/);
+  const npm = await fixturePid(f, "npm");
+  assert.ok(await identify(npm));
+  await f.unflag("hold-stage");
+  await until(() => identify(npm), value => !value);
+  assert.match((await f.supervisor(target, "recover", "--ack-interrupted-stage", id)).stdout, /Operator acknowledged interrupted staging/);
+  assert.ok(existsSync(f.paths.stage(id)));
+  assert.ok(await f.health(f.old));
+});
+
+test("legacy ownership surfaces lsof diagnostics instead of reporting no matching listener", { timeout, skip: process.platform !== "darwin" }, async t => {
+  const f = await fixture(t, true);
+  const old = f.launch();
+  await f.health(f.old);
+  const target = await f.next("legacy ownership diagnostics");
+  await f.install(target);
+  await f.flag("fail-lsof");
+  await assert.rejects(f.supervisor(target, "bootstrap"), /lsof failed during legacy ownership check.*fixture lsof diagnostic/);
+  assert.equal(f.paths.load(), undefined);
+  assert.equal(old.child.exitCode, null);
 });
 
 test("bootstrap rejects Pi records, non-main and dirty/ignored input before touching a legacy host", { timeout }, async t => {

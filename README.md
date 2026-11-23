@@ -215,8 +215,10 @@ After Steve merges a reviewed PR, send exactly `/upgrade` in the chosen idle bra
 (confirm the prompt) or `send '/upgrade'` in the CLI. Ordinary messages and model tool calls cannot request it.
 Admission uses the existing trusted loopback/SSH operator boundary, not a personal login. The old app serves
 reads while a detached one-shot helper stages and checks the pinned `main` commit; it refuses new work while
-the request is pending. The originating branch gets one durable app entry with the result, active SHA, and
-any rollback reason. The helper exits; there is no daemon, launchd installation, or automatic deployment.
+the request is pending. An interrupted stage stays pending until explicit operator recovery; a candidate that
+fails readiness normally rolls back automatically. The originating branch gets one durable app entry with the
+result, active SHA, and any rollback reason. The helper exits; there is no daemon, launchd installation, or
+automatic deployment.
 
 Before first use, see [legacy bootstrap](docs/INSTALL.md#first-bootstrap-from-a-release-without-the-upgrade-command),
 [diagnostics and recovery](docs/INSTALL.md#diagnose-recover-or-start-manually), and the

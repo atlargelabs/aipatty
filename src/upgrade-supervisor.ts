@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, realpathSync, writeSync } from "node:fs";
+import { closeSync, mkdirSync, realpathSync, rmSync, writeSync } from "node:fs";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -9,12 +9,12 @@ import { parseArgs } from "node:util";
 import { readConfig, type Config } from "./config.ts";
 import { backupDb, restoreDb } from "./upgrade-db.ts";
 import {
-  assertStageIdle, confirmActivation, detachServer, getHealth, identify, launchServer, legacyConnection, openUpgradeLog, probeServer,
-  LegacyInspectionError, quiescent, reapStage, sendParent, stageMarker, stopCandidate, type ServerChild,
+  confirmActivation, detachServer, getHealth, identify, launchServer, legacyConnection, openUpgradeLog, probeServer,
+  LegacyInspectionError, quiescent, sendParent, stopCandidate, type ServerChild,
 } from "./upgrade-process.ts";
-import { stageRelease, verifyRelease } from "./upgrade-release.ts";
+import { InterruptedStageError, publishRelease, stageRelease, verifyRelease, type StageOutput } from "./upgrade-release.ts";
 import {
-  errorText, exists, finish, idPattern, resultText, sameInstall, upgradeProtocol, UpgradePaths, type ProcessIdentity, type UpgradeJournal,
+  errorText, exists, finish, idPattern, interruptedStage, resultText, sameInstall, shaPattern, syncPath, upgradeProtocol, UpgradePaths, type UpgradeJournal,
 } from "./upgrade-state.ts";
 
 const stageDeadlineMs = 26 * 60_000;
@@ -28,12 +28,22 @@ async function verifySelected(paths: UpgradePaths, sha: string): Promise<void> {
   await verifyRelease(paths.release(sha), sha);
 }
 
-/** Child of the one-shot owner, not a public mode. Deadlines and command cleanup survive loss of that owner. */
+type StageResult = { output: StageOutput } | { failure: string };
+const validDigest = (value: unknown) => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+
+function validOutput(value: unknown, j: UpgradeJournal, target?: string): value is StageOutput {
+  if (!value || typeof value !== "object" || !("sha" in value) || !target || value.sha !== target) return false;
+  if (target === j.old) return !("digest" in value) && !("bootstrapTree" in value);
+  return "digest" in value && validDigest(value.digest)
+    && (j.legacy ? "bootstrapTree" in value && validDigest(value.bootstrapTree) : !("bootstrapTree" in value));
+}
+
+/** Child of the one-shot owner, not a public mode. Writes only its private checkout and log. */
 async function runStage(paths: UpgradePaths, config: Config, id: string, scriptRelease: string): Promise<void> {
   const signal = new AbortController();
   const authorized = await new Promise<boolean>(resolve => {
     process.once("disconnect", () => {
-      signal.abort(new Error("Staging supervisor disconnected"));
+      signal.abort(new InterruptedStageError("Staging supervisor disconnected"));
       resolve(false);
     });
     process.once("message", value => resolve(value === "prepare"));
@@ -41,75 +51,88 @@ async function runStage(paths: UpgradePaths, config: Config, id: string, scriptR
   if (!authorized) throw new Error("Stage worker was not authorized");
   const unlock = paths.stagingLease(id);
   let log: number | undefined;
+  let result: StageResult;
   try {
     const j = paths.load();
-    if (!process.connected || j?.id !== id || j.phase !== "staging" || j.stageProcess?.pid !== process.pid
-      || process.env[stageMarker(id)] !== "1" || paths.selected() !== j.old) {
+    if (!process.connected || j?.id !== id || j.phase !== "staging" || paths.selected() !== j.old) {
       throw new Error("Invalid or cancelled stage handoff");
     }
     sameInstall(j, config);
     log = openUpgradeLog(paths, id);
-    await stageRelease({ paths, id, old: j.old, origin: config.pi.repoUrl, log, signal: signal.signal,
-      bootstrap: j.legacy ? scriptRelease : undefined,
-      pinned: target => { paths.save({ ...j, target }); },
-      note: text => { writeSync(log!, `${new Date().toISOString()} ${text}\n`); },
-      assertIdle: () => assertStageIdle(paths, id),
-    });
-  } catch (error) {
-    if (process.connected) await sendParent(errorText(error)).catch(() => {});
-    throw error;
+    try {
+      result = { output: await stageRelease({ paths, id, old: j.old, origin: config.pi.repoUrl, log, signal: signal.signal,
+        bootstrap: j.legacy ? scriptRelease : undefined,
+        pinned: target => sendParent({ id, target }).catch(error => { throw new InterruptedStageError(errorText(error)); }),
+        note: text => { writeSync(log!, `${new Date().toISOString()} ${text}\n`); },
+      }) };
+    } catch (error) {
+      if (error instanceof InterruptedStageError) throw error;
+      result = { failure: errorText(error) };
+    }
   } finally {
-    if (log !== undefined) closeSync(log);
-    unlock();
+    try { if (log !== undefined) closeSync(log); }
+    finally { unlock(); }
   }
+  signal.signal.throwIfAborted();
+  await sendParent({ id, ...result });
 }
 
-async function prepare(paths: UpgradePaths, j: UpgradeJournal, source: string, log: number, record: (p: ProcessIdentity) => void): Promise<void> {
+async function prepare(paths: UpgradePaths, j: UpgradeJournal, source: string, log: number, pin: (target: string) => void): Promise<StageResult> {
   if (!j.legacy && !process.connected) throw new Error("Requesting host exited before staging");
   const child = spawn(process.execPath, [join(source, "src/upgrade-supervisor.ts"), "stage",
     "--install-dir", paths.root, "--port", String(j.port), "--id", j.id], {
-    cwd: source, detached: true, env: { ...process.env, [stageMarker(j.id)]: "1" }, stdio: ["ignore", log, log, "ipc"],
+    cwd: source, detached: true, stdio: ["ignore", log, log, "ipc"],
   });
-  let failure: string | undefined;
-  child.on("message", value => { if (typeof value === "string") failure = value; });
-  const completed = new Promise<Error | undefined>(resolve => {
-    child.once("error", resolve);
-    // All stdio is redirected; exit suffices, even if an already-disconnected IPC stream never emits close.
-    child.once("exit", (code, signal) => resolve(code === 0 ? undefined : new Error(failure ?? `Stage worker exited (${code ?? signal})`)));
+  let target: string | undefined, result: StageResult | undefined, protocolError: unknown;
+  child.on("message", value => {
+    if (protocolError) return;
+    try {
+      if (!value || typeof value !== "object" || !("id" in value) || value.id !== j.id || result) {
+        throw new Error("Invalid stage response");
+      }
+      if ("target" in value && typeof value.target === "string" && shaPattern.test(value.target) && !target) {
+        pin(value.target);
+        target = value.target;
+      } else if ("failure" in value && typeof value.failure === "string") result = { failure: value.failure };
+      else if ("output" in value && validOutput(value.output, j, target)) result = { output: value.output };
+      else throw new Error("Invalid stage response");
+    } catch (error) { protocolError = error; }
   });
-  const disconnect = () => { if (child.connected) child.disconnect(); };
-  const parentLost = Promise.withResolvers<Error>();
-  const onHostExit = () => {
-    disconnect();
-    parentLost.resolve(new Error("Requesting host exited during staging"));
-  };
-  if (!j.legacy) process.once("disconnect", onHostExit);
+  const exited = new Promise<void>((resolve, reject) => {
+    child.on("error", reject);
+    child.once("exit", (code, signal) => code === 0 && !signal ? resolve() : reject(new Error(`Stage worker exited (${code ?? signal})`)));
+  });
+  const ipcClosed = new Promise<void>(resolve => child.once("disconnect", resolve));
+  const parentLost = Promise.withResolvers<void>();
+  if (!j.legacy) process.once("disconnect", parentLost.resolve);
   const stageDeadline = new AbortController();
   try {
-    const identity = child.pid && await identify(child.pid);
-    if (!identity || !child.connected || (!j.legacy && !process.connected)) throw new Error("Stage handoff ended before the worker could be verified");
-    // A surviving owner can reap this group even if we lose the worker or both owners after it starts a command.
-    record(identity);
-    await new Promise<void>((resolve, reject) => child.send("prepare", error => error ? reject(error) : resolve()));
-    const expired = sleep(stageDeadlineMs, undefined, { signal: stageDeadline.signal, ref: false })
-      .then(() => new Error(`Staging exceeded its total deadline (${stageDeadlineMs} ms)`));
-    const error = await Promise.race([completed, parentLost.promise, expired]);
-    if (error) throw error;
+    await Promise.race([
+      Promise.all([exited, ipcClosed, new Promise<void>((resolve, reject) => child.send("prepare", error => error ? reject(error) : resolve()))]),
+      parentLost.promise.then(() => { throw new Error("Requesting host exited during staging"); }),
+      sleep(stageDeadlineMs, undefined, { signal: stageDeadline.signal, ref: false })
+        .then(() => { throw new Error(`Staging exceeded its total deadline (${stageDeadlineMs} ms)`); }),
+    ]);
+    if (protocolError) throw protocolError;
+    if (!result || !child.pid) throw new Error("Stage worker exited without a completion response");
+    // Only a veto on normal exit, not recovery authority or a claim about detached descendants. Never signal it.
+    try { process.kill(-child.pid, 0); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return result; throw error; }
+    throw new Error("Stage worker's group still has members");
   } finally {
     stageDeadline.abort();
-    process.off("disconnect", onHostExit);
-    disconnect();
-    const deadline = new AbortController();
-    try { await Promise.race([completed, sleep(3_000, undefined, { signal: deadline.signal })]); }
-    finally { deadline.abort(); }
-    child.channel?.unref();
-    child.unref();
+    process.off("disconnect", parentLost.resolve);
+    try { if (child.connected) child.disconnect(); }
+    finally {
+      child.channel?.unref();
+      child.unref();
+    }
   }
 }
 
 /** One owner, one target, no retry. The only replayable part is safe restoration of the recorded old release. */
 async function run(paths: UpgradePaths, args: {
-  mode: "bootstrap" | "handoff" | "recover"; id?: string; faux: boolean; port: number; scriptRelease: string;
+  mode: "bootstrap" | "handoff" | "recover"; id?: string; ack?: string; faux: boolean; port: number; scriptRelease: string;
 }): Promise<UpgradeJournal> {
   const { mode, scriptRelease } = args;
   const release = paths.lease();
@@ -200,6 +223,10 @@ async function run(paths: UpgradePaths, args: {
     await verifyRelease(scriptRelease, sourceSha);
     if (mode === "recover") {
       const current = requireJournal();
+      if (args.ack !== undefined && (current.phase !== "staging" || current.id !== args.ack)) {
+        throw new Error("Acknowledgement must name the pending staging request ID from this journal");
+      }
+      if (current.phase === "staging" && args.ack === undefined) throw new Error(interruptedStage(paths, current.id));
       if (current.phase === "done") {
         await verifySelected(paths, current.result?.active ?? current.old);
         paths.syncJournal();
@@ -207,13 +234,19 @@ async function run(paths: UpgradePaths, args: {
       }
       openLog();
       try {
-        if (current.phase === "requested" || current.phase === "staging") {
-          if (current.phase === "staging") await reapStage(paths, current);
-          const unstaged = current.phase === "staging" ? paths.stagingLease(current.id) : undefined;
+        if (current.phase === "requested") {
+          await verifySelected(paths, current.old);
+          return done(current, { kind: "cancelled", active: await verifyOld(current), reason: "Interrupted request was not staged." });
+        }
+        if (current.phase === "staging") {
+          // Matching acknowledgement is the operator's attestation after maintenance, not a process probe.
+          // This lock excludes a live worker; it cannot prove that its commands or descendants have exited.
+          const unlockStage = paths.stagingLease(current.id);
           try {
             await verifySelected(paths, current.old);
-            return done(current, { kind: "cancelled", active: await verifyOld(current), reason: "Interrupted staging was not retried." });
-          } finally { unstaged?.(); }
+            return done(current, { kind: "cancelled", active: await verifyOld(current),
+              reason: `Operator acknowledged interrupted staging. The private stage was not reused or removed: ${paths.stage(current.id)}.` });
+          } finally { unlockStage(); }
         }
         return await rollback(current, current.reason ?? "Interrupted cutover; the pinned candidate was not retried.");
       } catch (error) {
@@ -246,15 +279,26 @@ async function run(paths: UpgradePaths, args: {
     }
     openLog();
     let candidate: ServerChild | undefined;
+    let interrupted = false;
     try {
       const initial = requireJournal();
       noPi(paths);
-      await prepare(paths, initial, scriptRelease, log!, stageProcess => { save({ ...initial, stageProcess }); });
-      const prepared = paths.load();
-      if (prepared?.id !== initial.id || prepared.phase !== "staging" || !prepared.target) throw new Error("Stage worker did not pin a target");
-      await reapStage(paths, prepared);
-      j = prepared;
-      const sha = prepared.target;
+      const staged = paths.stage(initial.id);
+      mkdirSync(staged, { mode: 0o700 }); // Exclusive: never reuse a half-prepared release.
+      syncPath(paths.deploy);
+      interrupted = true;
+      const prepared = await prepare(paths, initial, scriptRelease, log!, target => { save({ ...initial, target }); });
+      if ("failure" in prepared) {
+        interrupted = false;
+        rmSync(staged, { recursive: true, force: true });
+        throw new Error(prepared.failure);
+      }
+      const sha = prepared.output.sha;
+      if (sha !== initial.old) {
+        await publishRelease(paths, initial.id, prepared.output, initial.legacy ? scriptRelease : undefined);
+      }
+      interrupted = false;
+      rmSync(staged, { recursive: true, force: true });
       await verifySelected(paths, initial.old);
       noPi(paths);
       if (sha === initial.old) {
@@ -296,11 +340,11 @@ async function run(paths: UpgradePaths, args: {
         note(why);
         throw error; // Never restore over a possibly committed release.
       }
-      if (current.phase === "requested" || current.phase === "staging") {
-        try { await reapStage(paths, current); }
-        catch (cleanup) {
-          note(`STAGE CLEANUP FAILED: ${why}; ${errorText(cleanup)}. Journal retained.`);
-          throw cleanup;
+      if (current.phase === "staging") {
+        if (interrupted) {
+          const message = `${interruptedStage(paths, current.id)} ${why}`;
+          note(message);
+          throw new Error(message, { cause: error });
         }
         return done(current, { kind: "failed", active: await verifyOld(current, parent?.pid), reason: why });
       }
@@ -328,18 +372,20 @@ async function run(paths: UpgradePaths, args: {
 
 async function main(): Promise<void> {
   const { values, positionals: [mode, ...extra] } = parseArgs({ allowPositionals: true, options: {
-    "install-dir": { type: "string" }, port: { type: "string" }, id: { type: "string" },
+    "install-dir": { type: "string" }, port: { type: "string" }, id: { type: "string" }, "ack-interrupted-stage": { type: "string" },
   } });
   const internal = mode === "handoff" || mode === "stage";
+  const ack = values["ack-interrupted-stage"];
   if (extra.length || (!internal && mode !== "bootstrap" && mode !== "recover")
-    || !values["install-dir"] || !values.port || (internal ? !values.id || !idPattern.test(values.id) || !process.connected : values.id !== undefined)) {
-    throw new Error("Usage: node src/upgrade-supervisor.ts bootstrap|recover --install-dir <canonical-root> --port <port>");
+    || !values["install-dir"] || !values.port || (internal ? !values.id || !idPattern.test(values.id) || !process.connected : values.id !== undefined)
+    || (ack !== undefined && (mode !== "recover" || !idPattern.test(ack)))) {
+    throw new Error("Usage: node src/upgrade-supervisor.ts bootstrap|recover --install-dir <canonical-root> --port <port> [recover only: --ack-interrupted-stage <id>]");
   }
   const config = readConfig(["--install-dir", values["install-dir"], "--port", values.port]);
   const paths = UpgradePaths.forConfig(config);
   const scriptRelease = realpathSync(fileURLToPath(new URL("../", import.meta.url)));
   if (mode === "stage") return runStage(paths, config, values.id!, scriptRelease);
-  const j = await run(paths, { mode, id: values.id, port: config.port, faux: config.faux, scriptRelease });
+  const j = await run(paths, { mode, id: values.id, ack, port: config.port, faux: config.faux, scriptRelease });
   const ok = mode === "recover" || j.result?.kind === "upgraded" || j.result?.kind === "noop";
   if (mode !== "handoff") {
     (ok ? console.log : console.error)(`${resultText(j)}\nLog: ${paths.log(j.id)}`);

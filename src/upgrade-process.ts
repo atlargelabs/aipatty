@@ -6,7 +6,6 @@ import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { LOOPBACK, DEFAULT_PORT, shutdownHeader } from "./config.ts";
 import { ownDataDir, OwnerBusy } from "./ownership.ts";
-import { assertStageWorkerIdle, newOwned, processEntryUnavailable, runProcesses, stopRun } from "./processes.ts";
 import { command } from "./upgrade-release.ts";
 import { ownedFile, upgradeChildEnv, upgradeProtocol, type ProcessIdentity, type UpgradeJournal, type UpgradePaths } from "./upgrade-state.ts";
 
@@ -68,53 +67,6 @@ export async function identify(pid: number): Promise<ProcessIdentity | undefined
   throw new Error(`Cannot identify process ${pid}`);
 }
 
-const stagePrefix = /^PATTY_STAGE_[0-9a-f]{32}$/;
-export const stageMarker = (id: string) => `PATTY_STAGE_${id.replaceAll("-", "")}`;
-
-/** Preserve only the stage identities when a test builds a deliberately filtered child environment. Independent
- * variables let nested stages and their detached apps keep both scopes, without exporting any credentials.
- */
-export function stageEnvironment(): NodeJS.ProcessEnv {
-  return Object.fromEntries(Object.entries(process.env).filter(([name, value]) => stagePrefix.test(name) && value === "1"));
-}
-
-/** The worker and reaper share blocking evidence, never signal authority. Hold the groups lease. */
-function stageOwnership(paths: UpgradePaths, id: string, workerGroup: number, root?: ProcessIdentity) {
-  const previous = paths.stageEvidence(id);
-  const owned = newOwned([], previous?.groups ?? [workerGroup]);
-  const suspects = new Map(previous?.procs);
-  owned.stage = { suspects, root };
-  const record = async () => paths.saveStageEvidence(id, { groups: [...owned.groups], procs: [...suspects] });
-  return { owned, record };
-}
-
-/** Under the upgrade lease. Keep observed detached groups across attempts, but never trust a group alone. */
-export async function reapStage(paths: UpgradePaths, j: UpgradeJournal): Promise<void> {
-  const worker = j.stageProcess;
-  if (!worker) return; // Not authorized to spawn commands before its identity is persisted.
-  const marker = stageMarker(j.id);
-  const unlock = paths.stageGroupsLease(j.id);
-  try {
-    const { owned, record } = stageOwnership(paths, j.id, worker.pid, worker);
-    const rootIsOurs = (await runProcesses(owned, "1", marker, record)).some(p => p.pid === worker.pid && p.start === worker.start);
-    if (rootIsOurs) owned.procs.set(worker.pid, worker.start);
-    else if ((await identify(worker.pid))?.start === worker.start) {
-      throw new Error(`Cannot verify the staging marker on PID ${worker.pid}; inspect before recovering`);
-    }
-    const left = await stopRun(owned, "1", worker.pid, 250, undefined, record, marker);
-    if (left.length) throw new Error(`Cannot prove staging processes exited (${left.map(p => p.pid).join(", ")}); leave the private stage in place and investigate`);
-  } finally { unlock(); }
-}
-
-/** The stage worker itself is still the live group leader when it publishes or removes its private checkout. */
-export async function assertStageIdle(paths: UpgradePaths, id: string): Promise<void> {
-  const unlock = paths.stageGroupsLease(id);
-  try {
-    const { owned, record } = stageOwnership(paths, id, process.pid);
-    await assertStageWorkerIdle(owned, stageMarker(id), record);
-  } finally { unlock(); }
-}
-
 function assertOwnerFiles(paths: UpgradePaths): void {
   for (const suffix of ["", "-journal", "-wal", "-shm"]) ownedFile(join(paths.data, "owner.sqlite") + suffix, suffix === "");
 }
@@ -154,7 +106,7 @@ export class LegacyInspectionError extends Error {}
 function procEntry<T>(path: string, read: (path: string) => T): T | undefined {
   try { return read(path); }
   catch (error) {
-    if (processEntryUnavailable(error)) return undefined;
+    if (["ENOENT", "ESRCH", "EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) return undefined;
     throw new LegacyInspectionError(`Could not inspect ${path} during legacy ownership check`, { cause: error });
   }
 }
@@ -173,7 +125,10 @@ async function legacyOwner(paths: UpgradePaths, j: UpgradeJournal): Promise<Proc
       return links.includes(lock) && links.some(link => sockets.has(/^socket:\[(\d+)\]$/.exec(link)?.[1] ?? ""));
     });
   } else {
-    const lsof = (args: string[]) => command("/usr/sbin/lsof", ["-nP", "-Fp", ...args], { ms: 3_000, exitCodes: [0, 1] });
+    const lsof = async (args: string[]) => {
+      try { return await command("/usr/sbin/lsof", ["-nP", "-Fp", ...args], { ms: 3_000, exitCodes: [0, 1], rejectStderr: true }); }
+      catch (error) { throw new LegacyInspectionError(`lsof failed during legacy ownership check: ${String(error)}`, { cause: error }); }
+    };
     const listening = [...new Set((await lsof([`-iTCP@${LOOPBACK}:${j.port}`, "-sTCP:LISTEN"])).split("\n")
       .filter(line => /^p\d+$/.test(line)).map(line => Number(line.slice(1))))];
     pids = [];
@@ -244,7 +199,7 @@ export async function legacyConnection(paths: UpgradePaths, j: UpgradeJournal) {
   }
 }
 
-export function sendParent(message: string): Promise<void> {
+export function sendParent(message: Parameters<NonNullable<typeof process.send>>[0]): Promise<void> {
   return new Promise((resolve, reject) => {
     if (!process.send || !process.connected) { reject(new Error("Host handoff connection closed")); return; }
     process.send(message, error => error ? reject(error) : resolve());

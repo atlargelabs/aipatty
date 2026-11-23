@@ -25,7 +25,6 @@ export interface UpgradeResult {
 }
 
 export interface ProcessIdentity { pid: number; start: string }
-export interface StageEvidence { groups: number[]; procs: [number, string][] }
 
 export interface UpgradeJournal {
   version: 1;
@@ -39,7 +38,6 @@ export interface UpgradeJournal {
   phase: typeof phases[number];
   target?: string;
   oldProcess?: ProcessIdentity;
-  stageProcess?: ProcessIdentity;
   reason?: string;
   result?: UpgradeResult;
   reported?: true;
@@ -161,14 +159,9 @@ export class UpgradePaths {
     return this.lock(join(this.state, "owner.sqlite"), "Another upgrade or recovery owns this installation");
   }
 
-  /** Staging commands have an independently bounded owner that drains if the coordinator dies. */
+  /** Excludes the worker itself during acknowledgement; a free lease says nothing about its subprocesses. */
   stagingLease(id: string): () => void {
-    return this.lock(this.artifact(id, ".stage-owner.sqlite"), `Staging for ${id} is still draining; see its log before recovering`);
-  }
-
-  /** Serializes stage evidence between the live worker (staging lease) and reaper (upgrade lease). */
-  stageGroupsLease(id: string): () => void {
-    return this.lock(this.artifact(id, ".stage-groups-owner.sqlite"), `Staging process evidence for ${id} is being checked`);
+    return this.lock(this.artifact(id, ".stage-owner.sqlite"), `Stage worker for ${id} still holds its lease; see its log before recovering`);
   }
 
   private lock(lock: string, busy: string): () => void {
@@ -207,22 +200,9 @@ export class UpgradePaths {
   backup(id: string): string { return this.artifact(id, ".sqlite"); }
   log(id: string): string { return this.artifact(id, ".log"); }
 
-  /** Under the stage groups lease. No record yet means the worker's recorded PGID is still pending. */
-  stageEvidence(id: string): StageEvidence | undefined {
-    const path = this.artifact(id, ".stage-evidence.json");
-    if (!ownedFile(path, false)) return;
-    const record = JSON.parse(readFileSync(path, "utf8")) as StageEvidence;
-    const validPid = (pid: unknown) => typeof pid === "number" && Number.isInteger(pid) && pid > 1 && pid <= 0x7fff_ffff;
-    if (!record || !Array.isArray(record.groups) || !record.groups.every(validPid)
-      || !Array.isArray(record.procs) || record.procs.some(p => !Array.isArray(p) || p.length !== 2
-        || !validPid(p[0]) || typeof p[1] !== "string" || !p[1])) {
-      throw new Error(`Invalid staging process evidence: ${path}`);
-    }
-    return record;
-  }
-
-  saveStageEvidence(id: string, record: StageEvidence): void {
-    atomicFile(this.artifact(id, ".stage-evidence.json"), JSON.stringify(record) + "\n");
+  stage(id: string): string {
+    if (!idPattern.test(id)) throw new Error("Invalid upgrade request ID");
+    return join(this.deploy, `.stage-${id}`);
   }
 
   private artifact(id: string, suffix: string): string {
@@ -242,7 +222,7 @@ export class UpgradePaths {
       || typeof j.legacy !== "boolean" || !phases.includes(j.phase)
       || (j.branch !== undefined && (!Number.isSafeInteger(j.branch) || j.branch < 1 || j.legacy))
       || (j.branch === undefined ? j.requestKey !== undefined : typeof j.requestKey !== "string" || !upgradeRequestKey.test(j.requestKey))
-      || !validProcess(j.oldProcess) || !validProcess(j.stageProcess)
+      || !validProcess(j.oldProcess)
       || (j.reason !== undefined && typeof j.reason !== "string")
       || (j.reported !== undefined && (j.phase !== "done" || j.reported !== true))
       || (j.phase === "done" ? !j.result || !outcomes.includes(j.result.kind) : j.result !== undefined)
@@ -265,6 +245,11 @@ export class UpgradePaths {
     syncPath(this.journal);
     syncPath(this.state);
   }
+}
+
+export function interruptedStage(paths: UpgradePaths, id: string): string {
+  return `Interrupted staging (${id}): retain ${paths.journal} and ${paths.stage(id)}. `
+    + `See ${paths.log(id)} and the install runbook before using recover --ack-interrupted-stage ${id}.`;
 }
 
 export function sameInstall(j: UpgradeJournal, config: Pick<Config, "port" | "faux">): void {
