@@ -144,6 +144,16 @@ async function scan(
   const workerChild = (proc: Proc) => worker && proc.pid !== process.pid && (proc.pgid === process.pid || proc.ppid === process.pid);
   const tree = (procs: Proc[]) => ownedTree(procs, proc => workerChild(proc)
     || owned.procs.get(proc.pid) === proc.start || marked.get(proc.pid) === proc.start);
+  const trackStage = async (found: Map<number, Proc>) => {
+    if (!isStage || !record) return false;
+    const before = owned.groups.size;
+    // Retain verified identities in memory so an unmarked child remains known if it calls setsid().
+    // The stage recorder writes only groups, which never seed individual process ownership.
+    remember(owned, [...found.values()]);
+    if (owned.groups.size === before) return false;
+    await record();
+    return true;
+  };
   let workerBusy = false;
   const snapshot = async () => {
     const procs = await listProcesses();
@@ -154,26 +164,29 @@ async function scan(
   let procs: Proc[];
   let confirmedQuiet = false;
   for (let attempt = 0;; attempt++) {
+    // Save any group already established by ancestry or a known identity before fallible marker reads.
+    if (isStage && record) await trackStage(tree(previous));
     const observation = await markedPids(runId, sample, variable);
     for (const p of sample) {
       if (!observation.unstable.has(p.pid)) sampled.set(p.pid, p.start);
       if (observation.marked.has(p.pid)) marked.set(p.pid, p.start);
     }
     // A process, marked or reached by ancestry, can vanish before the final table and leave an
-    // unmarked successor. Remember groups from this table too, but never signal from this snapshot.
-    if (isStage && record && rememberGroups(owned, tree(previous).values())) await record();
+    // unmarked successor. Remember evidence from this table too, but never signal from this snapshot.
+    const previouslyOwned = isStage && record ? tree(previous) : undefined;
+    if (previouslyOwned) await trackStage(previouslyOwned);
     procs = await snapshot();
     previous = procs;
     // A stage parent can detach a successor and exit during marker inspection. Inspect new identities
     // before declaring it idle. Unrelated system-user churn need not settle; staging doesn't change UID.
     if (!isStage) break;
-    const newGroups = record && rememberGroups(owned, tree(procs).values());
-    if (newGroups) await record();
+    const newGroups = record && await trackStage(tree(procs));
     sample = procs.filter(p => eligible(p) && sampled.get(p.pid) !== p.start);
     if (!sample.length) {
       const live = new Map(procs.map(p => [p.pid, p.start]));
       const disappeared = [...marked].filter(([pid, start]) => live.get(pid) !== start);
-      if (!newGroups && !disappeared.length && (confirmedQuiet || marked.size)) break;
+      const lostChild = previouslyOwned && [...previouslyOwned.values()].some(p => live.get(p.pid) !== p.start);
+      if (!newGroups && !disappeared.length && !lostChild && (confirmedQuiet || marked.size)) break;
       // ps is not atomic: a parent can exit after enumeration but before its row is read, and its
       // new child may be missing from that same snapshot. Confirm apparent quiet with a fresh scan;
       // also refresh the table after persisting any group evidence found in the last read.
@@ -281,7 +294,7 @@ export async function stopRun(
       await sleep(100);
       const procs = await listProcesses();
       if (variable !== RUN_MARKER && record
-        && rememberGroups(owned, ownedTree(procs, proc => owned.procs.get(proc.pid) === proc.start).values())) await record();
+        && remember(owned, [...ownedTree(procs, proc => owned.procs.get(proc.pid) === proc.start).values()])) await record();
       if (!procs.some(proc => proc.pid === root && proc.start === rootStart)) break;
     }
   }

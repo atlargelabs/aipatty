@@ -638,7 +638,7 @@ fi
   }
 });
 
-for (const source of ["worker", "ancestry"]) test(`a detached stage group found by ${source} stays pending across recovery processes`, { timeout }, async t => {
+for (const source of ["worker", "ancestry", "setsid", "env-failure"]) test(`a stage group found during ${source} stays pending across recovery processes`, { timeout }, async t => {
   const scratch = await realpath(await mkdtemp(join(tmpdir(), "aipatty-reap-retry-")));
   const id = randomUUID(), marker = stageMarker(id), successor = 2 ** 30 + 1;
   let worker = 2 ** 30;
@@ -654,27 +654,48 @@ for (const source of ["worker", "ancestry"]) test(`a detached stage group found 
   });
   assert.ok(child.pid);
   const marked = child.pid, pgid = source === "worker" ? marked : worker + 2;
+  const workerCheck = source !== "ancestry";
+  const groupError = `Cannot prove staging process group ${pgid} is gone`;
   await writeFile(join(scratch, "ps"), `#!/bin/sh
 case "$1:$2:$3" in
   -p:*-o) exit 1 ;;
   -A:-o:pid=,ppid=,pgid=,uid=,stat=,lstart=)
     if [ "$REAP_MODE" = ${source} ] && [ ! -f "$REAP_FIXTURE/seen" ]; then
       : > "$REAP_FIXTURE/seen"
-      printf '%s 1 %s %s S Mon Oct 19 11:00:01 2026\\n' ${marked} ${source === "worker" ? pgid : worker} "$REAP_UID"
-      if [ "$REAP_MODE" = ancestry ]; then
-        printf '%s %s %s %s S Mon Oct 19 11:00:02 2026\\n' ${pgid} ${marked} ${pgid} "$REAP_UID"
-      fi
+      case "$REAP_MODE" in
+        env-failure)
+          printf '%s %s %s %s S Mon Oct 19 11:00:02 2026\\n' ${pgid} "$REAP_WORKER" ${pgid} "$REAP_UID" ;;
+        *)
+          printf '%s 1 %s %s S Mon Oct 19 11:00:01 2026\\n' ${marked} ${source === "ancestry" ? worker : marked} "$REAP_UID"
+          if [ "$REAP_MODE" = ancestry ] || [ "$REAP_MODE" = setsid ]; then
+            printf '%s %s %s %s S Mon Oct 19 11:00:02 2026\\n' ${pgid} ${marked} ${source === "ancestry" ? pgid : marked} "$REAP_UID"
+          fi ;;
+      esac
+    elif [ "$REAP_MODE" = setsid ]; then
+      # Same child, but orphaned and now the leader of its own group.
+      printf '%s 1 %s %s S Mon Oct 19 11:00:02 2026\\n' ${pgid} ${pgid} "$REAP_UID"
     elif [ "$REAP_MODE" = retry ]; then
       printf '%s 1 %s %s S Mon Oct 19 11:00:03 2026\\n' ${successor} ${pgid} "$REAP_UID"
     fi ;;
   -A:-ww:-o) printf '%s fixture-node\\n' ${marked} ;;
-  -A:-E:-ww) printf '%s fixture-node %s=1\\n' ${marked} ${marker} ;;
+  -A:-E:-ww)
+    if [ "$REAP_MODE" = env-failure ]; then echo 'Fixture environment failure' >&2; exit 1; fi
+    printf '%s fixture-node %s=1\\n' ${marked} ${marker} ;;
 esac
 `, { mode: 0o700 });
   const attempt = (mode: string) => exec(process.execPath, ["--input-type=module", "-e", `
     import assert from "node:assert/strict";
+    import fs from "node:fs/promises";
+    import { syncBuiltinESMExports } from "node:module";
     import { assertStageIdle, reapStage } from "./src/upgrade-process.ts";
     import { UpgradePaths } from "./src/upgrade-state.ts";
+    process.env.REAP_WORKER = String(process.pid);
+    if (process.env.REAP_MODE === "env-failure" && process.platform === "linux") {
+      const read = fs.readFile;
+      fs.readFile = (path, ...args) => String(path).startsWith("/proc/")
+        ? Promise.reject(Object.assign(new Error("Fixture environment failure"), { code: "EIO" })) : read(path, ...args);
+      syncBuiltinESMExports();
+    }
     const paths = new UpgradePaths(process.env.REAP_FIXTURE, process.env.REAP_FIXTURE);
     const unlock = paths.lease();
     const signals = [];
@@ -685,7 +706,7 @@ esac
     };
     try {
       const id = ${JSON.stringify(id)};
-      if (process.env.REAP_MODE === "worker") await assertStageIdle(paths, id);
+      if (${workerCheck} && process.env.REAP_MODE === ${JSON.stringify(source)}) await assertStageIdle(paths, id);
       else await reapStage(paths, { version: 1, phase: "staging", id,
         legacy: false, faux: true, port: 8790, old: "a".repeat(40),
         stageProcess: { pid: ${worker}, start: "Mon Oct 19 11:00:00 2026" } });
@@ -696,15 +717,15 @@ esac
   `], { cwd: checkout, env: { PATH: `${scratch}:${process.env.PATH}`, REAP_FIXTURE: scratch,
     REAP_UID: String(process.geteuid!()), REAP_MODE: mode }, timeout: 15_000 });
 
-  // The marked process and (in the ancestry case) its unmarked detached child disappear from the
-  // final table. Neither an idle check before publication nor recovery may discard the detached group.
   const first = attempt(source);
-  if (source === "worker") worker = first.child.pid!;
-  await assert.rejects(first, new RegExp(`Cannot prove staging process group ${pgid} is gone`));
+  if (workerCheck) worker = first.child.pid!;
+  const expected = source === "env-failure" ? /Fixture environment failure/
+    : source === "setsid" ? /Staging still has subprocesses/ : new RegExp(groupError);
+  await assert.rejects(first, expected);
   child.kill("SIGKILL");
   await closed;
   const paths = new UpgradePaths(scratch, scratch);
-  const pending = source === "worker" ? [worker, pgid] : [pgid];
+  const pending = workerCheck ? [worker, ...(source === "setsid" ? [marked] : []), pgid] : [pgid];
   assert.deepEqual(paths.stageGroups(id), pending);
   await assert.rejects(attempt("retry"), new RegExp(`Cannot prove staging processes exited \\(${successor}\\)`));
   assert.deepEqual(paths.stageGroups(id), pending);
