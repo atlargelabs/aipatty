@@ -851,7 +851,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
           "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-mcp", "--append-system-prompt", rules,
           ...(claude === undefined ? [] : ["--provider", "claude-code", "-e", pi.claudeCodeExtension]),
         ], { cwd: repo, env: claude === undefined ? env : {
-          ...env, PATTY_CLAUDE_CODE_MODEL: claude, PATH: env.PATH?.split(delimiter).filter(isAbsolute).join(delimiter),
+          ...env, PATTY_CLAUDE_CODE_MODEL: claude, PATH: env.PATH?.split(delimiter).filter(isAbsolute).join(delimiter) || "/usr/bin:/bin",
         }, stdio: ["pipe", "pipe", "pipe"], detached: true });
         launched = true;
         held.add(child);

@@ -637,6 +637,9 @@ test("after a crash, the next start stops the surviving processes, cleans up, an
   const checkpoint = await until(async () => JSON.parse(await readFile(join(config.dataDir, "pi-run.json"), "utf8")),
     saved => saved.procs.length >= 2);
   assert.equal(checkpoint.asOf, 0, "new records keep the legacy numeric field without an ownership cutoff");
+  // Recording the child can race with flushing the earlier publication event; the recovery assertions
+  // below depend on the event having reached the archive before the simulated crash.
+  await until(async () => (await readFile(join(checkpoint.logDir, "events.jsonl"), "utf8")).includes(prUrl));
   host.kill("SIGKILL");
   await exited;
   const [pi] = await launches(config);

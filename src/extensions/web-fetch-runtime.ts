@@ -16,6 +16,19 @@ export function childEnv(): NodeJS.ProcessEnv {
   };
 }
 
+/** Require an operator-provisioned filtering proxy; never let Chrome fall back to direct egress. */
+export function egressProxy(): string {
+  try {
+    const url = new URL(process.env.PI_WEB_FETCH_EGRESS_PROXY ?? "");
+    if (["http:", "https:"].includes(url.protocol) && url.pathname === "/" && !url.username && !url.password && !url.search && !url.hash) {
+      return url.origin;
+    }
+  } catch {
+    // Missing or invalid proxy configuration must not enable direct browsing.
+  }
+  throw new Error("Set PI_WEB_FETCH_EGRESS_PROXY to the HTTP(S) origin of a trusted proxy that blocks private destinations at connection time");
+}
+
 export function extractorPath(): string {
   const path = process.env.PI_WEB_FETCH_TRAFILATURA;
   if (path && isAbsolute(path)) {
