@@ -249,10 +249,10 @@ function keepChatPlace(change) {
     if (children[i].getBoundingClientRect().bottom <= top) lo = i + 1; else hi = i;
   }
   const anchor = children[lo];
-  const offset = anchor?.getBoundingClientRect().top;
+  const offset = anchor && anchor.getBoundingClientRect().top - top;
   change();
   if (atBottom) box.scrollTop = box.scrollHeight;
-  else if (anchor) box.scrollTop += anchor.getBoundingClientRect().top - offset;
+  else if (anchor) box.scrollTop += anchor.getBoundingClientRect().top - box.getBoundingClientRect().top - offset;
 }
 
 function openRun(button, source) {
@@ -361,7 +361,7 @@ function renderRun(snapshot, durationMs) {
   }
   if (snapshot.stderr) {
     add("h3", "Pi stderr");
-    add("pre", shown(snapshot.stderr));
+    add("pre", (snapshot.stderr.truncated ? "[Earlier stderr omitted]\\n" : "") + snapshot.stderr.text);
   }
 }
 

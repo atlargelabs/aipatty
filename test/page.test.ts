@@ -4,7 +4,7 @@ import type { Tx } from "@earendil-works/pi-durable";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { startApi } from "../src/api.ts";
@@ -173,9 +173,10 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   const first = "20260101T010101-aaaaaaaa", second = "20260101T020202-bbbbbbbb", missing = "20260101T030303-cccccccc";
   const duplicate = "20260101T040404-dddddddd";
   const markup = '<img src="x" onerror="window.bad = true">';
-  await archivedPiRun(dir, first, { summary: "First archive " + markup }, JSON.stringify({
+  const firstArchive = await archivedPiRun(dir, first, { summary: "First archive " + markup }, JSON.stringify({
     type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Visible activity" }] },
   }) + "\n");
+  await writeFile(join(firstArchive, "stderr.log"), "x".repeat(15_000) + "recent diagnostic");
   await archivedPiRun(dir, second, { summary: "Second archive", status: "failed", durationMs: 65_000 });
   await archivedPiRun(dir, duplicate, { summary: "Duplicate-ID archive" });
   const call = (task: string, id: string) => fauxToolCall("pi", { task }, { id });
@@ -236,11 +237,21 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   assert.equal(await browser.evaluate(`document.querySelector('#entries').textContent.includes('→ bash {"command":"echo fixture"}')`), true);
   assert.equal(await browser.evaluate(`document.querySelector('#entries').textContent.includes('Do not show the rest of the task')`), false);
 
-  await browser.evaluate(`window.openerButton = document.querySelector('.assistant .pi-call'); window.openerButton.focus()`);
+  // This desktop width wraps the controls when the side pane narrows the transcript.
+  await browser.viewport(905, 850);
+  const chatOffset = `document.querySelector('#entries .entry').getBoundingClientRect().top - document.querySelector('#transcript').getBoundingClientRect().top`;
+  await browser.evaluate(`
+    document.querySelector('#transcript').scrollTop = 0;
+    window.entryOffset = ${chatOffset};
+    window.openerButton = document.querySelector('.assistant .pi-call');
+    window.openerButton.focus({ preventScroll: true });
+  `);
   await browser.key("Enter");
   const content = await shows("First archive");
   assert.match(content, /completed · 0m 2s/);
   assert.ok(content.includes(markup) && content.includes("Visible activity"));
+  assert.match(content.trimEnd(), /Pi stderr\[Earlier stderr omitted\][^]*recent diagnostic$/);
+  assert.equal(await browser.evaluate(`(${chatOffset}) === window.entryOffset`), true);
   assert.equal(await browser.evaluate(`!!document.querySelector('#pi-run img') || !!window.bad`), false);
   assert.equal(await browser.evaluate(`document.querySelector('main').getBoundingClientRect().right <= document.querySelector('#pi-run').getBoundingClientRect().left`), true);
   await browser.key("Escape");

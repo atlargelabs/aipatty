@@ -99,8 +99,8 @@ Pi stderr, and the final result. It links only to PRs and issues the host confir
 and reviewed SHA **at the time of the run**, not current GitHub state.
 
 Use **Refresh** for a new snapshot while Pi runs; there is no live terminal, automatic following, or input to Pi.
-Refused requests have no run. A completed run can be replayed after its clone is deleted, as long as its result
-record and logs are still present. Output is a bounded excerpt, not a complete transcript. It can contain sensitive
+Refused requests have no run. A completed run's result remains readable after its clone is deleted if its archive
+is retained. Output depends on the available logs and is a bounded excerpt, not a complete transcript. It can contain sensitive
 information printed by the run, so treat the pane like the rest of the loopback/SSH-only API.
 
 ## Install
