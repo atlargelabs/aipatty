@@ -812,6 +812,37 @@ test("two conversation branches get isolated Pi clones and snapshots; aborting o
   assert.equal((await host.branch(branch)).cost, 0.75);
 });
 
+test("a branch abort waiting on Pi finalization does not delay another branch's admission or abort", { timeout: 45_000 }, async t => {
+  const config = await setup(t);
+  const host = await openHost(config);
+  t.after(() => host.close());
+  const root = (await host.conversation("root"))!;
+  const side = await host.fork(root, { title: "Independent abort" });
+  const branch = (await host.conversation(String(side.id)))!;
+  const gate = join(config.dataDir, "gh-go");
+  await github(config, { ...openPr, waitFor: gate });
+  await scenario(config, [...review("c1", "r1"), assistant(report()), settled], {}, root.id);
+  await scenario(config, [assistant("Working on B.", 0.25, "toolUse"), { ready: "b-active", hang: true }], {}, branch.id);
+  const first = await host.submit(root, { type: "input", content: 'call pi {"task":"Publish from A."}' });
+  await until(() => existsSync(join(config.dataDir, "fake-gh-calls.txt")), Boolean, 20_000);
+  const abortingA = host.abort(root);
+  try {
+    const second = await host.submit(branch, { type: "input", content: 'call pi {"task":"Work on B.","pr":false}' });
+    await until(() => existsSync(flag(config, "b-active")), Boolean, 10_000);
+    await host.abort(branch);
+    assert.equal((await second.wait(ctx)).status, "unanswered");
+    assert.equal(host.runs.hasActive(), true, "A is still finalizing its PR result");
+    assert.equal((await host.branch(branch)).cost, 0.25);
+    await assert.rejects(host.reserveUpgrade(), /Wait for every branch to finish/);
+  } finally {
+    await writeFile(gate, "go");
+    await abortingA;
+  }
+  assert.equal((await first.wait(ctx)).status, "unanswered");
+  assert.equal((await host.branch(root)).cost, 0.75);
+  assert.equal(host.runs.hasActive(), false);
+});
+
 test("concurrent finishes preserve both archives and charge each actual branch only once across restart", { timeout: 60_000 }, async t => {
   const config = await setup(t);
   const host = await openHost(config);
@@ -1048,6 +1079,11 @@ test("an outcome settled before the harness committed it survives a restart, and
   assert.deepEqual(await ahead.settled(105), outcome);
   assert.deepEqual(await pendingRecords(config), []);
   assert.equal(ahead.hasActive(), false);
+
+  await rm(taskIndex(config, 105));
+  await writeFile(archive, "{ cannot read this archive");
+  await assert.rejects(ahead.settled(105, 5), /archive of unknown ownership is unreadable: .*result\.json/);
+  assert.equal(await readFile(archive, "utf8"), "{ cannot read this archive");
 });
 
 test("a cut-off continuation charges the new attempt once, and never the earlier one again", { timeout: 60_000 }, async t => {
@@ -1216,16 +1252,25 @@ test("restart completes cleanup after a spend checkpoint without counting the sa
   assert.ok(!existsSync(checkpoint));
 });
 
-test("a manifest I/O error with a clone holds cleanup, but a discarded job's unreadable audit trail doesn't", async t => {
+test("manifest I/O failure holds cleanup for a possible owned job, not for a discarded job or old unrelated clone", async t => {
   const config = await setup(t);
   const dir = join(config.pi.agentDir, "delegates/jobs/bad-read");
+  const old = join(config.pi.agentDir, "delegates/jobs/old-retained");
+  await mkdir(join(old, "workspace"), { recursive: true });
+  await mkdir(join(old, "job.json"));
+  for (const path of [old, join(old, "job.json")]) await utimes(path, new Date(0), new Date(0));
+  t.mock.method(console, "error", () => {});
+  const done = [assistant(report({ issue: null, pr: null })), settled];
+  await scenario(config, [{ ready: "before-io", waitFor: "after-io" }, ...done]);
+  const runs = await openPiRuns(config);
+  t.after(() => runs.close());
+  const running = runs.run(request({ pr: false }));
+  await until(() => existsSync(flag(config, "before-io")));
   await mkdir(join(dir, "workspace"), { recursive: true });
   await mkdir(join(dir, "job.json")); // A read error rather than a parse error: the scan might be incomplete.
   await writeFile(join(dir, "discarded"), new Date().toISOString()); // The marker alone can't vouch for the clone.
-  t.mock.method(console, "error", () => {});
-  await scenario(config, [assistant(report({ issue: null, pr: null })), settled]);
-  const runs = await openPiRuns(config);
-  const result = await runs.run(request({ pr: false }));
+  await writeFile(flag(config, "after-io"), "go");
+  const result = await running;
   assert.equal(result.status, "failed");
   assert.equal(result.usageComplete, false);
   assert.match(result.problems.join("\n"), /Delegate job bad-read could not be read/);
@@ -1237,6 +1282,7 @@ test("a manifest I/O error with a clone holds cleanup, but a discarded job's unr
   assert.equal((await reopened.settled(101))?.status, "failed");
   assert.equal((await reopened.run(request({ conversationId: 2, taskId: 102, pr: false }))).status, "completed");
   assert.ok(existsSync(join(dir, "job.json")));
+  assert.ok(existsSync(join(old, "workspace")), "the unrelated historical clone was neither adopted nor deleted");
 });
 
 test("nothing is launched without a saved record, and a record that cannot be removed holds only its branch", async t => {

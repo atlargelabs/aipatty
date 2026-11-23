@@ -443,15 +443,20 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     // The pointer is only an index. On a miss or damage, look for precisely this call's archive, without
     // overwriting evidence or choosing by recency. Only interruption/abort recovery uses this lookup.
     let found: RunOutcome | undefined;
+    let unreadable: string | undefined;
     for (const dir of await readdir(logRoot, { withFileTypes: true })) {
       if (!dir.isDirectory() || !validRunId(dir.name)) continue;
-      const copy = await logged(dir.name).catch(() => undefined);
+      const copy = await logged(dir.name).catch(error => {
+        unreadable ??= `${join(logRoot, dir.name, "result.json")} (${clip(message(error), 200)})`;
+        return undefined;
+      });
       if (!isCall(copy, taskId, conversationId)) continue;
       if (found) throw new Error(`More than one Pi archive matches task ${taskId}.`);
       found = copy.outcome;
     }
     if (found) return found;
     if (held?.taskId === taskId) throw new Error(held.reason);
+    if (unreadable) throw new Error(`Could not recover a Pi outcome for task ${taskId}; an archive of unknown ownership is unreadable: ${unreadable}.`);
     if (damaged) throw new Error(`Could not locate a Pi archive for task ${taskId} after its outcome index failed. Check ${logRoot}.`);
     return undefined;
   };
@@ -470,8 +475,9 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       const dir = join(jobsDir, id);
       // A job directory that is a link could lead anywhere.
       if (!await ownDir(jobsDir, dir)) continue;
+      const manifest = join(dir, "job.json");
       try {
-        const job = await readJson<JobManifest>(join(dir, "job.json"));
+        const job = await readJson<JobManifest>(manifest);
         if (job && typeof job === "object") jobs.set(id, job);
         // A job the run reported is the run's, with or without a manifest: its logs are kept and its clone goes.
         else if (trace.countedJobs.has(id)) jobs.set(id, {});
@@ -480,9 +486,17 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
           // A discarded job with no clone or lease cannot leave an outstanding workspace from this run, and
           // a stale unreadable audit trail must not break every branch. Other I/O failures may leave the scan
           // incomplete: don't mark spend reconciled or clear the record in that case.
-          const discarded = (await typeOf(join(dir, "discarded")))?.isFile() && !await typeOf(join(dir, "workspace"))
-            && !await typeOf(join(dir, "lease.json"));
-          if (!discarded) throw new Error(`Delegate job ${id} could not be read: ${message(error)}`);
+          const lease = await typeOf(join(dir, "lease.json"));
+          const discarded = !lease && (await typeOf(join(dir, "discarded")))?.isFile() && !await typeOf(join(dir, "workspace"));
+          if (!discarded) {
+            // Creating a fresh job or claiming a continuation changes the directory/lease. Age only rules
+            // out an unreported historical job here; it never establishes ownership for deletion or spend.
+            const start = Date.parse(saved.startedAt);
+            const older = !trace.countedJobs.has(id) && !trace.continuing.has(id)
+              && ((await typeOf(dir))?.mtimeMs ?? Infinity) < start
+              && ((await typeOf(manifest))?.mtimeMs ?? Infinity) < start && (!lease || lease.mtimeMs < start);
+            if (!older) throw new Error(`Delegate job ${id} could not be read: ${message(error)}`);
+          }
         }
         // Recency is not ownership: another Pi can be writing a job now. Without a reported ID or readable
         // provenance, leave the manifest, logs and clone untouched and do not include its spend in this run.

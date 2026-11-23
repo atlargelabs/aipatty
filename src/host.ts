@@ -43,9 +43,9 @@ export interface ModelStatus {
 
 export interface AgentHost {
   harness: Harness;
-  /** The `pi` run slot. */
+  /** Managed Pi runs, each owned by its conversation branch. */
   runs: PiRuns;
-  /** Stop the active `pi` run, leaving its result to the next start, then close the harness. */
+  /** Stop all active Pi runs, leaving interrupted results to the next start, then close the harness. */
   close(): Promise<void>;
   /** `root` or a branch's numeric ID; task-owned conversations are not branches. */
   conversation(id: string): Promise<Conversation | undefined>;
@@ -53,8 +53,8 @@ export interface AgentHost {
   modelStatus(conversation?: Conversation): Promise<ModelStatus>;
   models(): { provider: string; modelId: string; name: string }[];
   /**
-   * `setModel`, `setThinking` and `submit` wait their turn on one admission line, behind any abort. Given the caller's
-   * `context`, a call whose context was cancelled while it waited rejects when its turn comes and changes nothing.
+   * `setModel`, `setThinking` and `submit` wait behind aborts on their own branch. Given the caller's `context`,
+   * a call whose context was cancelled while it waited rejects when its turn comes and changes nothing.
    */
   setModel(model: ModelRef & { thinkingLevel?: ModelThinkingLevel }, conversation?: Conversation, context?: Context): Promise<void>;
   setThinking(level: string, conversation?: Conversation, context?: Context): Promise<void>;
@@ -145,7 +145,7 @@ async function forkPoint(from: Conversation, at: number | undefined, before: num
 
 async function openOwnedHost(config: Config): Promise<AgentHost> {
   const models = await openModels(config);
-  // Before any conversation resumes: stop and clean up a run the previous process left behind.
+  // Before any conversation resumes: stop and clean up runs the previous process left behind.
   const runs = await openPiRuns(config);
   await mkdir(config.workDir, { recursive: true, mode: 0o700 });
   const storage = await openNodeSqliteStorage(join(config.dataDir, "aipatty.sqlite"));
@@ -198,9 +198,8 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
     const recovered: Conversation[] = [];
     let upgrading = false;
 
-    // Serialize admission, aborts and model changes: no input may slip between the busy check and configure(),
-    // or be admitted while aborted work is still settling, where it would never start. A call made by a turn that was
-    // aborted while the call waited here is dropped: its `context` is cancelled by the time the abort lets it through.
+    // The host line keeps busy checks/configuration, stale-model recovery and the all-idle upgrade gate atomic
+    // with respect to admissions. Do not hold it while waiting for an ordinary branch abort to settle.
     let tail = Promise.resolve();
     function exclusive<T>(fn: () => Promise<T>, context?: Context): Promise<T> {
       const result = tail.then(() => {
@@ -208,6 +207,18 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
         return fn();
       });
       tail = result.then(() => {}, () => {});
+      return result;
+    }
+    // A new input on an aborting branch would be stranded if it slipped in before that branch went idle.
+    // Preserve its admission order and context checks, without making other branches wait for cleanup.
+    const branchTails = new Map<ConversationId, Promise<void>>();
+    const aborting = new Set<ConversationId>();
+    function onBranch<T>(target: Conversation, fn: () => Promise<T>): Promise<T> {
+      const previous = branchTails.get(target.id);
+      const result = previous ? previous.then(fn) : fn();
+      const next = result.then(() => {}, () => {});
+      branchTails.set(target.id, next);
+      void next.then(() => { if (branchTails.get(target.id) === next) branchTails.delete(target.id); });
       return result;
     }
     const unavailableError = async (id: ConversationId) => {
@@ -271,7 +282,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
       harness,
       runs,
       async close() {
-        // First, so the run is left for the next start to report, not settled as an abort.
+        // First, so interrupted runs are left for the next start to report, not settled as aborts.
         await runs.close();
         await harness.close(ctx);
       },
@@ -285,7 +296,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
         return exclusive(async () => {
           if (upgrading) throw new HttpError(409, "An upgrade is already in progress");
           const { tasks, submissions } = await harness.inspect(ctx);
-          if (tasks.length || submissions.length || runs.hasActive()) {
+          if (tasks.length || submissions.length || aborting.size || runs.hasActive()) {
             throw new HttpError(409, "Wait for every branch to finish, or abort it, before upgrading");
           }
           upgrading = true;
@@ -293,7 +304,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
         });
       },
       async setModel({ thinkingLevel, ...next }, target = root, context) {
-        await exclusive(async () => {
+        await onBranch(target, () => exclusive(async () => {
           if (!models.getModel(next.provider, next.modelId)) {
             throw new HttpError(400, `Unknown model ${next.provider}/${next.modelId}; list available models with 'aipatty models'`);
           }
@@ -320,14 +331,14 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
           harness.resume();
           // An input admitted while the aborted tasks are still settling would never start.
           for (const done of recovered.splice(0)) await done.waitForIdle(ctx);
-        }, context);
+        }, context));
       },
       setThinking(level, target = root, context) {
-        return exclusive(async () => {
+        return onBranch(target, () => exclusive(async () => {
           const thinkingLevel = thinkingLevels.find(value => value === level);
           if (!thinkingLevel) throw new HttpError(400, `Expected a thinking level: ${thinkingLevels.join(", ")}`);
           await target.configure({ thinkingLevel }, ctx);
-        }, context);
+        }, context));
       },
       async branches() {
         const records = [];
@@ -391,18 +402,25 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
       },
       totalCost,
       submit(target, draft, context) {
-        return exclusive(async () => {
+        return onBranch(target, () => exclusive(async () => {
           if (upgrading) throw new HttpError(409, "An upgrade is in progress; send again when it has finished");
           await assertAvailable(target);
           const submission = await target.submit(draft, ctx);
           logFailure(submission);
           return submission;
-        }, context);
+        }, context));
       },
       abort(target) {
-        return exclusive(async () => {
-          await assertRunning(target.id);
-          await target.abort(ctx);
+        return onBranch(target, async () => {
+          await exclusive(async () => {
+            await assertRunning(target.id);
+            aborting.add(target.id);
+          });
+          try {
+            await target.abort(ctx);
+          } finally {
+            aborting.delete(target.id);
+          }
         });
       },
       conversation,
