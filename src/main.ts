@@ -1,13 +1,19 @@
 import { execFileSync } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import packageJson from "../package.json" with { type: "json" };
-import { startApi } from "./api.ts";
+import { startApi, type Health } from "./api.ts";
 import { LOOPBACK, readConfig } from "./config.ts";
 import { openHost } from "./host.ts";
+import { pendingUpgrade, selfCheck, settleUpgrade, upgradeRequest } from "./upgrade.ts";
+
+/** The checkout this server runs from. */
+const release = realpathSync(fileURLToPath(new URL("../", import.meta.url)));
 
 function runningCommit(): string {
   try {
     return execFileSync("git", ["rev-parse", "--verify", "HEAD"], {
-      cwd: new URL("../", import.meta.url),
+      cwd: release,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 1_000,
@@ -18,13 +24,16 @@ function runningCommit(): string {
 }
 
 async function main(): Promise<void> {
-  const health = {
-    ok: true as const,
+  const health: Health = {
+    ok: true,
     commit: runningCommit(),
     startedAt: new Date().toISOString(),
     version: packageJson.version,
+    pid: process.pid,
   };
   const config = readConfig();
+  // Set when an upgrade supervisor started this server as its new release.
+  const pending = pendingUpgrade(config, health.commit);
   const stopping = Promise.withResolvers<void>();
   const stop = () => stopping.resolve();
   process.on("SIGINT", stop);
@@ -39,10 +48,21 @@ async function main(): Promise<void> {
       }
     });
     try {
-      const api = await startApi(agent, health, config.port, { onShutdown: stop });
-      console.log(`aipatty listening on ${LOOPBACK}:${api.port}`);
-      await Promise.race([stopping.promise, closed]);
-      await api.close();
+      health.problems = await selfCheck(agent, config);
+      for (const problem of health.problems) console.error("Health check:", problem);
+      if (pending && health.problems.length) throw new Error(`Health check failed: ${health.problems.join("; ")}`);
+      let port = config.port;
+      const api = await startApi(agent, health, port, {
+        onShutdown: stop, onUpgrade: upgradeRequest(agent, config, release, () => port),
+      });
+      port = api.port;
+      try {
+        await settleUpgrade(agent, config, pending, health.commit);
+        console.log(`aipatty listening on ${LOOPBACK}:${api.port}`);
+        await Promise.race([stopping.promise, closed]);
+      } finally {
+        await api.close();
+      }
     } finally {
       await agent.close();
       await closed;

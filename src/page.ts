@@ -2,6 +2,7 @@
  * The crude web page: branch list, transcript, input box, fork, rename, model picker and cost. Served by the API
  * with a strict CSP, so the script is a separate same-origin file and every value is rendered as text.
  */
+import { upgradeEntryKind } from "./protocol.ts";
 
 export const pageHtml = `<!doctype html>
 <html lang="en">
@@ -214,6 +215,9 @@ function entryNode(entry, message) {
 function entryNodes(entries) {
   const nodes = [];
   for (const entry of entries) {
+    if (entry.kind === ${JSON.stringify(upgradeEntryKind)} && entry.data && typeof entry.data.text === "string") {
+      nodes.push(entryNode(entry, { role: "upgrade", content: entry.data.text }));
+    }
     for (const message of entry.model || []) {
       if (messageText(message)) nodes.push(entryNode(entry, message));
     }

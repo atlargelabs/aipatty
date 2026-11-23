@@ -79,6 +79,11 @@ export interface AgentHost {
   assertRunning(): Promise<void>;
   /** Throw 409 unless scheduling runs and the branch's saved model is available. */
   assertAvailable(conversation?: Conversation): Promise<void>;
+  /**
+   * Throw 409 unless every branch is idle and no `pi` run is active. Otherwise no message is admitted until the
+   * returned function is called: an upgrade must not stop the server in the middle of new work.
+   */
+  reserveUpgrade(): Promise<() => void>;
 }
 
 /** Open paused, so an unavailable saved model never executes interrupted work. */
@@ -191,6 +196,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
     if (!blocked.size) harness.resume();
     // Branches recovered while others were still blocked: their aborted work settles once scheduling resumes.
     const recovered: Conversation[] = [];
+    let upgrading = false;
 
     // Serialize admission, aborts and model changes: no input may slip between the busy check and configure(),
     // or be admitted while aborted work is still settling, where it would never start. A call made by a turn that was
@@ -275,6 +281,17 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
         .sort((a, b) => a.provider.localeCompare(b.provider) || a.modelId.localeCompare(b.modelId)),
       assertRunning: () => assertRunning(),
       assertAvailable,
+      reserveUpgrade() {
+        return exclusive(async () => {
+          if (upgrading) throw new HttpError(409, "An upgrade is already in progress");
+          const { tasks, submissions } = await harness.inspect(ctx);
+          if (tasks.length || submissions.length || runs.active()) {
+            throw new HttpError(409, "Wait for every branch to finish, or abort it, before upgrading");
+          }
+          upgrading = true;
+          return () => { upgrading = false; };
+        });
+      },
       async setModel({ thinkingLevel, ...next }, target = root, context) {
         await exclusive(async () => {
           if (!models.getModel(next.provider, next.modelId)) {
@@ -375,6 +392,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
       totalCost,
       submit(target, draft, context) {
         return exclusive(async () => {
+          if (upgrading) throw new HttpError(409, "An upgrade is in progress; send again when it has finished");
           await assertAvailable(target);
           const submission = await target.submit(draft, ctx);
           logFailure(submission);

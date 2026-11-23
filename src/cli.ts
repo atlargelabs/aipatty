@@ -4,7 +4,7 @@ import { on } from "node:events";
 import WebSocket, { type RawData } from "ws";
 import { LOOPBACK, readFaux, readPort } from "./config.ts";
 import type { BranchInfo, SearchMatch } from "./branches.ts";
-import { failureText, messageText, shutdownHeader, type ConversationPage, type StreamFrame } from "./protocol.ts";
+import { failureText, messageText, shutdownHeader, upgradeText, type ConversationPage, type StreamFrame } from "./protocol.ts";
 import { branchLine } from "./tools.ts";
 
 /** The conversation path of a branch ID, or the root's. */
@@ -36,11 +36,16 @@ async function request<T>(base: URL, path: string, options?: RequestInit): Promi
 }
 
 async function send(base: URL, content: string, root: string): Promise<void> {
-  const { submissionId } = await request<{ submissionId: number }>(base, `${root}/messages`, {
+  const { submissionId } = await request<{ submissionId?: number }>(base, `${root}/messages`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content, requestId: randomUUID() }),
   });
+  if (submissionId === undefined) {
+    // `/upgrade` is the server's command, not a message with an answer to stream.
+    console.log("Upgrade started. The server restarts if it succeeds; the result appears in this branch's log.");
+    return;
+  }
   const url = new URL(`${root}/stream?submissionId=${submissionId}`, base);
   url.protocol = "ws:";
   const socket = new WebSocket(url);
@@ -87,6 +92,8 @@ async function log(base: URL, root: string, limit?: number): Promise<void> {
   let entries = pages.reverse().flatMap(page => page.entries);
   if (limit !== undefined) entries = entries.slice(-limit);
   for (const entry of entries) {
+    const upgrade = upgradeText(entry);
+    if (upgrade) console.log(limit === undefined ? `upgrade: ${upgrade}` : `[${entry.id}] upgrade: ${upgrade}`);
     for (const message of entry.model ?? []) {
       const text = messageText(message);
       if (text) console.log(limit === undefined ? `${message.role}: ${text}` : `[${entry.id}] ${message.role}: ${text}`);
@@ -97,7 +104,7 @@ async function log(base: URL, root: string, limit?: number): Promise<void> {
 const usage = `Usage: aipatty [--port <n>] [--branch <id>] <command>
   health | models | shutdown
   model set [provider] <modelId> | thinking set <level>
-  send "<text>" | abort | log
+  send "<text>" | send /upgrade | abort | log
   branches [list] | branches read <id> [--limit <n>] | branches search <id> "<text>"
   fork "<title>" [--at <entryId>] | rename "<title>"
 --branch selects the branch for model, thinking, send, abort, log, fork and rename; default the root.

@@ -6,7 +6,7 @@ import WebSocket, { WebSocketServer } from "ws";
 import { LOOPBACK } from "./config.ts";
 import { HttpError, type AgentHost } from "./host.ts";
 import { pageCss, pageHtml, pageJs } from "./page.ts";
-import { messageText, shutdownHeader, streamState, streamUpdate, type StreamFrame } from "./protocol.ts";
+import { messageText, shutdownHeader, streamState, streamUpdate, upgradeCommand, type StreamFrame } from "./protocol.ts";
 import { transcriptPage } from "./transcript.ts";
 
 const maxBody = 64 * 1024;
@@ -88,8 +88,7 @@ async function jsonBody(req: IncomingMessage): Promise<Record<string, unknown>> 
   return value as Record<string, unknown>;
 }
 
-async function messageDraft(req: IncomingMessage): Promise<InputSubmissionDraft> {
-  const { content, requestId, whenBusy } = await jsonBody(req);
+function messageDraft({ content, requestId, whenBusy }: Record<string, unknown>): InputSubmissionDraft {
   if (typeof content !== "string" || !content.trim()) throw new HttpError(400, "Expected non-empty content");
   if (requestId !== undefined && (typeof requestId !== "string" || !requestId.trim() || requestId.length > 256)) {
     throw new HttpError(400, "requestId must be a non-empty string of at most 256 characters");
@@ -119,7 +118,7 @@ function requireMethod(req: IncomingMessage, res: ServerResponse, method: string
 
 async function handleHttp(
   agent: AgentHost, health: Health, req: IncomingMessage, res: ServerResponse,
-  shutdown?: (res: ServerResponse) => void,
+  shutdown?: (res: ServerResponse) => void, upgrade?: (conversation: Conversation) => Promise<void>,
 ) {
   const { pathname, searchParams } = requestUrl(req);
   if (pathname === "/api/shutdown" && shutdown) {
@@ -185,7 +184,15 @@ async function handleHttp(
   if (!conversation) throw new HttpError(404, "Conversation not found");
 
   if (action === "messages") {
-    const submission = await agent.submit(conversation, await messageDraft(req));
+    const body = await jsonBody(req);
+    if (typeof body.content === "string" && body.content.trim() === upgradeCommand) {
+      // The operator's command, not a message: no model turn runs for it.
+      if (!upgrade) throw new HttpError(409, "This server cannot upgrade itself");
+      await upgrade(conversation);
+      sendJson(res, 202, { upgrade: "started" });
+      return;
+    }
+    const submission = await agent.submit(conversation, messageDraft(body));
     sendJson(res, 202, { submissionId: submission.id });
   } else if (action === "abort") {
     await agent.abort(conversation);
@@ -340,6 +347,9 @@ export interface Health {
   commit: string;
   startedAt: string;
   version: string;
+  pid?: number;
+  /** What the startup health check found wrong; empty when the release has what it needs. */
+  problems?: string[];
 }
 
 /**
@@ -348,8 +358,8 @@ export interface Health {
  * not linger.
  */
 export async function startApi(agent: AgentHost, health: Health, port: number, {
-  heartbeatMs = defaultHeartbeatMs, onShutdown,
-}: { heartbeatMs?: number; onShutdown?: () => void } = {}) {
+  heartbeatMs = defaultHeartbeatMs, onShutdown, onUpgrade,
+}: { heartbeatMs?: number; onShutdown?: () => void; onUpgrade?: (conversation: Conversation) => Promise<void> } = {}) {
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 });
   const streams: Streams = { controllers: new Set(), alive: new WeakSet() };
   const heartbeat = setInterval(() => {
@@ -375,7 +385,7 @@ export async function startApi(agent: AgentHost, health: Health, port: number, {
     sendJson(res, 202, { status: "shutdown-requested" });
   });
   const server = createServer({ requestTimeout: 30_000, headersTimeout: 10_000 }, (req, res) => {
-    void handleHttp(agent, health, req, res, shutdown).catch(error => {
+    void handleHttp(agent, health, req, res, shutdown, onUpgrade).catch(error => {
       if (res.destroyed) return;
       const { status, message } = errorResponse(error);
       if (!req.complete) res.shouldKeepAlive = false;

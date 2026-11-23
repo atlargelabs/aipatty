@@ -5,6 +5,8 @@ import { parseArgs } from "node:util";
 
 /** Server settings. */
 export interface Config {
+  /** The `--install-dir` root, when the directories below derive from one. */
+  installDir?: string;
   dataDir: string;
   port: number;
   /** The pi CLI's login file. */
@@ -103,6 +105,7 @@ export function readConfig(args: readonly string[] = process.argv.slice(2), env:
   const root = values["install-dir"] === undefined ? undefined : absolutePath(values["install-dir"]);
   const piDir = absolutePath(values["pi-dir"] ?? (root === undefined ? "~/.pi/agent" : join(root, "pi")));
   return {
+    ...(root === undefined ? {} : { installDir: root }),
     dataDir: absolutePath(values["data-dir"] ?? (root === undefined
       ? (faux ? "~/.aipatty/faux" : "~/.aipatty/data") : join(root, faux ? "faux" : "data"))),
     port: readPort(values.port, 0),
