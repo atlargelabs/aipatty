@@ -409,6 +409,9 @@ test("command is explicit, serialized across branches, survives cutover and deli
   const { id, requestKey } = f.paths.load()!;
   assert.match(response.stdout, new RegExp(id));
   assert.equal(f.paths.load()?.branch, branch);
+  const inFlightRetry = await f.send("/upgrade", branch, { marker: "1", requestId: requestKey });
+  assert.equal(inFlightRetry.status, 202);
+  assert.deepEqual(await inFlightRetry.json(), { upgradeId: id });
   assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 409);
   assert.equal((await f.send('call pi {"task":"not admitted","pr":false}')).status, 409);
   assert.equal((await f.healthNow())?.pid, old.child.pid);
@@ -757,6 +760,12 @@ test("interrupted legacy bootstrap leaves the old app running and requires ackno
   await assert.rejects(f.supervisor(target, "recover", "--ack-interrupted-stage", id), /during legacy ownership check/);
   assert.equal(f.paths.load()?.phase, "staging");
   await f.unflag(inspectionFailure);
+  const ownerFile = join(f.paths.data, "owner.sqlite");
+  await chmod(ownerFile, 0o660);
+  try {
+    await assert.rejects(f.supervisor(target, "recover", "--ack-interrupted-stage", id), /owner\.sqlite during legacy ownership check/);
+    assert.equal(f.paths.load()?.phase, "staging");
+  } finally { await chmod(ownerFile, 0o600); }
   assert.match((await f.supervisor(target, "recover", "--ack-interrupted-stage", id)).stdout, /Operator acknowledged interrupted staging/);
   assert.ok(existsSync(f.paths.stage(id)));
   assert.ok(await f.health(f.old));
@@ -851,6 +860,20 @@ test("candidate readiness rolls back if the durable upgrade request cannot be re
   assert.equal(f.paths.load()?.target, target);
   assert.equal(f.paths.selected(), f.old);
   assert.match((await f.cli("log")).stdout, /Faux reply: history before upgrade/);
+});
+
+test("a candidate's invalid HTTP health response is kept in the rollback result", { timeout }, async t => {
+  const f = await fixture(t);
+  f.launch();
+  await f.health(f.old);
+  const api = join(f.repo, "src/api.ts"), code = await readFile(api, "utf8");
+  const health = "sendJson(res, 200, { ...health, ...await agent.modelStatus() });";
+  assert.ok(code.includes(health));
+  await writeFile(api, code.replace(health, 'sendJson(res, 500, { error: "fixture health error" });'));
+  await f.next("candidate HTTP health error");
+  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
+  assert.match(JSON.stringify((await f.result(f.paths.load()!.id))[0].data), /Upgrade rolled back.*Invalid health response \(HTTP 500\)/);
+  assert.equal(f.paths.selected(), f.old);
 });
 
 test("first bootstrap can roll back to a legacy app when the candidate serves the wrong SHA", { timeout }, async t => {

@@ -143,6 +143,10 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
       assertSelected(paths, source, commit);
       ownedFile(join(source, "src/upgrade-supervisor.ts"));
     } catch (error) { throw new HttpError(409, errorText(error)); }
+    const key = `${target.id}:${requestKey}`;
+    // An accepted retry is a read, not a new admission. The transaction still checks the key for new work.
+    const prior = await agent.harness.snapshot(RequestDoc, key, ctx);
+    if (prior?.accepted && prior.id) return prior.id;
     const unblock = await agent.reserveUpgrade(target);
     let handed = false;
     let committed = false;
@@ -230,7 +234,7 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
         // No model turn is started. The operator's command is complete when this entry is durably stored (default
         // immediate Durable commit). Only then can any helper take ownership, let alone ask the app to stop.
         const accepted = await target.commit(async tx => {
-          const request = await tx.doc(RequestDoc, `${target.id}:${requestKey}`, null);
+          const request = await tx.doc(RequestDoc, key, null);
           if (request.id) {
             if (!request.accepted) throw new HttpError(409, "That upgrade command did not commit. Send a fresh /upgrade if still wanted.");
             return request.id;

@@ -52,9 +52,16 @@ function localJson(port: number, path: string, method: string, agent: Agent | fa
   });
 }
 
+class InvalidHealthResponse extends Error {}
+
 export async function getHealth(port: number): Promise<UpgradeHealth> {
-  const { code, value } = await localJson(port, "/health", "GET", false);
-  if (code !== 200 || !value || typeof value !== "object") throw new Error(`Invalid health response (HTTP ${code})`);
+  const { code, value } = await localJson(port, "/health", "GET", false).catch(error => {
+    if (error instanceof SyntaxError) throw new InvalidHealthResponse("Invalid JSON from /health", { cause: error });
+    throw error;
+  });
+  if (code !== 200 || !value || typeof value !== "object" || Array.isArray(value)) {
+    throw new InvalidHealthResponse(`Invalid health response (HTTP ${code})`);
+  }
   return value as UpgradeHealth;
 }
 
@@ -117,8 +124,9 @@ function procEntry<T>(path: string, read: (path: string) => T): T | undefined {
 }
 
 async function legacyOwner(paths: UpgradePaths, j: UpgradeJournal): Promise<ProcessIdentity> {
-  assertOwnerFiles(paths);
   const lock = join(paths.data, "owner.sqlite");
+  try { assertOwnerFiles(paths); }
+  catch (error) { throw new LegacyInspectionError(`Could not inspect ${lock} during legacy ownership check: ${String(error)}`, { cause: error }); }
   let pids: number[];
   if (process.platform === "linux") {
     const sockets = linuxListeningInodes(j.port);
@@ -166,7 +174,7 @@ async function legacyOwner(paths: UpgradePaths, j: UpgradeJournal): Promise<Proc
     ownDataDir(paths.data)();
   } catch (error) {
     if (error instanceof OwnerBusy) return identity;
-    throw error;
+    throw new LegacyInspectionError(`Could not check the exclusive lock on ${lock}: ${String(error)}`, { cause: error });
   }
   throw new Error("Legacy listener is not holding the exclusive conversation owner lock");
 }
@@ -240,7 +248,11 @@ export async function probeServer(server: ServerChild, j: UpgradeJournal, sha: s
   do {
     if (server.error) throw server.error;
     let health: UpgradeHealth | undefined;
-    try { health = await getHealth(j.port); } catch (error) { lastError = error; }
+    try { health = await getHealth(j.port); }
+    catch (error) {
+      if (error instanceof InvalidHealthResponse) throw error;
+      lastError = error;
+    }
     if (health) {
       if (health.ok !== true || health.commit !== sha || (gated && (health.pid !== server.child.pid
         || health.upgradeProtocol !== upgradeProtocol || health.validation?.id !== j.id))) {
@@ -254,7 +266,7 @@ export async function probeServer(server: ServerChild, j: UpgradeJournal, sha: s
     }
     await sleep(100);
   } while (Date.now() < deadline);
-  throw new Error("Timed out waiting for candidate readiness", { cause: lastError });
+  throw new Error(`Timed out waiting for candidate readiness${lastError instanceof Error ? `: ${lastError.message}` : ""}`, { cause: lastError });
 }
 
 /** This is after commit: failure can require a manual start, never a destructive rollback. */
