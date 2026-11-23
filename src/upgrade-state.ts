@@ -138,13 +138,11 @@ export class UpgradePaths {
       const state = inspect(paths.state);
       if (!state) continue;
       // Never follow a replacement state symlink. An ordinary sibling directory without a journal
-      // is not an installation, but a cutover backup without its journal leaves the DB uncertain.
+      // is not an installation, but request-specific artifacts still require investigation.
       if (state.isSymbolicLink()) ownedDir(paths.state);
       if (!state.isDirectory()) continue;
       if (!exists(paths.journal)) {
-        if (readdirSync(paths.state).some(name => name.endsWith(".sqlite") && idPattern.test(name.slice(0, -".sqlite".length)))) {
-          throw new Error(`Missing upgrade journal: ${paths.journal}. Cutover backup exists; refuse startup until investigated.`);
-        }
+        paths.assertNoOrphanedUpgrade();
         continue;
       }
       ownedDir(paths.state);
@@ -219,6 +217,18 @@ export class UpgradePaths {
     return join(this.state, id + suffix);
   }
 
+  /** A missing journal does not make an interrupted installation fresh or unmanaged. */
+  assertNoOrphanedUpgrade(): void {
+    const files = readdirSync(this.state);
+    const hasArtifact = (suffix: string) => files.some(name => name.endsWith(suffix) && idPattern.test(name.slice(0, -suffix.length)));
+    const missing = `Missing upgrade journal: ${this.journal}.`;
+    if (hasArtifact(".sqlite")) throw new Error(`${missing} Cutover backup exists; investigate before starting.`);
+    if (hasArtifact(".stage-owner.sqlite") || (inspect(this.deploy)?.isDirectory()
+      && readdirSync(this.deploy).some(name => name.startsWith(".stage-") && idPattern.test(name.slice(".stage-".length))))) {
+      throw new Error(`${missing} Private staging artifacts exist; investigate before starting.`);
+    }
+  }
+
   load(): UpgradeJournal | undefined {
     if (!exists(this.state)) return undefined;
     ownedDir(this.state);
@@ -229,8 +239,9 @@ export class UpgradePaths {
       || (j.target !== undefined && (typeof j.target !== "string" || !shaPattern.test(j.target)))
       || !Number.isInteger(j.port) || j.port < 1 || j.port > 65_535 || typeof j.faux !== "boolean"
       || typeof j.legacy !== "boolean" || !phases.includes(j.phase)
-      || (j.branch !== undefined && (!Number.isSafeInteger(j.branch) || j.branch < 1 || j.legacy))
-      || (j.branch === undefined ? j.requestKey !== undefined : typeof j.requestKey !== "string" || !upgradeRequestKey.test(j.requestKey))
+      || (j.legacy ? j.branch !== undefined || j.requestKey !== undefined
+        : j.branch === undefined || !Number.isSafeInteger(j.branch) || j.branch < 1
+          || typeof j.requestKey !== "string" || !upgradeRequestKey.test(j.requestKey))
       || !validProcess(j.oldProcess)
       || (j.reason !== undefined && typeof j.reason !== "string")
       || (j.reported !== undefined && (j.phase !== "done" || j.reported !== true))

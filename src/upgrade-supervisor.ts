@@ -144,20 +144,25 @@ async function run(paths: UpgradePaths, args: {
   const note = (text: string) => {
     if (log !== undefined) writeSync(log, `${new Date().toISOString()} ${text}\n`);
   };
-  const save = (next: UpgradeJournal) => { paths.save(next); j = next; return next; };
   const openLog = () => { log ??= openUpgradeLog(paths, j!.id); };
   const requireJournal = () => {
     if (!j) throw new Error(`No upgrade journal at ${paths.journal}`);
     return j;
   };
-  const readJournal = (expected = requireJournal()) => {
+  const assertJournal = (expected: UpgradeJournal | undefined) => {
     const persisted = paths.load();
-    if (!persisted) throw new Error(`Missing upgrade journal: ${paths.journal}`);
+    if (expected && !persisted) throw new Error(`Missing upgrade journal: ${paths.journal}`);
     // Compare the whole journal as stored, ignoring JSON formatting and omitted undefined properties.
-    if (!isDeepStrictEqual(persisted, JSON.parse(JSON.stringify(expected)))) {
+    if (!isDeepStrictEqual(persisted, expected && JSON.parse(JSON.stringify(expected)))) {
       throw new Error(`Upgrade journal changed: ${paths.journal}`);
     }
-    return persisted;
+  };
+  const save = (next: UpgradeJournal, before = j) => {
+    assertJournal(before);
+    if (!before) paths.assertNoOrphanedUpgrade();
+    paths.save(next);
+    j = next;
+    return next;
   };
   const verifyOld = async (current: UpgradeJournal, pid?: number): Promise<string | undefined> => {
     if (paths.selected() !== current.old) return;
@@ -177,11 +182,10 @@ async function run(paths: UpgradePaths, args: {
     }
   };
   const commitValidated = (before: UpgradeJournal, status: NonNullable<UpgradeJournal["result"]>) => {
-    const persisted = readJournal(before);
     if (paths.selected() !== (status.active ?? before.old)) {
       throw new Error(`Upgrade selection changed during validation: ${paths.journal}`);
     }
-    const next = save(finish(persisted, status));
+    const next = save(finish(before, status), before);
     // Work is committed already; an error appending diagnostics must not trigger a rollback.
     note(resultText(next));
     return next;
@@ -272,6 +276,7 @@ async function run(paths: UpgradePaths, args: {
 
     let parent: Awaited<ReturnType<typeof identify>>;
     if (mode === "bootstrap") {
+      if (!j) paths.assertNoOrphanedUpgrade();
       if (j && (j.phase !== "done" || (j.branch !== undefined && !j.reported))) {
         throw new Error(`An upgrade is unfinished or undelivered: ${paths.journal}`);
       }
@@ -303,6 +308,7 @@ async function run(paths: UpgradePaths, args: {
       syncPath(paths.deploy);
       interrupted = true;
       const prepared = await prepare(paths, initial, scriptRelease, log!, target => { save({ ...initial, target }); });
+      assertJournal(requireJournal());
       if ("failure" in prepared) {
         interrupted = false;
         rmSync(staged, { recursive: true, force: true });
@@ -311,6 +317,7 @@ async function run(paths: UpgradePaths, args: {
       const sha = prepared.output.sha;
       if (sha !== initial.old) {
         await publishRelease(paths, initial.id, prepared.output, initial.legacy ? scriptRelease : undefined);
+        assertJournal(requireJournal());
       }
       interrupted = false;
       rmSync(staged, { recursive: true, force: true });
@@ -337,6 +344,7 @@ async function run(paths: UpgradePaths, args: {
       try {
         noPi(paths);
         await verifySelected(paths, initial.old);
+        assertJournal(requireJournal());
         await backupDb(paths, initial.id);
         note(`Saved standalone SQLite backup at ${paths.backup(initial.id)}`);
         save({ ...requireJournal(), phase: "switching" });
@@ -353,7 +361,10 @@ async function run(paths: UpgradePaths, args: {
     } catch (error) {
       const why = errorText(error);
       let current: UpgradeJournal;
-      try { current = readJournal(); }
+      try {
+        current = requireJournal();
+        assertJournal(current);
+      }
       catch (inspection) {
         // An in-memory phase is not authority to restore. The finally block still disconnects any candidate.
         const message = `Upgrade failed: ${why}. Cannot verify the journal: ${errorText(inspection)}. Selection and backup left intact.`;

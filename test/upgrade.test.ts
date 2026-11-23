@@ -549,7 +549,7 @@ test("a committed request with a failed helper launch returns its upgrade ID and
   assert.equal((await f.result(id)).length, 1);
 });
 
-test("an unmanaged data-dir tolerates an unrelated writable upgrade directory but not an ambiguous journal", { timeout }, async t => {
+test("an unmanaged data-dir tolerates unrelated files but not an ambiguous upgrade journal or orphaned stage", { timeout }, async t => {
   const scratch = await realpath(await mkdtemp(join(tmpdir(), "aipatty-upgrade-unmanaged-")));
   t.after(() => rm(scratch, { recursive: true, force: true }));
   const data = join(scratch, "data"), upgrade = join(scratch, "upgrade");
@@ -558,8 +558,33 @@ test("an unmanaged data-dir tolerates an unrelated writable upgrade directory bu
   await chmod(upgrade, 0o770);
   const config = readConfig(["--data-dir", data], {});
   assert.equal(UpgradePaths.forStartup(config), undefined);
-  await writeFile(join(upgrade, "journal.json"), "{}");
+  const journal = join(upgrade, "journal.json");
+  await writeFile(journal, "{}");
   assert.throws(() => UpgradePaths.forStartup(config), /Expected an owned, canonical directory/);
+  await rm(journal);
+  await chmod(upgrade, 0o700);
+  const paths = new UpgradePaths(scratch, data);
+  const id = randomUUID();
+  await writeFile(join(upgrade, `${id}.stage-owner.sqlite`), "");
+  assert.throws(() => UpgradePaths.forStartup(config), /Missing upgrade journal: .*Private staging artifacts exist/);
+  await rm(join(upgrade, `${id}.stage-owner.sqlite`));
+  await mkdir(paths.stage(id), { recursive: true });
+  assert.throws(() => UpgradePaths.forStartup(config), /Missing upgrade journal: .*Private staging artifacts exist/);
+  await rm(paths.stage(id), { recursive: true });
+  assert.equal(UpgradePaths.forStartup(config), undefined);
+});
+
+test("a non-legacy journal without a branch or request key cannot authorize recovery", { timeout }, async t => {
+  const f = await fixture(t);
+  const target = await f.next("invalid durable request identity");
+  f.paths.init();
+  f.paths.save({ version: 1, id: randomUUID(), old: f.old, target, port: f.port,
+    faux: true, legacy: false, phase: "switching" });
+  const pending = await readFile(f.paths.journal, "utf8");
+  try {
+    await assert.rejects(f.supervisor(f.old, "recover"), /Invalid upgrade journal/);
+    assert.equal(await readFile(f.paths.journal, "utf8"), pending);
+  } finally { await rm(f.paths.journal, { force: true }); }
 });
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
@@ -597,6 +622,29 @@ test("a crashed coordinator leaves the old app up and retains the interrupted st
   assert.equal((await f.healthNow())?.pid, old.child.pid);
   assert.equal((await f.send("new work")).status, 409);
   assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 409);
+});
+
+test("a request key changed during staging prevents cutover and preserves the pending journal", { timeout }, async t => {
+  const f = await fixture(t);
+  const old = f.launch();
+  await f.health(f.old);
+  const target = await f.next("candidate with a changed journal during staging");
+  await f.flag("hold-stage");
+  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
+  await until(() => existsSync(join(f.scratch, "npm.log")));
+  const helper = await fixturePid(f, "coordinator");
+  const j = f.paths.load()!;
+  const changed = { ...j, requestKey: randomUUID() };
+  f.paths.save(changed);
+  await f.unflag("hold-stage");
+  await until(() => identify(helper), value => !value);
+  assert.match(await f.log(j.id), /Upgrade journal changed/);
+  assert.deepEqual(f.paths.load(), changed);
+  assert.equal(f.paths.selected(), f.old);
+  assert.equal((await f.healthNow())?.pid, old.child.pid);
+  assert.equal(existsSync(f.paths.backup(j.id)), false);
+  assert.equal(existsSync(f.paths.release(target)), false);
+  assert.ok(existsSync(f.paths.stage(j.id)));
 });
 
 if (process.env.UPGRADE_NESTED_TEST) {
@@ -1104,6 +1152,7 @@ test("recovery of an already listening legacy rollback refuses a corrupt or miss
   assert.equal(await original.exited, 0, original.output());
   const id = randomUUID();
   const target = await f.next("interrupted legacy rollback");
+  await f.install(target);
   f.paths.init();
   const release = ownDataDir(f.paths.data);
   try { await backupDb(f.paths, id); } finally { release(); }
@@ -1125,7 +1174,10 @@ test("recovery of an already listening legacy rollback refuses a corrupt or miss
       } finally { await f.unflag("hold-legacy-probe"); }
       await rejected;
       if (fault === "corrupt") assert.equal(await readFile(f.paths.journal, "utf8"), corrupt);
-      else assert.equal(f.paths.load(), undefined);
+      else {
+        await assert.rejects(f.supervisor(target, "bootstrap"), /Missing upgrade journal: .*Cutover backup exists/);
+        assert.equal(f.paths.load(), undefined);
+      }
       assert.equal(f.paths.selected(), f.old);
       assert.deepEqual(await readFile(f.paths.backup(id)), backup);
       assert.ok(await identify(running.child.pid!));
