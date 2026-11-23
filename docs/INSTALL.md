@@ -252,11 +252,10 @@ the result is written once directly to that branch (not attributed to the user o
 Readiness means the same process serves the expected SHA from the selected checkout, the SQLite/Durable host
 opened, Pi recovery is clear, and both the root and requesting branch models are in the local catalog with no
 saved work globally blocking scheduling. The candidate also checks it can still read the accepted branch
-request. A plain HTTP 200 is insufficient. The candidate exposes only health
-and cannot run resumed or external work before commit. Upgrade targets must keep the managed startup/validation
-protocol; older releases are supported only as the bootstrap source and rollback destination. This is local
-validation, not a paid model call, an
-OAuth refresh, a network test, or a PR/reviewer run. The operator resolves missing catalog/login or reviewer
+request. A plain HTTP 200 is insufficient. The candidate exposes only health until the same validated request
+and selection have been committed. Upgrade targets must keep the managed startup/validation protocol; older
+releases are supported only as the bootstrap source and rollback destination. This is local validation, not a
+paid model call, an OAuth refresh, a network test, or a PR/reviewer run. The operator resolves missing catalog/login or reviewer
 settings as usual. Apply the PR #18 setting change separately if applicable.
 
 ### Diagnose, recover, or start manually
@@ -291,6 +290,9 @@ node "$ROOT/deploy/current/src/cli.ts" --port "$PORT" health
   The helper does not infer quiescence from PIDs, timestamps, process groups, or a free lease. It does not
   signal leftover stage processes or remove their private checkout. Plain `recover`, another upgrade, and
   normal modern startup cannot clear the guard. Keep `$ROOT/deploy/.stage-$ID`, the journal and log intact.
+  If the journal or the entire `$ROOT/upgrade/` directory is missing while a private stage remains, modern
+  startup and new upgrade requests refuse to proceed. Preserve the stage and investigate the lost state; do
+  not delete the stage to bypass the guard.
 
   In a maintenance window, stop new work and keep respawn disabled. **Verify the old coordinator, worker and
   all stage commands (including detached descendants) can no longer be running.** If you cannot positively
@@ -315,8 +317,9 @@ node "$ROOT/deploy/current/src/cli.ts" --port "$PORT" health
   different or newer SHA. If an old app is still running after a failed handoff, stop that **verified** app
   with its own CLI (or Ctrl-C in its terminal) and wait for process exit before `recover`. Do not kill a random
   port listener. On a legacy rollback, continue the no-work maintenance window until recovery returns.
-- `done`: no automatic restart or redeploy follows a later crash. `recover` verifies the pointer and reports
-  the recorded result; that is not a live health probe. If the app is stopped (e.g. reboot or a lost activation
+- `done`: no automatic restart or redeploy follows a later crash. `recover` verifies the selected release and
+  rechecks that both the journal and pointer are unchanged before reporting the result. That is not a live
+  health probe. If the app is stopped (e.g. reboot or a lost activation
   after commit), first run `recover` as the guard, then use the [normal start command](#start) on `current`
   with the original root, port, and faux setting. **Even if `current` is legacy, do this guard check first.**
   Verify `health` and the transcript once the app is back. If the branch result is still missing and `recover`

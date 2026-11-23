@@ -4,6 +4,7 @@ import {
   rmSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { Config } from "./config.ts";
 import { ownSqliteLock } from "./ownership.ts";
 
@@ -14,7 +15,9 @@ export const upgradeCommand = "/upgrade";
 export const upgradeHeader = "x-aipatty-upgrade";
 export const upgradeEntryKind = "aipatty.upgrade";
 export const upgradeChildEnv = "PATTY_UPGRADE_CHILD";
+export const upgradeHandoffEnv = "PATTY_UPGRADE_HANDOFF";
 export const upgradeProtocol = 1;
+export const interruptedCutover = "Interrupted cutover; the pinned candidate was not retried.";
 
 const phases = ["requested", "staging", "stopping", "switching", "restoring", "restored", "done"] as const;
 const outcomes = ["upgraded", "noop", "failed", "cancelled", "rolled-back"] as const;
@@ -45,6 +48,17 @@ export interface UpgradeJournal {
 
 function validProcess(value: ProcessIdentity | undefined): boolean {
   return value === undefined || (!!value && Number.isSafeInteger(value.pid) && value.pid > 1 && typeof value.start === "string" && !!value.start);
+}
+
+/** Compare what was persisted, ignoring JSON layout and omitted undefined properties. */
+export function journalMatches(persisted: UpgradeJournal | undefined, expected: UpgradeJournal | undefined): boolean {
+  return isDeepStrictEqual(persisted, expected && JSON.parse(JSON.stringify(expected)));
+}
+
+/** Mutable phase/checkpoint fields may advance, but never the accepted request identity. */
+export function sameUpgradeRequest(a: UpgradeJournal, b: UpgradeJournal): boolean {
+  const fields = ["version", "id", "branch", "requestKey", "port", "faux", "old", "legacy"] as const;
+  return fields.every(field => a[field] === b[field]);
 }
 
 export const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
@@ -136,12 +150,10 @@ export class UpgradePaths {
     for (const root of roots) {
       const paths = new UpgradePaths(root, data);
       const state = inspect(paths.state);
-      if (!state) continue;
-      // Never follow a replacement state symlink. An ordinary sibling directory without a journal
-      // is not an installation, but request-specific artifacts still require investigation.
-      if (state.isSymbolicLink()) ownedDir(paths.state);
-      if (!state.isDirectory()) continue;
-      if (!exists(paths.journal)) {
+      // Never follow a replacement state symlink. A missing state directory does not clear a stage
+      // that may still have subprocesses in the deploy directory.
+      if (state?.isSymbolicLink()) ownedDir(paths.state);
+      if (!state?.isDirectory() || !exists(paths.journal)) {
         paths.assertNoOrphanedUpgrade();
         continue;
       }
@@ -219,7 +231,7 @@ export class UpgradePaths {
 
   /** A missing journal does not make an interrupted installation fresh or unmanaged. */
   assertNoOrphanedUpgrade(): void {
-    const files = readdirSync(this.state);
+    const files = inspect(this.state)?.isDirectory() ? readdirSync(this.state) : [];
     const hasArtifact = (suffix: string) => files.some(name => name.endsWith(suffix) && idPattern.test(name.slice(0, -suffix.length)));
     const missing = `Missing upgrade journal: ${this.journal}.`;
     if (hasArtifact(".sqlite")) throw new Error(`${missing} Cutover backup exists; investigate before starting.`);
@@ -254,6 +266,17 @@ export class UpgradePaths {
       throw new Error(`Invalid upgrade journal: ${this.journal}`);
     }
     return j;
+  }
+
+  /** Re-read authority after an awaited probe, immediately before the synchronous effect. */
+  check(expected: UpgradeJournal | undefined, selected?: string): void {
+    const actual = this.load();
+    if (expected && !actual) throw new Error(`Missing upgrade journal: ${this.journal}`);
+    if (!journalMatches(actual, expected)) throw new Error(`Upgrade journal changed: ${this.journal}`);
+    if (!actual) this.assertNoOrphanedUpgrade();
+    if (selected !== undefined && this.selected() !== selected) {
+      throw new Error(`Upgrade selection changed; expected deploy/${selected} at ${this.current}`);
+    }
   }
 
   save(journal: UpgradeJournal): void {

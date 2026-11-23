@@ -204,7 +204,7 @@ export async function stageRelease(options: {
 }
 
 /** Only the coordinator publishes, after normal worker exit. Do not move any worker-owned inode into a release. */
-export async function publishRelease(paths: UpgradePaths, id: string, output: StageOutput, bootstrap?: string): Promise<void> {
+export async function publishRelease(paths: UpgradePaths, id: string, output: StageOutput, beforePublish: () => void, bootstrap?: string): Promise<void> {
   const { sha, digest, bootstrapTree } = output;
   const staged = paths.stage(id), dest = paths.release(sha);
   if (!digest || (bootstrap && (bootstrap !== dest || !bootstrapTree))) throw new Error("Stage output is incomplete");
@@ -216,9 +216,11 @@ export async function publishRelease(paths: UpgradePaths, id: string, output: St
     syncTree(copy);
     if (bootstrap && bootstrapTree) {
       await verifyBootstrap(bootstrap, sha, bootstrapTree);
+      beforePublish();
       renameSync(join(copy, "node_modules"), join(bootstrap, "node_modules"));
       syncTree(bootstrap); // The operator checkout's sources and Git metadata also need to survive a reboot.
     } else {
+      beforePublish();
       if (exists(dest)) throw new Error(`Release appeared during staging: ${dest}`);
       renameSync(copy, dest);
     }

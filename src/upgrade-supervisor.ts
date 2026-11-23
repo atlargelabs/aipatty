@@ -5,7 +5,7 @@ import { closeSync, mkdirSync, realpathSync, rmSync, writeSync } from "node:fs";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
-import { isDeepStrictEqual, parseArgs } from "node:util";
+import { parseArgs } from "node:util";
 import { readConfig, type Config } from "./config.ts";
 import { backupDb, restoreDb } from "./upgrade-db.ts";
 import {
@@ -14,7 +14,8 @@ import {
 } from "./upgrade-process.ts";
 import { InterruptedStageError, publishRelease, stageRelease, verifyRelease, type StageOutput } from "./upgrade-release.ts";
 import {
-  errorText, exists, finish, idPattern, interruptedStage, resultText, sameInstall, shaPattern, syncPath, upgradeProtocol, UpgradePaths, type UpgradeJournal,
+  errorText, exists, finish, idPattern, interruptedCutover, interruptedStage, resultText, sameInstall, shaPattern, syncPath,
+  upgradeHandoffEnv, upgradeProtocol, UpgradePaths, type UpgradeJournal,
 } from "./upgrade-state.ts";
 
 const stageDeadlineMs = 26 * 60_000;
@@ -41,14 +42,14 @@ function validOutput(value: unknown, j: UpgradeJournal, target?: string): value 
 /** Child of the one-shot owner, not a public mode. Writes only its private checkout and log. */
 async function runStage(paths: UpgradePaths, config: Config, id: string, scriptRelease: string): Promise<void> {
   const signal = new AbortController();
-  const authorized = await new Promise<boolean>(resolve => {
+  const expected = await new Promise<UpgradeJournal | undefined>(resolve => {
     process.once("disconnect", () => {
       signal.abort(new InterruptedStageError("Staging supervisor disconnected"));
-      resolve(false);
+      resolve(undefined);
     });
-    process.once("message", value => resolve(value === "prepare"));
+    process.once("message", value => resolve(value as UpgradeJournal));
   });
-  if (!authorized) throw new Error("Stage worker was not authorized");
+  if (!expected) throw new Error("Stage worker was not authorized");
   // Git and npm must not create group-writable files in the private checkout, even with a shared account umask.
   process.umask(0o077);
   const unlock = paths.stagingLease(id);
@@ -56,10 +57,9 @@ async function runStage(paths: UpgradePaths, config: Config, id: string, scriptR
   let result: StageResult;
   try {
     const j = paths.load();
-    if (!process.connected || j?.id !== id || j.phase !== "staging" || paths.selected() !== j.old) {
-      throw new Error("Invalid or cancelled stage handoff");
-    }
+    if (!process.connected || j?.id !== id || j.phase !== "staging") throw new Error("Invalid or cancelled stage handoff");
     sameInstall(j, config);
+    paths.check(expected, j.old);
     log = openUpgradeLog(paths, id);
     try {
       result = { output: await stageRelease({ paths, id, old: j.old, origin: config.pi.repoUrl, log, signal: signal.signal,
@@ -110,7 +110,7 @@ async function prepare(paths: UpgradePaths, j: UpgradeJournal, source: string, l
   const stageDeadline = new AbortController();
   try {
     await Promise.race([
-      Promise.all([exited, ipcClosed, new Promise<void>((resolve, reject) => child.send("prepare", error => error ? reject(error) : resolve()))]),
+      Promise.all([exited, ipcClosed, new Promise<void>((resolve, reject) => child.send(j, error => error ? reject(error) : resolve()))]),
       parentLost.promise.then(() => { throw new Error("Requesting host exited during staging"); }),
       sleep(stageDeadlineMs, undefined, { signal: stageDeadline.signal, ref: false })
         .then(() => { throw new Error(`Staging exceeded its total deadline (${stageDeadlineMs} ms)`); }),
@@ -134,7 +134,8 @@ async function prepare(paths: UpgradePaths, j: UpgradeJournal, source: string, l
 
 /** One owner, one target, no retry. The only replayable part is safe restoration of the recorded old release. */
 async function run(paths: UpgradePaths, args: {
-  mode: "bootstrap" | "handoff" | "recover"; id?: string; ack?: string; faux: boolean; port: number; scriptRelease: string;
+  mode: "bootstrap" | "handoff" | "recover"; id?: string; handoff?: UpgradeJournal; ack?: string;
+  faux: boolean; port: number; scriptRelease: string;
 }): Promise<UpgradeJournal> {
   const { mode, scriptRelease } = args;
   const release = paths.lease();
@@ -149,17 +150,8 @@ async function run(paths: UpgradePaths, args: {
     if (!j) throw new Error(`No upgrade journal at ${paths.journal}`);
     return j;
   };
-  const assertJournal = (expected: UpgradeJournal | undefined) => {
-    const persisted = paths.load();
-    if (expected && !persisted) throw new Error(`Missing upgrade journal: ${paths.journal}`);
-    // Compare the whole journal as stored, ignoring JSON formatting and omitted undefined properties.
-    if (!isDeepStrictEqual(persisted, expected && JSON.parse(JSON.stringify(expected)))) {
-      throw new Error(`Upgrade journal changed: ${paths.journal}`);
-    }
-  };
-  const save = (next: UpgradeJournal, before = j) => {
-    assertJournal(before);
-    if (!before) paths.assertNoOrphanedUpgrade();
+  const save = (next: UpgradeJournal, selected: string, before = j) => {
+    paths.check(before, selected);
     paths.save(next);
     j = next;
     return next;
@@ -182,35 +174,43 @@ async function run(paths: UpgradePaths, args: {
     }
   };
   const commitValidated = (before: UpgradeJournal, status: NonNullable<UpgradeJournal["result"]>) => {
-    if (paths.selected() !== (status.active ?? before.old)) {
-      throw new Error(`Upgrade selection changed during validation: ${paths.journal}`);
-    }
-    const next = save(finish(before, status), before);
+    const next = save(finish(before, status), status.active ?? before.old, before);
     // Work is committed already; an error appending diagnostics must not trigger a rollback.
     note(resultText(next));
     return next;
   };
 
-  async function rollback(current: UpgradeJournal, why: string): Promise<UpgradeJournal> {
+  async function activated(server: ServerChild, terminal: UpgradeJournal, sha: string): Promise<UpgradeJournal> {
+    await confirmActivation(server, terminal, sha);
+    // Activation also acknowledges delivery for a conversation request. No other journal change is allowed.
+    const expected = terminal.branch === undefined ? terminal : { ...terminal, reported: true as const };
+    paths.check(expected, sha);
+    return expected;
+  }
+
+  async function rollback(current: UpgradeJournal, why: string, selected: string): Promise<UpgradeJournal> {
+    if (selected !== current.old && (current.phase === "stopping" || current.phase === "restored" || selected !== current.target)) {
+      throw new Error(`Refusing to restore over unexpected current release ${selected}`);
+    }
     note(`Restoring ${current.old}: ${why}`);
     await verifyRelease(paths.release(current.old), current.old);
+    paths.check(current, selected);
     if (current.phase === "restored" && current.legacy && await verifyOld(current)) {
       return commitValidated(current, { kind: "rolled-back", active: current.old, reason: current.reason ?? why });
     }
     const free = await quiescent(paths, current.port, current.phase === "stopping" ? current.oldProcess : undefined);
     try {
-      const selected = paths.selected();
-      if (selected !== current.old && (current.phase === "stopping" || current.phase === "restored" || selected !== current.target)) {
-        throw new Error(`Refusing to restore over unexpected current release ${selected}`);
-      }
       if (current.phase === "switching" || current.phase === "restoring") {
-        current = save({ ...current, phase: "restoring", reason: current.reason ?? why });
+        current = save({ ...current, phase: "restoring", reason: current.reason ?? why }, selected);
         restoreDb(paths, current.id);
         paths.select(current.old);
       }
-      if (current.phase !== "restored") current = save({ ...current, phase: "restored", reason: current.reason ?? why });
+      if (current.phase !== "restored") current = save({ ...current, phase: "restored", reason: current.reason ?? why }, current.old);
       // If legacy shutdown raced late Pi work before the backup, only the unchanged old release may recover it.
       if (!current.legacy) noPi(paths);
+      // This also covers already-restored recovery, where there was no guarded phase write.
+      // The legacy app cannot check this itself. Release the data lock and spawn without yielding.
+      paths.check(current, current.old);
     } finally { free(); }
     const old = launchServer(paths, current, current.old, !current.legacy);
     try {
@@ -222,10 +222,9 @@ async function run(paths: UpgradePaths, args: {
       }
       const verified = commitValidated(current, { kind: "rolled-back", active: current.old, reason: current.reason ?? why });
       detachServer(old);
-      if (!current.legacy) await confirmActivation(old, current, current.old);
-      return verified;
+      return current.legacy ? verified : await activated(old, verified, current.old);
     } catch (error) {
-      if (!current.legacy && paths.load()?.phase !== "done") await stopCandidate(old);
+      if (!current.legacy && j?.phase !== "done") await stopCandidate(old);
       throw error;
     } finally { detachServer(old); }
   }
@@ -239,7 +238,9 @@ async function run(paths: UpgradePaths, args: {
     if (j) sameInstall(j, { port: args.port, faux: args.faux });
     const sourceSha = basename(scriptRelease);
     if (scriptRelease !== paths.release(sourceSha)) throw new Error("Run the helper from an immutable deploy/<sha> release of this root");
+    const enteredSelection = paths.selected();
     await verifyRelease(scriptRelease, sourceSha);
+    paths.check(j, enteredSelection);
     if (mode === "recover") {
       const current = requireJournal();
       if (args.ack !== undefined && (current.phase !== "staging" || current.id !== args.ack)) {
@@ -247,7 +248,9 @@ async function run(paths: UpgradePaths, args: {
       }
       if (current.phase === "staging" && args.ack === undefined) throw new Error(interruptedStage(paths, current.id));
       if (current.phase === "done") {
-        await verifySelected(paths, current.result?.active ?? current.old);
+        const selected = current.result?.active ?? current.old;
+        await verifySelected(paths, selected);
+        paths.check(current, selected);
         paths.syncJournal();
         return current;
       }
@@ -267,7 +270,7 @@ async function run(paths: UpgradePaths, args: {
               reason: `Operator acknowledged interrupted staging. The private stage was not reused or removed: ${paths.stage(current.id)}.` });
           } finally { unlockStage(); }
         }
-        return await rollback(current, current.reason ?? "Interrupted cutover; the pinned candidate was not retried.");
+        return await rollback(current, current.reason ?? interruptedCutover, enteredSelection);
       } catch (error) {
         note(`RECOVERY FAILED (${requireJournal().phase}): ${errorText(error)}. Journal and backup retained.`);
         throw error;
@@ -276,30 +279,32 @@ async function run(paths: UpgradePaths, args: {
 
     let parent: Awaited<ReturnType<typeof identify>>;
     if (mode === "bootstrap") {
-      if (!j) paths.assertNoOrphanedUpgrade();
       if (j && (j.phase !== "done" || (j.branch !== undefined && !j.reported))) {
         throw new Error(`An upgrade is unfinished or undelivered: ${paths.journal}`);
       }
-      if (j && paths.selected() !== (j.result?.active ?? j.old)) throw new Error("Current differs from the upgrade journal");
-      const old = paths.selected();
+      const old = enteredSelection;
+      if (j && old !== (j.result?.active ?? j.old)) throw new Error("Current differs from the upgrade journal");
       await verifySelected(paths, old);
       noPi(paths);
       const initial: UpgradeJournal = { version: 1, id: bootstrapId!, port: args.port, faux: args.faux, old, legacy: true, phase: "staging" };
       const legacy = await legacyConnection(paths, initial);
       legacy.close();
-      save(initial);
+      noPi(paths);
+      save(initial, old);
     } else {
       const requested = requireJournal();
-      if (!process.connected || requested.id !== args.id || requested.phase !== "requested" || requested.legacy
+      if (!args.handoff || !process.connected || requested.id !== args.id || requested.phase !== "requested" || requested.legacy
         || requested.branch === undefined || requested.old !== sourceSha) throw new Error("Invalid or expired host handoff");
+      paths.check(args.handoff, sourceSha);
       if (process.ppid <= 1) throw new Error("Host handoff lost its parent");
       parent = await identify(process.ppid);
-      if (!parent || !await verifyOld(requested, parent.pid)) throw new Error("Could not verify the requesting host");
-      save({ ...requested, phase: "staging" });
+      if (!parent || !await verifyOld(requested, parent.pid) || !process.connected) throw new Error("Could not verify the requesting host");
+      save({ ...requested, phase: "staging" }, sourceSha);
     }
     openLog();
     let candidate: ServerChild | undefined;
     let interrupted = false;
+    let selected = enteredSelection;
     try {
       const initial = requireJournal();
       noPi(paths);
@@ -307,8 +312,10 @@ async function run(paths: UpgradePaths, args: {
       mkdirSync(staged, { mode: 0o700 }); // Exclusive: never reuse a half-prepared release.
       syncPath(paths.deploy);
       interrupted = true;
-      const prepared = await prepare(paths, initial, scriptRelease, log!, target => { save({ ...initial, target }); });
-      assertJournal(requireJournal());
+      const prepared = await prepare(paths, initial, scriptRelease, log!, target => { save({ ...initial, target }, initial.old); });
+      const stagedJournal = requireJournal();
+      const checkStaged = () => paths.check(stagedJournal, initial.old);
+      checkStaged();
       if ("failure" in prepared) {
         interrupted = false;
         rmSync(staged, { recursive: true, force: true });
@@ -316,8 +323,8 @@ async function run(paths: UpgradePaths, args: {
       }
       const sha = prepared.output.sha;
       if (sha !== initial.old) {
-        await publishRelease(paths, initial.id, prepared.output, initial.legacy ? scriptRelease : undefined);
-        assertJournal(requireJournal());
+        await publishRelease(paths, initial.id, prepared.output, checkStaged, initial.legacy ? scriptRelease : undefined);
+        checkStaged();
       }
       interrupted = false;
       rmSync(staged, { recursive: true, force: true });
@@ -331,24 +338,29 @@ async function run(paths: UpgradePaths, args: {
       }
       const legacy = initial.legacy ? await legacyConnection(paths, initial) : undefined;
       try {
-        if (!legacy && (!process.connected || !await verifyOld(initial, parent?.pid))) throw new Error("The old host exited before cutover");
+        if (!legacy && (!process.connected || !await verifyOld(initial, parent?.pid) || !process.connected)) {
+          throw new Error("The old host exited before cutover");
+        }
         noPi(paths);
         note(`Requesting graceful stop of ${initial.old}`);
-        save({ ...requireJournal(), phase: "stopping", oldProcess: legacy?.identity ?? parent });
+        const stopping = save({ ...stagedJournal, phase: "stopping", oldProcess: legacy?.identity ?? parent }, initial.old);
         if (legacy) {
           await legacy.shutdown();
           note(`Legacy shutdown acknowledged; waiting for PID ${legacy.identity.pid} to exit`);
-        } else await sendParent("drain");
+        } else await sendParent({ drain: stopping });
       } finally { legacy?.close(); }
       const free = await quiescent(paths, initial.port, legacy?.identity ?? parent);
       try {
-        noPi(paths);
+        const stopping = requireJournal();
+        const checkStopped = () => { paths.check(stopping, initial.old); noPi(paths); };
         await verifySelected(paths, initial.old);
-        assertJournal(requireJournal());
-        await backupDb(paths, initial.id);
+        checkStopped();
+        await backupDb(paths, initial.id, checkStopped);
+        checkStopped();
         note(`Saved standalone SQLite backup at ${paths.backup(initial.id)}`);
-        save({ ...requireJournal(), phase: "switching" });
+        save({ ...stopping, phase: "switching" }, initial.old);
         paths.select(sha);
+        selected = sha;
       } finally { free(); }
       note(`Starting ${sha} in validation mode`);
       const switching = requireJournal();
@@ -356,24 +368,24 @@ async function run(paths: UpgradePaths, args: {
       await probeServer(candidate, switching, sha, true);
       const verified = commitValidated(switching, { kind: "upgraded", active: sha });
       detachServer(candidate);
-      await confirmActivation(candidate, verified, sha);
-      return verified;
+      return await activated(candidate, verified, sha);
     } catch (error) {
       const why = errorText(error);
+      if (j?.phase === "done") {
+        // Never restore after commit. The candidate may already have acknowledged delivery and started work.
+        note(why);
+        throw error;
+      }
       let current: UpgradeJournal;
       try {
         current = requireJournal();
-        assertJournal(current);
+        paths.check(current, selected);
       }
       catch (inspection) {
         // An in-memory phase is not authority to restore. The finally block still disconnects any candidate.
-        const message = `Upgrade failed: ${why}. Cannot verify the journal: ${errorText(inspection)}. Selection and backup left intact.`;
+        const message = `Upgrade failed: ${why}. Cannot verify the journal and selection: ${errorText(inspection)}. Selection and backup left intact.`;
         note(message);
         throw new Error(message, { cause: inspection });
-      }
-      if (current.phase === "done") {
-        note(why);
-        throw error; // Never restore over a possibly committed release.
       }
       if (current.phase === "staging") {
         if (interrupted) {
@@ -385,7 +397,7 @@ async function run(paths: UpgradePaths, args: {
       }
       try {
         if (candidate) await stopCandidate(candidate);
-        return await rollback(current, why);
+        return await rollback(current, why, selected);
       } catch (failure) {
         note(`ROLLBACK FAILED (${requireJournal().phase}): ${why}; ${errorText(failure)}. Journal and backup retained.`);
         throw new Error(`Upgrade failed: ${why}. Rollback failed: ${errorText(failure)}. See ${paths.log(current.id)} and ${paths.journal}; use recover after investigating.`);
@@ -419,8 +431,11 @@ async function main(): Promise<void> {
   const config = readConfig(["--install-dir", values["install-dir"], "--port", values.port]);
   const paths = UpgradePaths.forConfig(config);
   const scriptRelease = realpathSync(fileURLToPath(new URL("../", import.meta.url)));
+  const request = process.env[upgradeHandoffEnv];
+  delete process.env[upgradeHandoffEnv];
   if (mode === "stage") return runStage(paths, config, values.id!, scriptRelease);
-  const j = await run(paths, { mode, id: values.id, ack, port: config.port, faux: config.faux, scriptRelease });
+  const handoff = mode === "handoff" && request ? JSON.parse(request) as UpgradeJournal : undefined;
+  const j = await run(paths, { mode, id: values.id, handoff, ack, port: config.port, faux: config.faux, scriptRelease });
   const ok = mode === "recover" || j.result?.kind === "upgraded" || j.result?.kind === "noop";
   if (mode !== "handoff") {
     (ok ? console.log : console.error)(`${resultText(j)}\nLog: ${paths.log(j.id)}`);

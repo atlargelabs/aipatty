@@ -10,8 +10,8 @@ import { HttpError, type AgentHost } from "./host.ts";
 import { OwnerBusy } from "./ownership.ts";
 import { openUpgradeLog } from "./upgrade-process.ts";
 import {
-  errorText, exists, finish, idPattern, interruptedStage, ownedFile, resultText, sameInstall, upgradeEntryKind,
-  UpgradePaths, type UpgradeJournal,
+  errorText, exists, finish, idPattern, interruptedCutover, interruptedStage, journalMatches, ownedFile, resultText,
+  sameInstall, sameUpgradeRequest, upgradeEntryKind, upgradeHandoffEnv, UpgradePaths, type UpgradeJournal,
 } from "./upgrade-state.ts";
 
 const ResultDoc = defineDoc<{ last: string }>({
@@ -32,11 +32,18 @@ export async function assertAcceptedRequest(agent: AgentHost, j: UpgradeJournal)
 }
 
 /** A DB transaction covers both the visible transcript entry and its idempotency marker. */
-async function report(agent: AgentHost, paths: UpgradePaths, j: UpgradeJournal): Promise<void> {
-  if (j.phase !== "done" || j.branch === undefined || j.reported) return;
-  const observed = paths.load();
-  if (observed?.id !== j.id || observed.phase !== "done") throw new Error("Upgrade journal changed during delivery");
-  if (observed.reported) return;
+async function report(agent: AgentHost, paths: UpgradePaths, j: UpgradeJournal): Promise<UpgradeJournal> {
+  const check = () => paths.check(j, j.result?.active ?? j.old);
+  check();
+  if (j.phase !== "done" || j.branch === undefined || j.reported) return j;
+  const ack = (result = j.result): UpgradeJournal => {
+    // The transaction may already have committed. On drift, retain the on-disk record and let the
+    // idempotency marker suppress duplicates when the original result can be retried.
+    check();
+    const next = { ...j, result, reported: true as const };
+    paths.save(next);
+    return next;
+  };
   const key = requestDocKey(j);
   const accepted = await agent.harness.snapshot(RequestDoc, key, ctx);
   if (accepted?.id !== j.id || !accepted.accepted) {
@@ -45,21 +52,27 @@ async function report(agent: AgentHost, paths: UpgradePaths, j: UpgradeJournal):
     }
     // The external record can precede SQLite commit. A crash in that window isn't an accepted command.
     // Retire the key durably so even a later retransmission cannot create a new upgrade from it.
-    await agent.harness.commit(async tx => { (await tx.doc(RequestDoc, key, null)).id = j.id; }, ctx);
-    paths.save({ ...j, reported: true, result: { ...j.result, reason: "Interrupted before the operator command committed; no command was accepted." } });
-    return;
+    await agent.harness.commit(async tx => {
+      const request = await tx.doc(RequestDoc, key, null);
+      check();
+      if (request.accepted || (request.id && request.id !== j.id)) throw new Error(`Upgrade ${j.id}: its durable request changed`);
+      request.id = j.id;
+    }, ctx);
+    return ack({ ...j.result, reason: "Interrupted before the operator command committed; no command was accepted." });
   }
   const branch = await agent.conversation(String(j.branch));
   if (!branch) throw new Error(`Upgrade ${j.id}: requesting branch ${j.branch} is missing`);
   await branch.commit(async tx => {
     const marker = await tx.doc(ResultDoc);
+    check();
     if (marker.last === j.id) return;
     await tx.appendEntry(branch.id, {
       kind: upgradeEntryKind, data: { id: j.id, type: "result", text: resultText(j) },
     });
+    check();
     marker.last = j.id;
   }, ctx);
-  paths.save({ ...j, reported: true });
+  return ack();
 }
 
 function assertSelected(paths: UpgradePaths, source: string, commit: string, expected = commit): void {
@@ -71,7 +84,7 @@ function assertSelected(paths: UpgradePaths, source: string, commit: string, exp
 interface StartupState { paths: UpgradePaths; journal: UpgradeJournal }
 
 /** Run under owner.sqlite and before opening Durable storage or Pi recovery. */
-export async function guardStartup(config: Config, source: string, commit: string, childId?: string): Promise<StartupState | undefined> {
+export function guardStartup(config: Config, source: string, commit: string, childId?: string): StartupState | undefined {
   const paths = UpgradePaths.forStartup(config);
   if (!paths) {
     if (childId !== undefined) throw new Error("Validation start requires the managed upgrade layout and journal");
@@ -91,14 +104,10 @@ export async function guardStartup(config: Config, source: string, commit: strin
     // This phase precedes worker authorization. No staged commands or cutover need to be recovered.
     const unlock = paths.lease();
     try {
-      j = paths.load();
-      if (!j) throw new Error("Upgrade journal disappeared during startup");
-      sameInstall(j, config);
-      if (j.phase === "requested") {
-        assertSelected(paths, source, commit, j.old);
-        j = finish(j, { kind: "cancelled", reason: "Interrupted request was not staged." });
-        paths.save(j);
-      }
+      assertSelected(paths, source, commit, j.old);
+      paths.check(j, commit);
+      j = finish(j, { kind: "cancelled", reason: "Interrupted request was not staged." });
+      paths.save(j);
     } finally { unlock(); }
   }
   if (j.phase === "staging") throw new Error(interruptedStage(paths, j.id));
@@ -111,48 +120,67 @@ export async function guardStartup(config: Config, source: string, commit: strin
 /** A lost supervisor is only permission to start when its commit point can be read and synced. */
 export function committedValidation(startup: StartupState, source: string, commit: string): StartupState | undefined {
   const { paths, journal } = startup;
-  const j = paths.load();
-  if (j?.id !== journal.id || j.phase !== "done" || j.result?.active !== commit
-    || (j.result.kind !== "upgraded" && j.result.kind !== "rolled-back")) return;
+  // These are the only terminal transitions from the exact journal this process validated. Root and
+  // data ownership are bound by startup, and the whole record includes the port and request identity.
+  const expected = journal.phase === "switching" && journal.target === commit
+    ? finish(journal, { kind: "upgraded", active: commit })
+    : journal.phase === "restored" && !journal.legacy && journal.old === commit
+      ? finish(journal, { kind: "rolled-back", active: commit, reason: journal.reason ?? interruptedCutover })
+      : undefined;
+  if (!expected || !journalMatches(paths.load(), expected)) return;
   assertSelected(paths, source, commit);
   paths.syncJournal();
-  return { paths, journal: j };
+  return { paths, journal: expected };
 }
 
-export async function reportStartup(agent: AgentHost, startup: StartupState | undefined, listeningCommit: string): Promise<void> {
+export async function reportStartup(agent: AgentHost, startup: StartupState | undefined, listeningCommit: string): Promise<StartupState | undefined> {
   if (!startup) return;
   const { paths, journal } = startup;
-  let j = paths.load();
-  if (j?.id !== journal.id || j.phase !== "done") throw new Error("Upgrade journal changed during startup");
-  if (!j.result?.active && !j.reported && j.old === listeningCommit && paths.selected() === listeningCommit) {
+  let j = journal;
+  paths.check(j, listeningCommit);
+  if (j.phase !== "done") throw new Error("Startup requires a terminal upgrade journal");
+  if (!j.result?.active && !j.reported && j.old === listeningCommit) {
     // An interrupted stage may have been cancelled before any server could be probed. This one is now bound.
     j = finish(j, { ...j.result!, active: listeningCommit });
     paths.save(j);
   }
   // If the committed release cannot deliver, do not confirm activation or restore over its DB. The next
   // explicit start retries the same result, and the helper has already recorded which checkout to start.
-  try { await report(agent, paths, j); }
+  try { return { paths, journal: await report(agent, paths, j) }; }
   catch (error) { throw new Error(`Could not deliver upgrade ${j.id}: ${errorText(error)}`, { cause: error }); }
+}
+
+/** Last synchronous check before resuming work or making the listener available for commands. */
+export function checkStartup(config: Config, startup: StartupState | undefined, commit: string): void {
+  if (startup) startup.paths.check(startup.journal, commit);
+  else if (UpgradePaths.forStartup(config)) throw new Error("Upgrade journal appeared during startup; start again to verify it");
 }
 
 export function hostUpgrade(config: Config, agent: AgentHost, source: string, commit: string, stop: () => void) {
   return async (target: Conversation, requestKey: string): Promise<string> => {
     let paths: UpgradePaths;
+    const id = randomUUID();
+    const request: UpgradeJournal = { version: 1, id, port: config.port, faux: config.faux, old: commit,
+      branch: target.id, requestKey, legacy: false, phase: "requested" };
+    const key = requestDocKey(request);
     try {
       paths = UpgradePaths.forConfig(config);
       assertSelected(paths, source, commit);
       ownedFile(join(source, "src/upgrade-supervisor.ts"));
+      // An accepted retry only reads its ID; it cannot take the supervisor lease or admit new work.
+      const prior = await agent.harness.snapshot(RequestDoc, key, ctx);
+      if (prior?.accepted && prior.id) {
+        assertSelected(paths, source, commit);
+        if (!paths.load()) paths.assertNoOrphanedUpgrade();
+        return prior.id;
+      }
     } catch (error) { throw new HttpError(409, errorText(error)); }
-    const key = `${target.id}:${requestKey}`;
-    // An accepted retry is a read, not a new admission. The transaction still checks the key for new work.
-    const prior = await agent.harness.snapshot(RequestDoc, key, ctx);
-    if (prior?.accepted && prior.id) return prior.id;
     const unblock = await agent.reserveUpgrade(target);
     let handed = false;
     let committed = false;
     let journalAttempted = false;
     let drainStarted = false;
-    const id = randomUUID();
+    let terminal: UpgradeJournal | undefined;
     let recoveryWatch: FSWatcher | undefined;
     const cannotWatch = (error: unknown) => console.error(`Cannot watch recovery of ${id}; after recover returns, restart the selected app to reopen admission:`, error);
     const watchRecovery = () => {
@@ -165,8 +193,8 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
           console.error(`Cannot read recovery of ${id}; admission will stay closed until a terminal journal is verified. If already recovered, restart the selected app:`, error);
           return;
         }
-        if (j?.id !== id) { close(); return; }
-        if (j.phase !== "done") return;
+        if (!j || !sameUpgradeRequest(j, request)) { close(); return; }
+        if (j.phase !== "done" || (terminal && !journalMatches(j, terminal))) return;
         close();
         void settleHandoff("Explicit recovery completed.", false).catch(error => console.error(`Upgrade ${id}:`, error));
       };
@@ -185,19 +213,21 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
         try {
           unlock = paths.lease();
           let j = paths.load();
-          if (j?.id !== id) throw new Error(`Missing or changed upgrade journal for ${id}`);
-          sameInstall(j, config);
+          if (!j || !sameUpgradeRequest(j, request)) throw new Error(`Missing or changed upgrade journal for ${id}`);
+          if (terminal) paths.check(terminal, commit);
           if (j.phase === "requested" || (j.phase === "stopping" && !drainStarted)) {
             // This same host still owns Durable storage; a dead helper cannot have advanced past stopping.
-            assertSelected(paths, source, commit, j.old);
+            paths.check(j.phase === "requested" ? request : j, commit);
             j = finish(j, { kind: "cancelled", active: commit, reason });
             paths.save(j);
           }
           if (j.phase === "staging") throw new Error(interruptedStage(paths, id));
           if (j.phase !== "done") throw new Error(`Upgrade ${id} stopped during ${j.phase}; no new work before documented recovery. ${reason}`);
           assertSelected(paths, source, commit, j.result?.active ?? j.old);
+          paths.check(j, commit);
+          terminal = j;
           paths.syncJournal();
-          try { await report(agent, paths, j); }
+          try { terminal = j = await report(agent, paths, j); }
           catch (error) {
             const message = `Could not deliver upgrade ${id}: ${errorText(error)}. The journal still has the result; restart the selected app to retry delivery, not deployment.`;
             console.error(message);
@@ -207,6 +237,9 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
               finally { closeSync(log); }
             } catch (logError) { console.error(`Could not log delivery failure for ${id}:`, logError); }
           }
+          // A transcript failure with an unchanged terminal record is retryable. Drift isn't authority
+          // to reopen admission, even when it was detected during delivery.
+          paths.check(j, commit);
           break;
         } catch (error) {
           if (error instanceof OwnerBusy && Date.now() < deadline) { await sleep(100); continue; }
@@ -222,36 +255,38 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
     try {
       const unlock = paths.lease();
       try {
-        const previous = paths.load();
+        let previous = paths.load();
+        paths.check(previous, commit);
         if (previous) {
           sameInstall(previous, config);
           if (previous.phase !== "done") throw new HttpError(409, "Another upgrade is pending; see the upgrade journal");
-          await report(agent, paths, previous);
+          assertSelected(paths, source, commit, previous.result?.active ?? previous.old);
+          previous = await report(agent, paths, previous);
         }
-        if (exists(paths.piRun)) throw new HttpError(409, `Pi recovery is pending: ${paths.piRun}`);
-        const j: UpgradeJournal = { version: 1, id, port: config.port, faux: config.faux, old: commit,
-          branch: target.id, requestKey, legacy: false, phase: "requested" };
         // No model turn is started. The operator's command is complete when this entry is durably stored (default
         // immediate Durable commit). Only then can any helper take ownership, let alone ask the app to stop.
         const accepted = await target.commit(async tx => {
-          const request = await tx.doc(RequestDoc, key, null);
-          if (request.id) {
-            if (!request.accepted) throw new HttpError(409, "That upgrade command did not commit. Send a fresh /upgrade if still wanted.");
-            return request.id;
+          const marker = await tx.doc(RequestDoc, key, null);
+          paths.check(previous, commit);
+          if (marker.id) {
+            if (!marker.accepted) throw new HttpError(409, "That upgrade command did not commit. Send a fresh /upgrade if still wanted.");
+            return marker.id;
           }
+          if (exists(paths.piRun)) throw new HttpError(409, `Pi recovery is pending: ${paths.piRun}`);
           journalAttempted = true;
-          try { paths.save(j); }
+          try { paths.save(request); }
           catch (error) {
-            // Under the lease, seeing the previous journal (or continued absence) proves the attempted
-            // atomic rename did not happen. If that read is uncertain, keep admission closed.
-            try { if (paths.load()?.id === previous?.id) journalAttempted = false; } catch { /* fail closed */ }
+            // Under the lease, seeing the previous record and selection proves no forward transition.
+            // If either is uncertain, keep admission closed.
+            try { paths.check(previous, commit); journalAttempted = false; } catch { /* fail closed */ }
             throw error;
           }
-          request.id = id;
-          request.accepted = true;
+          marker.id = id;
+          marker.accepted = true;
           await tx.appendEntry(target.id, {
             kind: upgradeEntryKind, data: { id, type: "request", text: `Requested upgrade (${id}).` },
           });
+          paths.check(request, commit);
           return id;
         }, ctx);
         committed = true;
@@ -259,21 +294,26 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
           unblock();
           return accepted;
         }
+        paths.check(request, commit);
       } finally { unlock(); }
       const log = openUpgradeLog(paths, id);
       try {
+        paths.check(request, commit);
         const child = spawn(process.execPath, [join(source, "src/upgrade-supervisor.ts"), "handoff",
           "--install-dir", paths.root, "--port", String(config.port), "--id", id], {
-          cwd: source, detached: true, stdio: ["ignore", log, log, "ipc"],
+          cwd: source, env: { ...process.env, [upgradeHandoffEnv]: JSON.stringify(request) },
+          detached: true, stdio: ["ignore", log, log, "ipc"],
         });
         child.on("message", message => {
-          if (message !== "drain") return;
+          if (!message || typeof message !== "object" || !("drain" in message)) return;
           try {
-            const j = paths.load();
-            if (j?.id === id && j.phase === "stopping") {
-              drainStarted = true;
-              stop();
+            const j = message.drain as UpgradeJournal | undefined;
+            if (j?.phase !== "stopping" || !sameUpgradeRequest(j, request) || j.oldProcess?.pid !== process.pid) {
+              throw new Error("Invalid upgrade drain request");
             }
+            paths.check(j, commit);
+            drainStarted = true;
+            stop();
           } catch (error) { console.error(`Cannot drain for upgrade ${id}:`, error); }
         });
         const settle = (reason: string) => { void settleHandoff(reason).catch(error => console.error(`Upgrade ${id}:`, error)); };

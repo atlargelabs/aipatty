@@ -14,7 +14,8 @@ import type { ConversationPage } from "../src/protocol.ts";
 import { ownDataDir } from "../src/ownership.ts";
 import { RUN_MARKER } from "../src/processes.ts";
 import { backupDb, restoreDb } from "../src/upgrade-db.ts";
-import { upgradeEntryKind, UpgradePaths } from "../src/upgrade-state.ts";
+import { committedValidation } from "../src/upgrade-host.ts";
+import { finish, interruptedCutover, upgradeEntryKind, UpgradePaths, type UpgradeJournal } from "../src/upgrade-state.ts";
 import { identify, type UpgradeHealth } from "../src/upgrade-process.ts";
 import { checkout, until } from "./helpers.ts";
 
@@ -142,6 +143,19 @@ async function unusedPort(): Promise<number> {
   return port;
 }
 
+const barriers = ["quiescent", "selected", "handoff", "ack-retirement", "ack-result", "publication", "backup"] as const;
+function pauseAt(name: typeof barriers[number]): string {
+  return `{
+    const { existsSync, writeFileSync } = await import("node:fs");
+    const { setTimeout: delay } = await import("node:timers/promises");
+    const hold = process.env.UPGRADE_FIXTURE + "/hold-${name}";
+    if (existsSync(hold)) {
+      writeFileSync(hold + ".entered", "");
+      while (existsSync(hold)) await delay(25);
+    }
+  }`;
+}
+
 /** Real Git trees, clone/fetch, release scripts, shutdown/validation and SQLite. Only the origin and install tooling
  * are a fixture: no GitHub, live credentials, or nested npm test recursion. The shim records each required command
  * and links this test run's already installed deps. All process hooks below exist only in these scratch commits.
@@ -156,7 +170,8 @@ async function fixture(t: TestContext, legacy = false, hostHasGitPaths = false) 
   const commits = new Set<string>();
   t.after(async () => {
     // Wake a fixture process held at a barrier even when a test fails. Don't signal by PID from /health.
-    for (const name of ["hold-stage", "hold-stage-child", "hold-pi", "hold-legacy-exit", "hold-probe", "hold-legacy-probe"]) {
+    for (const name of ["hold-stage", "hold-stage-child", "hold-pi", "hold-legacy-exit", "hold-probe", "hold-legacy-probe",
+      ...barriers.map(name => `hold-${name}`)]) {
       await rm(join(scratch, name), { force: true });
     }
     await writeFile(join(scratch, "let-nested-finish"), "");
@@ -243,6 +258,10 @@ exec /usr/sbin/lsof "$@"
 ${probeStart}`));
   const supervisorPath = join(repo, "src/upgrade-supervisor.ts");
   const supervisorCode = await readFile(supervisorPath, "utf8");
+  const afterQuiescent = /const free = await quiescent\(paths, current\.port, [^\n]+\n    try \{/;
+  const verifiedSelected = "  await verifyRelease(paths.release(sha), sha);";
+  assert.match(supervisorCode, afterQuiescent);
+  assert.ok(supervisorCode.includes(verifiedSelected));
   const prepareStart = "  let target: string | undefined, result:";
   const sendCompletion = "  await sendParent({ id, ...result });";
   assert.ok(supervisorCode.includes(prepareStart) && supervisorCode.includes(sendCompletion));
@@ -252,21 +271,35 @@ ${probeStart}`));
   writeFileSync(join(process.env.UPGRADE_FIXTURE!, "worker.pid"), String(child.pid));
 ${prepareStart}`)
     .replace(sendCompletion, `  if (existsSync(join(process.env.UPGRADE_FIXTURE!, "omit-stage-result"))) return;
-${sendCompletion}`));
+${sendCompletion}`)
+    .replace(afterQuiescent, match => `${match}\n${pauseAt("quiescent")}`)
+    .replace(verifiedSelected, `${verifiedSelected}\n${pauseAt("selected")}`));
+  const releasePath = join(repo, "src/upgrade-release.ts");
+  const dbPath = join(repo, "src/upgrade-db.ts");
+  for (const [path, line, barrier] of [
+    [releasePath, "    syncTree(copy);", "publication"], [dbPath, "    syncPath(temp);", "backup"],
+  ] as const) {
+    const code = await readFile(path, "utf8");
+    assert.ok(code.includes(line));
+    await writeFile(path, code.replace(line, `${line}\n${pauseAt(barrier)}`));
+  }
   const upgradeHostPath = join(repo, "src/upgrade-host.ts");
   const upgradeHostCode = await readFile(upgradeHostPath, "utf8");
-  const reportStart = "  if (j.phase !== \"done\" || j.branch === undefined || j.reported) return;";
-  const saveRequest = "try { paths.save(j); }";
-  const startHelper = '      const log = openUpgradeLog(paths, id);\n      try {\n        const child = spawn';
-  assert.ok(upgradeHostCode.includes(reportStart) && upgradeHostCode.includes(saveRequest) && upgradeHostCode.includes(startHelper));
+  const reportStart = '  if (j.phase !== "done" || j.branch === undefined || j.reported) return j;';
+  const saveRequest = "try { paths.save(request); }";
+  const startHelper = '      const log = openUpgradeLog(paths, id);\n      try {';
+  const retireAck = "    return ack({", resultAck = "  return ack();";
+  for (const line of [reportStart, saveRequest, startHelper, retireAck, resultAck]) assert.ok(upgradeHostCode.includes(line));
   await writeFile(upgradeHostPath, upgradeHostCode.replace(reportStart, `${reportStart}
   const { existsSync } = await import("node:fs");
   if (existsSync(join(process.env.UPGRADE_FIXTURE!, "fail-report"))) throw new Error("fixture transcript write failed");
 `).replace(saveRequest, `try {
   const { existsSync } = await import("node:fs");
   if (existsSync(join(process.env.UPGRADE_FIXTURE!, "fail-journal-write"))) throw new Error("fixture journal write failed before rename");
-  paths.save(j);
-}`).replace(startHelper, `
+  paths.save(request);
+}`).replace(retireAck, `${pauseAt("ack-retirement")}\n${retireAck}`)
+  .replace(resultAck, `${pauseAt("ack-result")}\n${resultAck}`).replace(startHelper, `
+      ${pauseAt("handoff")}
       const { existsSync } = await import("node:fs");
       if (existsSync(join(process.env.UPGRADE_FIXTURE!, "fail-start-helper"))) throw new Error("fixture log failed to open");
 ${startHelper}`));
@@ -359,8 +392,16 @@ ${startHelper}`));
   const flag = (name: string) => writeFile(join(scratch, name), "");
   const unflag = (name: string) => rm(join(scratch, name), { force: true });
   const log = (id: string) => readFile(paths.log(id), "utf8");
+  const pause = async (name: typeof barriers[number]) => {
+    const hold = `hold-${name}`;
+    await flag(hold);
+    return {
+      entered: () => until(() => existsSync(join(scratch, `${hold}.entered`))),
+      resume: async () => { await unflag(hold); await unflag(`${hold}.entered`); },
+    };
+  };
   return { scratch, paths, repo, port, url, old, git, launch, health, healthNow, next, install,
-    supervisor, cli, request, send, fork, entries, result, flag, unflag, log };
+    supervisor, cli, request, send, fork, entries, result, flag, unflag, log, pause };
 }
 
 test("first bootstrap uses legacy shutdown, waits for exit beyond the ACK and preserves the DB without a fabricated branch", { timeout }, async t => {
@@ -569,9 +610,147 @@ test("an unmanaged data-dir tolerates unrelated files but not an ambiguous upgra
   assert.throws(() => UpgradePaths.forStartup(config), /Missing upgrade journal: .*Private staging artifacts exist/);
   await rm(join(upgrade, `${id}.stage-owner.sqlite`));
   await mkdir(paths.stage(id), { recursive: true });
-  assert.throws(() => UpgradePaths.forStartup(config), /Missing upgrade journal: .*Private staging artifacts exist/);
+  for (const missing of ["journal", "directory"]) {
+    if (missing === "directory") await rm(upgrade, { recursive: true });
+    assert.throws(() => UpgradePaths.forStartup(config), /Missing upgrade journal: .*Private staging artifacts exist/, missing);
+  }
   await rm(paths.stage(id), { recursive: true });
   assert.equal(UpgradePaths.forStartup(config), undefined);
+});
+
+test("a live request cannot replace a lost state directory while a private stage exists", { timeout }, async t => {
+  const f = await fixture(t);
+  const old = f.launch();
+  await f.health(f.old);
+  f.paths.init();
+  const stage = f.paths.stage(randomUUID());
+  await mkdir(stage);
+  await rename(f.paths.state, f.paths.state + ".moved");
+  const response = await f.send("/upgrade", "root", { marker: "1" });
+  assert.equal(response.status, 409);
+  assert.match(await response.text(), /Missing upgrade journal: .*Private staging artifacts exist/);
+  assert.equal(f.paths.load(), undefined);
+  assert.ok(existsSync(stage));
+  assert.ok(!(await f.entries()).some(e => e.kind === upgradeEntryKind));
+  await f.cli("shutdown");
+  assert.equal(await old.exited, 0, old.output());
+  await rm(f.paths.state, { recursive: true }); // Test startup with the entire state directory absent.
+  const restarted = f.launch();
+  assert.equal(await restarted.exited, 1, restarted.output());
+  assert.match(restarted.output(), /Missing upgrade journal: .*Private staging artifacts exist/);
+  await assert.rejects(f.supervisor(f.old, "bootstrap"), /Missing upgrade journal: .*Private staging artifacts exist/);
+  assert.equal(f.paths.load(), undefined);
+});
+
+for (const field of ["branch", "requestKey"] as const) {
+  test(`failed handoff does not cancel a replacement request with a different ${field}`, { timeout }, async t => {
+    const f = await fixture(t);
+    const child = f.launch();
+    await f.health(f.old);
+    const branch = await f.fork();
+    await f.flag("fail-start-helper");
+    const barrier = await f.pause("handoff");
+    const response = f.send("/upgrade", "root", { marker: "1" });
+    await barrier.entered();
+    const accepted = f.paths.load()!;
+    f.paths.save(field === "branch" ? { ...accepted, branch } : { ...accepted, requestKey: randomUUID() });
+    const replacement = await readFile(f.paths.journal, "utf8");
+    await barrier.resume();
+    assert.deepEqual(await (await response).json(), { upgradeId: accepted.id });
+    assert.match(child.output(), /Missing or changed upgrade journal/);
+    assert.equal(await readFile(f.paths.journal, "utf8"), replacement);
+    assert.equal((await f.send("keep admission closed")).status, 409);
+    assert.equal((await f.entries(branch)).filter(e => e.kind === upgradeEntryKind).length, 0);
+    assert.equal((await f.entries()).filter(e => e.kind === upgradeEntryKind).length, 1); // Only the accepted request.
+  });
+}
+
+test("delivery cannot acknowledge a replaced terminal record after committing its result", { timeout }, async t => {
+  const f = await fixture(t);
+  const old = f.launch();
+  await f.health(f.old);
+  const barrier = await f.pause("ack-result");
+  assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
+  await barrier.entered();
+  assert.throws(() => f.paths.lease(), /Another upgrade or recovery owns/);
+  const original = f.paths.load()!;
+  assert.equal(original.reported, undefined);
+  assert.equal((await f.result(original.id)).length, 1);
+  f.paths.save(finish(original, { ...original.result!, reason: "different terminal result" }));
+  const replacement = await readFile(f.paths.journal, "utf8");
+  await barrier.resume();
+  await until(() => old.output().includes("Could not settle upgrade"));
+  assert.match(old.output(), /Could not deliver upgrade .*Upgrade journal changed/);
+  assert.equal(await readFile(f.paths.journal, "utf8"), replacement);
+  assert.equal((await f.send("must not reopen on drift")).status, 409);
+  await f.cli("shutdown");
+  assert.equal(await old.exited, 0, old.output());
+  f.paths.save(original);
+  f.launch();
+  await f.health(f.old);
+  await until(() => f.paths.load()?.reported);
+  assert.equal((await f.result(original.id)).length, 1);
+});
+
+test("retiring an uncommitted request cannot acknowledge a missing journal", { timeout }, async t => {
+  const f = await fixture(t);
+  const seed = f.launch();
+  await f.health(f.old);
+  const branch = await f.fork();
+  await f.cli("shutdown");
+  assert.equal(await seed.exited, 0, seed.output());
+  const requestKey = randomUUID();
+  f.paths.init();
+  f.paths.save({ version: 1, id: randomUUID(), old: f.old, port: f.port, faux: true, legacy: false,
+    phase: "requested", branch, requestKey });
+  const barrier = await f.pause("ack-retirement");
+  const start = f.launch();
+  await barrier.entered();
+  assert.throws(() => ownDataDir(f.paths.data), /owns data directory/);
+  const original = f.paths.load()!;
+  assert.equal(original.phase, "done");
+  await rm(f.paths.journal);
+  await barrier.resume();
+  assert.equal(await start.exited, 1, start.output());
+  assert.match(start.output(), /Could not deliver upgrade .*Missing upgrade journal/);
+  assert.equal(f.paths.load(), undefined);
+  f.paths.save(original);
+  f.launch();
+  await f.health(f.old);
+  await until(() => f.paths.load()?.reported);
+  const response = await f.send("/upgrade", branch, { marker: "1", requestId: requestKey });
+  assert.equal(response.status, 409);
+  assert.match(await response.text(), /did not commit/);
+  assert.equal((await f.entries(branch)).filter(e => e.kind === upgradeEntryKind).length, 0);
+});
+
+test("gated activation accepts only the exact validated phase-to-terminal transition", { timeout }, async t => {
+  const f = await fixture(t);
+  const target = await f.next("candidate identity");
+  const source = await f.install(target);
+  f.paths.init();
+  f.paths.select(target);
+  const before: UpgradeJournal = { version: 1, id: randomUUID(), old: f.old, target, port: f.port, faux: true, legacy: false,
+    branch: 1, requestKey: randomUUID(), phase: "switching" };
+  const terminal = finish(before, { kind: "upgraded", active: target });
+  for (const patch of [
+    { port: f.port === 65535 ? 1 : f.port + 1 }, { faux: false }, { branch: 2 }, { requestKey: randomUUID() },
+    { legacy: true, branch: undefined, requestKey: undefined }, { old: "a".repeat(40) }, { reported: true as const },
+    { old: target, target: f.old, result: { kind: "rolled-back" as const, active: target } },
+  ]) {
+    f.paths.save({ ...terminal, ...patch });
+    assert.ok(f.paths.load(), "replacement is syntactically valid");
+    assert.equal(committedValidation({ paths: f.paths, journal: before }, source, target), undefined, JSON.stringify(patch));
+  }
+  f.paths.save(terminal);
+  assert.deepEqual(committedValidation({ paths: f.paths, journal: before }, source, target)?.journal, terminal);
+  assert.throws(() => committedValidation({ paths: f.paths, journal: before }, f.paths.release(f.old), target), /Start the selected immutable/);
+  f.paths.select(f.old);
+  assert.throws(() => committedValidation({ paths: f.paths, journal: before }, source, target), /Start the selected immutable/);
+  const restored = { ...before, phase: "restored" as const };
+  const rollback = finish(restored, { kind: "rolled-back", active: f.old, reason: interruptedCutover });
+  f.paths.save(rollback);
+  assert.deepEqual(committedValidation({ paths: f.paths, journal: restored }, f.paths.release(f.old), f.old)?.journal, rollback);
 });
 
 test("a non-legacy journal without a branch or request key cannot authorize recovery", { timeout }, async t => {
@@ -1096,7 +1275,8 @@ test("an interrupted switch closes the gated candidate; startup refuses the unce
   assert.ok(existsSync(backup));
 });
 
-for (const [fault, ready] of [["corrupt", false], ["missing", false], ["missing", true], ["changed branch", true], ["changed request key", true]] as const) {
+for (const [fault, ready] of [["corrupt", false], ["missing", false], ["missing", true], ["changed branch", true],
+  ["changed request key", true], ["replacement terminal port", true], ["selection", true]] as const) {
   test(`a cutover journal fault (${fault}) disconnects the ${ready ? "ready" : "unready"} candidate without restoring`, { timeout }, async t => {
     const f = await fixture(t);
     f.launch();
@@ -1116,16 +1296,20 @@ for (const [fault, ready] of [["corrupt", false], ["missing", false], ["missing"
       if (fault === "corrupt") await writeFile(f.paths.journal, corrupted);
       else if (fault === "missing") await rm(f.paths.journal);
       else if (fault === "changed branch") f.paths.save({ ...j, branch: j.branch! + 1 });
-      else f.paths.save({ ...j, requestKey: randomUUID() });
+      else if (fault === "changed request key") f.paths.save({ ...j, requestKey: randomUUID() });
+      else if (fault === "replacement terminal port") {
+        f.paths.save(finish({ ...j, port: j.port === 65535 ? 1 : j.port + 1 }, { kind: "upgraded", active: target }));
+      } else f.paths.select(f.old);
       const replacement = fault === "missing" ? undefined : await readFile(f.paths.journal, "utf8");
       await f.unflag("hold-probe");
       await until(() => identify(helper), value => !value);
       await until(() => identify(candidate!.pid!), value => !value);
       assert.equal(await f.healthNow(), undefined);
-      assert.equal(f.paths.selected(), target);
+      assert.equal(f.paths.selected(), fault === "selection" ? f.old : target);
       assert.deepEqual(await readFile(f.paths.backup(j.id)), backup);
       const diagnostic = fault === "corrupt" ? /not valid JSON|Unexpected token/
-        : fault === "missing" ? /Missing upgrade journal/ : /Upgrade journal changed/;
+        : fault === "missing" ? /Missing upgrade journal/
+          : fault === "selection" ? /Upgrade selection changed/ : /Upgrade journal changed/;
       assert.match(await f.log(j.id), diagnostic);
       if (replacement !== undefined) assert.equal(await readFile(f.paths.journal, "utf8"), replacement);
       else {
@@ -1143,6 +1327,95 @@ for (const [fault, ready] of [["corrupt", false], ["missing", false], ["missing"
     assert.equal((await f.result(j.id)).length, 1);
   });
 }
+
+for (const boundary of ["publication", "backup"] as const) {
+  test(`selection drift during ${boundary} cannot promote the prepared files`, { timeout }, async t => {
+    const f = await fixture(t);
+    const host = f.launch();
+    await f.health(f.old);
+    const other = await f.next("third release for selection drift");
+    await f.install(other);
+    const target = await f.next("intended target");
+    const barrier = await f.pause(boundary);
+    assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
+    await barrier.entered();
+    assert.throws(() => f.paths.lease(), /Another upgrade or recovery owns/);
+    const pending = f.paths.load()!;
+    assert.equal(pending.phase, boundary === "publication" ? "staging" : "stopping");
+    f.paths.select(other);
+    await barrier.resume();
+    await until(async () => (await f.log(pending.id)).includes("Selection and backup left intact"));
+    assert.deepEqual(f.paths.load(), pending);
+    assert.equal(f.paths.selected(), other);
+    assert.ok(!existsSync(f.paths.backup(pending.id)));
+    if (boundary === "publication") {
+      assert.ok(!existsSync(f.paths.release(target)));
+      assert.ok(existsSync(f.paths.stage(pending.id)));
+      assert.equal((await f.healthNow())?.pid, host.child.pid);
+    } else {
+      assert.equal(await host.exited, 0, host.output());
+      assert.equal(await f.healthNow(), undefined);
+    }
+  });
+}
+
+test("recovery rechecks the terminal record and selection after verifying the release", { timeout }, async t => {
+  const f = await fixture(t);
+  const other = await f.next("other managed selection");
+  await f.install(other);
+  f.paths.init();
+  const done: UpgradeJournal = { version: 1, id: randomUUID(), old: f.old, port: f.port, faux: true, legacy: true,
+    phase: "done", result: { kind: "noop", active: f.old } };
+  for (const fault of ["result", "selection"] as const) {
+    f.paths.save(done);
+    f.paths.select(f.old);
+    const barrier = await f.pause("selected");
+    const rejected = assert.rejects(f.supervisor(f.old, "recover"),
+      fault === "result" ? /Upgrade journal changed/ : /Upgrade selection changed/);
+    await barrier.entered();
+    assert.throws(() => f.paths.lease(), /Another upgrade or recovery owns/);
+    if (fault === "result") f.paths.save(finish(done, { ...done.result!, reason: "replacement" }));
+    else f.paths.select(other);
+    const replacement = await readFile(f.paths.journal, "utf8");
+    await barrier.resume();
+    await rejected;
+    assert.equal(await readFile(f.paths.journal, "utf8"), replacement);
+    assert.equal(f.paths.selected(), fault === "selection" ? other : f.old);
+  }
+});
+
+test("restored legacy recovery rechecks the journal under the data lock before launching", { timeout }, async t => {
+  const f = await fixture(t, true);
+  const legacy = f.launch();
+  await f.health(f.old);
+  await f.cli("shutdown");
+  assert.equal(await legacy.exited, 0, legacy.output());
+  f.paths.init();
+  const target = await f.next("stopped legacy rollback");
+  await f.install(target);
+  const j: UpgradeJournal = { version: 1, id: randomUUID(), old: f.old, target, port: f.port, faux: true, legacy: true,
+    phase: "restored", reason: "test recovery" };
+  const release = ownDataDir(f.paths.data);
+  try { await backupDb(f.paths, j.id); } finally { release(); }
+  const backup = await readFile(f.paths.backup(j.id));
+  f.paths.save(j);
+  const barrier = await f.pause("quiescent");
+  const rejected = assert.rejects(f.supervisor(target, "recover"), /Upgrade journal changed/);
+  await barrier.entered();
+  assert.throws(() => f.paths.lease(), /Another upgrade or recovery owns/);
+  assert.throws(() => ownDataDir(f.paths.data), /owns data directory/);
+  const replacement = { ...j, reason: "replacement journal" };
+  f.paths.save(replacement);
+  await barrier.resume();
+  await rejected;
+  assert.equal(await f.healthNow(), undefined);
+  assert.deepEqual(f.paths.load(), replacement);
+  assert.equal(f.paths.selected(), f.old);
+  assert.deepEqual(await readFile(f.paths.backup(j.id)), backup);
+  f.paths.save(j);
+  assert.match((await f.supervisor(target, "recover")).stdout, /Upgrade rolled back/);
+  await f.health(f.old);
+});
 
 test("recovery of an already listening legacy rollback refuses a corrupt or missing journal after probing", { timeout }, async t => {
   const f = await fixture(t, true);

@@ -16,7 +16,7 @@ function checkFiles(path: string, required = true): void {
 }
 
 /** Only called with the separate conversation owner lock held, after the old server exits. */
-export async function backupDb(paths: UpgradePaths, id: string): Promise<void> {
+export async function backupDb(paths: UpgradePaths, id: string, beforePublish?: () => void): Promise<void> {
   const dest = paths.backup(id);
   checkFiles(paths.db);
   if (exists(dest)) throw new Error(`Backup already exists: ${dest}`);
@@ -33,6 +33,8 @@ export async function backupDb(paths: UpgradePaths, id: string): Promise<void> {
     }
     if (sidecars.some(suffix => exists(temp + suffix))) throw new Error("Unexpected backup sidecar");
     syncPath(temp);
+    beforePublish?.();
+    if (exists(dest)) throw new Error(`Backup already exists: ${dest}`);
     renameSync(temp, dest);
     syncPath(paths.state);
   } finally {

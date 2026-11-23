@@ -5,7 +5,7 @@ import packageJson from "../package.json" with { type: "json" };
 import { startApi, type Health } from "./api.ts";
 import { LOOPBACK, readConfig } from "./config.ts";
 import { openHost } from "./host.ts";
-import { assertAcceptedRequest, committedValidation, guardStartup, hostUpgrade, reportStartup } from "./upgrade-host.ts";
+import { assertAcceptedRequest, checkStartup, committedValidation, guardStartup, hostUpgrade, reportStartup } from "./upgrade-host.ts";
 import { gitEnv } from "./upgrade-release.ts";
 import { errorText, upgradeChildEnv, upgradeProtocol } from "./upgrade-state.ts";
 
@@ -47,9 +47,9 @@ async function main(): Promise<void> {
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
   try {
-    let startup: Awaited<ReturnType<typeof guardStartup>>;
-    const agent = await openHost(config, { paused: true, async beforeOpen() {
-      startup = await guardStartup(config, source, health.commit, childId);
+    let startup: ReturnType<typeof guardStartup>;
+    const agent = await openHost(config, { paused: true, beforeOpen() {
+      startup = guardStartup(config, source, health.commit, childId);
     } });
     const { harness } = agent;
     const closed = harness.closed.then(end => {
@@ -61,7 +61,8 @@ async function main(): Promise<void> {
     try {
       let serving = false;
       const activate = async () => {
-        await reportStartup(agent, startup, health.commit);
+        startup = await reportStartup(agent, startup, health.commit);
+        checkStartup(config, startup, health.commit);
         agent.activate();
         serving = true;
         delete health.validation;
@@ -76,6 +77,7 @@ async function main(): Promise<void> {
             if (!branch) throw new Error("The requesting conversation is missing");
             await agent.assertAvailable(branch);
           }
+          checkStartup(config, startup, health.commit);
           health.validation = { id: childId, ready: true };
         } catch (error) {
           health.validation = { id: childId, ready: false, reason: errorText(error) };
