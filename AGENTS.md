@@ -42,11 +42,24 @@ The rest follow from the same idea:
   release a minute to become healthy, then fall back.
 - **Verify the end state.** Check what you actually want, such as `/health` reporting the expected commit,
   instead of trusting that each step returned success.
+- **Errors say what to do next.** Name what failed, why, and the command or file that fixes it, as in
+  `Model openai/gpt-x is unavailable. Run 'aipatty models' then 'aipatty model set <modelId>'.` The person reading
+  it is often on a phone or in the conversation, without the code in front of them.
 - **Do not repeat a check another gate already makes.** CI and the `protect-main` ruleset gate `main`, so a
   deploy does not run the test suite again.
 - **Do one-time things by hand** and write the steps in `docs/INSTALL.md`.
 - **Say what is not handled.** List the cases left out, in the docs, as decisions. A known limit in one sentence
   is better than fifty lines that cover it.
+
+## Keep it easy to maintain
+
+- **Build only what is needed now.** Solve the problem in front of you with the least code that does it. Leave
+  out options, flags and abstraction layers until something needs them a second time. `docs/PLAN.md` works the
+  same way: features are deferred until something needs them, and guards are added only after a real mistake.
+  Code written for a need that never arrives still has to be read, tested and kept working.
+- **One source of truth.** Define each constant, file format and rule once and import it everywhere it is used.
+  The `/upgrade` command and its transcript entry kind live in `src/protocol.ts`, and the server, CLI and page
+  all read them from there. Two copies drift apart, and the bug appears only where they meet.
 
 ## Reviewing, and answering a review
 
