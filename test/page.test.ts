@@ -201,7 +201,7 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   await root.commit(async tx => {
     await tx.appendEntry(root.id, { kind: "test", model: [fauxAssistantMessage([call("Missing archive", "missing"), call("Refused", "first")], { stopReason: "toolUse" })] });
     await exchange(tx, "pi", "missing", "old result", missing);
-    await exchange(tx, "pi", "first", `Pi run ${first} is still active. Only one run at a time.`);
+    await exchange(tx, "pi", "first", `Pi run ${first} is still active on branch 1. Wait for it, or abort this branch.`);
     await tx.appendEntry(root.id, { kind: "test", model: [fauxAssistantMessage([call("Unfinished task", "never")], { stopReason: "aborted" })] });
     await tx.appendEntry(root.id, { kind: "test", model: [fauxAssistantMessage([call("Ambiguous A", "duplicate"), call("Ambiguous B", "duplicate")], { stopReason: "toolUse" })] });
     await exchange(tx, "pi", "duplicate", "Refused duplicate");

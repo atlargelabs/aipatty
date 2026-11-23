@@ -32,13 +32,17 @@ have the permissions of the user the server runs as.
 Work meant for a PR goes through the `pi` tool. Each call runs one session of the Pi CLI pinned in `package.json`,
 in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits for it.
 
-- **One at a time.** A second call, from any branch, is refused while a run is active.
+- **One per conversation branch.** A second call in the same branch is refused during startup, execution and
+  cleanup. Different branches start and finish independently in separate clones; there is no global run cap
+  or coordination of work in GitHub.
 - **Launch.** The CLI runs in one-shot JSON mode with no session. It explicitly loads the release's pinned
   `delegates`, `just-web-fetch` (managed `web_fetch`) and `pi-web-search` (`web_search`, plus `url_context` on
   supported models). The default stays `openai/gpt-6.2-sol`. An explicit `model: "claude-code/<model-id>"`
   opts that run into the experimental Claude Code provider; there is no automatic Claude discovery or fallback
   on OpenAI runs. Nothing loads by discovery: no checkout settings, extensions, skills, context files or MCP
-  servers. Pi shares the server's Pi directory, sign-in and `delegates` settings.
+  servers. Pi shares the server's Pi directory, sign-in and `delegates` settings. Set `delegates.maxParallel`
+  to `10` in that directory's `settings.json` for ten concurrent top-level delegates **per Pi** (not a shared
+  pool or a cap on all nested jobs). See [the operator setup](docs/INSTALL.md#enable-ten-delegates-per-pi).
 - **Rules.** Pi is told the git and issue workflow: an issue, a task branch and a PR that links the issue;
   `npm run check` and `npm test` before every push; a `crmanager` review of the final commit, repeated until it
   has no P0 or P1 finding; and that only Steve merges.
@@ -60,21 +64,19 @@ in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits fo
 - **Abort and timeout.** Aborting the branch, or the run's time limit (60 minutes unless the call says otherwise,
   counted from the start of the clone), stops Pi and the processes it started, its delegates included. The result
   reports what the run had done. Once Pi has finished and the host is checking the result, the run ends as it
-  ended.
+  ended. Stopping one branch does not stop another's run.
 - **Cleanup.** Every run's events, error output, prompt and result are kept in `logs/runs/<run-id>/` in the data
   directory, with the logs of its delegate jobs. The workspace and the delegates' clones are deleted. Logs can
-  hold private data.
-- **Restart.** A run does not survive the server. On the next start, before any conversation resumes, the server
-  stops what is left of the run, cleans up, and reports the call as `interrupted` in its branch, with any PR link
-  the run had printed. It never runs the call again. A run that had already settled when the server died keeps
-  its result.
-- **When cleanup fails.** If a run's processes cannot be stopped or cannot be told from another's, its files
-  cannot be removed, or its saved record (`pi-run.json` in the data directory) cannot be read, nothing more is
-  deleted and no new run starts until that is resolved and the server restarted. The refusal says what is wrong.
-  A run whose processes could not be stopped, or whose events could not be read back after a restart, has not
-  had all its spend added. A later cleanup
-  that stops them adds it to the run's `result.json`; if the call's result was already recorded in its branch by
-  then, the branch's cost does not include it.
+  hold private data. The host saves the result there and indexes it by the tool's task under `pi-outcomes/`
+  before clearing the run's checkpoint in `pi-runs/<run-id>.json`.
+- **Restart.** Runs do not survive the server. On the next start, before conversations resume, the server
+  independently stops and cleans up interrupted runs and reports each call as `interrupted` in its own branch,
+  with any known PR link. It never runs the calls again; an already settled run keeps its result.
+- **When cleanup fails.** If a known run's processes cannot be proved stopped or its files cannot be removed,
+  that branch is held until the problem is resolved and the server restarted. Unreadable or conflicting run
+  records can make ownership unknown, in which case no new Pi run starts. The refusal says what to inspect.
+  Preserve the records and workspaces as evidence. A later cleanup may add spend to `result.json`; if the
+  call's result was already committed in its branch, that spend is not charged there again.
 
 A run needs `git`, `gh`, a GitHub login for the account running the server, and the Pi sign-in. For a PR run,
 `delegates.reviewExtension` in the selected Pi directory's `settings.json` must be an absolute path to the
@@ -93,8 +95,8 @@ A run's processes are identified by a remembered PID and start time or by a mark
 Discovery also follows their children and other members of their live process groups. A remembered group ID
 alone can be reused: if the leader is gone and no member can be independently identified, the remaining
 members are not signalled and cleanup stays pending. Inspect the reported PIDs and restart once the ambiguity
-is resolved. Existing `pi-run.json` records are still readable; the legacy `asOf` timestamp is ignored for
-ownership. A process that leaves both its parent and its group and hides its environment is not found unless
+is resolved. Existing `pi-run.json` records are recovered in place; the legacy `asOf` timestamp is ignored for
+ownership. See the [cutover and rollback procedure](docs/INSTALL.md#pi-run-state-cutover-and-rollback). A process that leaves both its parent and its group and hides its environment is not found unless
 its identity was remembered.
 
 ## Page

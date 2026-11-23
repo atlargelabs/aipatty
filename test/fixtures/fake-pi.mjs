@@ -1,17 +1,18 @@
-// A stand-in for the Pi CLI in one-shot JSON mode. It plays the steps of `fake-scenario.json` in the agent directory
-// and records how it was launched in `fake-launches.jsonl` there.
+// A stand-in for the Pi CLI in one-shot JSON mode. Plays a branch's `fake-scenario-<branch>.json` or the common
+// `fake-scenario.json` in the agent directory, and records how it was launched in `fake-launches.jsonl` there.
 import { spawn } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 const agentDir = process.env.PI_CODING_AGENT_DIR;
-const scenario = JSON.parse(readFileSync(join(agentDir, "fake-scenario.json"), "utf8"));
-const sessionId = scenario.sessionId ?? "fake-session";
-if (scenario.ignoreTerm) process.on("SIGTERM", () => {});
-
 let prompt = "";
 for await (const chunk of process.stdin) prompt += chunk;
+const branch = /requested from aipatty's conversation branch (\d+)/.exec(prompt)?.[1];
+const branchScenario = join(agentDir, `fake-scenario-${branch}.json`);
+const scenario = JSON.parse(readFileSync(existsSync(branchScenario) ? branchScenario : join(agentDir, "fake-scenario.json"), "utf8"));
+const sessionId = scenario.sessionId ?? `fake-session-${process.env.PATTY_RUN_ID}`;
+if (scenario.ignoreTerm) process.on("SIGTERM", () => {});
 appendFileSync(join(agentDir, "fake-launches.jsonl"), JSON.stringify({
   argv: process.argv.slice(2), cwd: process.cwd(), prompt, pid: process.pid,
   env: Object.fromEntries(Object.entries(process.env).filter(([name]) => /^(PI_|PATTY_|AIPATTY_)/.test(name))),
@@ -43,6 +44,8 @@ for (const step of scenario.steps ?? []) {
       workspace: { kind: "clone", path: join(dir, "workspace"), source: step.job.source ?? process.cwd() },
     }));
   }
+  if (step.ready) writeFileSync(join(agentDir, step.ready), "ready");
+  if (step.waitFor) while (!existsSync(join(agentDir, step.waitFor))) await sleep(10);
   if (step.sleep) await sleep(step.sleep);
   if (step.hang) await new Promise(() => setInterval(() => {}, 1000));
   if (step.exit !== undefined) process.exit(step.exit);

@@ -285,7 +285,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
         return exclusive(async () => {
           if (upgrading) throw new HttpError(409, "An upgrade is already in progress");
           const { tasks, submissions } = await harness.inspect(ctx);
-          if (tasks.length || submissions.length || runs.active()) {
+          if (tasks.length || submissions.length || runs.hasActive()) {
             throw new HttpError(409, "Wait for every branch to finish, or abort it, before upgrading");
           }
           upgrading = true;

@@ -1,8 +1,8 @@
 import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { existsSync, mkdirSync } from "node:fs";
+import { copyFile, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -53,11 +53,16 @@ async function setup(t: TestContext, installRoot = false): Promise<Config> {
 
 const reviewerEntry = "node_modules/@earendil-works/pi-review/review.ts";
 const reviewSetting = (config: Config, reviewExtension: unknown) =>
-  writeFile(join(config.pi.agentDir, "settings.json"), JSON.stringify({ delegates: { reviewExtension } }));
+  writeFile(join(config.pi.agentDir, "settings.json"), JSON.stringify({ delegates: { maxParallel: 10, reviewExtension } }));
+const stateDir = (config: Config) => join(config.dataDir, "pi-runs");
+const checkpointFile = (config: Config, id: string) => join(stateDir(config), `${id}.json`);
+const pendingRecords = async (config: Config) => (await readdir(stateDir(config))).filter(name => name.endsWith(".json")).sort();
+const taskIndex = (config: Config, taskId: number) => join(config.dataDir, "pi-outcomes", `${taskId}.json`);
 
 type Step = Record<string, unknown>;
-const scenario = (config: Config, steps: Step[], extra: object = {}) =>
-  writeFile(join(config.pi.agentDir, "fake-scenario.json"), JSON.stringify({ steps, ...extra }));
+const scenario = (config: Config, steps: Step[], extra: object = {}, branch?: number) =>
+  writeFile(join(config.pi.agentDir, `fake-scenario${branch === undefined ? "" : `-${branch}`}.json`), JSON.stringify({ steps, ...extra }));
+const flag = (config: Config, name: string) => join(config.pi.agentDir, name);
 const github = (config: Config, known: object) => writeFile(join(config.dataDir, "fake-gh.json"), JSON.stringify(known));
 /** What GitHub says a PR closes. */
 const closing = (number: number, owner = "atlargelabs", name = "aipatty") => [{ number, repository: { name, owner: { login: owner } } }];
@@ -152,9 +157,10 @@ test("an install-root run forwards its Pi directory and loads only the pinned co
   for (const rule of [/only Steve merges/, /npm run check/, /npm test/, /`Closes #N`, as plain text/, /\/review pr <number>/, /crmanager/, /<result>/, /do not look for or report the cost/]) assert.match(rules, rule);
   assert.deepEqual(await readdir(config.runsDir), []);
   assert.ok(existsSync(join(outcome.logDir, "events.jsonl")));
-  assert.deepEqual(JSON.parse(await readFile(join(outcome.logDir, "result.json"), "utf8")), { outcome, reconciled: true, taskId: 101 });
+  assert.deepEqual(JSON.parse(await readFile(join(outcome.logDir, "result.json"), "utf8")), { outcome, reconciled: true, taskId: 101, conversationId: 1 });
+  assert.deepEqual(await pendingRecords(config), []);
   assert.ok(!existsSync(join(config.dataDir, "pi-run.json")));
-  await rm(join(config.dataDir, "pi-outcomes.json"));
+  await rm(taskIndex(config, 101));
   const replay = await (await openPiRuns(config)).snapshot(outcome.runId);
   assert.equal(replay?.status, "completed");
   assert.equal(typeof replay?.durationMs, "number");
@@ -524,22 +530,25 @@ test("deploy/current selects the running release's reviewer on deploy and rollba
   assert.equal(await readFile(settings, "utf8"), original);
 });
 
-test("a second run is refused while one is active, on any branch, and the slot frees afterwards", async t => {
+test("a branch reserves its Pi slot synchronously during startup, rejects same-branch calls, and reuses it after cleanup", async t => {
   const config = await setup(t);
   await scenario(config, [{ hang: true }]);
   const runs = await openPiRuns(config);
-  const controller = new AbortController();
-  const first = runs.run(request({ conversationId: 3 }), controller.signal);
-  const active = runs.active();
-  assert.equal(active?.conversationId, 3);
-  await assert.rejects(runs.run(request({ conversationId: 4, taskId: 102 })),
-    new RegExp(`Pi run ${active!.runId}, started from branch 3, is still active\\. Only one run at a time`));
-  await until(() => existsSync(join(config.pi.agentDir, "fake-launches.jsonl")));
-  controller.abort();
+  t.after(() => runs.close());
+  let id = "";
+  const first = runs.run(request({ conversationId: 3, pr: false }), undefined, runId => { id = runId; });
+  // No await between the calls, as when the tool calls arrive in one model batch.
+  await assert.rejects(runs.run(request({ conversationId: 3, taskId: 102 })),
+    new RegExp(`Pi run ${id} is still active on branch 3`));
+  assert.equal(runs.hasActive(), true);
+  await until(() => existsSync(flag(config, "fake-launches.jsonl")));
+  assert.equal(await runs.settled(102), undefined, "settling the refused call does not stop the admitted one");
+  assert.equal((await runs.settled(101))?.status, "aborted");
   assert.equal((await first).status, "aborted");
-  assert.equal(runs.active(), undefined);
+  assert.equal(runs.hasActive(), false);
+  assert.deepEqual(await pendingRecords(config), []);
   await scenario(config, [assistant(report({ pr: null, issue: null })), settled]);
-  assert.equal((await runs.run(request({ pr: false }))).status, "completed");
+  assert.equal((await runs.run(request({ conversationId: 3, taskId: 103, pr: false }))).status, "completed");
 });
 
 test("abort and timeout stop Pi and its delegates' processes, keep the logs, and delete the workspace and delegate clones", { timeout: 60_000 }, async t => {
@@ -580,7 +589,7 @@ test("abort and timeout stop Pi and its delegates' processes, keep the logs, and
     assert.equal(outcome.usageComplete, false);
     assert.match(outcome.problems.join("\n"), /1 delegate call\(s\) were cut off before they reported/);
     assert.doesNotMatch(outcome.problems.join("\n"), /manifest/);
-    assert.ok(!existsSync(join(config.dataDir, "pi-run.json")));
+    assert.deepEqual(await pendingRecords(config), []);
     return outcome;
   };
 
@@ -617,53 +626,65 @@ test("abort and timeout stop Pi and its delegates' processes, keep the logs, and
   assert.ok(existsSync(join(victim, "workspace")) && !existsSync(join(victim, "discarded")), "the linked directory is untouched");
 });
 
-test("after a crash, the next start stops the surviving processes, cleans up, and reports the call interrupted", { timeout: 60_000 }, async t => {
+test("after a crash, the next start stops each surviving run, cleans up, and reports both calls interrupted", { timeout: 60_000 }, async t => {
   const config = await setup(t);
   await scenario(config, [
-    assistant("Working.", 0.5, "toolUse"),
+    assistant("Working on A.", 0.5, "toolUse"),
     ...delegate("c1", { id: "job-pr", profile: "prmanager", task: "Publish.", cost: 1, prUrl }),
-    { job: { id: "job-running", cost: 0.5 } }, { spawn: true }, { hang: true },
-  ]);
-  // A host process that starts the run and is then killed outright.
+    { job: { id: "job-running-a", cost: 0.5 } }, { spawn: true }, { hang: true },
+  ], {}, 7);
+  await scenario(config, [assistant("Working on B.", 0.25, "toolUse"), { job: { id: "job-running-b", cost: 0.5 } }, { spawn: true }, { hang: true }], {}, 8);
+  // A host process that starts two runs and is then killed outright.
   const script = `
     import { openPiRuns } from ${JSON.stringify(join(checkout, "src/pi-run.ts"))};
     const runs = await openPiRuns(${JSON.stringify(config)});
-    await runs.run(${JSON.stringify(request({ conversationId: 7, taskId: 107 }))});`;
+    await Promise.all(${JSON.stringify([request({ conversationId: 7, taskId: 107 }), request({ conversationId: 8, taskId: 108, pr: false })])}
+      .map(request => runs.run(request)));`;
   const host = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: "ignore" });
   const exited = new Promise(resolve => host.once("exit", resolve));
   t.after(() => { host.kill("SIGKILL"); });
-  await until(async () => (await spawned(config)).length === 1, Boolean, 20_000);
-  // Long enough for the host to have recorded the detached child.
-  const checkpoint = await until(async () => JSON.parse(await readFile(join(config.dataDir, "pi-run.json"), "utf8")),
-    saved => saved.procs.length >= 2);
-  assert.equal(checkpoint.asOf, 0, "new records keep the legacy numeric field without an ownership cutoff");
-  // Recording the child can race with flushing the earlier publication event; the recovery assertions
-  // below depend on the event having reached the archive before the simulated crash.
-  await until(async () => (await readFile(join(checkpoint.logDir, "events.jsonl"), "utf8")).includes(prUrl));
+  await until(async () => (await spawned(config)).length === 2, Boolean, 20_000);
+  const beforeCrash = await launches(config);
+  const pids = [...beforeCrash.map(pi => pi.pid), ...await spawned(config)];
+  t.after(() => { for (const pid of pids) if (alive(pid)) process.kill(pid, "SIGKILL"); });
+  for (const pi of beforeCrash) {
+    const id = pi.env.PATTY_RUN_ID;
+    const checkpoint = await until(async () => JSON.parse(await readFile(checkpointFile(config, id), "utf8")),
+      saved => saved.procs.length >= 2);
+    assert.equal(checkpoint.asOf, 0, "new records keep the legacy numeric field without an ownership cutoff");
+    const event = checkpoint.conversationId === 7 ? prUrl : "Working on B.";
+    await until(async () => (await readFile(join(checkpoint.logDir, "events.jsonl"), "utf8")).includes(event));
+  }
   host.kill("SIGKILL");
   await exited;
-  const [pi] = await launches(config);
-  const [child] = await spawned(config);
-  assert.ok(alive(pi.pid) && alive(child), "the run outlives its host");
+  assert.equal(pids.length, 4);
+  assert.ok(pids.every(alive), "both runs outlive their host");
 
   const runs = await openPiRuns(config);
-  assert.ok(!alive(pi.pid) && !alive(child));
+  assert.ok(pids.every(pid => !alive(pid)));
   assert.deepEqual(await readdir(config.runsDir), []);
-  assert.ok(!existsSync(join(config.pi.agentDir, "delegates/jobs/job-running/workspace")));
-  assert.ok(!existsSync(join(config.dataDir, "pi-run.json")));
-  assert.equal(runs.active(), undefined);
-  const outcome = await runs.settled(107);
-  assert.equal(outcome?.status, "interrupted");
-  assert.deepEqual(outcome?.pr, { url: prUrl, number: 12, confirmed: false });
-  // Pi's message, the delegate that reported, and what the running job had recorded.
-  assert.equal(outcome?.usage.cost.total, 0.5 + 1 + 0.5);
-  assert.equal(outcome?.usageComplete, false);
-  assert.match(outcome!.summary, /is not run again/);
+  assert.deepEqual(await pendingRecords(config), []);
+  assert.equal(runs.hasActive(), false);
+  const first = await runs.settled(107);
+  const second = await runs.settled(108);
+  assert.deepEqual(first?.pr, { url: prUrl, number: 12, confirmed: false });
+  assert.equal(second?.pr, undefined);
+  for (const [outcome, name, cost] of [[first, "a", 2], [second, "b", 0.75]] as const) {
+    assert.ok(outcome);
+    assert.equal(outcome.status, "interrupted");
+    assert.equal(outcome.usage.cost.total, cost);
+    assert.equal(outcome.usageComplete, false);
+    assert.match(outcome.summary, /is not run again/);
+    assert.ok(existsSync(join(outcome.logDir, `delegates/job-running-${name}/job.json`)));
+    assert.ok(!existsSync(join(config.pi.agentDir, `delegates/jobs/job-running-${name}/workspace`)));
+  }
   assert.equal(await runs.settled(999), undefined);
 
-  // Never rerun: only the one launch, and a third start still knows the call.
-  assert.equal((await launches(config)).length, 1);
-  assert.equal((await (await openPiRuns(config)).settled(107))?.status, "interrupted");
+  // Never rerun: only the two original launches, and a third start still knows both calls.
+  assert.equal((await launches(config)).length, 2);
+  const reopened = await openPiRuns(config);
+  assert.deepEqual(await reopened.settled(107), first);
+  assert.deepEqual(await reopened.settled(108), second);
 });
 
 /** What the fake model answered last. */
@@ -720,13 +741,15 @@ test("the model's own tools work in the work directory", { timeout: 30_000 }, as
   }
 });
 
-test("aborting the branch stops its run and reports what the run had done", { timeout: 60_000 }, async t => {
+test("two conversation branches get isolated Pi clones and snapshots; aborting one leaves the other running", { timeout: 60_000 }, async t => {
   const config = await setup(t);
-  await scenario(config, [assistant("Working.", 0.5, "toolUse"), ...delegate("c1", { id: "job-pr", profile: "prmanager", task: "Publish.", cost: 1, prUrl }), { spawn: true }, { hang: true }]);
   const host = await openHost(config);
   t.after(() => host.close());
   const root = (await host.conversation("root"))!;
   const side = await host.fork(root, { title: "Second branch" });
+  const branch = (await host.conversation(String(side.id)))!;
+  await scenario(config, [assistant("Working on A.", 0.5, "toolUse"), ...delegate("c1", { id: "job-pr", profile: "prmanager", task: "Publish.", cost: 1, prUrl }), { spawn: true }, { hang: true }], {}, root.id);
+  await scenario(config, [assistant("Working on B.", 0.25, "toolUse"), { ready: "b-ready", waitFor: "b-go" }, assistant(report({ summary: "Finished B.", pr: null, issue: null }), 0.5), settled], {}, branch.id);
   const api = await startApi(host, { ok: true, commit: "test", startedAt: "now", version: "0" }, 0);
   t.after(() => api.close());
   const base = `http://127.0.0.1:${api.port}`;
@@ -735,69 +758,169 @@ test("aborting the branch stops its run and reports what the run had done", { ti
   await until(async () => (await spawned(config)).length === 1, Boolean, 20_000);
   const live = await until(() => stream.state(), state => !!state?.live.tools?.[0]?.details);
   const slot = live!.live.tools![0];
-  const id = host.runs.active()!.runId;
+  const [first] = await launches(config);
+  const id = first.env.PATTY_RUN_ID;
   assert.deepEqual(slot.details, { runId: id });
   assert.ok(live!.entries.some(entry => entry.model?.some(message => message.role === "assistant"
     && message.content.some(part => part.type === "toolCall" && part.name === "pi" && part.id === slot.callId))));
-  const snapshot = async () => {
-    const response = await fetch(base + piRunApiPath + id);
+
+  const other = await host.submit(branch, { type: "input", content: 'call pi {"task":"Independent job.","pr":false}' });
+  await until(() => existsSync(flag(config, "b-ready")), Boolean, 20_000);
+  const [, second] = await launches(config);
+  const otherId = second.env.PATTY_RUN_ID;
+  assert.notEqual(otherId, id);
+  assert.equal(first.cwd, await realpath(join(config.runsDir, id, "repo")));
+  assert.equal(second.cwd, await realpath(join(config.runsDir, otherId, "repo")));
+  assert.deepEqual(await pendingRecords(config), [`${id}.json`, `${otherId}.json`].sort());
+  const snapshot = async (runId: string) => {
+    const response = await fetch(base + piRunApiPath + runId);
     assert.equal(response.status, 200);
     return response.json() as Promise<PiRunSnapshot>;
   };
-  const running = await until(snapshot, value => !!value.activity?.items.length);
-  assert.equal(running.status, "running");
-  assert.equal(running.runId, id);
-  assert.ok(running.activity!.items.some(item => item.kind === "text" && item.output.text === "Working."));
-
-  const branch = (await host.conversation(String(side.id)))!;
-  await (await host.submit(branch, { type: "input", content: 'call pi {"task":"Do not start."}' })).wait(ctx);
-  const refused = (await branch.entries({}, 10, undefined, ctx)).items.flatMap(entry => entry.model ?? [])
-    .find(message => message.role === "toolResult");
-  assert.ok(refused?.role === "toolResult" && refused.isError);
-  assert.equal(refused.details, undefined);
-  assert.ok(messageText(refused).includes(id), "the refusal mentions the other run only as text");
+  for (const [runId, name] of [[id, "A"], [otherId, "B"]]) {
+    const running = await until(() => snapshot(runId), value => !!value.activity?.items.length);
+    assert.equal(running.status, "running");
+    assert.equal(running.runId, runId);
+    assert.ok(running.activity!.items.some(item => item.kind === "text" && item.output.text === `Working on ${name}.`));
+  }
 
   await host.abort(root);
-  const archived = await snapshot();
+  const archived = await snapshot(id);
   assert.equal(archived.status, "aborted");
   assert.equal(archived.result?.pr, undefined, "an unconfirmed PR is not linked");
   assert.equal((await submission.wait(ctx)).status, "unanswered");
-  const [pi] = await launches(config);
-  assert.ok(!alive(pi.pid) && !alive((await spawned(config))[0]));
-  assert.equal(host.runs.active(), undefined);
+  assert.ok(!alive(first.pid) && !alive((await spawned(config))[0]));
+  assert.ok(alive(second.pid));
+  assert.equal((await snapshot(otherId)).status, "running");
+  assert.equal(host.runs.hasActive(), true);
+  assert.deepEqual(await readdir(config.runsDir), [otherId]);
+  assert.deepEqual(await pendingRecords(config), [`${otherId}.json`]);
+  await assert.rejects(host.reserveUpgrade(), /Wait for every branch to finish/);
+  await writeFile(flag(config, "b-go"), "go");
+  assert.equal((await other.wait(ctx)).status, "done");
+  assert.equal((await snapshot(otherId)).status, "completed");
+  assert.equal(host.runs.hasActive(), false);
   assert.deepEqual(await readdir(config.runsDir), []);
   const { items } = await root.entries({}, 10, undefined, ctx);
   const results = items.flatMap(entry => (entry.model ?? []).filter(message => message.role === "toolResult").map(messageText));
   assert.equal(results.length, 1);
-  assert.match(results[0], new RegExp(`Pi run \\S+: aborted[^]*PR: ${prUrl} \\(NOT CONFIRMED with GitHub\\)[^]*Cost: \\$1\\.50 \\(incomplete`));
+  assert.match(results[0], new RegExp(`Pi run ${id}: aborted[^]*PR: ${prUrl} \\(NOT CONFIRMED with GitHub\\)[^]*Cost: \\$1\\.50 \\(incomplete`));
   assert.equal((await host.branch(root)).cost, 1.5);
+  assert.equal((await host.branch(branch)).cost, 0.75);
 });
 
-test("a restart reports the interrupted call in its branch, without running it again", { timeout: 60_000 }, async t => {
+test("concurrent finishes preserve both archives and charge each actual branch only once across restart", { timeout: 60_000 }, async t => {
   const config = await setup(t);
-  await scenario(config, [assistant("Working.", 0.5, "toolUse"), { spawn: true }, { hang: true }]);
+  const host = await openHost(config);
+  t.after(() => host.close());
+  const root = (await host.conversation("root"))!;
+  const side = await host.fork(root, { title: "Concurrent" });
+  const branch = (await host.conversation(String(side.id)))!;
+  const cases = [[root, "a", 0.25], [branch, "b", 0.75]] as const;
+  for (const [target, name, cost] of cases) {
+    await scenario(config, [
+      { job: { id: `job-${name}`, cost: 0.5 } }, { ready: `${name}-ready`, waitFor: "finish" },
+      assistant(report({ summary: `Done ${name}.`, pr: null, issue: null }), cost), settled,
+    ], {}, target.id);
+  }
+  const submissions = await Promise.all(cases.map(([target, name]) => host.submit(target, {
+    type: "input", content: `call pi {"task":"Run ${name}.","pr":false}`,
+  })));
+  await until(() => cases.every(([, name]) => existsSync(flag(config, `${name}-ready`))), Boolean, 20_000);
+  const jobs = join(config.pi.agentDir, "delegates/jobs");
+  // An unreadable manifest touched while both runs are active is not evidence of ownership by either.
+  await mkdir(join(jobs, "other/workspace"), { recursive: true });
+  await writeFile(join(jobs, "other/job.json"), "{ unreadable");
+  await writeFile(flag(config, "finish"), "go");
+  for (const submission of submissions) assert.equal((await submission.wait(ctx)).status, "done");
+  assert.deepEqual(await pendingRecords(config), []);
+  const calls = [];
+  const started = await launches(config);
+  for (const [target, name, cost] of cases) {
+    assert.equal((await host.branch(target)).cost, cost + 0.5);
+    const id = started.find(pi => pi.prompt.includes(`Run ${name}.`))!.env.PATTY_RUN_ID;
+    const dir = join(config.dataDir, "logs/runs", id);
+    const { taskId, outcome, conversationId } = JSON.parse(await readFile(join(dir, "result.json"), "utf8"));
+    assert.equal(conversationId, target.id);
+    assert.equal(outcome.status, "completed");
+    assert.equal(outcome.summary, `Done ${name}.`);
+    assert.equal(outcome.usage.cost.total, cost + 0.5);
+    assert.deepEqual(await readdir(join(dir, "delegates")), [`job-${name}`]);
+    assert.ok(!existsSync(join(jobs, `job-${name}/workspace`)));
+    calls.push({ conversationId, taskId, outcome, cost: cost + 0.5 });
+  }
+  assert.ok(existsSync(join(jobs, "other/workspace")));
+  assert.equal(await host.totalCost(), 2);
+  await host.close();
+
+  const reopened = await openHost(config);
+  t.after(() => reopened.close());
+  for (const { conversationId, taskId, outcome, cost } of calls) {
+    assert.deepEqual(await reopened.runs.settled(taskId), outcome);
+    const target = (await reopened.conversation(String(conversationId)))!;
+    assert.equal((await reopened.branch(target)).cost, cost);
+  }
+  assert.equal(await reopened.totalCost(), 2);
+  assert.equal((await launches(config)).length, 2);
+});
+
+test("shutdown stops all runs; restart reports each interrupted call only in its own branch, without replay", { timeout: 60_000 }, async t => {
+  const config = await setup(t);
   const first = await openHost(config);
-  const submission = await first.submit((await first.conversation("root"))!, { type: "input", content: 'call pi {"task":"Add the thing."}' });
-  await until(async () => (await spawned(config)).length === 1, Boolean, 20_000);
+  t.after(() => first.close());
+  const root = (await first.conversation("root"))!;
+  const side = await first.fork(root, { title: "Other interrupted run" });
+  const branch = (await first.conversation(String(side.id)))!;
+  const cases = [[root, "a", 0.5], [branch, "b", 0.75]] as const;
+  for (const [target, name, cost] of cases) {
+    await scenario(config, [assistant(`Working ${name}.`, cost, "toolUse"), { spawn: true }, { hang: true }], {}, target.id);
+  }
+  const submissions = await Promise.all(cases.map(([target, name]) => first.submit(target, { type: "input", content: `call pi {"task":"Work ${name}."}` })));
+  await until(async () => (await spawned(config)).length === 2, Boolean, 20_000);
+  const started = await launches(config);
+  for (const pi of started) {
+    const file = join(config.dataDir, "logs/runs", pi.env.PATTY_RUN_ID, "events.jsonl");
+    await until(async () => (await readFile(file, "utf8")).includes("Working"));
+  }
   await first.close();
-  const [pi] = await launches(config);
-  assert.ok(!alive(pi.pid) && !alive((await spawned(config))[0]));
-  // Left for the next start: the saved run, and no result in the transcript yet.
-  assert.ok(existsSync(join(config.dataDir, "pi-run.json")));
+  assert.ok([...started.map(pi => pi.pid), ...await spawned(config)].every(pid => !alive(pid)));
+  // No result committed yet. Put one checkpoint at the old singleton path to exercise in-place recovery
+  // across the format cutover, alongside another interrupted run with a distinct identity.
+  const [old, recent] = await pendingRecords(config);
+  assert.ok(old && recent);
+  await rename(join(stateDir(config), old), join(config.dataDir, "pi-run.json"));
 
   const second = await openHost(config);
   t.after(() => second.close());
-  const root = (await second.conversation("root"))!;
-  await (await second.harness.submission(submission.id, ctx))!.wait(ctx);
-  await root.waitForIdle(ctx);
-  const { items } = await root.entries({}, 10, undefined, ctx);
-  const results = items.flatMap(entry => (entry.model ?? []).filter(message => message.role === "toolResult").map(messageText));
-  assert.equal(results.length, 1, JSON.stringify(results));
-  assert.match(results[0], /Pi run \S+: interrupted\nSummary: aipatty stopped while this run was in progress/);
-  assert.equal((await second.branch(root)).cost, 0.5);
-  assert.equal((await launches(config)).length, 1);
+  for (const [i, [target, name, cost]] of cases.entries()) {
+    await (await second.harness.submission(submissions[i].id, ctx))!.wait(ctx);
+    const recovered = (await second.conversation(String(target.id)))!;
+    await recovered.waitForIdle(ctx);
+    const { items } = await recovered.entries({}, 10, undefined, ctx);
+    const results = items.flatMap(entry => (entry.model ?? []).filter(message => message.role === "toolResult").map(messageText));
+    assert.equal(results.length, 1, JSON.stringify(results));
+    const id = started.find(pi => pi.prompt.includes(`Work ${name}.`))!.env.PATTY_RUN_ID;
+    assert.match(results[0], new RegExp(`Pi run ${id}: interrupted\\nSummary: aipatty stopped while this run was in progress`));
+    assert.equal((await second.branch(recovered)).cost, cost);
+  }
+  assert.equal(await second.totalCost(), 1.25);
+  assert.equal((await launches(config)).length, 2);
   assert.deepEqual(await readdir(config.runsDir), []);
+  assert.deepEqual(await pendingRecords(config), []);
   assert.ok(!existsSync(join(config.dataDir, "pi-run.json")));
+});
+
+test("the all-idle upgrade gate still sees Pi work even with no durable submissions", async t => {
+  const config = await setup(t);
+  await scenario(config, [{ hang: true }]);
+  const host = await openHost(config);
+  t.after(() => host.close());
+  const running = host.runs.run(request({ conversationId: 3, pr: false }));
+  await assert.rejects(host.reserveUpgrade(), /Wait for every branch to finish/);
+  assert.equal((await host.runs.settled(101))?.status, "aborted");
+  await running;
+  const release = await host.reserveUpgrade();
+  release();
 });
 
 test("reviews and reports are read strictly", () => {
@@ -843,15 +966,22 @@ test("reviews and reports are read strictly", () => {
 
 test("an outcome settled before the harness committed it survives a restart, and an abort while it settles does not change it", { timeout: 60_000 }, async t => {
   const config = await setup(t);
-  await github(config, { ...openPr, delayMs: 1_500 });
+  const gate = join(config.dataDir, "gh-go");
+  await github(config, { ...openPr, waitFor: gate });
   await scenario(config, [...review("c1", "r1"), assistant(report()), settled]);
   const runs = await openPiRuns(config);
+  t.after(async () => { await writeFile(gate, "go").catch(() => {}); await runs.close(); });
   const controller = new AbortController();
   const running = runs.run(request({ conversationId: 5, taskId: 105 }), controller.signal);
-  // Pi is done and the host is asking GitHub: the run ends as it ended.
+  // Pi is done and the host is still verifying and settling the outcome. This branch stays reserved, but other
+  // branches neither wait for this run nor block its eventual handoff.
   await until(() => existsSync(join(config.dataDir, "fake-gh-calls.txt")), Boolean, 20_000);
+  await assert.rejects(runs.run(request({ conversationId: 5, taskId: 106 })), /still active on branch 5/);
+  assert.equal((await runs.run(request({ conversationId: 6, taskId: 106, pr: false }))).status, "completed");
+  assert.equal(runs.hasActive(), true);
   controller.abort();
   const late = runs.settled(105);
+  await writeFile(gate, "go");
   const outcome = await running;
   assert.equal(outcome.status, "completed", JSON.stringify(outcome.problems));
   assert.equal(outcome.review.status, "clean");
@@ -862,9 +992,13 @@ test("an outcome settled before the harness committed it survives a restart, and
   assert.deepEqual(await next.settled(105), outcome);
   assert.equal(await next.settled(998), undefined);
 
-  // With the index unreadable, it is rebuilt from the copies in the run logs.
+  // The old shared index remains readable, and an unreadable one can still be rebuilt from the run logs.
+  await rm(taskIndex(config, 105));
+  const legacyIndex = join(config.dataDir, "pi-outcomes.json");
+  await writeFile(legacyIndex, JSON.stringify({ "105": { outcome, reconciled: true } }));
+  assert.deepEqual(await (await openPiRuns(config)).settled(105), outcome);
   t.mock.method(console, "error", () => {});
-  await writeFile(join(config.dataDir, "pi-outcomes.json"), "{ not json");
+  await writeFile(legacyIndex, "{ not json");
   const rebuilt = await (await openPiRuns(config)).settled(105);
   assert.equal(rebuilt?.status, "completed");
   assert.equal(rebuilt?.runId, outcome.runId);
@@ -873,15 +1007,24 @@ test("an outcome settled before the harness committed it survives a restart, and
 
   // The process died after the run's own copy of the result was written and before the index and the record caught
   // up: the settled result stands, and is not replaced by an interruption.
-  await rm(join(config.dataDir, "pi-outcomes.json"));
-  await writeFile(join(config.dataDir, "pi-run.json"), JSON.stringify({
-    runId: outcome.runId, conversationId: 5, taskId: 105, pr: true, startedAt: "", procs: [], groups: [], asOf: Date.now(),
+  await rm(legacyIndex);
+  await writeFile(checkpointFile(config, outcome.runId), JSON.stringify({
+    runId: outcome.runId, conversationId: 5, taskId: 105, pr: true, startedAt: "", procs: [], groups: [], asOf: 0,
     workspace: join(config.runsDir, outcome.runId), logDir: outcome.logDir,
   }));
+  const events = join(outcome.logDir, "events.jsonl");
+  await rename(events, `${events}.aside`);
+  await mkdir(events);
+  const held = await openPiRuns(config);
+  assert.deepEqual(await held.settled(105, 5), outcome, "deliver the archived result even if cleanup cannot read the events");
+  assert.equal(await held.settled(105, 6), undefined);
+  assert.deepEqual(await pendingRecords(config), [`${outcome.runId}.json`]);
+  await rm(events, { recursive: true });
+  await rename(`${events}.aside`, events);
   const ahead = await openPiRuns(config);
-  assert.equal((await ahead.settled(105))?.status, "completed");
-  assert.ok(!existsSync(join(config.dataDir, "pi-run.json")));
-  assert.equal(ahead.active(), undefined);
+  assert.deepEqual(await ahead.settled(105), outcome);
+  assert.deepEqual(await pendingRecords(config), []);
+  assert.equal(ahead.hasActive(), false);
 });
 
 test("a cut-off continuation charges the new attempt once, and never the earlier one again", { timeout: 60_000 }, async t => {
@@ -924,7 +1067,7 @@ test("a run record that cannot be used blocks new runs and deletes nothing", asy
   const stateFile = join(config.dataDir, "pi-run.json");
 
   await writeFile(stateFile, "{ not json");
-  await assert.rejects((await openPiRuns(config)).run(request({ pr: false })), /pi-run\.json, cannot be used[^]*No new run starts until it is inspected/);
+  await assert.rejects((await openPiRuns(config)).run(request({ pr: false })), /pi-run\.json cannot be used[^]*No new run starts until it is inspected/);
   assert.equal(await readFile(stateFile, "utf8"), "{ not json");
 
   // A record naming a directory that is not the run's own is not followed.
@@ -953,23 +1096,96 @@ test("a run record that cannot be used blocks new runs and deletes nothing", asy
   assert.equal((await (await openPiRuns(config)).run(request({ pr: false }))).status, "completed");
 });
 
-test("nothing is launched without a saved record, and a record that cannot be removed keeps the slot closed", async t => {
+/** An on-disk checkpoint from a run not held by the current host. */
+async function savedRun(config: Config, runId: string, conversationId: number, taskId: number) {
+  const saved = {
+    runId, conversationId, taskId, pr: false, startedAt: new Date().toISOString(), procs: [], groups: [], asOf: 0,
+    workspace: join(config.runsDir, runId), logDir: join(config.dataDir, "logs/runs", runId),
+  };
+  await mkdir(saved.workspace, { recursive: true });
+  await mkdir(saved.logDir, { recursive: true });
+  await mkdir(stateDir(config), { recursive: true });
+  await writeFile(checkpointFile(config, runId), JSON.stringify(saved));
+  return saved;
+}
+
+test("a damaged per-run record holds new runs without preventing recovery of an independently identified run", async t => {
+  const config = await setup(t);
+  const good = await savedRun(config, "20260101T000000-deadbeef", 1, 101);
+  const bad = await savedRun(config, "20260101T000000-deadcafe", 2, 102);
+  const malformed = "{ unreadable";
+  await writeFile(checkpointFile(config, bad.runId), malformed);
+  t.mock.method(console, "error", () => {});
+  const runs = await openPiRuns(config);
+  assert.equal((await runs.settled(good.taskId))?.status, "interrupted", "events may not exist if Pi never launched");
+  assert.ok(!existsSync(good.workspace));
+  await assert.rejects(runs.run(request({ conversationId: 3, taskId: 103, pr: false })), /deadcafe\.json cannot be used/);
+  assert.equal(await readFile(checkpointFile(config, bad.runId), "utf8"), malformed);
+  assert.ok(existsSync(bad.workspace));
+  assert.equal(await runs.settled(bad.taskId), undefined);
+  assert.ok(!existsSync(flag(config, "fake-launches.jsonl")));
+});
+
+test("conflicting legacy and per-run records are left intact rather than choosing one to recover", async t => {
+  const config = await setup(t);
+  const saved = await savedRun(config, "20260101T000000-deadbeef", 1, 101);
+  const legacy = join(config.dataDir, "pi-run.json");
+  const record = JSON.stringify({ ...saved, conversationId: 2, taskId: 102 });
+  await writeFile(legacy, record);
+  t.mock.method(console, "error", () => {});
+  const runs = await openPiRuns(config);
+  await assert.rejects(runs.run(request({ conversationId: 3, taskId: 103, pr: false })), /conflicting claims/);
+  assert.equal(await readFile(legacy, "utf8"), record);
+  assert.equal(await readFile(checkpointFile(config, saved.runId), "utf8"), JSON.stringify(saved));
+  assert.ok(existsSync(saved.workspace));
+  assert.equal(await runs.settled(101), undefined);
+  assert.equal(await runs.settled(102), undefined);
+});
+
+test("restart completes cleanup after a spend checkpoint without counting the same delegate twice", async t => {
+  const config = await setup(t);
+  const saved = await savedRun(config, "20260101T000000-deadbeef", 1, 101);
+  const job = join(config.pi.agentDir, "delegates/jobs/interrupted-job");
+  await mkdir(join(job, "workspace"), { recursive: true });
+  await writeFile(join(job, "job.json"), JSON.stringify({
+    workspace: { source: saved.workspace }, usage: { cost: 0.5 },
+  }));
+  const checkpoint = join(saved.logDir, "reconciled.json");
+  await writeFile(checkpoint, JSON.stringify({
+    taskId: saved.taskId, conversationId: saved.conversationId, reconciled: true,
+    outcome: {
+      runId: saved.runId, logDir: saved.logDir, status: "completed", summary: "Done.", usage: usage(0.75),
+      review: { status: "none", important: 0, lesser: 0 }, usageComplete: true, remaining: [], problems: [],
+    },
+  }));
+  t.mock.method(console, "error", () => {});
+  const reopened = await openPiRuns(config);
+  const outcome = await reopened.settled(saved.taskId, saved.conversationId);
+  assert.equal(outcome?.status, "interrupted", "the spend checkpoint is not a terminal result");
+  assert.equal(outcome?.usage.cost.total, 0.75);
+  assert.equal(outcome?.usageComplete, false);
+  assert.deepEqual(await pendingRecords(config), []);
+  assert.ok(!existsSync(join(job, "workspace")));
+  assert.ok(!existsSync(checkpoint));
+});
+
+test("nothing is launched without a saved record, and a record that cannot be removed holds only its branch", async t => {
   const config = await setup(t);
   await scenario(config, [assistant(report({ pr: null, issue: null })), settled]);
   t.mock.method(console, "error", () => {});
   const runs = await openPiRuns(config);
   // The record cannot be written: a directory is in its place.
-  const stateFile = join(config.dataDir, "pi-run.json");
-  await mkdir(join(stateFile, "blocker"), { recursive: true });
-  const outcome = await runs.run(request({ pr: false }));
+  const outcome = await runs.run(request({ pr: false }), undefined,
+    runId => mkdirSync(join(checkpointFile(config, runId), "blocker"), { recursive: true }));
   assert.equal(outcome.status, "failed");
   assert.match(outcome.problems.join("\n"), /The run failed in the host/);
   assert.ok(!existsSync(join(config.pi.agentDir, "fake-launches.jsonl")), "nothing was launched");
   assert.deepEqual(await readdir(config.runsDir), []);
-  // The settled outcome is still returned and kept by call, and the slot stays closed until someone looks.
+  // The settled outcome is still kept by call, and only this branch stays closed until someone looks.
   assert.match(outcome.problems.join("\n"), /The run's record could not be closed/);
   assert.deepEqual(await runs.settled(101), outcome);
-  await assert.rejects(runs.run(request({ pr: false })), /could not be cleaned up[^]*No new run starts until that is resolved/);
+  await assert.rejects(runs.run(request({ taskId: 105, pr: false })), /could not be cleaned up[^]*No new run starts on branch 1/);
+  assert.equal((await runs.run(request({ conversationId: 2, taskId: 102, pr: false }))).status, "completed");
 });
 
 test("a remembered leaderless group needs a live member with independent ownership evidence", { timeout: 30_000 }, async t => {
@@ -1028,6 +1244,8 @@ test("a remembered leaderless group needs a live member with independent ownersh
   assert.ok(existsSync(workspace), "ambiguity leaves the workspace intact");
   assert.equal(JSON.parse(await readFile(stateFile, "utf8")).asOf, 0, "the retained record still has the legacy field");
   await assert.rejects(runs.run(request({ pr: false })), /could not be cleaned up after a restart:[^]*could not be told from the run's/);
+  await scenario(config, [assistant(report({ issue: null, pr: null })), settled]);
+  assert.equal((await runs.run(request({ conversationId: 2, taskId: 102, pr: false }))).status, "completed");
 
   // A stop saves what it learns of the tree before it signals anything.
   const learning = newOwned();
