@@ -163,9 +163,10 @@ async function run(paths: UpgradePaths, args: {
         const old = await legacyConnection(paths, current);
         old.close();
       } else {
+        // Recovery without the original host PID cannot bind a matching health response to this root.
+        if (pid === undefined) return;
         const health = await getHealth(current.port);
-        if (health.ok !== true || health.commit !== current.old || health.upgradeProtocol !== upgradeProtocol
-          || (pid !== undefined && health.pid !== pid)) return;
+        if (health.ok !== true || health.commit !== current.old || health.upgradeProtocol !== upgradeProtocol || health.pid !== pid) return;
       }
       return current.old;
     } catch (error) {
@@ -201,9 +202,11 @@ async function run(paths: UpgradePaths, args: {
     const free = await quiescent(paths, current.port, current.phase === "stopping" ? current.oldProcess : undefined);
     try {
       if (current.phase === "switching" || current.phase === "restoring") {
-        current = save({ ...current, phase: "restoring", reason: current.reason ?? why }, selected);
-        restoreDb(paths, current.id);
-        paths.select(current.old);
+        const restoring = save({ ...current, phase: "restoring", reason: current.reason ?? why }, selected);
+        current = restoring;
+        const checkRestoring = () => { paths.check(restoring, selected); if (!restoring.legacy) noPi(paths); };
+        restoreDb(paths, restoring.id, checkRestoring);
+        paths.select(restoring.old, checkRestoring);
       }
       if (current.phase !== "restored") current = save({ ...current, phase: "restored", reason: current.reason ?? why }, current.old);
       // If legacy shutdown raced late Pi work before the backup, only the unchanged old release may recover it.
@@ -219,7 +222,7 @@ async function run(paths: UpgradePaths, args: {
         const legacy = await legacyConnection(paths, current);
         legacy.close();
         if (legacy.identity.pid !== old.child.pid) throw new Error("Rollback listener isn't the old process we launched");
-      }
+      } else noPi(paths);
       const verified = commitValidated(current, { kind: "rolled-back", active: current.old, reason: current.reason ?? why });
       detachServer(old);
       return current.legacy ? verified : await activated(old, verified, current.old);
@@ -358,14 +361,15 @@ async function run(paths: UpgradePaths, args: {
         await backupDb(paths, initial.id, checkStopped);
         checkStopped();
         note(`Saved standalone SQLite backup at ${paths.backup(initial.id)}`);
-        save({ ...stopping, phase: "switching" }, initial.old);
-        paths.select(sha);
+        const switching = save({ ...stopping, phase: "switching" }, initial.old);
+        paths.select(sha, () => { paths.check(switching, initial.old); noPi(paths); });
         selected = sha;
       } finally { free(); }
       note(`Starting ${sha} in validation mode`);
       const switching = requireJournal();
       candidate = launchServer(paths, switching, sha, true);
       await probeServer(candidate, switching, sha, true);
+      noPi(paths);
       const verified = commitValidated(switching, { kind: "upgraded", active: sha });
       detachServer(candidate);
       return await activated(candidate, verified, sha);

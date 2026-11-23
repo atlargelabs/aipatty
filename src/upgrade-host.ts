@@ -14,7 +14,7 @@ import {
   sameInstall, sameUpgradeRequest, upgradeEntryKind, upgradeHandoffEnv, UpgradePaths, type UpgradeJournal,
 } from "./upgrade-state.ts";
 
-const ResultDoc = defineDoc<{ last: string }>({
+const ResultDoc = defineDoc<{ last: string; journal?: string }>({
   kind: "aipatty.upgrade.delivery", version: 1, scope: "session",
   initial: () => ({ last: "" }), checkpointWhen: () => true,
 });
@@ -65,12 +65,18 @@ async function report(agent: AgentHost, paths: UpgradePaths, j: UpgradeJournal):
   await branch.commit(async tx => {
     const marker = await tx.doc(ResultDoc);
     check();
-    if (marker.last === j.id) return;
+    if (marker.last === j.id) {
+      if (!marker.journal || !journalMatches(JSON.parse(marker.journal), j)) {
+        throw new Error(`Upgrade ${j.id}: already delivered a different terminal journal`);
+      }
+      return;
+    }
     await tx.appendEntry(branch.id, {
       kind: upgradeEntryKind, data: { id: j.id, type: "result", text: resultText(j) },
     });
     check();
     marker.last = j.id;
+    marker.journal = JSON.stringify(j);
   }, ctx);
   return ack();
 }
@@ -135,15 +141,9 @@ export function committedValidation(startup: StartupState, source: string, commi
 
 export async function reportStartup(agent: AgentHost, startup: StartupState | undefined, listeningCommit: string): Promise<StartupState | undefined> {
   if (!startup) return;
-  const { paths, journal } = startup;
-  let j = journal;
+  const { paths, journal: j } = startup;
   paths.check(j, listeningCommit);
   if (j.phase !== "done") throw new Error("Startup requires a terminal upgrade journal");
-  if (!j.result?.active && !j.reported && j.old === listeningCommit) {
-    // An interrupted stage may have been cancelled before any server could be probed. This one is now bound.
-    j = finish(j, { ...j.result!, active: listeningCommit });
-    paths.save(j);
-  }
   // If the committed release cannot deliver, do not confirm activation or restore over its DB. The next
   // explicit start retries the same result, and the helper has already recorded which checkout to start.
   try { return { paths, journal: await report(agent, paths, j) }; }
@@ -151,9 +151,11 @@ export async function reportStartup(agent: AgentHost, startup: StartupState | un
 }
 
 /** Last synchronous check before resuming work or making the listener available for commands. */
-export function checkStartup(config: Config, startup: StartupState | undefined, commit: string): void {
-  if (startup) startup.paths.check(startup.journal, commit);
-  else if (UpgradePaths.forStartup(config)) throw new Error("Upgrade journal appeared during startup; start again to verify it");
+export function checkStartup(config: Config, startup: StartupState | undefined, commit: string, validating = false): void {
+  if (startup) {
+    startup.paths.check(startup.journal, commit);
+    if (validating && exists(startup.paths.piRun)) throw new Error("Pi recovery is present; refusing validation without touching that run");
+  } else if (UpgradePaths.forStartup(config)) throw new Error("Upgrade journal appeared during startup; start again to verify it");
 }
 
 export function hostUpgrade(config: Config, agent: AgentHost, source: string, commit: string, stop: () => void) {

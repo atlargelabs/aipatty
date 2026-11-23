@@ -48,7 +48,7 @@ async function main(): Promise<void> {
   process.on("SIGTERM", stop);
   try {
     let startup: ReturnType<typeof guardStartup>;
-    const agent = await openHost(config, { paused: true, beforeOpen() {
+    const agent = await openHost(config, { paused: true, validation: childId !== undefined, beforeOpen() {
       startup = guardStartup(config, source, health.commit, childId);
     } });
     const { harness } = agent;
@@ -61,8 +61,9 @@ async function main(): Promise<void> {
     try {
       let serving = false;
       const activate = async () => {
+        if (childId !== undefined) checkStartup(config, startup, health.commit, true);
         startup = await reportStartup(agent, startup, health.commit);
-        checkStartup(config, startup, health.commit);
+        checkStartup(config, startup, health.commit, childId !== undefined);
         agent.activate();
         serving = true;
         delete health.validation;
@@ -77,7 +78,7 @@ async function main(): Promise<void> {
             if (!branch) throw new Error("The requesting conversation is missing");
             await agent.assertAvailable(branch);
           }
-          checkStartup(config, startup, health.commit);
+          checkStartup(config, startup, health.commit, true);
           health.validation = { id: childId, ready: true };
         } catch (error) {
           health.validation = { id: childId, ready: false, reason: errorText(error) };
@@ -106,6 +107,8 @@ async function main(): Promise<void> {
   } finally {
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);
+    // A candidate that fails before it listens must not keep its own IPC channel alive.
+    if (childId !== undefined && process.connected) process.disconnect?.();
   }
 }
 

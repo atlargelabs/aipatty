@@ -327,8 +327,8 @@ export interface PiRuns {
   close(): Promise<void>;
 }
 
-/** Open the run slot: first stop and clean up a run that a previous process left behind. */
-export async function openPiRuns(config: Config): Promise<PiRuns> {
+/** Open the run slot. Validation may inspect it but must not recover a previous process's run. */
+export async function openPiRuns(config: Config, { recover = true } = {}): Promise<PiRuns> {
   const { pi } = config;
   const pollMs = pi.pollMs ?? defaultPollMs;
   const stateFile = join(config.dataDir, "pi-run.json");
@@ -375,6 +375,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     if (saved !== undefined && (saved === null || typeof saved !== "object" || Array.isArray(saved))) throw new Error("expected a JSON object");
     for (const [key, entry] of Object.entries(saved ?? {})) if (isKept(entry)) kept.set(key, entry);
   } catch (error) {
+    if (!recover) throw new Error(`Pi outcomes need recovery: ${outcomesFile}`, { cause: error });
     // Rebuild the index from the newest run logs and write it over the unreadable one, which stays in place until
     // then: a rebuild that is cut off is done again.
     const aside = `${outcomesFile}.unreadable-${Date.now()}`;
@@ -653,16 +654,22 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
 
   // A run the previous process left: stop it, clean up, and report its call `interrupted`. It is never run again.
   let left: SavedRun | undefined;
-  try {
-    const saved = await readJson<unknown>(stateFile);
-    // Anything the file holds that is not a run of this data directory, `null` included, is a damaged record.
-    if (saved !== undefined && !ownRecord(saved)) throw new Error("it does not describe a run of this data directory");
-    left = saved;
-  } catch (error) {
-    left = undefined;
-    stuck = `The record of an earlier Pi run, ${stateFile}, cannot be used (${clip(message(error), 300)}). Its processes and workspace may still be there. `
-      + "No new run starts until it is inspected and removed, and aipatty restarted.";
-    console.error(`Pi runs: ${stuck}`);
+  if (!recover) {
+    const record = await lstat(stateFile).catch(error => {
+      if (!isMissing(error)) throw error;
+    });
+    if (record) throw new Error(`Pi recovery is present; refusing validation without touching ${stateFile}`);
+  } else {
+    try {
+      const saved = await readJson<unknown>(stateFile);
+      // Anything the file holds that is not a run of this data directory, `null` included, is a damaged record.
+      if (saved !== undefined && !ownRecord(saved)) throw new Error("it does not describe a run of this data directory");
+      left = saved;
+    } catch (error) {
+      stuck = `The record of an earlier Pi run, ${stateFile}, cannot be used (${clip(message(error), 300)}). Its processes and workspace may still be there. `
+        + "No new run starts until it is inspected and removed, and aipatty restarted.";
+      console.error(`Pi runs: ${stuck}`);
+    }
   }
   if (left) {
     const saved = left;

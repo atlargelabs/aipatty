@@ -203,12 +203,13 @@ export class UpgradePaths {
     return sha;
   }
 
-  select(sha: string): void {
+  select(sha: string, beforeSelect: () => void = () => { this.selected(); }): void {
     ownedDir(this.release(sha));
-    this.selected(); // Do not replace anything other than the managed symlink.
     const temp = join(this.deploy, `.current-${randomUUID()}`);
     try {
       symlinkSync(sha, temp);
+      // Check the managed pointer (and the caller's journal, if supplied) right before replacing it.
+      beforeSelect();
       renameSync(temp, this.current);
       syncPath(this.deploy);
     } finally {
@@ -254,7 +255,7 @@ export class UpgradePaths {
       || (j.legacy ? j.branch !== undefined || j.requestKey !== undefined
         : j.branch === undefined || !Number.isSafeInteger(j.branch) || j.branch < 1
           || typeof j.requestKey !== "string" || !upgradeRequestKey.test(j.requestKey))
-      || !validProcess(j.oldProcess)
+      || !validProcess(j.oldProcess) || (j.phase === "stopping" && !j.oldProcess)
       || (j.reason !== undefined && typeof j.reason !== "string")
       || (j.reported !== undefined && (j.phase !== "done" || j.reported !== true))
       || (j.phase === "done" ? !j.result || !outcomes.includes(j.result.kind) : j.result !== undefined)

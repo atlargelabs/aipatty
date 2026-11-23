@@ -43,7 +43,7 @@ export async function backupDb(paths: UpgradePaths, id: string, beforePublish?: 
 }
 
 /** Repeatable until the restored phase is synced. Never restore after an old server is permitted to write again. */
-export function restoreDb(paths: UpgradePaths, id: string): void {
+export function restoreDb(paths: UpgradePaths, id: string, beforeReplace?: () => void): void {
   const source = paths.backup(id);
   ownedFile(source);
   for (const suffix of sidecars) if (exists(source + suffix)) throw new Error(`Unexpected backup sidecar: ${source + suffix}`);
@@ -58,8 +58,10 @@ export function restoreDb(paths: UpgradePaths, id: string): void {
     copyFileSync(source, temp, constants.COPYFILE_EXCL);
     syncPath(temp);
     // Do not give the restored main file the failed candidate's WAL/journal on the next open.
+    beforeReplace?.();
     for (const suffix of sidecars) rmSync(paths.db + suffix, { force: true });
     syncPath(paths.data);
+    beforeReplace?.();
     renameSync(temp, paths.db);
     syncPath(paths.data);
   } finally {

@@ -251,7 +251,8 @@ the result is written once directly to that branch (not attributed to the user o
 
 Readiness means the same process serves the expected SHA from the selected checkout, the SQLite/Durable host
 opened, Pi recovery is clear, and both the root and requesting branch models are in the local catalog with no
-saved work globally blocking scheduling. The candidate also checks it can still read the accepted branch
+saved work globally blocking scheduling. A candidate refuses pending Pi recovery; it never cleans up another
+run during validation. The candidate also checks it can still read the accepted branch
 request. A plain HTTP 200 is insufficient. The candidate exposes only health until the same validated request
 and selection have been committed. Upgrade targets must keep the managed startup/validation protocol; older
 releases are supported only as the bootstrap source and rollback destination. This is local validation, not a
@@ -314,7 +315,8 @@ node "$ROOT/deploy/current/src/cli.ts" --port "$PORT" health
   move it out of `deploy/` before a fresh request. Never reuse an interrupted private checkout.
 - `stopping`/`switching`/`restoring`/`restored`: don't start either release by hand. The new app refuses an
   unguarded start. `recover` verifies quiescence and restores the recorded old release as required, never a
-  different or newer SHA. If an old app is still running after a failed handoff, stop that **verified** app
+  different or newer SHA. In `stopping`, recovery must have the recorded process identity to confirm exit;
+  a free port and data lock alone are not enough. If an old app is still running after a failed handoff, stop that **verified** app
   with its own CLI (or Ctrl-C in its terminal) and wait for process exit before `recover`. Do not kill a random
   port listener. On a legacy rollback, continue the no-work maintenance window until recovery returns.
 - `done`: no automatic restart or redeploy follows a later crash. `recover` verifies the selected release and

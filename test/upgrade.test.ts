@@ -3,6 +3,7 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, cp, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { createServer as createHttpServer } from "node:http";
 import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -143,7 +144,8 @@ async function unusedPort(): Promise<number> {
   return port;
 }
 
-const barriers = ["quiescent", "selected", "handoff", "ack-retirement", "ack-result", "publication", "backup"] as const;
+const barriers = ["quiescent", "selected", "handoff", "ack-retirement", "ack-result", "publication", "backup",
+  "restore-db", "restore-pointer", "pi-init", "pi-ready"] as const;
 function pauseAt(name: typeof barriers[number]): string {
   return `{
     const { existsSync, writeFileSync } = await import("node:fs");
@@ -260,8 +262,9 @@ ${probeStart}`));
   const supervisorCode = await readFile(supervisorPath, "utf8");
   const afterQuiescent = /const free = await quiescent\(paths, current\.port, [^\n]+\n    try \{/;
   const verifiedSelected = "  await verifyRelease(paths.release(sha), sha);";
+  const restoredDb = "        restoreDb(paths, restoring.id, checkRestoring);";
   assert.match(supervisorCode, afterQuiescent);
-  assert.ok(supervisorCode.includes(verifiedSelected));
+  assert.ok(supervisorCode.includes(verifiedSelected) && supervisorCode.includes(restoredDb));
   const prepareStart = "  let target: string | undefined, result:";
   const sendCompletion = "  await sendParent({ id, ...result });";
   assert.ok(supervisorCode.includes(prepareStart) && supervisorCode.includes(sendCompletion));
@@ -273,7 +276,8 @@ ${prepareStart}`)
     .replace(sendCompletion, `  if (existsSync(join(process.env.UPGRADE_FIXTURE!, "omit-stage-result"))) return;
 ${sendCompletion}`)
     .replace(afterQuiescent, match => `${match}\n${pauseAt("quiescent")}`)
-    .replace(verifiedSelected, `${verifiedSelected}\n${pauseAt("selected")}`));
+    .replace(verifiedSelected, `${verifiedSelected}\n${pauseAt("selected")}`)
+    .replace(restoredDb, `${restoredDb}\n${pauseAt("restore-pointer")}`));
   const releasePath = join(repo, "src/upgrade-release.ts");
   const dbPath = join(repo, "src/upgrade-db.ts");
   for (const [path, line, barrier] of [
@@ -283,6 +287,22 @@ ${sendCompletion}`)
     assert.ok(code.includes(line));
     await writeFile(path, code.replace(line, `${line}\n${pauseAt(barrier)}`));
   }
+  const dbCode = await readFile(dbPath, "utf8");
+  const beforeReplace = "    beforeReplace?.();";
+  assert.ok(dbCode.includes(beforeReplace));
+  await writeFile(dbPath, dbCode.replace(beforeReplace, `{
+    const hold = process.env.UPGRADE_FIXTURE + "/hold-restore-db";
+    if (exists(hold)) {
+      writeFileSync(hold + ".entered", "");
+      const wait = new Int32Array(new SharedArrayBuffer(4));
+      while (exists(hold)) Atomics.wait(wait, 0, 0, 25);
+    }
+  }\n${beforeReplace}`));
+  const ownedHostPath = join(repo, "src/host.ts");
+  const ownedHostCode = await readFile(ownedHostPath, "utf8");
+  const openModels = "  const models = await openModels(config);";
+  assert.ok(ownedHostCode.includes(openModels));
+  await writeFile(ownedHostPath, ownedHostCode.replace(openModels, `${openModels}\n${pauseAt("pi-init")}`));
   const upgradeHostPath = join(repo, "src/upgrade-host.ts");
   const upgradeHostCode = await readFile(upgradeHostPath, "utf8");
   const reportStart = '  if (j.phase !== "done" || j.branch === undefined || j.reported) return j;';
@@ -304,8 +324,11 @@ ${sendCompletion}`)
       if (existsSync(join(process.env.UPGRADE_FIXTURE!, "fail-start-helper"))) throw new Error("fixture log failed to open");
 ${startHelper}`));
   const mainPath = join(repo, "src/main.ts");
-  const modernMain = await readFile(mainPath, "utf8");
-  if (legacy) await writeFile(mainPath, legacyMain);
+  const mainCode = await readFile(mainPath, "utf8");
+  const beforeReady = "\n          checkStartup(config, startup, health.commit, true);";
+  assert.ok(mainCode.includes(beforeReady));
+  const modernMain = mainCode.replace(beforeReady, `\n${pauseAt("pi-ready")}${beforeReady}`);
+  await writeFile(mainPath, legacy ? legacyMain : modernMain);
   async function commit(label: string) {
     await writeFile(join(repo, "label"), label);
     await git("add", "--all");
@@ -685,6 +708,10 @@ test("delivery cannot acknowledge a replaced terminal record after committing it
   assert.equal((await f.send("must not reopen on drift")).status, 409);
   await f.cli("shutdown");
   assert.equal(await old.exited, 0, old.output());
+  const stale = f.launch();
+  assert.equal(await stale.exited, 1, stale.output());
+  assert.match(stale.output(), /already delivered a different terminal journal/);
+  assert.equal(await readFile(f.paths.journal, "utf8"), replacement);
   f.paths.save(original);
   f.launch();
   await f.health(f.old);
@@ -1358,6 +1385,124 @@ for (const boundary of ["publication", "backup"] as const) {
     }
   });
 }
+
+for (const boundary of ["restore-db", "restore-pointer"] as const) {
+  test(`rollback rechecks selection at ${boundary} promotion`, { timeout }, async t => {
+    const f = await fixture(t);
+    const host = f.launch();
+    await f.health(f.old);
+    await f.cli("shutdown");
+    assert.equal(await host.exited, 0, host.output());
+    f.paths.init();
+    const other = await f.next("unexpected rollback selection");
+    await f.install(other);
+    const target = await f.next("interrupted cutover target");
+    await f.install(target);
+    const j: UpgradeJournal = { version: 1, id: randomUUID(), old: f.old, target, port: f.port, faux: true, legacy: false,
+      branch: 1, requestKey: randomUUID(), phase: "switching" };
+    const unlock = ownDataDir(f.paths.data);
+    try {
+      {
+        using db = new DatabaseSync(f.paths.db);
+        db.exec("CREATE TABLE rollback_fixture (value TEXT); INSERT INTO rollback_fixture VALUES ('backup');");
+      }
+      await backupDb(f.paths, j.id);
+      using db = new DatabaseSync(f.paths.db);
+      db.exec("UPDATE rollback_fixture SET value = 'candidate';");
+    } finally { unlock(); }
+    f.paths.save(j);
+    f.paths.select(target);
+    const backup = await readFile(f.paths.backup(j.id));
+    const barrier = await f.pause(boundary);
+    const rejected = assert.rejects(f.supervisor(target, "recover"), /Upgrade selection changed/);
+    await barrier.entered();
+    assert.throws(() => f.paths.lease(), /Another upgrade or recovery owns/);
+    assert.throws(() => ownDataDir(f.paths.data), /owns data directory/);
+    const restoring = f.paths.load()!;
+    assert.equal(restoring.phase, "restoring");
+    f.paths.select(other);
+    await barrier.resume();
+    await rejected;
+    assert.deepEqual(f.paths.load(), restoring);
+    assert.equal(f.paths.selected(), other);
+    assert.deepEqual(await readFile(f.paths.backup(j.id)), backup);
+    assert.equal(await f.healthNow(), undefined);
+    using db = new DatabaseSync(f.paths.db, { readOnly: true });
+    assert.equal(db.prepare("SELECT value FROM rollback_fixture").get()?.value, boundary === "restore-db" ? "candidate" : "backup");
+  });
+}
+
+for (const boundary of ["pi-init", "pi-ready"] as const) {
+  test(`validation refuses a Pi record that appears at ${boundary}`, { timeout }, async t => {
+    const f = await fixture(t);
+    const host = f.launch();
+    await f.health(f.old);
+    const target = await f.next("Pi record appears during validation");
+    const barrier = await f.pause(boundary);
+    assert.equal((await f.send("/upgrade", "root", { marker: "1" })).status, 202);
+    await barrier.entered();
+    assert.equal(await host.exited, 0, host.output());
+    const pending = f.paths.load()!;
+    assert.equal(pending.phase, "switching");
+    const runId = `fixture-${randomUUID()}`;
+    const workspace = join(f.paths.root, "runs", runId), logDir = join(f.paths.data, "logs", "runs", runId);
+    await mkdir(workspace);
+    await mkdir(logDir);
+    const record = JSON.stringify({ runId, taskId: 1, conversationId: 1, groups: [], procs: [], asOf: 0, workspace, logDir });
+    await writeFile(f.paths.piRun, record);
+    await barrier.resume();
+    await until(async () => (await f.log(pending.id)).includes("ROLLBACK FAILED"));
+    assert.match(await f.log(pending.id), /Pi recovery is present; refusing validation/);
+    assert.equal(await readFile(f.paths.piRun, "utf8"), record);
+    assert.ok(existsSync(workspace));
+    assert.equal(f.paths.selected(), target);
+    assert.equal(f.paths.load()?.phase, "restoring");
+    await until(f.healthNow, h => !h);
+  });
+}
+
+test("stopping recovery requires the recorded process even after the legacy listener and lock are free", { timeout }, async t => {
+  const f = await fixture(t, true);
+  const legacy = f.launch();
+  await f.health(f.old);
+  const target = await f.next("stopping recovery requires process identity");
+  await f.install(target);
+  await f.flag("hold-legacy-exit");
+  await f.cli("shutdown");
+  await until(() => existsSync(join(f.scratch, "legacy-closed")));
+  assert.ok(await identify(legacy.child.pid!));
+  ownDataDir(f.paths.data)();
+  assert.equal(await f.healthNow(), undefined);
+  f.paths.init();
+  const stopping: UpgradeJournal = { version: 1, id: randomUUID(), old: f.old, target, port: f.port,
+    faux: true, legacy: true, phase: "stopping" };
+  f.paths.save(stopping);
+  const original = await readFile(f.paths.journal, "utf8");
+  try {
+    await assert.rejects(f.supervisor(target, "recover"), /Invalid upgrade journal/);
+    assert.ok(await identify(legacy.child.pid!));
+    assert.equal(await f.healthNow(), undefined);
+    assert.equal(await readFile(f.paths.journal, "utf8"), original);
+  } finally { await rm(f.paths.journal); await f.unflag("hold-legacy-exit"); }
+});
+
+test("modern recovery without the original PID does not report matching health as active", { timeout }, async t => {
+  const f = await fixture(t);
+  const other = createHttpServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
+      ok: true, commit: f.old, upgradeProtocol: 1, pid: process.pid,
+    }));
+  });
+  await new Promise<void>((resolve, reject) => other.once("error", reject).listen(f.port, "127.0.0.1", resolve));
+  try {
+    f.paths.init();
+    f.paths.save({ version: 1, id: randomUUID(), old: f.old, port: f.port, faux: true, legacy: false,
+      phase: "requested", branch: 1, requestKey: randomUUID() });
+    const recovered = await f.supervisor(f.old, "recover");
+    assert.match(recovered.stdout, /No active server was verified/);
+    assert.equal(f.paths.load()?.result?.active, undefined);
+  } finally { await new Promise<void>(resolve => other.close(() => resolve())); }
+});
 
 test("recovery rechecks the terminal record and selection after verifying the release", { timeout }, async t => {
   const f = await fixture(t);

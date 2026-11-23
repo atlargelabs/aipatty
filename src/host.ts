@@ -87,12 +87,14 @@ export interface AgentHost {
 }
 
 /** Open paused, so an unavailable saved model never executes interrupted work. */
-export async function openHost(config: Config, options: { paused?: boolean; beforeOpen?: () => void | Promise<void> } = {}): Promise<AgentHost> {
+export async function openHost(config: Config, options: {
+  paused?: boolean; validation?: boolean; beforeOpen?: () => void | Promise<void>;
+} = {}): Promise<AgentHost> {
   await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
   const release = ownDataDir(config.dataDir);
   try {
     await options.beforeOpen?.();
-    const agent = await openOwnedHost(config, options.paused === true);
+    const agent = await openOwnedHost(config, options.paused === true || options.validation === true, options.validation === true);
     void agent.harness.closed.then(release);
     return agent;
   } catch (error) {
@@ -144,10 +146,10 @@ async function forkPoint(from: Conversation, at: number | undefined, before: num
   return point;
 }
 
-async function openOwnedHost(config: Config, paused: boolean): Promise<AgentHost> {
+async function openOwnedHost(config: Config, paused: boolean, validation: boolean): Promise<AgentHost> {
   const models = await openModels(config);
-  // Before any conversation resumes: stop and clean up a run the previous process left behind.
-  const runs = await openPiRuns(config);
+  // A gated candidate cannot repair or clear Pi state. Normal startup recovers it before resuming work.
+  const runs = await openPiRuns(config, { recover: !validation });
   await mkdir(config.workDir, { recursive: true, mode: 0o700 });
   const database = await openNodeSqliteDatabase(join(config.dataDir, "aipatty.sqlite"));
   const storage = await (async () => {
