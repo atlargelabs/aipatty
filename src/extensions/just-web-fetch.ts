@@ -37,11 +37,11 @@ const EPHEMERAL_DIR = join(DATA_DIR, "ephemeral");
 
 `);
   entry = replace(entry, "// --- Extension Loading ---", "// --- Constants ---", "");
-  entry = replace(entry, "// --- Subprocess Helpers ---", "// Exported for tests", `import { extractContent, extractorPath } from ${JSON.stringify(helpers)};\n\n`);
+  entry = replace(entry, "// --- Subprocess Helpers ---", "// Exported for tests", `import { egressProxy, extractContent, extractorPath } from ${JSON.stringify(helpers)};\n\n`);
   entry = replace(entry, "\t// Dependency check", "\t\ttry {\n\t\t\tstore", '\tpi.on("session_start", async (_event, ctx) => {\n');
   entry = entry.replace("config.retentionDays ?? DEFAULT_RETENTION_DAYS", "DEFAULT_RETENTION_DAYS");
   entry = replace(entry, "\t\t// 4. Signal readiness", "\t\t// Start cache cleanup", "");
-  entry = entry.replace("\t\t// 4. Fetch page", "\t\textractorPath();\n\n\t\t// 4. Fetch page");
+  entry = entry.replace("\t\t// 4. Fetch page", "\t\textractorPath();\n\t\tegressProxy();\n\n\t\t// 4. Fetch page");
   entry = replace(entry, "\t\tconst extractResult = await withTimeout", "\t\tif (!extractResult.ok)", "\t\tconst extractResult = await extractContent(html, signal);\n");
 
   // npm aliases Puppeteer to puppeteer-core: no executable config discovery, no browser download. Keep the
@@ -58,10 +58,14 @@ const EPHEMERAL_DIR = join(DATA_DIR, "ephemeral");
 		if (!executable.ok) throw new Error(configured
 			? "PUPPETEER_EXECUTABLE_PATH is not executable"
 			: "Install Chrome/Chromium or set PUPPETEER_EXECUTABLE_PATH to its absolute path");
-		this.launching = puppeteer.launch({ headless: true, executablePath: executable.path, env: childEnv() });
+		this.launching = puppeteer.launch({
+			headless: true, pipe: true, executablePath: executable.path, env: childEnv(),
+			args: ["--proxy-server=" + egressProxy(), "--proxy-bypass-list=<-loopback>",
+				"--disable-quic", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"],
+		});
 
 `);
-  browser = `import { isAbsolute } from "node:path";\nimport { childEnv } from ${JSON.stringify(helpers)};\n${browser}`;
+  browser = `import { isAbsolute } from "node:path";\nimport { childEnv, egressProxy } from ${JSON.stringify(helpers)};\n${browser}`;
 
   // Only the two patched modules are staged. Resolve every other sibling against the pinned release rather
   // than against the worktree or a temporary project's node_modules. The bundled CLI's loader (not Node's

@@ -131,12 +131,15 @@ in aipatty's durable conversations, delegate jobs, or `crmanager` reviews.
   locations or uses `PUPPETEER_EXECUTABLE_PATH` (a trusted absolute executable path). Install `trafilatura`
   separately, for example with `uv tool install trafilatura` or into a service-owned Python virtual environment.
   Set `PI_WEB_FETCH_TRAFILATURA` in the server's environment to the absolute path of that executable. The managed
-  tool never invokes `uvx`, `pipx`, or another on-demand installer inside a run; no browser is downloaded during
-  install or use. Missing prerequisites fail only the tool call. The adapter ignores `just-web-fetch.json` and
-  disables all fetch hook directories and event-bus registration. It keeps Chrome's sandbox and upstream
-  private-address and redirect checks, which are not a network sandbox. Use egress controls if private network
-  exclusion must be guaranteed. Complete extracts are temporary files in the Pi agent dir; archived tool events
-  may retain web content.
+  tool never invokes `uvx`, `pipx`, or another on-demand installer inside a run; no browser is downloaded.
+  **Before enabling fetch,** provision a trusted forward proxy that blocks private and special-purpose addresses
+  at connection time, including for HTTPS tunnels, and restrict the browser's network access to that proxy.
+  Set `PI_WEB_FETCH_EGRESS_PROXY` in the server's environment to its HTTP(S) origin (no credentials or path).
+  Without that setting the tool fails closed; Chrome receives a fixed proxy with no direct fallback. Upstream
+  URL/redirect checks and the Chrome sandbox stay on, but are not a substitute for network enforcement. Missing
+  prerequisites fail only the fetch call. The adapter ignores `just-web-fetch.json` and disables all fetch hook
+  directories and event-bus registration. Complete extracts are temporary files in the Pi agent dir; archived
+  tool events may retain web content.
 - **`web_search`:** uses the coding model if supported, or an explicitly configured search model in the trusted
   Pi agent dir (`$ROOT/pi/web-search.json` for a root install, or the selected `--pi-dir`). That file accepts
   `{"provider":"<provider>","model":"<model-id>"}`; `PI_WEB_SEARCH_CONFIG` is ignored in managed runs. The
