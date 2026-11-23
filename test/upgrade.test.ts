@@ -2,13 +2,14 @@ import assert from "node:assert/strict";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { cp, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
+import { readConfig } from "../src/config.ts";
 import type { ConversationPage } from "../src/protocol.ts";
 import { ownDataDir } from "../src/ownership.ts";
 import { RUN_MARKER } from "../src/processes.ts";
@@ -217,7 +218,13 @@ exec /usr/sbin/lsof "$@"
   const processCode = await readFile(processPath, "utf8");
   const probeStart = "  const deadline = Date.now() + startupMs;";
   assert.ok(processCode.includes(probeStart));
-  await writeFile(processPath, processCode.replace('command("/usr/sbin/lsof",', 'command(join(process.env.UPGRADE_FIXTURE!, "bin", "lsof"),').replace(probeStart, `
+  const tcpFile = 'requiredProcEntry("/proc/net/tcp",';
+  assert.ok(processCode.includes(tcpFile));
+  await writeFile(processPath, processCode
+    .replace("closeSync, constants, openSync", "closeSync, constants, existsSync, openSync")
+    .replace(tcpFile, `requiredProcEntry(existsSync(join(process.env.UPGRADE_FIXTURE!, "fail-proc-net-tcp"))
+      ? join(process.env.UPGRADE_FIXTURE!, "missing-proc-net-tcp") : "/proc/net/tcp",`)
+    .replace('command("/usr/sbin/lsof",', 'command(join(process.env.UPGRADE_FIXTURE!, "bin", "lsof"),').replace(probeStart, `
   if (gated && sha === j.target) {
     const { existsSync, writeFileSync } = await import("node:fs");
     const directory = process.env.UPGRADE_FIXTURE!;
@@ -241,7 +248,8 @@ ${sendCompletion}`));
   const upgradeHostCode = await readFile(upgradeHostPath, "utf8");
   const reportStart = "  if (j.phase !== \"done\" || j.branch === undefined || j.reported) return;";
   const saveRequest = "try { paths.save(j); }";
-  assert.ok(upgradeHostCode.includes(reportStart) && upgradeHostCode.includes(saveRequest));
+  const startHelper = '      const log = openUpgradeLog(paths, id);\n      try {\n        const child = spawn';
+  assert.ok(upgradeHostCode.includes(reportStart) && upgradeHostCode.includes(saveRequest) && upgradeHostCode.includes(startHelper));
   await writeFile(upgradeHostPath, upgradeHostCode.replace(reportStart, `${reportStart}
   const { existsSync } = await import("node:fs");
   if (existsSync(join(process.env.UPGRADE_FIXTURE!, "fail-report"))) throw new Error("fixture transcript write failed");
@@ -249,7 +257,10 @@ ${sendCompletion}`));
   const { existsSync } = await import("node:fs");
   if (existsSync(join(process.env.UPGRADE_FIXTURE!, "fail-journal-write"))) throw new Error("fixture journal write failed before rename");
   paths.save(j);
-}`));
+}`).replace(startHelper, `
+      const { existsSync } = await import("node:fs");
+      if (existsSync(join(process.env.UPGRADE_FIXTURE!, "fail-start-helper"))) throw new Error("fixture log failed to open");
+${startHelper}`));
   const mainPath = join(repo, "src/main.ts");
   const modernMain = await readFile(mainPath, "utf8");
   if (legacy) await writeFile(mainPath, legacyMain);
@@ -507,6 +518,36 @@ test("a journal write failure before the request rename does not close admission
   assert.match(JSON.stringify((await f.result(f.paths.load()!.id))[0].data), /Upgrade not needed/);
 });
 
+test("a committed request with a failed helper launch returns its upgrade ID and reports once", { timeout }, async t => {
+  const f = await fixture(t);
+  f.launch();
+  await f.health(f.old);
+  await f.flag("fail-start-helper");
+  const requestId = randomUUID();
+  const send = () => f.send("/upgrade", "root", { marker: "1", requestId });
+  const accepted = await send();
+  assert.equal(accepted.status, 202);
+  const id = f.paths.load()!.id;
+  assert.equal((await accepted.json() as { upgradeId: string }).upgradeId, id);
+  const [result] = await f.result(id);
+  assert.match(JSON.stringify(result.data), /Upgrade cancelled.*fixture log failed to open/);
+  assert.equal((await (await send()).json() as { upgradeId: string }).upgradeId, id);
+  assert.equal((await f.result(id)).length, 1);
+});
+
+test("an unmanaged data-dir tolerates an unrelated writable upgrade directory but not an ambiguous journal", { timeout }, async t => {
+  const scratch = await realpath(await mkdtemp(join(tmpdir(), "aipatty-upgrade-unmanaged-")));
+  t.after(() => rm(scratch, { recursive: true, force: true }));
+  const data = join(scratch, "data"), upgrade = join(scratch, "upgrade");
+  await mkdir(data);
+  await mkdir(upgrade);
+  await chmod(upgrade, 0o770);
+  const config = readConfig(["--data-dir", data], {});
+  assert.equal(UpgradePaths.forStartup(config), undefined);
+  await writeFile(join(upgrade, "journal.json"), "{}");
+  assert.throws(() => UpgradePaths.forStartup(config), /Expected an owned, canonical directory/);
+});
+
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 const fixturePid = async (f: Fixture, name: string) => Number(await readFile(join(f.scratch, `${name}.pid`), "utf8"));
 
@@ -711,6 +752,11 @@ test("interrupted legacy bootstrap leaves the old app running and requires ackno
   assert.ok(await identify(npm));
   await f.unflag("hold-stage");
   await until(() => identify(npm), value => !value);
+  const inspectionFailure = process.platform === "linux" ? "fail-proc-net-tcp" : "fail-lsof";
+  await f.flag(inspectionFailure);
+  await assert.rejects(f.supervisor(target, "recover", "--ack-interrupted-stage", id), /during legacy ownership check/);
+  assert.equal(f.paths.load()?.phase, "staging");
+  await f.unflag(inspectionFailure);
   assert.match((await f.supervisor(target, "recover", "--ack-interrupted-stage", id)).stdout, /Operator acknowledged interrupted staging/);
   assert.ok(existsSync(f.paths.stage(id)));
   assert.ok(await f.health(f.old));

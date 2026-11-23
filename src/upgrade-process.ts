@@ -97,11 +97,16 @@ export async function quiescent(paths: UpgradePaths, port: number, old?: Process
 
 function linuxListeningInodes(port: number): Set<string> {
   const address = `0100007F:${port.toString(16).toUpperCase().padStart(4, "0")}`;
-  return new Set(readFileSync("/proc/net/tcp", "utf8").trim().split("\n").slice(1)
+  return new Set(requiredProcEntry("/proc/net/tcp", path => readFileSync(path, "utf8")).trim().split("\n").slice(1)
     .map(line => line.trim().split(/\s+/)).filter(row => row[1] === address && row[3] === "0A").map(row => row[9]));
 }
 
 export class LegacyInspectionError extends Error {}
+
+function requiredProcEntry<T>(path: string, read: (path: string) => T): T {
+  try { return read(path); }
+  catch (error) { throw new LegacyInspectionError(`Could not inspect ${path} during legacy ownership check: ${String(error)}`, { cause: error }); }
+}
 
 function procEntry<T>(path: string, read: (path: string) => T): T | undefined {
   try { return read(path); }
@@ -117,7 +122,7 @@ async function legacyOwner(paths: UpgradePaths, j: UpgradeJournal): Promise<Proc
   let pids: number[];
   if (process.platform === "linux") {
     const sockets = linuxListeningInodes(j.port);
-    pids = readdirSync("/proc").filter(value => /^\d+$/.test(value)).map(Number).filter(pid => {
+    pids = requiredProcEntry("/proc", path => readdirSync(path)).filter(value => /^\d+$/.test(value)).map(Number).filter(pid => {
       const dir = `/proc/${pid}/fd`;
       const fds = procEntry(dir, path => readdirSync(path));
       if (!fds) return false;
@@ -145,7 +150,8 @@ async function legacyOwner(paths: UpgradePaths, j: UpgradeJournal): Promise<Proc
   const scripts = [join(paths.current, "src/main.ts"), join(paths.release(j.old), "src/main.ts")];
   let matches: boolean;
   if (process.platform === "linux") {
-    const [node, script, ...rest] = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").slice(0, -1);
+    const cmd = procEntry(`/proc/${pid}/cmdline`, path => readFileSync(path, "utf8"));
+    const [node, script, ...rest] = (cmd ?? "").split("\0").slice(0, -1);
     matches = /(?:^|\/)node$/.test(node) && scripts.includes(script) && argv.some(args => JSON.stringify(args) === JSON.stringify(rest));
   } else {
     const line = (await command("ps", ["-ww", "-p", String(pid), "-o", "command="], { ms: probeMs })).trim();

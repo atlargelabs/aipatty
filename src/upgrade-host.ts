@@ -145,6 +145,7 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
     } catch (error) { throw new HttpError(409, errorText(error)); }
     const unblock = await agent.reserveUpgrade(target);
     let handed = false;
+    let committed = false;
     let journalAttempted = false;
     let drainStarted = false;
     const id = randomUUID();
@@ -249,6 +250,7 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
           });
           return id;
         }, ctx);
+        committed = true;
         if (accepted !== id) {
           unblock();
           return accepted;
@@ -283,7 +285,12 @@ export function hostUpgrade(config: Config, agent: AgentHost, source: string, co
       } finally { closeSync(log); }
     } catch (error) {
       if (!journalAttempted) unblock();
-      else if (!handed) await settleHandoff(`Could not start the upgrade helper: ${errorText(error)}`);
+      else if (!handed) {
+        await settleHandoff(`Could not start the upgrade helper: ${errorText(error)}`)
+          .catch(settleError => console.error(`Upgrade ${id}:`, settleError));
+      }
+      // The operator already has a durable request. Report any launch failure against it, not as a rejection.
+      if (committed) return id;
       throw error instanceof HttpError ? error : new HttpError(409, errorText(error));
     }
   };

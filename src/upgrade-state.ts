@@ -135,13 +135,16 @@ export class UpgradePaths {
     if (config.installDir && exists(config.installDir)) roots.add(realpathSync(config.installDir));
     for (const root of roots) {
       const paths = new UpgradePaths(root, data);
-      if (exists(paths.state)) {
-        ownedDir(paths.state);
-        if (!exists(paths.journal)) continue;
-        const configured = UpgradePaths.forConfig(config);
-        if (configured.root !== root) throw new Error(`Use the journal's installation root: ${root}`);
-        return configured;
-      }
+      const state = inspect(paths.state);
+      if (!state) continue;
+      // Never follow a replacement state symlink. An ordinary sibling directory without a journal
+      // is not an installation; inspection errors other than absence still propagate.
+      if (state.isSymbolicLink()) ownedDir(paths.state);
+      if (!state.isDirectory() || !exists(paths.journal)) continue;
+      ownedDir(paths.state);
+      const configured = UpgradePaths.forConfig(config);
+      if (configured.root !== root) throw new Error(`Use the journal's installation root: ${root}`);
+      return configured;
     }
   }
 
