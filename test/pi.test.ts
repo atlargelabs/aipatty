@@ -863,7 +863,10 @@ test("concurrent finishes preserve both archives and charge each actual branch o
     const target = (await reopened.conversation(String(conversationId)))!;
     assert.equal((await reopened.branch(target)).cost, cost);
   }
-  // Even a damaged pointer, or one that points to the other task, can't swap results or hide a valid archive.
+  // Even missing, damaged or misdirected pointers can't swap results or hide a valid archive.
+  const missing = calls[0];
+  await rm(taskIndex(config, missing.taskId));
+  assert.deepEqual(await reopened.runs.settled(missing.taskId, missing.conversationId), missing.outcome);
   t.mock.method(console, "error", () => {});
   for (const [i, corrupt] of ["{ malformed", JSON.stringify(calls[0].outcome.runId)].entries()) {
     const { conversationId, taskId, outcome } = calls[i];
@@ -1171,21 +1174,31 @@ test("restart completes cleanup after a spend checkpoint without counting the sa
     },
   }));
   t.mock.method(console, "error", () => {});
+  const events = join(saved.logDir, "events.jsonl");
+  await mkdir(events); // Recovery can't read this transcript, but already has the checkpointed spend.
+  const held = await openPiRuns(config);
+  const pending = await held.settled(saved.taskId, saved.conversationId);
+  assert.equal(pending?.status, "interrupted", "the spend checkpoint is not a terminal result");
+  assert.equal(pending?.usage.cost.total, 0.75);
+  assert.equal(pending?.usageComplete, false);
+  assert.deepEqual(await pendingRecords(config), [`${saved.runId}.json`]);
+  assert.ok(existsSync(join(job, "workspace")));
+  assert.ok(existsSync(checkpoint));
+
+  await rm(events, { recursive: true });
   const reopened = await openPiRuns(config);
-  const outcome = await reopened.settled(saved.taskId, saved.conversationId);
-  assert.equal(outcome?.status, "interrupted", "the spend checkpoint is not a terminal result");
-  assert.equal(outcome?.usage.cost.total, 0.75);
-  assert.equal(outcome?.usageComplete, false);
+  assert.deepEqual(await reopened.settled(saved.taskId, saved.conversationId), pending);
   assert.deepEqual(await pendingRecords(config), []);
   assert.ok(!existsSync(join(job, "workspace")));
   assert.ok(!existsSync(checkpoint));
 });
 
-test("a delegate manifest I/O failure leaves the checkpoint for recovery and does not delete the clone", async t => {
+test("a manifest I/O error with a clone holds cleanup, but a discarded job's unreadable audit trail doesn't", async t => {
   const config = await setup(t);
   const dir = join(config.pi.agentDir, "delegates/jobs/bad-read");
   await mkdir(join(dir, "workspace"), { recursive: true });
   await mkdir(join(dir, "job.json")); // A read error rather than a parse error: the scan might be incomplete.
+  await writeFile(join(dir, "discarded"), new Date().toISOString()); // The marker alone can't vouch for the clone.
   t.mock.method(console, "error", () => {});
   await scenario(config, [assistant(report({ issue: null, pr: null })), settled]);
   const runs = await openPiRuns(config);
@@ -1195,10 +1208,12 @@ test("a delegate manifest I/O failure leaves the checkpoint for recovery and doe
   assert.match(result.problems.join("\n"), /Delegate job bad-read could not be read/);
   assert.deepEqual(await pendingRecords(config), [`${result.runId}.json`]);
   assert.ok(existsSync(join(dir, "workspace")));
-  await rm(join(dir, "job.json"), { recursive: true });
+  await rm(join(dir, "workspace"), { recursive: true });
   const reopened = await openPiRuns(config);
   assert.deepEqual(await pendingRecords(config), []);
   assert.equal((await reopened.settled(101))?.status, "failed");
+  assert.equal((await reopened.run(request({ conversationId: 2, taskId: 102, pr: false }))).status, "completed");
+  assert.ok(existsSync(join(dir, "job.json")));
 });
 
 test("nothing is launched without a saved record, and a record that cannot be removed holds only its branch", async t => {

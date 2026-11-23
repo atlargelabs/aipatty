@@ -341,13 +341,14 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
   await mkdir(config.runsDir, { recursive: true, mode: 0o700 });
 
   const inside = (parent: string, child: string) => resolve(child).startsWith(resolve(parent) + sep);
+  // Only a missing path is "not there": anything else leaves the question open.
+  const typeOf = (path: string) => lstat(path).catch(error => {
+    if (isMissing(error)) return undefined;
+    throw error;
+  });
   /** Whether `path` is a real directory, not a link to one, directly inside `parent`. */
   const ownDir = async (parent: string, path: string) => {
-    const stat = await lstat(path).catch(error => {
-      // Only a missing path is "not there": anything else leaves the question open.
-      if (isMissing(error)) return undefined;
-      throw error;
-    });
+    const stat = await typeOf(path);
     return !!stat?.isDirectory() && !stat.isSymbolicLink()
       && await realpath(path) === join(await realpath(parent), path.slice(resolve(parent).length + 1));
   };
@@ -422,20 +423,21 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       : heldBranches.get(conversationId);
     if (held?.taskId === taskId && held.outcome) return held.outcome;
     const legacy = kept.get(String(taskId));
+    let damaged = false;
     try {
       const id = await readJson<unknown>(outcomeIndex(taskId));
-      if (id === undefined) {
-        return conversationId === undefined || legacy?.conversationId === undefined || legacy.conversationId === conversationId
-          ? legacy?.outcome : undefined;
+      if (id !== undefined) {
+        const copy = validRunId(id) ? await logged(id) : undefined;
+        if (!isCall(copy, taskId, conversationId)) throw new Error("the indexed archive does not describe this call");
+        return copy.outcome;
       }
-      const copy = validRunId(id) ? await logged(id) : undefined;
-      if (!isCall(copy, taskId, conversationId)) throw new Error("the indexed archive does not describe this call");
-      return copy.outcome;
+      if (legacy && (conversationId === undefined || legacy.conversationId === undefined || legacy.conversationId === conversationId)) return legacy.outcome;
     } catch (error) {
+      damaged = true;
       console.error(`Pi runs: could not read the indexed outcome of task ${taskId}: ${message(error)}`);
     }
-    // The pointer is only an index. If it is damaged, look for exactly this call's primary archive without
-    // overwriting evidence or choosing by recency. The normal lookup (including a refused call) needn't scan.
+    // The pointer is only an index. On a miss or damage, look for precisely this call's archive, without
+    // overwriting evidence or choosing by recency. Only interruption/abort recovery uses this lookup.
     let found: RunOutcome | undefined;
     for (const dir of await readdir(logRoot, { withFileTypes: true })) {
       if (!dir.isDirectory() || !validRunId(dir.name)) continue;
@@ -444,7 +446,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       if (found) throw new Error(`More than one Pi archive matches task ${taskId}.`);
       found = copy.outcome;
     }
-    if (!found) throw new Error(`Could not locate a Pi archive for task ${taskId} after its outcome index failed. Check ${logRoot}.`);
+    if (damaged && !found) throw new Error(`Could not locate a Pi archive for task ${taskId} after its outcome index failed. Check ${logRoot}.`);
     return found;
   };
 
@@ -468,8 +470,14 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         // A job the run reported is the run's, with or without a manifest: its logs are kept and its clone goes.
         else if (trace.countedJobs.has(id)) jobs.set(id, {});
       } catch (error) {
-        // An I/O failure could leave the scan incomplete. Don't mark spend reconciled or clear the record.
-        if (!(error instanceof SyntaxError)) throw new Error(`Delegate job ${id} could not be read: ${message(error)}`);
+        if (!(error instanceof SyntaxError)) {
+          // A discarded job with no clone or lease cannot leave an outstanding workspace from this run, and
+          // a stale unreadable audit trail must not break every branch. Other I/O failures may leave the scan
+          // incomplete: don't mark spend reconciled or clear the record in that case.
+          const discarded = (await typeOf(join(dir, "discarded")))?.isFile() && !await typeOf(join(dir, "workspace"))
+            && !await typeOf(join(dir, "lease.json"));
+          if (!discarded) throw new Error(`Delegate job ${id} could not be read: ${message(error)}`);
+        }
         // Recency is not ownership: another Pi can be writing a job now. Without a reported ID or readable
         // provenance, leave the manifest, logs and clone untouched and do not include its spend in this run.
         if (trace.countedJobs.has(id)) jobs.set(id, {});
@@ -572,7 +580,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       if (saved.workspace !== join(config.runsDir, saved.runId)) throw new Error(`${saved.workspace} is not this run's workspace`);
       if (await ownDir(config.runsDir, saved.workspace)) {
         await rm(saved.workspace, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
-      } else if (await lstat(saved.workspace).catch(error => { if (!isMissing(error)) throw error; })) {
+      } else if (await typeOf(saved.workspace)) {
         throw new Error(`${saved.workspace} is not a directory of ${config.runsDir}`);
       }
       return { clean: true, reconciled };
@@ -766,12 +774,21 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     const record = () => writeJson(stateFile, { ...saved, procs: [...owned.procs], groups: [...owned.groups], asOf: 0 });
     const trace = new RunTrace(pi.repo);
     let outcome: RunOutcome | undefined;
+    const interrupted = (result: RunOutcome) => {
+      result.status = "interrupted";
+      result.summary = "aipatty stopped while this run was in progress. The run is not run again; "
+        + "it may have partially run. Check GitHub for what it published before starting another.";
+      result.usageComplete = false;
+      return result;
+    };
     try {
       const old = kept.get(String(saved.taskId));
       const final = await logged(saved.runId, saved) ?? (old?.outcome.runId === saved.runId
         && (old.conversationId === undefined || old.conversationId === saved.conversationId) ? old : undefined);
       outcome = final?.outcome;
       const pending = final ? undefined : await logged(saved.runId, saved, "reconciled.json");
+      // If events can't be replayed for cleanup, still deliver spend saved before the interruption.
+      if (pending) outcome = interrupted(pending.outcome);
       const split = lineSplitter((line, whole) => trace.line(line, whole));
       try {
         for await (const chunk of createReadStream(join(saved.logDir, "events.jsonl"))) split.write(chunk as Buffer);
@@ -779,13 +796,9 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         if (!isMissing(error)) throw new Error(`its events could not be read: ${message(error)}`);
       }
       split.end();
-      outcome ??= pending?.outcome ?? baseOutcome(saved, trace, "interrupted");
-      if (!final) {
-        outcome.status = "interrupted";
-        outcome.summary = "aipatty stopped while this run was in progress. The run was stopped and is not run again; "
-          + "it may have partially run. Check GitHub for what it published before starting another.";
-        outcome.usageComplete = false;
-        if (!pending) unconfirmedLinks(trace, outcome);
+      if (!outcome) {
+        outcome = interrupted(baseOutcome(saved, trace, "interrupted"));
+        unconfirmedLinks(trace, outcome);
       }
       const { clean, reconciled } = await cleanUp(saved, owned, trace, outcome, (final ?? pending)?.reconciled ?? false, { record });
       if (outcome.status === "completed" && outcome.problems.length) outcome.status = "failed";
