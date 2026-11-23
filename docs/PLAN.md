@@ -156,7 +156,9 @@ Deferred until something needs them: a read-only research mode, concurrent runs,
 
 - **API:** bound to `127.0.0.1`, with no listen address to configure. List branches, send, steer, abort, fork, set
   the model, stream live output, and `/health` with the running commit.
-- **Page:** branch list, transcript, input box, fork button, model picker, and cost. Add a Gmail switch when Gmail ships.
+- **Page:** branch list, transcript, input box, fork button, model picker, cost, and a read-only pane for the exact
+  Pi run behind a tool call. It shows archived results or a manually refreshed snapshot, not an interactive terminal.
+  Add a Gmail switch when Gmail ships.
 - **CLI:** the same API from a terminal.
 - **Auth:** SSH to the mini. The server has no login of its own and answers only to `127.0.0.1` or `localhost` at
   its own port, so a web page on another site cannot drive it through a browser.

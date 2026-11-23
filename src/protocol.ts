@@ -1,6 +1,7 @@
 import type { JsonValue } from "@earendil-works/chord/json";
 import { contentText, type Message } from "@earendil-works/pi-ai";
 import type { ConversationView, EntryRecord, LiveState, ModelRef, UsageState } from "@earendil-works/pi-durable";
+import type { RunOutcome } from "./pi-run.ts";
 
 /** Non-safelisted marker: an ordinary browser form cannot send it. */
 export const shutdownHeader = "x-aipatty-shutdown";
@@ -16,6 +17,40 @@ export function upgradeText(entry: Pick<EntryRecord, "kind" | "data">): string |
   const { data } = entry;
   if (entry.kind !== upgradeEntryKind || !data || typeof data !== "object" || Array.isArray(data)) return undefined;
   return typeof data.text === "string" ? data.text : undefined;
+}
+
+/** `completed` means the run finished and any required PR and review passed the host's checks. */
+export const runStatuses = ["completed", "failed", "aborted", "timed_out", "interrupted"] as const;
+export type RunStatus = typeof runStatuses[number];
+export const piRunApiPath = "/api/pi-runs/";
+/** A timestamp to the second, then eight hex digits (see the generator in pi-run.ts). */
+export const piRunId = /^\d{8}T\d{6}-[0-9a-f]{8}$/;
+
+export interface PiRunText {
+  text: string;
+  truncated: boolean;
+}
+
+export type PiRunActivity =
+  | { kind: "text"; output: PiRunText }
+  | { kind: "tool"; name: string; status: "started" | "finished" | "error"; output?: PiRunText };
+
+/** The read-only projection of one run, not the raw saved result or event stream. */
+export interface PiRunSnapshot {
+  runId: string;
+  status: RunStatus | "running";
+  durationMs?: number;
+  activity?: { items: PiRunActivity[]; truncated: boolean; incomplete: boolean };
+  stderr?: PiRunText;
+  result?: {
+    summary?: PiRunText;
+    pr?: { url: string; headSha?: string };
+    issue?: { url: string };
+    review?: RunOutcome["review"];
+    problems: PiRunText[];
+    remaining: PiRunText[];
+    listsTruncated: boolean;
+  };
 }
 
 /** A transcript page, in chronological order, and its conversation's current metadata. */

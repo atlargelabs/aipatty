@@ -7,13 +7,14 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
+import { startApi } from "../src/api.ts";
 import { readConfig, type Config } from "../src/config.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
 import { openPiRuns, outcomeText, type RunOutcome, type RunRequest } from "../src/pi-run.ts";
 import { readReport, readReview } from "../src/pi-trace.ts";
 import { listProcesses, newOwned, remember, runProcesses, stopRun } from "../src/processes.ts";
-import { messageText } from "../src/protocol.ts";
-import { checkout, fauxConfig, fixture, until } from "./helpers.ts";
+import { messageText, piRunApiPath, type PiRunSnapshot } from "../src/protocol.ts";
+import { checkout, connect, fauxConfig, fixture, until } from "./helpers.ts";
 
 const exec = promisify(execFile);
 const repo = "atlargelabs/aipatty";
@@ -143,6 +144,12 @@ test("an install-root run forwards its Pi directory and loads only the pinned de
   assert.ok(existsSync(join(outcome.logDir, "events.jsonl")));
   assert.deepEqual(JSON.parse(await readFile(join(outcome.logDir, "result.json"), "utf8")), { outcome, reconciled: true, taskId: 101 });
   assert.ok(!existsSync(join(config.dataDir, "pi-run.json")));
+  await rm(join(config.dataDir, "pi-outcomes.json"));
+  const replay = await (await openPiRuns(config)).snapshot(outcome.runId);
+  assert.equal(replay?.status, "completed");
+  assert.equal(typeof replay?.durationMs, "number");
+  assert.equal(replay?.result?.pr?.headSha, head);
+  assert.equal(replay?.result?.review?.sha, head);
 });
 
 test("the result is confirmed with gh, and delegate spend is charged once", async t => {
@@ -693,9 +700,41 @@ test("aborting the branch stops its run and reports what the run had done", { ti
   const host = await openHost(config);
   t.after(() => host.close());
   const root = (await host.conversation("root"))!;
+  const side = await host.fork(root, { title: "Second branch" });
+  const api = await startApi(host, { ok: true, commit: "test", startedAt: "now", version: "0" }, 0);
+  t.after(() => api.close());
+  const base = `http://127.0.0.1:${api.port}`;
+  const stream = connect(t, base);
   const submission = await host.submit(root, { type: "input", content: 'call pi {"task":"Add the thing."}' });
   await until(async () => (await spawned(config)).length === 1, Boolean, 20_000);
+  const live = await until(() => stream.state(), state => !!state?.live.tools?.[0]?.details);
+  const slot = live!.live.tools![0];
+  const id = host.runs.active()!.runId;
+  assert.deepEqual(slot.details, { runId: id });
+  assert.ok(live!.entries.some(entry => entry.model?.some(message => message.role === "assistant"
+    && message.content.some(part => part.type === "toolCall" && part.name === "pi" && part.id === slot.callId))));
+  const snapshot = async () => {
+    const response = await fetch(base + piRunApiPath + id);
+    assert.equal(response.status, 200);
+    return response.json() as Promise<PiRunSnapshot>;
+  };
+  const running = await until(snapshot, value => !!value.activity?.items.length);
+  assert.equal(running.status, "running");
+  assert.equal(running.runId, id);
+  assert.ok(running.activity!.items.some(item => item.kind === "text" && item.output.text === "Working."));
+
+  const branch = (await host.conversation(String(side.id)))!;
+  await (await host.submit(branch, { type: "input", content: 'call pi {"task":"Do not start."}' })).wait(ctx);
+  const refused = (await branch.entries({}, 10, undefined, ctx)).items.flatMap(entry => entry.model ?? [])
+    .find(message => message.role === "toolResult");
+  assert.ok(refused?.role === "toolResult" && refused.isError);
+  assert.equal(refused.details, undefined);
+  assert.ok(messageText(refused).includes(id), "the refusal mentions the other run only as text");
+
   await host.abort(root);
+  const archived = await snapshot();
+  assert.equal(archived.status, "aborted");
+  assert.equal(archived.result?.pr, undefined, "an unconfirmed PR is not linked");
   assert.equal((await submission.wait(ctx)).status, "unanswered");
   const [pi] = await launches(config);
   assert.ok(!alive(pi.pid) && !alive((await spawned(config))[0]));

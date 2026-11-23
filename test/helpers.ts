@@ -1,10 +1,11 @@
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { TestContext } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import WebSocket, { type RawData } from "ws";
 import { readConfig } from "../src/config.ts";
+import { runLogParts } from "../src/pi-run-view.ts";
 import { applyUpdate, type StreamFrame } from "../src/protocol.ts";
 
 export const checkout = join(import.meta.dirname, "..");
@@ -41,6 +42,15 @@ export function fauxConfig(dir: string) {
 /** The same on the real catalog: the bundled models plus any `models-store.json` in `dir`. */
 export function realConfig(dir: string) {
   return readConfig(fixtureArgs(dir), {});
+}
+
+/** An old archive without a workspace or an entry in the Pi recovery cache. */
+export async function archivedPiRun(dir: string, runId: string, outcome: object, events?: string): Promise<string> {
+  const path = join(dir, ...runLogParts, runId);
+  await mkdir(path, { recursive: true });
+  await writeFile(join(path, "result.json"), JSON.stringify({ outcome: { runId, status: "completed", ...outcome }, taskId: 321, reconciled: true }));
+  if (events !== undefined) await writeFile(join(path, "events.jsonl"), events);
+  return path;
 }
 
 /** Collect frames starting with the first message, not just after the open event, and fold them as a client would. */

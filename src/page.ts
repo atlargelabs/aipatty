@@ -2,7 +2,7 @@
  * The crude web page: branch list, transcript, input box, fork, rename, model picker and cost. Served by the API
  * with a strict CSP, so the script is a separate same-origin file and every value is rendered as text.
  */
-import { upgradeEntryKind } from "./protocol.ts";
+import { piRunApiPath, piRunId, upgradeEntryKind } from "./protocol.ts";
 
 export const pageHtml = `<!doctype html>
 <html lang="en">
@@ -46,6 +46,18 @@ export const pageHtml = `<!doctype html>
       </div>
     </form>
   </main>
+  <aside id="pi-run" aria-labelledby="pi-run-heading" hidden>
+    <div class="run-controls">
+      <h2 id="pi-run-heading">Pi run</h2>
+      <button id="pi-run-refresh" type="button">Refresh</button>
+      <button id="pi-run-close" type="button" aria-label="Close Pi run">Close</button>
+    </div>
+    <div id="pi-run-view" tabindex="0" aria-label="Run details">
+      <p id="pi-run-task" hidden></p>
+      <p id="pi-run-message" role="status"></p>
+      <div id="pi-run-data"></div>
+    </div>
+  </aside>
 </div>
 </body>
 </html>
@@ -79,9 +91,22 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 #live .entry { border-style: dashed; }
 #run-failure { background: #fff4e5; color: #8a4b00; }
 #composer { display: flex; gap: .5rem; padding: .6rem .8rem; border-top: 1px solid #ddd; background: #fff; }
-#composer textarea { flex: 1; font: inherit; padding: .4rem; resize: vertical; }
+#composer textarea { flex: 1; min-width: 0; font: inherit; padding: .4rem; resize: vertical; }
 #actions { display: flex; flex-direction: column; gap: .4rem; }
 button { font: inherit; padding: .3rem .7rem; }
+.pi-call { max-width: 100%; text-align: left; white-space: normal; overflow-wrap: anywhere; color: #17458a; }
+#pi-run:not([hidden]) { display: flex; }
+#pi-run { flex: 0 0 clamp(18rem, 36vw, 35rem); min-width: 0; flex-direction: column; border-left: 1px solid #ddd; background: #fff; }
+.run-controls { display: flex; align-items: center; gap: .5rem; padding: .5rem .8rem; border-bottom: 1px solid #ddd; }
+.run-controls h2 { flex: 1; font-size: 1rem; margin: 0; }
+#pi-run-view { overflow: auto; padding: .5rem .8rem; overflow-wrap: anywhere; }
+#pi-run-view h3 { font-size: .95rem; margin-bottom: .35rem; }
+#pi-run-view p { white-space: pre-wrap; }
+#pi-run-view pre { white-space: pre-wrap; background: #f4f4f4; padding: .5rem; font: 12px/1.45 ui-monospace, monospace; }
+#pi-run-view li { margin-bottom: .35rem; }
+@media (max-width: 900px) {
+  #pi-run { position: fixed; inset: 0; z-index: 3; border: 0; }
+}
 @media (max-width: 700px) {
   #menu { display: inline-block; }
   nav { position: fixed; top: 2.8rem; left: 0; bottom: 0; z-index: 2; display: none; box-shadow: 2px 0 8px #0003; }
@@ -92,6 +117,8 @@ button { font: inherit; padding: .3rem .7rem; }
 export const pageJs = `"use strict";
 const $ = id => document.getElementById(id);
 const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const piRunId = ${piRunId};
+const piRunApiPath = ${JSON.stringify(piRunApiPath)};
 const app = { branch: null, branches: [], totalCost: 0, entries: [], before: null, live: {}, socket: null, models: [] };
 
 function money(value) { return "$" + value.toFixed(value > 0 && value < 0.01 ? 4 : 2); }
@@ -119,16 +146,227 @@ function guard(fn) {
   };
 }
 
-/** Visible text of a message: text blocks, and tool calls as one line each. */
+function blockText(block) {
+  if (block.type === "text") return block.text;
+  if (block.type === "toolCall") return "→ " + block.name + " " + JSON.stringify(block.arguments);
+  if (block.type === "image") return "[image]";
+  return "";
+}
+
+/** The in-flight generation is still text: partial tool arguments are not a durable call yet. */
 function messageText(message) {
   if (typeof message.content === "string") return message.content;
-  return (message.content || []).map(block => {
-    if (block.type === "text") return block.text;
-    if (block.type === "toolCall") return "→ " + block.name + " " + JSON.stringify(block.arguments);
-    if (block.type === "image") return "[image]";
-    return "";
-  }).filter(Boolean).join("\\n");
+  return (message.content || []).map(blockText).filter(Boolean).join("\\n");
 }
+
+function isPiCall(block) { return block.type === "toolCall" && block.name === "pi"; }
+function isPiResult(message) { return message.role === "toolResult" && message.toolName === "pi"; }
+function runIdOf(details) {
+  return typeof details?.runId === "string" && piRunId.test(details.runId) ? details.runId : undefined;
+}
+
+function taskTitle(value) {
+  const line = typeof value === "string" ? value.trim().split("\\n", 1)[0].trim() : "";
+  return line.length > 120 ? line.slice(0, 119) + "…" : line;
+}
+
+function runButton(label, source) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "pi-call";
+  button.setAttribute("aria-controls", "pi-run");
+  button.textContent = label;
+  button.addEventListener("click", () => openRun(button, source));
+  return button;
+}
+
+function messageNodes(entry, message) {
+  if (message.role !== "assistant" || !message.content?.some(isPiCall)) {
+    const text = document.createTextNode(messageText(message));
+    const id = isPiResult(message) ? runIdOf(message.details) : undefined;
+    return id ? [runButton("Open Pi run", { id, durationMs: message.durationMs }), document.createTextNode("\\n"), text] : [text];
+  }
+  const nodes = [];
+  const seen = new Set();
+  for (const block of message.content) {
+    let node;
+    if (isPiCall(block)) {
+      const title = taskTitle(block.arguments?.task);
+      // Durable executes only the first call with a given ID in a round.
+      if (seen.has(block.id)) node = "→ pi (duplicate call ID)";
+      else node = runButton("Open Pi run" + (title ? " · " + title : ""), { entry, callId: block.id, title });
+    } else node = blockText(block);
+    if (block.type === "toolCall") seen.add(block.id);
+    if (!node) continue;
+    if (nodes.length) nodes.push(document.createTextNode("\\n"));
+    nodes.push(typeof node === "string" ? document.createTextNode(node) : node);
+  }
+  return nodes;
+}
+
+// Follow the durable exchange, not a run ID printed by a model or a tool error. A result may be on
+// a newer transcript page; all newer loaded entries are still present when paging back to the call.
+function resolveRun(source) {
+  if (source.id) return source;
+  const { entry, callId } = source;
+  const start = app.entries.findIndex(item => item.id === entry.id);
+  if (start === -1) return {};
+  for (let i = start + 1; i < app.entries.length; i++) {
+    const next = app.entries[i];
+    if (next.conversationId !== entry.conversationId) continue;
+    for (const message of next.model || []) {
+      if (isPiResult(message) && message.toolCallId === callId) {
+        return { id: runIdOf(message.details), durationMs: message.durationMs, settled: true };
+      }
+      // If a later round reused a provider's ID, it can't be the result of this call.
+      if (message.role === "assistant" && message.content.some(block => block.type === "toolCall" && block.id === callId)) return {};
+    }
+  }
+  if (entry.conversationId !== app.branch) return {};
+  const slot = app.live.tools?.find(slot => slot.name === "pi" && slot.callId === callId);
+  return { id: runIdOf(slot?.details) };
+}
+
+let openedRun;
+const narrowPane = matchMedia("(max-width: 900px)");
+function syncPane() {
+  const inert = !!openedRun && narrowPane.matches;
+  for (const element of document.querySelectorAll("header, #branches, main")) element.inert = inert;
+}
+
+// Keep the first visible entry at the same offset when the desktop pane reflows the chat.
+function keepChatPlace(change) {
+  const box = $("transcript");
+  const top = box.getBoundingClientRect().top;
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 2;
+  const children = $("entries").children;
+  let lo = 0, hi = children.length;
+  while (lo < hi) {
+    const i = (lo + hi) >>> 1;
+    if (children[i].getBoundingClientRect().bottom <= top) lo = i + 1; else hi = i;
+  }
+  const anchor = children[lo];
+  const offset = anchor?.getBoundingClientRect().top;
+  change();
+  if (atBottom) box.scrollTop = box.scrollHeight;
+  else if (anchor) box.scrollTop += anchor.getBoundingClientRect().top - offset;
+}
+
+function openRun(button, source) {
+  const alreadyOpen = !!openedRun;
+  openedRun = { button, source: { ...source } };
+  if (!alreadyOpen) keepChatPlace(() => { $("pi-run").hidden = false; });
+  $("pi-run-task").textContent = source.title || "";
+  $("pi-run-task").hidden = !source.title;
+  $("pi-run-data").replaceChildren();
+  $("pi-run-refresh").disabled = false;
+  $("pi-run-view").scrollTop = 0;
+  syncPane();
+  $("pi-run-close").focus({ preventScroll: true });
+  void refreshRun();
+}
+
+function closeRun(restoreFocus = true) {
+  if (!openedRun) return;
+  const { button } = openedRun;
+  openedRun = undefined;
+  keepChatPlace(() => { $("pi-run").hidden = true; });
+  $("pi-run-data").replaceChildren();
+  syncPane();
+  if (restoreFocus && button.isConnected) button.focus({ preventScroll: true });
+}
+
+async function refreshRun() {
+  const open = openedRun;
+  const refresh = $("pi-run-refresh");
+  if (!open || refresh.disabled) return;
+  const { id, durationMs, settled } = resolveRun(open.source);
+  const message = $("pi-run-message");
+  if (!id) {
+    message.textContent = settled ? "This request did not start a Pi run. See the tool result in chat."
+      : "No run is available for this call yet. If it starts, use Refresh to see it.";
+    return;
+  }
+  // Once selected, the pane stays on that exact run, even if the live tool slot disappears or the chat resyncs.
+  open.source.id = id;
+  open.source.durationMs = durationMs;
+  refresh.disabled = true;
+  message.textContent = "Loading Pi run…";
+  try {
+    const snapshot = await api(piRunApiPath + id);
+    if (openedRun !== open) return;
+    renderRun(snapshot, durationMs);
+  } catch (error) {
+    if (openedRun !== open) return;
+    $("pi-run-data").replaceChildren();
+    message.textContent = "Could not open run " + id + ": " + error.message;
+  } finally {
+    if (openedRun === open) refresh.disabled = false;
+  }
+}
+
+function renderRun(snapshot, durationMs) {
+  const status = snapshot.status.replaceAll("_", " ");
+  const ms = snapshot.durationMs ?? durationMs;
+  const elapsed = ms === undefined ? "" : " · " + Math.floor(ms / 60000) + "m " + Math.floor(ms / 1000) % 60 + "s";
+  $("pi-run-message").textContent = snapshot.runId + " · " + status + elapsed
+    + (snapshot.status === "running" ? " (snapshot; refresh for more)" : "");
+  const data = $("pi-run-data");
+  data.replaceChildren();
+  const add = (tag, text, parent = data) => {
+    const node = document.createElement(tag);
+    node.textContent = text;
+    parent.append(node);
+    return node;
+  };
+  const shown = output => output.text + (output.truncated ? "\\n[Truncated]" : "");
+  const result = snapshot.result;
+  if (result) {
+    add("h3", "Result");
+    if (result.summary) add("p", shown(result.summary));
+    for (const [label, link] of [["Confirmed PR", result.pr], ["Confirmed issue", result.issue]]) {
+      if (!link) continue;
+      const anchor = add("a", label + " #" + link.url.split("/").at(-1), add("p", ""));
+      anchor.href = link.url;
+      anchor.target = "_blank";
+      anchor.rel = "noreferrer";
+    }
+    if (result.pr?.headSha) add("p", "PR head: " + result.pr.headSha);
+    if (result.review && result.review.status !== "none") {
+      const review = result.review;
+      add("p", "Review: " + review.status + (review.verdict ? " · verdict: " + review.verdict : "")
+        + "\\nReviewed SHA: " + (review.sha ?? "unknown")
+        + "\\nFindings: " + review.important + " important, " + review.lesser + " lesser");
+    }
+    for (const [label, items] of [["Problems", result.problems], ["Remaining", result.remaining]]) {
+      if (!items.length) continue;
+      add("h3", label);
+      const list = add("ul", "");
+      for (const item of items) add("li", shown(item), list);
+    }
+    if (result.listsTruncated) add("p", "Result lists truncated.");
+  }
+  add("h3", "Recent activity");
+  const activity = snapshot.activity;
+  if (activity?.truncated) add("p", "Activity truncated; only a recent excerpt is shown.");
+  if (activity?.incomplete) add("p", "Incomplete or unreadable events skipped.");
+  if (!activity?.items.length) add("p", activity ? "No visible activity in this snapshot." : "No activity log available.");
+  for (const item of activity?.items ?? []) {
+    if (item.kind === "tool") add("div", "→ " + item.name + " · " + item.status);
+    if (item.output) add("pre", shown(item.output));
+  }
+  if (snapshot.stderr) {
+    add("h3", "Pi stderr");
+    add("pre", shown(snapshot.stderr));
+  }
+}
+
+narrowPane.addEventListener("change", syncPane);
+$("pi-run-refresh").addEventListener("click", refreshRun);
+$("pi-run-close").addEventListener("click", () => closeRun());
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && openedRun) closeRun();
+});
 
 function current() { return app.branches.find(branch => branch.id === app.branch); }
 
@@ -208,7 +446,7 @@ function entryNode(entry, message) {
   fork.className = "fork-here";
   fork.textContent = "Fork here";
   fork.addEventListener("click", guard(() => forkAt(entry.id)));
-  div.append(fork, role, document.createTextNode(messageText(message)));
+  div.append(fork, role, ...messageNodes(entry, message));
   return div;
 }
 
@@ -219,7 +457,8 @@ function entryNodes(entries) {
       nodes.push(entryNode(entry, { role: "upgrade", content: entry.data.text }));
     }
     for (const message of entry.model || []) {
-      if (messageText(message)) nodes.push(entryNode(entry, message));
+      if (message.role === "assistant" && message.content.some(isPiCall)
+          || isPiResult(message) && runIdOf(message.details) || messageText(message)) nodes.push(entryNode(entry, message));
     }
   }
   return nodes;
@@ -312,6 +551,7 @@ async function refreshBranches() {
 }
 
 async function selectBranch(id) {
+  closeRun(false);
   app.branch = id;
   app.entries = [];
   app.before = null;
@@ -411,9 +651,10 @@ $("older").addEventListener("click", guard(async () => {
     app.entries = page.entries.concat(app.entries);
     app.before = page.before;
     const box = $("transcript");
-    const height = box.scrollHeight;
-    renderEntries();
-    box.scrollTop += box.scrollHeight - height;
+    const { scrollHeight, scrollTop } = box;
+    $("entries").prepend(...entryNodes(page.entries));
+    $("older").hidden = app.before === null;
+    box.scrollTop = scrollTop + box.scrollHeight - scrollHeight;
   } finally {
     if (revision === transcriptRevision) button.disabled = false;
   }

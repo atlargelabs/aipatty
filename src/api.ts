@@ -6,7 +6,7 @@ import WebSocket, { WebSocketServer } from "ws";
 import { LOOPBACK } from "./config.ts";
 import { HttpError, type AgentHost } from "./host.ts";
 import { pageCss, pageHtml, pageJs } from "./page.ts";
-import { messageText, shutdownHeader, streamState, streamUpdate, upgradeCommand, type StreamFrame } from "./protocol.ts";
+import { messageText, piRunApiPath, piRunId, shutdownHeader, streamState, streamUpdate, upgradeCommand, type StreamFrame } from "./protocol.ts";
 import { transcriptPage } from "./transcript.ts";
 
 const maxBody = 64 * 1024;
@@ -164,6 +164,15 @@ async function handleHttp(
   if (pathname === "/api/branches") {
     requireMethod(req, res, "GET");
     sendJson(res, 200, await agent.branches());
+    return;
+  }
+  if (pathname.startsWith(piRunApiPath)) {
+    requireMethod(req, res, "GET");
+    const id = pathname.slice(piRunApiPath.length);
+    if (req.url !== pathname || !piRunId.test(id)) throw new HttpError(400, "Invalid Pi run ID");
+    const snapshot = await agent.runs.snapshot(id);
+    if (!snapshot) throw new HttpError(404, "Pi run archive unavailable (not found, removed, or missing its result record)");
+    sendJson(res, 200, snapshot);
     return;
   }
   // The root's model and thinking level, kept from step 1 for the CLI's defaults.

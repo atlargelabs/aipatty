@@ -92,6 +92,17 @@ its identity was remembered.
 Open `http://127.0.0.1:8790/` (or the port given with `--port`) for the branch list, transcript, input box, fork (of the whole branch, or
 at a completed exchange with "Fork here"), rename, search, model and thinking pickers, and cost. ⌘/Ctrl+Enter sends.
 
+Use **Open Pi run** on a `pi` call (or its result) to inspect that run beside the conversation. On a narrow screen
+it uses the full screen; Close or Esc goes back to the same place in chat. Inherited calls open the original run.
+The pane shows its status and elapsed time when known, recent tool starts and finishes, assistant text, bash output,
+Pi stderr, and the final result. It links only to PRs and issues the host confirmed, and shows the confirmed PR head
+and reviewed SHA **at the time of the run**, not current GitHub state.
+
+Use **Refresh** for a new snapshot while Pi runs; there is no live terminal, automatic following, or input to Pi.
+Refused requests have no run. A completed run can be replayed after its clone is deleted, as long as its result
+record and logs are still present. Output is a bounded excerpt, not a complete transcript. It can contain sensitive
+information printed by the run, so treat the pane like the rest of the loopback/SSH-only API.
+
 ## Install
 
 Requires Node 26 or newer.
@@ -237,6 +248,11 @@ the authentication.
 - `GET /health` (includes the process ID, the root's saved model, its catalog availability, the thinking level,
   and `problems`: what the startup health check found, empty when healthy)
 - `GET /api/models`
+- `GET /api/pi-runs/:runId`: a no-store, read-only snapshot of one active or archived Pi run. Uses the ID from
+  the `pi` tool's structured progress/result. Returns `runId`, `status`, `durationMs` when known, bounded `activity`
+  and `stderr` when available, and a terminal `result` with confirmed links and review status. No file or path
+  parameter is accepted. A bad ID is `400`; an unknown run or missing/unusable result record is `404`. An archive
+  with intact result metadata but missing event logs still shows its result.
 - `POST /api/shutdown` (no body needed): requires the `X-Aipatty-Shutdown: 1` header so ordinary browser forms
   cannot trigger it. No CORS is enabled. Returns `202 { "status": "shutdown-requested" }` before stopping the
   server; it does not wait for cleanup. The same Host and Origin rules below apply.

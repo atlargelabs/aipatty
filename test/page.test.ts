@@ -1,4 +1,6 @@
 import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import type { Tx } from "@earendil-works/pi-durable";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -8,7 +10,7 @@ import { test, type TestContext } from "node:test";
 import { startApi } from "../src/api.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
 import { upgradeEntryKind } from "../src/protocol.ts";
-import { checkout, fauxConfig, fixture, realConfig, until } from "./helpers.ts";
+import { archivedPiRun, checkout, fauxConfig, fixture, realConfig, until } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
 
@@ -90,6 +92,12 @@ async function openBrowser(t: TestContext, flags: string[] = []) {
     errors,
     evaluate,
     navigate: (url: string) => send("Page.navigate", { url }),
+    viewport: (width: number, height: number) => send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false }),
+    async key(key: "Enter" | "Escape") {
+      const params = { key, code: key, windowsVirtualKeyCode: key === "Enter" ? 13 : 27 };
+      await send("Input.dispatchKeyEvent", { type: "keyDown", ...params, ...(key === "Enter" && { text: "\r" }) });
+      await send("Input.dispatchKeyEvent", { type: "keyUp", ...params });
+    },
     /** Press or release the left mouse button at a point of the page, as a person's click does in two steps. */
     mouse: (type: "mousePressed" | "mouseReleased", x: number, y: number) =>
       send("Input.dispatchMouseEvent", { type, x, y, button: "left", clickCount: 1 }),
@@ -153,6 +161,107 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
   await browser.navigate("about:blank");
   await browser.navigate(`${base}/#${side.id}`);
   await waitFor(browser, "the branch named in the fragment", value => value.title === "Side" && value.messages.length === 4);
+  assert.deepEqual(browser.errors, []);
+});
+
+test("Pi calls open the exact archive across pages and forks, without rebuilding the chat", { skip: !chrome, timeout: 60_000 }, async t => {
+  const dir = await fixture(t);
+  const host = await openHost(fauxConfig(dir));
+  const api = await startApi(host, health, 0);
+  t.after(async () => { await api.close(); await host.close(); });
+  const root = (await host.conversation("root"))!;
+  const first = "20260101T010101-aaaaaaaa", second = "20260101T020202-bbbbbbbb", missing = "20260101T030303-cccccccc";
+  const markup = '<img src="x" onerror="window.bad = true">';
+  await archivedPiRun(dir, first, { summary: "First archive " + markup }, JSON.stringify({
+    type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Visible activity" }] },
+  }) + "\n");
+  await archivedPiRun(dir, second, { summary: "Second archive", status: "failed", durationMs: 65_000 });
+  const call = (task: string, id: string) => fauxToolCall("pi", { task }, { id });
+  const exchange = (tx: Tx, toolName: string, toolCallId: string, text: string, runId?: string) =>
+    tx.appendEntry(root.id, { kind: "test", model: [{
+      role: "toolResult", toolName, toolCallId, content: [{ type: "text", text }], timestamp: 0,
+      isError: runId === undefined && toolName === "pi", ...(runId && { details: { runId }, durationMs: 2_500 }),
+    }] });
+  const forkAt = await root.commit(async tx => {
+    await tx.appendEntry(root.id, { kind: "test", model: [{ role: "user", content: `→ pi {"runId":"${second}"}`, timestamp: 0 }] });
+    await tx.appendEntry(root.id, { kind: "test", model: [fauxAssistantMessage([
+      { type: "text", text: 'Pasted → pi {} stays plain' },
+      call("First task\nDo not show the rest of the task", "first"), call("Second task", "second"),
+      fauxToolCall("bash", { command: "echo fixture" }, { id: "shell" }),
+    ], { stopReason: "toolUse" })] });
+    // Parallel results can arrive in a different order than the calls.
+    await exchange(tx, "pi", "second", "second result", second);
+    await exchange(tx, "pi", "first", "first result", first);
+    return (await exchange(tx, "bash", "shell", "fixture")).id;
+  }, ctx);
+  const side = await host.fork(root, { title: "Forked history", at: forkAt });
+  await root.commit(async tx => {
+    await tx.appendEntry(root.id, { kind: "test", model: [fauxAssistantMessage([call("Missing archive", "missing"), call("Refused", "first")], { stopReason: "toolUse" })] });
+    await exchange(tx, "pi", "missing", "old result", missing);
+    await exchange(tx, "pi", "first", `Pi run ${first} is still active. Only one run at a time.`);
+    for (let i = 0; i < 45; i++) await tx.appendEntry(root.id, { kind: "test", model: [{ role: "user", content: `filler ${i}`, timestamp: 0 }] });
+  }, ctx);
+
+  const browser = await openBrowser(t);
+  await browser.viewport(1250, 850);
+  const base = `http://127.0.0.1:${api.port}`;
+  const html = await fetch(base);
+  assert.equal(html.headers.get("content-security-policy"), "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
+  await browser.navigate(base);
+  await waitFor(browser, "50 newest entries", state => state.messages.length === 50);
+  const click = async (label: string) => browser.evaluate(`(() => {
+    const button = [...document.querySelectorAll('.assistant .pi-call')].find(button => button.textContent.includes(${JSON.stringify(label)}));
+    button.click();
+  })()`);
+  const paneText = () => browser.evaluate<string>(`document.querySelector('#pi-run-view').textContent`);
+  const shows = async (text: string) => {
+    try { return await until(paneText, value => value.includes(text)); }
+    catch { assert.fail(`Expected ${text} in the pane; found ${await paneText()}; errors: ${browser.errors.join(", ")}`); }
+  };
+  // The first result has its own control even though its call isn't on this page yet.
+  assert.equal(await browser.evaluate(`document.querySelectorAll('.toolResult .pi-call').length`), 2);
+  await browser.evaluate(`document.querySelector('.toolResult .pi-call').click()`);
+  await shows("First archive");
+  await browser.evaluate(`document.querySelector('#pi-run-close').click(); window.kept = document.querySelector('#entries .entry'); document.querySelector('#older').click()`);
+  await until(() => browser.evaluate(`document.querySelector('#older').hidden`));
+  assert.equal(await browser.evaluate("window.kept.isConnected"), true);
+  assert.equal(await browser.evaluate(`document.querySelectorAll('.assistant .pi-call').length`), 4);
+  assert.equal(await browser.evaluate(`document.querySelectorAll('.user .pi-call').length`), 0);
+  assert.equal(await browser.evaluate(`document.querySelector('#entries').textContent.includes('→ bash {"command":"echo fixture"}')`), true);
+  assert.equal(await browser.evaluate(`document.querySelector('#entries').textContent.includes('Do not show the rest of the task')`), false);
+
+  await browser.evaluate(`window.openerButton = document.querySelector('.assistant .pi-call'); window.openerButton.focus()`);
+  await browser.key("Enter");
+  const content = await shows("First archive");
+  assert.match(content, /completed · 0m 2s/);
+  assert.ok(content.includes(markup) && content.includes("Visible activity"));
+  assert.equal(await browser.evaluate(`!!document.querySelector('#pi-run img') || !!window.bad`), false);
+  assert.equal(await browser.evaluate(`document.querySelector('main').getBoundingClientRect().right <= document.querySelector('#pi-run').getBoundingClientRect().left`), true);
+  await browser.key("Escape");
+  assert.equal(await browser.evaluate(`document.querySelector('#pi-run').hidden && document.activeElement === window.openerButton`), true);
+  await click("Second task");
+  const failed = await shows("Second archive");
+  assert.match(failed, /failed · 1m 5s/);
+  assert.match(failed, /No activity log available/);
+  await click("Missing archive");
+  await shows("archive unavailable");
+  await click("Refused");
+  await shows("did not start a Pi run");
+
+  // A branch change closes the pane. A reload of the fork reads the original exchange, not the later reused ID.
+  await browser.evaluate(`document.querySelector('[data-branch="${side.id}"]').click()`);
+  await waitFor(browser, "the fork", state => state.current === "Forked history" && state.messages.length === 5);
+  assert.equal(await browser.evaluate(`document.querySelector('#pi-run').hidden`), true);
+  await browser.navigate("about:blank");
+  await browser.navigate(base + "/#" + side.id);
+  await waitFor(browser, "reloaded fork", state => state.current === "Forked history" && state.messages.length === 5);
+  await browser.viewport(390, 480);
+  await browser.evaluate(`document.querySelector('#transcript').scrollTop = 85; window.chatTop = document.querySelector('#transcript').scrollTop`);
+  await click("First task");
+  await shows("First archive");
+  assert.equal(await browser.evaluate(`document.querySelector('main').inert && document.querySelector('#pi-run').getBoundingClientRect().width === 390`), true);
+  await browser.evaluate(`document.querySelector('#pi-run-close').click()`);
+  assert.equal(await browser.evaluate(`!document.querySelector('main').inert && document.querySelector('#transcript').scrollTop === window.chatTop`), true);
   assert.deepEqual(browser.errors, []);
 });
 
