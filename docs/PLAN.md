@@ -170,7 +170,7 @@ Deferred until something needs them: a read-only research mode, concurrent runs,
 Three parts: a small supervisor script, a fallback that always ends on the old release, and a health check every
 release runs as it starts. The code is `src/upgrade-supervisor.ts` and `src/upgrade.ts`.
 
-1. **Request.** Steve sends `/upgrade` as a message in a branch, from the page or the CLI. It is the server's
+1. **Request.** Steve types `/upgrade` in a branch on the page, or runs the CLI's `upgrade`. It is the server's
    command, not a tool: no model turn runs and the model cannot ask for it. The server refuses unless every branch
    is idle and no Pi run is active, admits no new message while the upgrade runs, and starts the supervisor from the
    running release as a detached process.

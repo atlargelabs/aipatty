@@ -155,9 +155,9 @@ test("/upgrade moves to the latest main, keeps the conversation and reports in t
   assert.deepEqual(before.problems, []);
   await f.say("before the upgrade");
 
-  // Nothing new on main: the same server keeps running. The CLI sends the command like any message.
+  // Nothing new on main: the same server keeps running.
   const cli = (...args: string[]) => execFileSync(process.execPath, [join(checkout, "src/cli.ts"), "--port", String(f.port), ...args], { env: {}, encoding: "utf8" });
-  assert.match(cli("send", "/upgrade"), /^Upgrade started\./);
+  assert.match(cli("upgrade"), /^Upgrade started\./);
   assert.equal(await f.reported("Already"), `upgrade: Already up to date: ${short(f.first)} is the latest main.`);
   assert.equal((await f.health())?.pid, before.pid);
 

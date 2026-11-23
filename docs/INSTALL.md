@@ -133,8 +133,9 @@ or send the server `SIGTERM`. These all use the same cleanup; see [CLI shutdown 
 
 ## Upgrade
 
-With the server started as in [Start](#start), from a release that has the command, send `/upgrade` in any branch:
-type it in the page, or run `node src/cli.ts send /upgrade` (add `--branch <id>` for a branch other than the root).
+With the server started as in [Start](#start), from a release that has the command, ask for an upgrade in any
+branch: type `/upgrade` in the page, or run `node src/cli.ts upgrade` (add `--branch <id>` for a branch other than
+the root).
 It is refused while any branch is busy or a Pi run is active; wait or abort first.
 
 The server starts a one-shot supervisor, which fetches the tip of `main` into `$ROOT/deploy/<sha>` and runs

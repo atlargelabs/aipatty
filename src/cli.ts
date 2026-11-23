@@ -4,7 +4,7 @@ import { on } from "node:events";
 import WebSocket, { type RawData } from "ws";
 import { LOOPBACK, readFaux, readPort } from "./config.ts";
 import type { BranchInfo, SearchMatch } from "./branches.ts";
-import { failureText, messageText, shutdownHeader, upgradeText, type ConversationPage, type StreamFrame } from "./protocol.ts";
+import { failureText, messageText, shutdownHeader, upgradeCommand, upgradeText, type ConversationPage, type StreamFrame } from "./protocol.ts";
 import { branchLine } from "./tools.ts";
 
 /** The conversation path of a branch ID, or the root's. */
@@ -42,7 +42,7 @@ async function send(base: URL, content: string, root: string): Promise<void> {
     body: JSON.stringify({ content, requestId: randomUUID() }),
   });
   if (submissionId === undefined) {
-    // `/upgrade` is the server's command, not a message with an answer to stream.
+    // The server took the content as its `/upgrade` command: there is no answer to stream.
     console.log("Upgrade started. The server restarts if it succeeds; the result appears in this branch's log.");
     return;
   }
@@ -102,12 +102,12 @@ async function log(base: URL, root: string, limit?: number): Promise<void> {
 }
 
 const usage = `Usage: aipatty [--port <n>] [--branch <id>] <command>
-  health | models | shutdown
+  health | models | shutdown | upgrade
   model set [provider] <modelId> | thinking set <level>
-  send "<text>" | send /upgrade | abort | log
+  send "<text>" | abort | log
   branches [list] | branches read <id> [--limit <n>] | branches search <id> "<text>"
   fork "<title>" [--at <entryId>] | rename "<title>"
---branch selects the branch for model, thinking, send, abort, log, fork and rename; default the root.
+--branch selects the branch for model, thinking, send, abort, log, fork, rename and upgrade; default the root.
 --port is the server's port on this machine; default 8790.`;
 
 /** Remove `--name <value>` from `args`, returning the value. */
@@ -158,6 +158,9 @@ async function main(): Promise<void> {
     await log(base, root, limit);
   } else if (command === "send" && rest.length === 1 && rest[0].trim()) {
     await send(base, rest[0], root);
+  } else if (command === "upgrade" && rest.length === 0) {
+    // The same request as typing `/upgrade` in the page; the result is posted in this branch.
+    await send(base, upgradeCommand, root);
   } else if (command === "fork" && rest.length === 1) {
     const branchInfo = await json(`${root}/fork`, "POST", { title: rest[0], ...(at ? { at: Number(at) } : {}) });
     print(branchInfo);

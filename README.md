@@ -184,7 +184,7 @@ node src/cli.ts models                # list available model IDs and providers
 node src/cli.ts model set <id>        # select a model from that list (optional provider before ID)
 node src/cli.ts thinking set <level>  # off, minimal, low, medium, high, xhigh or max
 node src/cli.ts send "hello"          # send a message and stream the answer
-node src/cli.ts send /upgrade         # deploy the latest main in a managed install; the result appears in the log
+node src/cli.ts upgrade               # deploy the latest main in a managed install; the result appears in the log
 node src/cli.ts abort                 # withdraw queued messages and stop the running turn
 node src/cli.ts shutdown              # request a graceful stop of the whole server
 node src/cli.ts log                   # print the transcript
@@ -195,8 +195,8 @@ node src/cli.ts fork "<title>" [--at <entryId>]    # fork the root (or --branch 
 node src/cli.ts rename "<title>"                   # retitle the root (or --branch <id>)
 ```
 
-`--branch <id>` before or after the command points `model set`, `thinking set`, `send`, `abort`, `log`, `fork` and
-`rename` at a branch instead of the root.
+`--branch <id>` before or after the command points `model set`, `thinking set`, `send`, `abort`, `log`, `fork`,
+`rename` and `upgrade` at a branch instead of the root.
 
 The CLI connects to `127.0.0.1:8790`. `--port <n>` names another port, for a server started with `--port`
 (or a matching SSH forward). For example: `aipatty --port 9000 shutdown` (or `node src/cli.ts --port 9000 shutdown`).
@@ -211,8 +211,8 @@ process to exit before starting another one on the same data directory.
 
 ## Upgrade
 
-In a [service install](#configure), the message `/upgrade` in any branch, from the page or the CLI, deploys the
-latest committed `main`. It goes to the server, not the model, and is refused while any branch is busy. A one-shot
+In a [service install](#configure), typing `/upgrade` in a branch on the page, or running the CLI's `upgrade`,
+deploys the latest committed `main`. It goes to the server, not the model, and is refused while any branch is busy. A one-shot
 supervisor script stages the release beside the running one, then stops the server, backs up the database and
 starts the new release. Every release checks its own health as it starts; `health` lists any `problems`. A new
 release that exits or reports a problem is replaced by the old one with the database restored. The outcome, with
