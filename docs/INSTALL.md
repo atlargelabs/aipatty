@@ -66,8 +66,10 @@ ROOT="$HOME/aipatty"
 Each Pi gets `delegates.maxParallel: 10` for concurrent top-level calls and batch width. It is not a global
 pool or a hard total for nested jobs. The pinned `maxThinkers` default stays six. The managed launcher uses
 Pi's built-in settings defaults in memory. Neither `<pi-dir>/settings.json` nor a checkout's `.pi/settings.json`
-is used or edited for managed runs. Do not add a settings file for them. Keep any existing file for standalone
-Pi or [rollback](#first-deploy-with-release-owned-pi-settings).
+is used or edited for managed runs. Managed Pi also skips provider overrides from `models.json` and ambient
+`SYSTEM.md` and `APPEND_SYSTEM.md` discovery. This does not disable the shared `models-store.json` catalog
+cache or ordinary provider login and environment configuration. Do not add local policy files for managed
+runs; keep existing files for standalone Pi or [rollback](#first-deploy-with-release-owned-pi-settings).
 
 Provision machine-specific executables and network settings separately, in the service account's trusted
 environment, not in the release. For example, use `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` for Pi HTTP
@@ -213,7 +215,7 @@ update on upgrade or rollback.
 
 ## First deploy with release-owned Pi settings
 
-Keep the same Pi directory and leave any `settings.json`, `web-search.json`, and old reviewer files in place.
+Keep the same Pi directory and leave legacy Pi configuration and old reviewer files in place.
 There is **no `maxParallel` edit, reviewer-path edit, installation of global extensions, or settings migration**.
 Use the normal upgrade or, by hand, install with `npm ci --ignore-scripts`, [stop](#stop) and wait, repoint
 `current`, start with the same directory options, and verify the commit and `problems` with `health`. Follow

@@ -1,9 +1,10 @@
+import { getBuiltinModelDataGeneratedAt } from "@earendil-works/pi-ai/providers/all";
+import { azureProvider } from "@earendil-works/pi-ai/providers/azure";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { pathToFileURL } from "node:url";
@@ -14,8 +15,8 @@ import { checkout } from "./helpers.ts";
 const exec = promisify(execFile);
 
 async function setup(t: TestContext) {
-  // In production the stage is not under the release's node_modules: test real absolute/virtual resolution.
-  const dir = await mkdtemp(join(tmpdir(), "aipatty-extension-test-"));
+  // Outside node_modules for real absolute/virtual resolution, and short enough for Darwin's Unix socket paths.
+  const dir = await mkdtemp("/tmp/aipatty-test-");
   t.after(() => rm(dir, { recursive: true, force: true }));
   const agentDir = join(dir, "agent"), cwd = join(dir, "checkout"), home = join(dir, "home"), temp = join(dir, "temp");
   await Promise.all([agentDir, cwd, home, temp].map(path => mkdir(path)));
@@ -104,10 +105,7 @@ printf '# Fixture Markdown\\n'
   });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   t.after(() => { server.closeAllConnections(); server.close(); });
-  await writeFile(join(agentDir, "models.json"), JSON.stringify({ providers: { "fixture-search": {
-    api: "openai-responses", baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
-    apiKey: "fixture-key", models: [{ id: "search-model", name: "Local search fixture" }],
-  } } }));
+  env.FIXTURE_SEARCH_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   await writeFile(join(agentDir, "web-search.json"), JSON.stringify({ provider: "fixture-search", model: "search-model" }));
   const ambientSearch = join(cwd, "web-search.json");
   await writeFile(ambientSearch, JSON.stringify({ provider: "must-not-load", model: "bad" }));
@@ -189,28 +187,37 @@ test("bundled Pi and real delegate children use release policy through upgrade a
     shellPath: shell, defaultProjectTrust: "always", packages: ["./.pi"], extensions: [extension],
     delegates: { maxParallel: 32, maxThinkers: 32, reviewExtension: extension, environment: { checks: [], exemption: "checkout" } },
   }));
+  const ambientPrompt = "standalone system prompt must not reach managed Pi";
+  await writeFile(join(agentDir, "SYSTEM.md"), ambientPrompt);
   await git("init", "--quiet", "--initial-branch=main");
   await git("add", ".pi");
   await git("commit", "--quiet", "-m", "fixture");
 
-  // The parent has a scripted in-process provider. Its children really spawn the bundle with only pinned
-  // delegates/codemode. A loopback provider gives those children a deterministic reply without a login.
-  const requests: Array<{ auth?: string; body: { messages: unknown[]; tools: { function: { name: string } }[] } }> = [];
+  // The parent uses a scripted provider. The children use Pi's real Azure transport pointed at loopback via
+  // its standard host env, and a fixture model present only in their shared on-disk catalog cache.
+  const requests: Array<{ url?: string; auth: string | string[] | undefined; body: { input: unknown[]; tools: { name: string }[] } }> = [];
   const server = createServer(async (req, res) => {
     req.setEncoding("utf8");
     let body = "";
     for await (const chunk of req) body += chunk;
-    requests.push({ auth: req.headers.authorization, body: JSON.parse(body) });
-    const reply = { id: "fixture", model: "reply", choices: [{ index: 0, delta: { content: "Fixture child completed" }, finish_reason: "stop" }] };
+    requests.push({ url: req.url, auth: req.headers["api-key"], body: JSON.parse(body) });
     res.writeHead(200, { "Content-Type": "text/event-stream" });
-    res.end(`data: ${JSON.stringify(reply)}\n\ndata: [DONE]\n\n`);
+    const item = { id: "fixture", type: "message", role: "assistant", content: [{ type: "output_text", text: "Fixture child completed" }] };
+    for (const event of [
+      { type: "response.output_item.done", output_index: 0, item },
+      { type: "response.completed", response: { id: "fixture", status: "completed", output: [item] } },
+    ]) res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    res.end();
   });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   t.after(() => { server.closeAllConnections(); server.close(); });
-  await writeFile(join(agentDir, "models.json"), JSON.stringify({ providers: { "fixture-child": {
-    api: "openai-completions", baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
-    apiKey: "fixture-fallback", models: [{ id: "reply", name: "Local delegate fixture" }],
-  } } }));
+  env.AZURE_OPENAI_BASE_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  env.AZURE_OPENAI_API_KEY = "fixture-fallback";
+  const template = azureProvider().getModels().find(m => m.id === "gpt-4.1")!;
+  const cache = JSON.stringify({ azure: { models: [{ ...template, id: "cached-smoke" }],
+    lastModified: (getBuiltinModelDataGeneratedAt() ?? Date.now()) + 1_000 } });
+  const modelsStore = join(agentDir, "models-store.json");
+  await writeFile(modelsStore, cache);
   const smoke = async (selected: PiConfig, expectedAuth: string, parallel = 10, legacyRun = false) => {
     const result = await run([selected.extension, join(checkout, "test/fixtures/pi-delegates-smoke.ts")],
       ["--model", "fixture/coding"], {}, selected.cli);
@@ -244,11 +251,13 @@ test("bundled Pi and real delegate children use release policy through upgrade a
       }
     }
     assert.equal(requests.length, 2);
-    const review = requests.find(req => req.body.tools.some(tool => tool.function.name === "delegate_review_diff"));
+    const review = requests.find(req => req.body.tools.some(tool => tool.name === "delegate_review_diff"));
     assert.ok(review);
-    assert.match(JSON.stringify(review.body.messages), /Delegated scope: Commit [0-9a-f]{40}/);
-    assert.deepEqual(review.body.tools.map(tool => tool.function.name).sort(), ["codemode", "delegate_review_diff", "find", "grep", "ls", "read"]);
-    assert.ok(requests.every(req => req.auth === `Bearer ${expectedAuth}`), JSON.stringify(requests.map(req => req.auth)));
+    assert.match(JSON.stringify(review.body.input), /Delegated scope: Commit [0-9a-f]{40}/);
+    assert.deepEqual(review.body.tools.map(tool => tool.name).sort(), ["codemode", "delegate_review_diff", "find", "grep", "ls", "read"]);
+    assert.ok(requests.every(req => req.auth === expectedAuth), JSON.stringify(requests.map(req => req.auth)));
+    assert.ok(requests.every(req => req.url?.includes("/responses") && !req.url.includes("/ambient")), JSON.stringify(requests.map(req => req.url)));
+    if (!legacyRun) assert.ok(requests.every(req => !JSON.stringify(req.body.input).includes(ambientPrompt)));
     requests.length = 0;
   };
 
@@ -263,6 +272,12 @@ test("bundled Pi and real delegate children use release policy through upgrade a
     delegates: { maxParallel: 1, reviewExtension: join(current, relativeReview), environment: { checks: [], setup: [] },
       publication: { repository: "fixture/not-authorized", baseBranch: "other", requiredChecks: [] } } }, null, 2) + "\n";
   await writeFile(settings, legacy);
+  const models = join(agentDir, "models.json");
+  const ambientModels = JSON.stringify({ providers: { azure: {
+    api: "openai-completions", baseUrl: `${env.AZURE_OPENAI_BASE_URL}/ambient`, apiKey: `!${shell}`,
+    models: [{ id: "cached-smoke", name: "Ambient endpoint override" }],
+  } } });
+  await writeFile(models, ambientModels);
   await rm(auth, { force: true });
   const select = async (release: string): Promise<PiConfig> => {
     await rm(current, { force: true });
@@ -285,16 +300,21 @@ test("bundled Pi and real delegate children use release policy through upgrade a
   assert.deepEqual(JSON.parse(cleanAuth), {});
   assert.equal(await readFile(settings, "utf8"), legacy);
 
-  const fixtureAuth = '{ "fixture-child": {"type":"api_key", "key":"fixture-shared-state"} }\n';
+  const fixtureAuth = '{ "azure": {"type":"api_key", "key":"fixture-shared-state"} }\n';
   await writeFile(auth, fixtureAuth);
   await smoke(await select(next), "fixture-shared-state");
   await smoke(first, "fixture-shared-state"); // Repointing current doesn't change an already selected release.
   await smoke(await select(old), "fixture-shared-state");
   assert.equal(await readFile(settings, "utf8"), legacy);
   assert.equal(await readFile(auth, "utf8"), fixtureAuth);
+  assert.equal(await readFile(modelsStore, "utf8"), cache);
+  assert.equal(await readFile(models, "utf8"), ambientModels);
+  assert.equal(await readFile(join(agentDir, "SYSTEM.md"), "utf8"), ambientPrompt);
   await assert.rejects(readFile(marker), { code: "ENOENT" });
 
-  // The raw CLI (as used by standalone Pi and older releases) still reads the retained legacy settings.
+  // The raw CLI still reads the legacy settings. Remove the intentionally conflicting model override in
+  // this fixture so it too selects the fixture model from the cache and talks only to loopback.
+  await rm(models);
   await smoke({ ...first, cli: join(old, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"),
     extension: join(old, "node_modules/pi-delegates/src/index.ts"), reviewExtension: join(current, relativeReview) },
     "fixture-shared-state", 1, true);

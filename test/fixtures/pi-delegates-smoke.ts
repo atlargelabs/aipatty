@@ -6,8 +6,8 @@ export default function (pi: ExtensionAPI) {
   stub.setResponses([
     fauxAssistantMessage([fauxToolCall("bash", { command: "printf managed-shell" })]),
     fauxAssistantMessage([fauxToolCall("delegate_parallel", { tasks: [
-      { profile: "worker", name: "fixture worker", task: "Inspect the fixture.", model: "fixture-child/reply" },
-      { profile: "crmanager", name: "fixture review", task: "/review commit HEAD\nInspect the fixture.", model: "fixture-child/reply" },
+      { profile: "worker", name: "fixture worker", task: "Inspect the fixture.", model: "azure/cached-smoke" },
+      { profile: "crmanager", name: "fixture review", task: "/review commit HEAD\nInspect the fixture.", model: "azure/cached-smoke" },
     ] })]),
     fauxAssistantMessage("fixture parent done"),
   ]);

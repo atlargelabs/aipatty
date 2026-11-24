@@ -13,6 +13,11 @@ export default function (pi: ExtensionAPI) {
     fauxAssistantMessage("unrelated coding turn completed"),
   ]);
   pi.registerProvider(stub.provider);
+  pi.registerProvider("fixture-search", {
+    baseUrl: process.env.FIXTURE_SEARCH_URL!, api: "openai-responses", apiKey: "fixture-key",
+    models: [{ id: "search-model", name: "Loopback search fixture", reasoning: false, input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 10000, maxTokens: 1000 }],
+  });
   pi.on("before_agent_start", async (_event, ctx) => {
     pi.events.emit("web-fetch:register", {
       name: "unexpected-bus-hook", matches: ["**"],
