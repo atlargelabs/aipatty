@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { get } from "node:http";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -16,6 +17,16 @@ import { backupDb, restoreDb, upgradeFiles, type Pending } from "../src/upgrade-
 import { checkout, fauxConfig, fixture, until } from "./helpers.ts";
 
 const timeout = 90_000;
+const tailscaleOrigin = "https://mini.example.ts.net";
+
+async function assertServeOrigin(port: number): Promise<void> {
+  const status = await new Promise<number | undefined>((resolve, reject) => {
+    get(`http://127.0.0.1:${port}/health`, {
+      headers: { Host: new URL(tailscaleOrigin).host, Origin: tailscaleOrigin },
+    }, res => { res.resume(); resolve(res.statusCode); }).on("error", reject);
+  });
+  assert.equal(status, 200);
+}
 const short = (sha: string) => sha.slice(0, 7);
 
 function git(cwd: string, ...args: string[]): string {
@@ -35,7 +46,7 @@ async function freePort(): Promise<number> {
  * A managed install of this checkout's source on the fake model: a local `origin` whose `main` is the first release,
  * `deploy/<sha>` cloned from it, and `deploy/current`. `npm ci` is replaced by a link to this checkout's dependencies.
  */
-async function install(t: TestContext) {
+async function install(t: TestContext, originOption?: string) {
   // Not under node_modules, where Node will not run TypeScript.
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "aipatty-upgrade-")));
   const root = join(dir, "root"), origin = join(dir, "origin.git"), work = join(dir, "work"), bin = join(dir, "bin");
@@ -79,8 +90,10 @@ async function install(t: TestContext) {
   const started: ChildProcess[] = [];
   /** Start `deploy/current` as the operator does. */
   const start = () => {
-    const child = spawn(process.execPath, [join(files.current, "src/main.ts"), "--install-dir", root, "--port", String(port)],
-      { env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(process.execPath, [
+      join(files.current, "src/main.ts"), "--install-dir", root, "--port", String(port),
+      ...(originOption ? ["--tailscale-origin", originOption] : []),
+    ], { env, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     child.stdout.on("data", chunk => { output += chunk; });
     child.stderr.on("data", chunk => { output += chunk; });
@@ -149,7 +162,7 @@ async function install(t: TestContext) {
 }
 
 test("/upgrade moves to the latest main, keeps the conversation and reports in the branch", { timeout }, async t => {
-  const f = await install(t);
+  const f = await install(t, tailscaleOrigin);
   f.start();
   const before = await f.serving(f.first);
   assert.deepEqual(before.problems, []);
@@ -165,6 +178,7 @@ test("/upgrade moves to the latest main, keeps the conversation and reports in t
   assert.equal((await f.send(" /upgrade\n")).status, 202);
   const after = await f.serving(next);
   assert.notEqual(after.pid, before.pid);
+  await assertServeOrigin(f.port);
   assert.equal(await f.reported("Upgrade complete"), `upgrade: Upgrade complete. Now running ${short(next)}; was ${short(f.first)}.`);
   assert.deepEqual((await f.lines()).slice(0, 2), ["user: before the upgrade", "assistant: Faux reply: before the upgrade"]);
   assert.equal(f.current(), next);
@@ -179,7 +193,7 @@ for (const [what, changes, reason] of [
   ["fails its health check", { "src/config.ts": (text: string) => text.replace("dist/bundle/cli.js", "dist/bundle/gone.js") }, /Health check failed: Pi CLI: ENOENT/],
 ] as const) {
   test(`a new release that ${what} is rolled back to the old release and its database`, { timeout }, async t => {
-    const f = await install(t);
+    const f = await install(t, tailscaleOrigin);
     f.start();
     const before = await f.serving(f.first);
     await f.say("before the upgrade");
@@ -191,6 +205,7 @@ for (const [what, changes, reason] of [
     assert.match(report, reason);
     const after = await f.serving(f.first);
     assert.notEqual(after.pid, before.pid);
+    await assertServeOrigin(f.port);
     assert.equal(f.current(), f.first);
     assert.ok(!existsSync(f.files.pending));
     assert.deepEqual((await f.lines()).slice(0, 2), ["user: before the upgrade", "assistant: Faux reply: before the upgrade"]);

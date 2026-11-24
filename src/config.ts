@@ -9,6 +9,8 @@ export interface Config {
   installDir?: string;
   dataDir: string;
   port: number;
+  /** Exact HTTPS origin accepted in addition to the loopback origins, when using Tailscale Serve. */
+  tailscaleOrigin?: string;
   /** The pi CLI's login file. */
   authFile: string;
   /** The pi CLI's cached model catalog. */
@@ -51,13 +53,13 @@ export interface PiConfig {
 /** The checkout this server runs from. */
 const release = fileURLToPath(new URL("../", import.meta.url));
 
-/** The only address the server listens on. Other machines reach it through an SSH port forward. */
+/** The only address the server listens on, even behind an SSH forward or Tailscale Serve. */
 export const LOOPBACK = "127.0.0.1";
 
 /** The port the server listens on, and the CLI connects to, unless `--port` says otherwise. */
 export const DEFAULT_PORT = 8790;
 
-const serverUsage = "Usage: node src/main.ts [--port <n>] [--install-dir <path>] [--data-dir <path>] [--pi-dir <path>] [--work-dir <path>] [--runs-dir <path>]";
+const serverUsage = "Usage: node src/main.ts [--port <n>] [--tailscale-origin <https-origin>] [--install-dir <path>] [--data-dir <path>] [--pi-dir <path>] [--work-dir <path>] [--runs-dir <path>]";
 
 /**
  * Whether `AIPATTY_FAUX` asks for the fake model. It is the only environment setting; an empty value is unset. The
@@ -86,15 +88,28 @@ function absolutePath(path: string): string {
   return path.startsWith("~/") ? join(homedir(), path.slice(2)) : resolve(path);
 }
 
+function readTailscaleOrigin(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const url = URL.parse(value);
+  if (url?.protocol !== "https:" || !/^[a-z0-9-]+\.[a-z0-9-]+\.ts\.net$/.test(url.hostname)
+    || (value !== url.origin && value !== `${url.origin}/`)) {
+    throw new Error("--tailscale-origin must be the HTTPS origin printed by Tailscale Serve (https://<device>.<tailnet>.ts.net), without a path");
+  }
+  return url.origin;
+}
+
 /** Parse the server's command-line options and its one environment setting. */
 export function readConfig(args: readonly string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env): Config {
   const faux = readFaux(env);
-  let values: { port?: string; "install-dir"?: string; "data-dir"?: string; "pi-dir"?: string; "work-dir"?: string; "runs-dir"?: string };
+  let values: {
+    port?: string; "tailscale-origin"?: string; "install-dir"?: string; "data-dir"?: string;
+    "pi-dir"?: string; "work-dir"?: string; "runs-dir"?: string;
+  };
   try {
     ({ values } = parseArgs({
       args: [...args],
       options: {
-        port: { type: "string" }, "install-dir": { type: "string" },
+        port: { type: "string" }, "tailscale-origin": { type: "string" }, "install-dir": { type: "string" },
         "data-dir": { type: "string" }, "pi-dir": { type: "string" },
         "work-dir": { type: "string" }, "runs-dir": { type: "string" },
       },
@@ -108,8 +123,10 @@ export function readConfig(args: readonly string[] = process.argv.slice(2), env:
   }
   const root = values["install-dir"] === undefined ? undefined : absolutePath(values["install-dir"]);
   const piDir = absolutePath(values["pi-dir"] ?? (root === undefined ? "~/.pi/agent" : join(root, "pi")));
+  const tailscaleOrigin = readTailscaleOrigin(values["tailscale-origin"]);
   return {
     ...(root === undefined ? {} : { installDir: root }),
+    ...(tailscaleOrigin === undefined ? {} : { tailscaleOrigin }),
     dataDir: absolutePath(values["data-dir"] ?? (root === undefined
       ? (faux ? "~/.aipatty/faux" : "~/.aipatty/data") : join(root, faux ? "faux" : "data"))),
     port: readPort(values.port, 0),

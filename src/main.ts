@@ -53,6 +53,7 @@ async function main(): Promise<void> {
       if (pending && health.problems.length) throw new Error(`Health check failed: ${health.problems.join("; ")}`);
       let port = config.port;
       const api = await startApi(agent, health, port, {
+        tailscaleOrigin: config.tailscaleOrigin,
         onShutdown: stop, onUpgrade: upgradeRequest(agent, config, release, () => port),
       });
       port = api.port;

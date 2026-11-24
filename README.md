@@ -244,15 +244,18 @@ upgrades. See [the runbook](docs/INSTALL.md#upgrade) for the files it keeps and 
 
 ## From another machine
 
-The server has no login and accepts connections from its own machine only. To use the page or the CLI from a laptop,
-forward the port over SSH and open `http://127.0.0.1:8790/` there:
+The server has no login and listens on loopback only. To use the page or the CLI from a laptop,
+forward the port over SSH and open `http://127.0.0.1:8790/` there. The SSH host can be the mini's Tailscale name:
 
 ```sh
 ssh -N -L 8790:127.0.0.1:8790 <the machine aipatty runs on>
 ```
 
-Use the same port number at both ends: the server answers only to `127.0.0.1` or `localhost` at its own port. SSH is
-the authentication.
+Use the same port number at both ends. SSH authenticates this connection.
+
+For a normal HTTPS bookmark on your phone or laptop, use [Tailscale Serve](docs/INSTALL.md#optional-tailnet-browser-access).
+Start aipatty with `--tailscale-origin <https-url>` set to the exact URL Serve prints. The listener stays on
+loopback; access to the HTTPS URL is controlled by your tailnet policy. Do not use Tailscale Funnel.
 
 ## API
 
@@ -289,9 +292,11 @@ the authentication.
   answer, or the `reason` and `detail` of a failed run. The server pings every 30 s and drops a stream that does
   not answer.
 
-Both HTTP and WebSocket requests must name the server as `127.0.0.1` or `localhost`, at the actual listener port. If
-present, `Origin` must also match that same HTTP origin. This stops a web page on another site from driving the
-server through the browser. It is not authentication: any process on the machine can connect.
+For HTTP and WebSocket requests, `Host` must name `127.0.0.1` or `localhost` at the actual listener port, or the
+exact configured Tailscale Serve hostname and port. If present, `Origin` must match the origin for that `Host`
+(HTTP on loopback, HTTPS for Serve). This stops another site from driving the server through the browser. It is
+not authentication: any process on the machine can connect, and any tailnet client allowed to reach Serve gets
+full access.
 
 ## Test
 

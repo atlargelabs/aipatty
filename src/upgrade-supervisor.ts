@@ -28,7 +28,7 @@ import { LOOPBACK, readConfig } from "./config.ts";
 import { ownDataDir, ownLock } from "./ownership.ts";
 
 /** An upgrade between stopping the old server and the new one passing its health check. */
-export interface Pending { old: string; new: string; branch: number; port: number }
+export interface Pending { old: string; new: string; branch: number; port: number; tailscaleOrigin?: string }
 
 /** An outcome the next server to start, or the one still running, posts in the requesting branch. */
 export interface Result { branch: number; text: string }
@@ -169,14 +169,18 @@ async function stopChild(child: ChildProcess, ended: Promise<unknown>): Promise<
  * Start `deploy/current` the way the runbook does and wait until it serves `commit` and `ready()` holds. The server
  * outlives this script. If it does not get there it is stopped, and the error carries the end of its output.
  */
-async function serve(root: string, port: number, commit: string, ready: () => boolean = () => true): Promise<void> {
+async function serve(
+  root: string, port: number, commit: string, tailscaleOrigin?: string, ready: () => boolean = () => true,
+): Promise<void> {
   const { current, serverLog } = upgradeFiles(root);
   const before = statSync(serverLog, { throwIfNoEntry: false })?.size ?? 0;
   const out = openSync(serverLog, "a");
   let child: ChildProcess;
   try {
-    child = spawn(process.execPath, [join(current, "src/main.ts"), "--install-dir", root, "--port", String(port)],
-      { cwd: root, detached: true, stdio: ["ignore", out, out] });
+    child = spawn(process.execPath, [
+      join(current, "src/main.ts"), "--install-dir", root, "--port", String(port),
+      ...(tailscaleOrigin ? ["--tailscale-origin", tailscaleOrigin] : []),
+    ], { cwd: root, detached: true, stdio: ["ignore", out, out] });
   } finally {
     closeSync(out);
   }
@@ -217,11 +221,11 @@ async function rollback(root: string, pending: Pending, reason: string, restore 
   } finally {
     release();
   }
-  await serve(root, pending.port, pending.old);
+  await serve(root, pending.port, pending.old, pending.tailscaleOrigin);
   log(`Rolled back to ${pending.old}`);
 }
 
-async function upgrade(root: string, port: number, branch: number): Promise<void> {
+async function upgrade(root: string, port: number, branch: number, tailscaleOrigin?: string): Promise<void> {
   // The server that asked is this script's parent, for as long as it lives.
   const server = process.ppid;
   const files = upgradeFiles(root);
@@ -240,7 +244,7 @@ async function upgrade(root: string, port: number, branch: number): Promise<void
     return;
   }
 
-  const pending: Pending = { old, new: sha, branch, port };
+  const pending: Pending = { old, new: sha, branch, port, tailscaleOrigin };
   let switched = false;
   try {
     // A parent that changed means the server has already gone, and its successor is not ours to signal.
@@ -259,7 +263,7 @@ async function upgrade(root: string, port: number, branch: number): Promise<void
     } finally {
       release();
     }
-    await serve(root, port, sha, () => !existsSync(files.pending));
+    await serve(root, port, sha, tailscaleOrigin, () => !existsSync(files.pending));
     log(`Upgraded to ${sha}`);
   } catch (error) {
     await rollback(root, pending, message(error), switched);
@@ -270,7 +274,10 @@ if (import.meta.main) {
   try {
     const { values, positionals } = parseArgs({
       allowPositionals: true,
-      options: { "install-dir": { type: "string" }, port: { type: "string" }, branch: { type: "string" } },
+      options: {
+        "install-dir": { type: "string" }, port: { type: "string" }, branch: { type: "string" },
+        "tailscale-origin": { type: "string" },
+      },
     });
     const [mode] = positionals;
     const root = values["install-dir"];
@@ -284,7 +291,7 @@ if (import.meta.main) {
     const unlock = ownLock(files.lock, "Another upgrade is running in this installation");
     try {
       if (start) {
-        await upgrade(root, Number(values.port), Number(values.branch));
+        await upgrade(root, Number(values.port), Number(values.branch), values["tailscale-origin"]);
       } else {
         const pending = readJson<Pending>(files.pending);
         if (pending) await rollback(root, pending, "The upgrade was interrupted before the new release passed its health check.");

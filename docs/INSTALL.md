@@ -119,6 +119,44 @@ ssh -N -L 8790:127.0.0.1:8790 macmini &
 node src/cli.ts health          # compare the commit with the expected release SHA
 ```
 
+## Optional tailnet browser access
+
+Use [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve) for a private HTTPS bookmark on a
+phone or laptop. No Caddy or change to the listener is needed. The CLI still uses loopback (directly or over SSH).
+
+1. Connect the mini and the client devices to your tailnet. **Before enabling Serve**, check Tailscale's
+   **Access controls**: only your identity should be allowed to reach the mini's TCP port `443`. A broad
+   allow rule still grants access; the default policy typically allows all tailnet members. aipatty has no
+   login of its own. Anyone who can reach Serve can read conversations and operate aipatty. Do not use Funnel.
+2. On the mini, run `tailscale serve status` first to make sure you are not replacing an existing handler at
+   `https://<mini>.<tailnet>.ts.net/`. Then run:
+
+   ```sh
+   tailscale serve --bg http://127.0.0.1:8790
+   ```
+
+   Use your actual listener port if it differs from `8790`. If prompted, follow Tailscale's link to enable HTTPS
+   for the tailnet, then rerun the command. Copy the HTTPS URL the command prints (the exact name, not just
+   `macmini` or its Tailscale IP).
+3. Once `deploy/current` is on a release with `--tailscale-origin`, [stop](#stop) the old process if one is
+   running. As the service account, start with the same install root and options as before, adding that URL:
+
+   ```sh
+   node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT" \
+     --tailscale-origin https://macmini.example.ts.net
+   ```
+
+   Keep this option on manual restarts. `/upgrade` carries it across restarts and rollback when started from a
+   release that supports it. If you manually roll back to an older release that doesn't know the option, take
+   it off the launch command and use SSH until you return to a supported release.
+4. With Tailscale on, open the printed URL on your phone or laptop. Check `/health` at the same URL and compare
+   its commit to the expected release, then send a message and check that the reply updates live. A `502`
+   usually means aipatty isn't running on the port named in `tailscale serve status`; a `403` from aipatty
+   means the startup URL is missing or doesn't match the browser's URL.
+
+To remove the default HTTPS route, run `tailscale serve --https=443 off` on the mini. Drop
+`--tailscale-origin` the next time you start aipatty. The SSH forward is unaffected.
+
 ## Optional coding extensions
 
 Each release brings its own pinned `just-web-fetch`, `pi-web-search` and `pi-claude-code` via

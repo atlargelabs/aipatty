@@ -172,12 +172,12 @@ Deferred until something needs them: a read-only research mode, concurrent runs,
   Pi run behind a tool call. It shows archived results or a manually refreshed snapshot, not an interactive terminal.
   Add a Gmail switch when Gmail ships.
 - **CLI:** the same API from a terminal.
-- **Auth:** SSH to the mini. The server has no login of its own and answers only to `127.0.0.1` or `localhost` at
-  its own port, so a web page on another site cannot drive it through a browser.
-- **Laptop:** `ssh -N -L 8790:127.0.0.1:8790 macmini`, then the page or the CLI at `127.0.0.1:8790`.
-- **Phone:** not settled. An SSH app can hold the same forward, but iOS suspends it in the background. The
-  alternative is `tailscale serve` on the mini, which would need an option naming the public origin the server
-  accepts; that option is not built and the route is not tested.
+- **Auth:** SSH or the tailnet's access policy. The server has no login of its own. HTTP and WebSocket requests
+  must name the loopback listener or the single configured HTTPS origin, and any browser `Origin` must match.
+- **Laptop CLI:** `ssh -N -L 8790:127.0.0.1:8790 macmini`, then the CLI at `127.0.0.1:8790`.
+- **Phone or laptop browser:** [Tailscale Serve](INSTALL.md#optional-tailnet-browser-access) on the mini, with
+  `--tailscale-origin` set to the exact HTTPS origin. The loopback URL still works through SSH.
+  Not handled: public access, multiple proxy origins, or an app login.
 
 ## Upgrade and rollback
 
