@@ -630,14 +630,21 @@ function appendEntries(entries) {
   });
 }
 
-// Keep the unchanged prefix of a streaming Markdown segment in place (including code scroll positions).
-function updateLiveMarkdown(node, text) {
+// Keep matching live nodes in place, even inside a growing list or quote. Only the new parser output supplies markup.
+function updateLiveMarkdown(node, rendered) {
   const before = [...node.childNodes];
-  const after = [...markdownNode(text).childNodes];
-  let first = 0;
-  while (first < before.length && first < after.length && before[first].isEqualNode(after[first])) first++;
-  for (const child of before.slice(first)) child.remove();
-  node.append(...after.slice(first));
+  const after = [...rendered.childNodes];
+  after.forEach((next, index) => {
+    const old = before[index];
+    if (!old) node.append(next);
+    else if (old.isEqualNode(next)) return;
+    else if (old.nodeType === Node.TEXT_NODE && next.nodeType === Node.TEXT_NODE) old.data = next.data;
+    else if (old.nodeType === Node.ELEMENT_NODE && old.nodeName === next.nodeName
+        && old.attributes.length === next.attributes.length
+        && [...old.attributes].every(attr => next.getAttribute(attr.name) === attr.value)) updateLiveMarkdown(old, next);
+    else old.replaceWith(next);
+  });
+  for (const child of before.slice(after.length)) child.remove();
 }
 
 let liveProse = [];
@@ -663,7 +670,7 @@ function renderLive() {
   prose.forEach((text, index) => {
     const node = div.children[index];
     if (!node) div.append(markdownNode(text));
-    else if (text !== previous[index]) updateLiveMarkdown(node, text);
+    else if (text !== previous[index]) updateLiveMarkdown(node, markdownNode(text));
   });
   while (div.children.length > prose.length) div.lastElementChild.remove();
 }

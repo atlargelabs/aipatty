@@ -244,10 +244,10 @@ test("streaming formats prose while hiding tools; settled calls and results stay
   t.after(async () => { await api.close(); await host.close(); });
   const root = (await host.conversation("root"))!;
   const command = "echo **private arg** and `literal code`";
-  const opening = "## Working\n\n~~~txt\n" + "x".repeat(200) + "\n~~~";
+  const opening = "## Working\n\n1. First item\n\n   ~~~txt\n   " + "x".repeat(200) + "\n   ~~~";
   const round = fauxAssistantMessage([
     { type: "thinking", thinking: "## Hidden reasoning" },
-    { type: "text", text: opening + "\n\n~~~txt\nStill an open fence" },
+    { type: "text", text: opening + "\n2. Second item\n\n~~~txt\nStill an open fence" },
     fauxToolCall("bash", { command }, { id: "shell" }),
     { type: "text", text: "**After the call**" },
   ], { stopReason: "toolUse" });
@@ -266,9 +266,9 @@ test("streaming formats prose while hiding tools; settled calls and results stay
   assert.deepEqual(await browser.evaluate(`(() => {
     const live = document.querySelector('#live .entry');
     const [first, second] = live.querySelectorAll('pre');
-    return [live.querySelector('h2').textContent, second.textContent,
+    return [live.querySelector('h2').textContent, live.querySelectorAll('ol li').length, second.textContent,
       first === window.streamedCode && first.scrollLeft === 80, !/private arg|bash|Hidden reasoning/.test(live.textContent)];
-  })()`), ["Working", "Still an open fence", true, true]);
+  })()`), ["Working", 2, "Still an open fence", true, true]);
 
   const result = "# Literal result\n**not emphasis**\n`not code`";
   await root.commit(async tx => {
