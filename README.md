@@ -107,11 +107,12 @@ at a completed exchange with "Fork here"), rename, search, model and thinking pi
 Enter sends on desktop and inserts a newline when the primary pointer is coarse and cannot hover (touch-first).
 Shift+Enter inserts a newline in either case. Use the Send button or ⌘/Ctrl+Enter (without Shift or Alt) to send.
 
-The transcript renders Markdown in user messages and visible assistant prose, including while a reply streams.
-Single newlines are preserved within paragraphs, and fenced code scrolls horizontally on narrow screens. Links
-must be absolute HTTP(S) URLs outside aipatty's hosts and open in a new tab. Raw HTML is shown as text, and
-images are not loaded. Thinking stays hidden; tool call labels, arguments and results, the Pi run pane, and
-upgrade and status text are not rendered as Markdown. This only changes how the conversation is displayed.
+The transcript renders Markdown in user messages and saved assistant prose. The live preview remains plain text
+and omits partial tool calls. Single newlines are preserved within paragraphs, and fenced code scrolls horizontally
+on narrow screens. Links must be absolute HTTP(S) URLs outside aipatty's hosts and open in a new tab. Raw HTML
+is shown as text, and images are not loaded. Thinking stays hidden; tool call labels, arguments and results, the
+Pi run pane, and upgrade and status text are not rendered as Markdown. Markdown tables are not supported.
+This only changes how the conversation is displayed.
 
 Use **Open Pi run** on a `pi` call (or its result) to inspect that run beside the conversation. On a narrow screen
 it uses the full screen; Close or Esc goes back to the same place in chat. Inherited calls open the original run.

@@ -630,24 +630,6 @@ function appendEntries(entries) {
   });
 }
 
-// Keep matching live nodes in place, even inside a growing list or quote. Only the new parser output supplies markup.
-function updateLiveMarkdown(node, rendered) {
-  const before = [...node.childNodes];
-  const after = [...rendered.childNodes];
-  after.forEach((next, index) => {
-    const old = before[index];
-    if (!old) node.append(next);
-    else if (old.isEqualNode(next)) return;
-    else if (old.nodeType === Node.TEXT_NODE && next.nodeType === Node.TEXT_NODE) old.data = next.data;
-    else if (old.nodeType === Node.ELEMENT_NODE && old.nodeName === next.nodeName
-        && old.attributes.length === next.attributes.length
-        && [...old.attributes].every(attr => next.getAttribute(attr.name) === attr.value)) updateLiveMarkdown(old, next);
-    else old.replaceWith(next);
-  });
-  for (const child of before.slice(after.length)) child.remove();
-}
-
-let liveProse = [];
 function renderLive() {
   $("abort").disabled = !app.live.run;
   const failure = app.live.runFailure;
@@ -655,24 +637,17 @@ function renderLive() {
   $("run-failure").hidden = !failure;
   const live = $("live");
   const message = app.live.generation?.message;
-  // A partial tool call separates live prose but is not part of the preview. Its literal label belongs in the transcript.
-  const prose = visibleParts(message?.content).filter(block => block.type === "text").map(block => block.text);
-  const previous = liveProse;
-  if (prose.length === previous.length && prose.every((text, index) => text === previous[index])) return;
-  liveProse = prose;
-  if (!prose.length) { live.replaceChildren(); return; }
+  // Keep the live preview plain: later tokens can restructure earlier Markdown (e.g. a list or link reference).
+  // Partial calls aren't preview text; show their labels only when they reach the transcript.
+  const text = visibleParts(message?.content).filter(block => block.type === "text").map(block => block.text).join("\\n");
+  if (!text) { live.replaceChildren(); return; }
   let div = live.firstElementChild;
   if (!div) {
     div = document.createElement("div");
     div.className = "entry assistant";
     live.append(div);
   }
-  prose.forEach((text, index) => {
-    const node = div.children[index];
-    if (!node) div.append(markdownNode(text));
-    else if (text !== previous[index]) updateLiveMarkdown(node, markdownNode(text));
-  });
-  while (div.children.length > prose.length) div.lastElementChild.remove();
+  setText(div, text);
 }
 
 function connect(id) {

@@ -238,37 +238,31 @@ test("user and assistant Markdown renders on narrow screens without creating uns
   assert.deepEqual(browser.errors, []);
 });
 
-test("streaming formats prose while hiding tools; settled calls and results stay literal", { skip: !chrome, timeout: 60_000 }, async t => {
+test("the live preview shows only prose; settled Markdown does not span tool calls", { skip: !chrome, timeout: 60_000 }, async t => {
   const host = await openHost(fauxConfig(await fixture(t)));
   const api = await startApi(host, health, 0);
   t.after(async () => { await api.close(); await host.close(); });
   const root = (await host.conversation("root"))!;
   const command = "echo **private arg** and `literal code`";
-  const opening = "## Working\n\n1. First item\n\n   ~~~txt\n   " + "x".repeat(200) + "\n   ~~~";
+  const beforeCall = "## Working\n\n~~~txt\nStill an open fence";
+  const afterCall = "**After the call**";
   const round = fauxAssistantMessage([
     { type: "thinking", thinking: "## Hidden reasoning" },
-    { type: "text", text: opening + "\n2. Second item\n\n~~~txt\nStill an open fence" },
+    { type: "text", text: beforeCall },
     fauxToolCall("bash", { command }, { id: "shell" }),
-    { type: "text", text: "**After the call**" },
+    { type: "text", text: afterCall },
   ], { stopReason: "toolUse" });
   const browser = await openBrowser(t);
-  await browser.viewport(390, 600);
   await browser.navigate(`http://127.0.0.1:${api.port}/`);
   await waitFor(browser, "the main branch", state => state.current === "Main");
-  const publish = (message: ReturnType<typeof fauxAssistantMessage>) => root.commit(async tx => {
-    (await tx.doc(LiveDoc, root.id)).generation = { attempt: 1, message: JSON.parse(JSON.stringify(message)) };
+  await root.commit(async tx => {
+    (await tx.doc(LiveDoc, root.id)).generation = { attempt: 1, message: JSON.parse(JSON.stringify(round)) };
   }, ctx);
-  await publish(fauxAssistantMessage(opening));
-  await until(() => browser.evaluate(`!!document.querySelector('#live pre')`));
-  await browser.evaluate(`window.streamedCode = document.querySelector('#live pre'); window.streamedCode.scrollLeft = 80;`);
-  await publish(round);
-  await until(() => browser.evaluate(`document.querySelector('#live strong')?.textContent === 'After the call'`));
+  await until(() => browser.evaluate(`!!document.querySelector('#live .entry')`));
   assert.deepEqual(await browser.evaluate(`(() => {
     const live = document.querySelector('#live .entry');
-    const [first, second] = live.querySelectorAll('pre');
-    return [live.querySelector('h2').textContent, live.querySelectorAll('ol li').length, second.textContent,
-      first === window.streamedCode && first.scrollLeft === 80, !/private arg|bash|Hidden reasoning/.test(live.textContent)];
-  })()`), ["Working", 2, "Still an open fence", true, true]);
+    return [live.textContent, live.childElementCount];
+  })()`), [beforeCall + "\n" + afterCall, 0]);
 
   const result = "# Literal result\n**not emphasis**\n`not code`";
   await root.commit(async tx => {
@@ -282,10 +276,10 @@ test("streaming formats prose while hiding tools; settled calls and results stay
   assert.deepEqual(await browser.evaluate(`(() => {
     const [before, tool, after] = document.querySelector('#entries .assistant .message-body').children;
     const result = document.querySelector('#entries .toolResult .message-body');
-    return [[...before.querySelectorAll('pre')].at(-1).textContent, tool.textContent, tool.childElementCount,
+    return [before.querySelector('h2').textContent, before.querySelector('pre').textContent, tool.textContent, tool.childElementCount,
       after.querySelector('strong').textContent, result.textContent, result.childElementCount,
       document.querySelector('#live').childElementCount];
-  })()`), ["Still an open fence", `→ bash ${JSON.stringify({ command })}`, 0, "After the call", result, 0, 0]);
+  })()`), ["Working", "Still an open fence", `→ bash ${JSON.stringify({ command })}`, 0, "After the call", result, 0, 0]);
   assert.deepEqual(browser.errors, []);
 });
 
