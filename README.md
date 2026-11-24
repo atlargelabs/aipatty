@@ -5,7 +5,8 @@ It runs as one long-lived process, keeps its conversations in SQLite, and contin
 The design and build order are in [docs/PLAN.md](docs/PLAN.md). This checkout implements build steps 1 and 2: a tree
 of conversation branches, each with its own model, over an HTTP and WebSocket API, a web page, and a CLI client; and
 the `pi` tool, which hands coding work to a pinned Pi CLI. Installing it on the Mac mini is in
-[docs/INSTALL.md](docs/INSTALL.md).
+[docs/INSTALL.md](docs/INSTALL.md). The [connected Gym pilot](docs/CONNECTED-GYM-APP.md) adds a phone workout log
+and opt-in coaching branches.
 
 ## Branches
 
@@ -124,6 +125,19 @@ deleted if its archive is retained. Output depends on the available logs and is 
 transcript. It can contain sensitive information printed by the run. Anyone allowed to reach aipatty, including
 through Tailscale Serve if enabled, can read these archives.
 
+## Gym pilot
+
+Fork a coaching branch and send `/connect gym`. It keeps the usual chat tools and adds the Gym tools and
+coaching instructions. Its forks use the same log. `/connect` lists apps and their availability; send
+`/disconnect gym` while idle to return to ordinary chat without deleting any workouts. These commands also
+work with `aipatty --branch <id> send '<command>'`.
+
+Tap **Open Gym** in the branch header, or open `/apps/gym/` on the same origin. Log sets with a weight (`kg` or
+`lb`) or time (`sec` or `min`); edit or delete recent workouts there. The coach can read that log, log a workout
+you completed, or save a plan when asked. The phone page shows the latest saved plan. Gym data lives separately
+at `apps/gym/gym.sqlite` under the data directory; `/upgrade` does not back it up. See the
+[pilot guide](docs/CONNECTED-GYM-APP.md#try-it) and [operator notes](docs/INSTALL.md#gym-pilot).
+
 ## Install
 
 Requires Node 26 or newer.
@@ -156,7 +170,7 @@ The server takes six command-line options:
 | --- | --- | --- |
 | `--port <n>` | `8790` | Listen port. `0` asks the operating system for a free one, which the server prints |
 | `--install-dir <path>` | Unset | Derive the state directories below from one installation root |
-| `--data-dir <path>` | `~/.aipatty/data` (`~/.aipatty/faux` in faux mode) | Where the conversation database, the ownership lock and the run logs live |
+| `--data-dir <path>` | `~/.aipatty/data` (`~/.aipatty/faux` in faux mode) | Where the conversation and app databases, the ownership lock and the run logs live |
 | `--pi-dir <path>` | `~/.pi/agent` | The Pi directory, shared with the pinned CLI: its login file `auth.json`, its cached model catalog `models-store.json`, which the server only reads, and the `delegates` settings and jobs |
 | `--work-dir <path>` | `~/.aipatty/work` | Where the model's own file and shell tools start |
 | `--runs-dir <path>` | `~/.aipatty/runs` | Where each `pi` run gets its disposable workspace |

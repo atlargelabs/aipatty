@@ -1,7 +1,7 @@
 import { BACKGROUND_CONTEXT as ctx, type Context } from "@earendil-works/chord/context";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import {
-  createRegistry, Harness, LiveDoc, ROOT_CONVERSATION_ID, UsageDoc,
+  configure, createRegistry, Harness, LiveDoc, ROOT_CONVERSATION_ID, UsageDoc,
   type Conversation, type ConversationId, type EntryId, type InputSubmissionDraft, type ModelRef, type Submission,
   type ConversationRecord, type Cursor, type EntryRecord, type Page, type Tx, type UsageState,
 } from "@earendil-works/pi-durable";
@@ -13,22 +13,21 @@ import { createToolSearchExtension } from "@earendil-works/pi-durable/tool-searc
 import { createCodingTools } from "@earendil-works/pi-durable/tools";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import type { AppStatus, ConnectedApp } from "./apps/app.ts";
+import { gymApp } from "./apps/gym/index.ts";
 import { BranchDoc, ROOT_TITLE, thinkingLevels, validTitle, type BranchInfo, type SearchMatch } from "./branches.ts";
 import type { Config } from "./config.ts";
+import { HttpError } from "./http.ts";
 import { ownDataDir } from "./ownership.ts";
 import { openModels } from "./models.ts";
 import { openPiRuns, type PiRuns } from "./pi-run.ts";
 import { piExtension } from "./pi-tool.ts";
-import { failureText, messageText, usageCost } from "./protocol.ts";
+import { appCommand, appEntryKind, connectCommand, disconnectCommand, failureText, messageText, usageCost } from "./protocol.ts";
 import { treeExtension } from "./tools.ts";
+import { upgradeFiles } from "./upgrade-supervisor.ts";
 
-export class HttpError extends Error {
-  readonly status: number;
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
-}
+/** Reviewed modules only; not runtime configuration. */
+const connectedApps: readonly ConnectedApp[] = [gymApp];
 
 /** What a new root conversation starts with. Afterwards `model set` and `thinking set` change the saved values. */
 const newRoot = { model: { provider: "openai", modelId: "gpt-6.2-sol" }, thinkingLevel: "high" } as const;
@@ -43,6 +42,9 @@ export interface ModelStatus {
 
 export interface AgentHost {
   harness: Harness;
+  apps: ReadonlyMap<string, AppStatus>;
+  /** Handle an operator app command without a model turn. Returns its transcript text. */
+  appCommand(conversation: Conversation, command: NonNullable<ReturnType<typeof appCommand>>): Promise<string>;
   /** Managed Pi runs, each owned by its conversation branch. */
   runs: PiRuns;
   /** Stop all active Pi runs, leaving interrupted results to the next start, then close the harness. */
@@ -162,15 +164,69 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
     if (!host) throw new Error("aipatty is still starting");
     return host;
   }));
+  // Without an explicit default Durable selects every installed extension (including on old conversations).
+  const extensions = registry.snapshot().installed();
+  const apps = new Map<string, AppStatus>();
+  const log = config.installDir ? `server stderr (${upgradeFiles(config.installDir).serverLog} when started by /upgrade)` : "server stderr";
+  for (const app of connectedApps) {
+    const dataDir = join(config.dataDir, "apps", app.id);
+    try {
+      await mkdir(dataDir, { recursive: true, mode: 0o700 });
+      const opened = app.open(dataDir);
+      try { registry.install(opened.extension); }
+      catch (error) { opened.close(); throw error; }
+      apps.set(app.id, { title: app.title, instructions: app.instructions, opened });
+    } catch (error) {
+      console.error(`Could not open ${app.title} at ${dataDir}:`, error);
+      apps.set(app.id, {
+        title: app.title,
+        unavailable: `Could not open ${dataDir}: ${error instanceof Error ? error.message : String(error)}. See ${log}. Fix the app data and restart.`,
+      });
+    }
+  }
+  const closeResources = async () => {
+    for (const app of apps.values()) {
+      try { app.opened?.close(); } catch (error) { console.error(`Could not close ${app.title}:`, error); }
+    }
+    await sandbox.close();
+  };
   const harness = await Harness.open(storage, {
     models,
     registry,
     env: () => new NodeExecutionEnv({ cwd: config.workDir }),
-    settings: { afterFailedRun: "withdraw" },
+    settings: { extensions, afterFailedRun: "withdraw" },
     onReport: report => console.error("pi-durable:", report),
-  }, ctx);
+  }, ctx).catch(async error => { await closeResources(); throw error; });
+  const closed = harness.closed.then(closeResources);
+  void closed.catch(error => console.error("Host cleanup failed:", error));
   try {
     const root = await harness.root(ctx, { agent: config.faux ? { ...newRoot, model: fauxModel } : newRoot });
+    const branchRecords = async () => {
+      const records: ConversationRecord[] = [];
+      let cursor: Cursor | undefined;
+      do {
+        const page: Page<ConversationRecord, Cursor> = await harness.commit(tx => tx.scanConversations({}, 200, cursor), ctx);
+        records.push(...page.items.filter(record => !record.owner));
+        cursor = page.next;
+      } while (cursor);
+      return records;
+    };
+    const sayApp = (tx: Tx, id: ConversationId, text: string) => tx.appendEntry(id, { kind: appEntryKind, data: { text } });
+    const applyAttachment = async (tx: Tx, id: ConversationId, marker: string | undefined) => {
+      const app = marker ? apps.get(marker) : undefined;
+      await configure(tx, id, {
+        extensions: app?.opened ? { add: [app.opened.extension] } : null,
+        instructions: app?.opened ? app.instructions : null,
+      });
+      if (marker && !app?.opened) {
+        const reason = app?.unavailable ?? "This release does not include the app.";
+        await sayApp(tx, id, `${app?.title ?? marker} is unavailable; using normal chat. ${reason}`);
+      }
+    };
+    // Apply the marker before any interrupted work can resume. A bypass does not remove the marker.
+    for (const { id } of await branchRecords()) {
+      await harness.commit(async tx => applyAttachment(tx, id, (await tx.doc(BranchDoc, id)).app), ctx);
+    }
     const available = (model: ModelRef | null | undefined) => !!model && !!models.getModel(model.provider, model.modelId);
     const status = async (conversation: Conversation = root, context = ctx): Promise<ModelStatus> => {
       const agent = await conversation.agent(context);
@@ -260,13 +316,14 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
     };
     const branch = async (target: Conversation): Promise<BranchInfo> => {
       const record = await harness.commit(tx => tx.conversation(target.id), ctx);
-      const [title, live, usage, model] = await Promise.all([
+      const [doc, live, usage, model] = await Promise.all([
         harness.snapshot(BranchDoc, target.id, ctx), harness.snapshot(LiveDoc, target.id, ctx),
         harness.snapshot(UsageDoc, target.id, ctx), status(target),
       ]);
       return {
         id: target.id,
-        title: title?.title || (target.id === ROOT_CONVERSATION_ID ? ROOT_TITLE : `Branch ${target.id}`),
+        title: doc?.title || (target.id === ROOT_CONVERSATION_ID ? ROOT_TITLE : `Branch ${target.id}`),
+        ...(doc?.app && apps.get(doc.app)?.opened ? { app: doc.app } : {}),
         parent: record?.parent ? { id: record.parent.conversationId, at: record.parent.at } : null,
         model: model.model,
         modelStatus: model.modelStatus,
@@ -277,14 +334,54 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
     };
     const totalCost = async () => usageCost(await harness.usage(ctx));
 
-    void harness.closed.then(() => sandbox.close()).catch(() => {});
     host = {
       harness,
+      apps,
       runs,
       async close() {
         // First, so interrupted runs are left for the next start to report, not settled as aborts.
         await runs.close();
         await harness.close(ctx);
+        await closed;
+      },
+      appCommand(target, { connect, args }) {
+        return exclusive(async () => {
+          if (upgrading) throw new HttpError(409, "An upgrade is in progress; send again when it has finished");
+          const list = connect && args.length === 0;
+          if (!list) {
+            const { tasks, submissions } = await harness.inspect(ctx);
+            if (aborting.has(target.id) || tasks.some(t => t.record.conversationId === target.id)
+              || submissions.some(s => s.conversationId === target.id)) {
+              throw new HttpError(409, "Wait for this branch to finish, or abort it, before changing its app.");
+            }
+          }
+          return target.commit(async tx => {
+            const doc = await tx.doc(BranchDoc, target.id);
+            const current = doc.app;
+            const id = args[0];
+            const app = apps.get(id);
+            let text: string;
+            if (list) {
+              const lines = [...apps].map(([id, app]) => `${id} (${app.title}) — ${app.opened ? "available" : `unavailable. ${app.unavailable}`}`);
+              text = `Connected app: ${current ?? "none"}.\n${lines.join("\n")}`;
+            } else if (args.length !== 1) {
+              text = `Use ${connectCommand} to list apps, ${connectCommand} <app> to attach, or ${disconnectCommand} <app> to detach.`;
+            } else if (connect && current && current !== id) {
+              text = `This branch is connected to ${current}. Run ${disconnectCommand} ${current} before connecting another app.`;
+            } else if (connect && !app?.opened) {
+              text = app ? `${app.title} is unavailable. ${app.unavailable}` : `Unknown app: ${id}. Run ${connectCommand} to list apps.`;
+            } else if (!connect && current !== id) {
+              text = `This branch is not connected to ${id}.${current ? ` It is connected to ${current}.` : ""}`;
+            } else {
+              if (connect) doc.app = id;
+              else delete doc.app;
+              await applyAttachment(tx, target.id, doc.app);
+              text = connect ? `Connected this branch to ${app!.title}.` : `Disconnected ${app?.title ?? id}; this branch is normal chat.`;
+            }
+            await sayApp(tx, target.id, text);
+            return text;
+          }, ctx);
+        });
       },
       modelStatus: status,
       models: () => models.getModels()
@@ -341,13 +438,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
         }, context));
       },
       async branches() {
-        const records = [];
-        let cursor: Cursor | undefined;
-        do {
-          const page: Page<ConversationRecord, Cursor> = await harness.commit(tx => tx.scanConversations({}, 200, cursor), ctx);
-          records.push(...page.items.filter(record => !record.owner));
-          cursor = page.next;
-        } while (cursor);
+        const records = await branchRecords();
         const branches = await Promise.all(records.map(async record => branch((await harness.conversation(record.id, ctx))!)));
         return { branches, totalCost: await totalCost() };
       },
@@ -359,7 +450,11 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
         const { model, thinking } = await status(from, context);
         const agent = { thinkingLevel: thinking, ...(model ? { model } : {}) };
         const init = async (tx: Tx, id: ConversationId) => {
-          (await tx.doc(BranchDoc, id)).title = name;
+          const doc = await tx.doc(BranchDoc, id);
+          doc.title = name;
+          const marker = (await tx.doc(BranchDoc, from.id)).app;
+          if (marker) doc.app = marker;
+          await applyAttachment(tx, id, marker);
           context.abortSignal?.throwIfAborted();
         };
         const point = await forkPoint(from, at, before, context);
@@ -428,7 +523,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
     return host;
   } catch (error) {
     await harness.close(ctx);
-    await sandbox.close();
+    await closed;
     throw error;
   }
 }

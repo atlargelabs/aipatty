@@ -2,7 +2,7 @@
  * The crude web page: branch list, transcript, input box, fork, rename, model picker and cost. Served by the API
  * with a strict CSP, so the script is a separate same-origin file and every value is rendered as text.
  */
-import { piRunApiPath, piRunId, upgradeEntryKind } from "./protocol.ts";
+import { appEntryKind, piRunApiPath, piRunId, upgradeEntryKind } from "./protocol.ts";
 
 export const pageHtml = `<!doctype html>
 <html lang="en">
@@ -32,6 +32,8 @@ export const pageHtml = `<!doctype html>
       <button id="search" type="button">Search</button>
     </div>
     <div id="notice" role="status" hidden></div>
+    <div id="app-notice" role="status" hidden></div>
+    <div id="app-header" hidden></div>
     <section id="transcript" aria-live="polite">
       <button id="older" type="button" hidden>Load older</button>
       <div id="entries"></div>
@@ -80,7 +82,9 @@ nav li .busy { color: #0a7d32; }
 main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 #controls { display: flex; flex-wrap: wrap; gap: .5rem; padding: .5rem .8rem; border-bottom: 1px solid #eee; align-items: center; }
 #controls select { max-width: 14rem; }
-#notice { padding: .4rem .8rem; background: #fff4e5; color: #8a4b00; }
+#notice, #app-notice { padding: .4rem .8rem; background: #fff4e5; color: #8a4b00; }
+#app-notice { white-space: pre-wrap; overflow-wrap: anywhere; }
+#app-header { padding: .4rem .8rem; border-bottom: 1px solid #ddd; background: #fff; overflow-wrap: anywhere; max-height: 7rem; overflow: auto; }
 #transcript { flex: 1; overflow-y: auto; padding: .8rem; }
 .entry { margin: 0 0 .8rem; padding: .5rem .7rem; border-radius: 8px; background: #fff; border: 1px solid #e4e4e4; white-space: pre-wrap; overflow-wrap: anywhere; }
 .entry.user { background: #eef5ff; border-color: #cfe0fb; }
@@ -121,6 +125,7 @@ const $ = id => document.getElementById(id);
 const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const piRunId = ${piRunId};
 const piRunApiPath = ${JSON.stringify(piRunApiPath)};
+const appEntryKind = ${JSON.stringify(appEntryKind)};
 const app = { branch: null, branches: [], totalCost: 0, entries: [], before: null, live: {}, socket: null, models: [] };
 
 function money(value) { return "$" + value.toFixed(value > 0 && value < 0.01 ? 4 : 2); }
@@ -187,7 +192,16 @@ function messageNodes(entry, message) {
   if (!isToolRound(message) || !message.content.some(isPiCall)) {
     const text = document.createTextNode(messageText(message));
     const id = isPiResult(message) ? runIdOf(message.details) : undefined;
-    return id ? [runButton("Open Pi run", { id, durationMs: message.durationMs }), document.createTextNode("\\n"), text] : [text];
+    if (id) return [runButton("Open Pi run", { id, durationMs: message.durationMs }), document.createTextNode("\\n"), text];
+    if (message.role === "toolResult" && !isPiResult(message)) {
+      const body = document.createElement("div");
+      body.append(text);
+      const slot = { entry, result: message, text };
+      appToolBodies.set(body, slot);
+      renderAppTool(body, slot);
+      return [body];
+    }
+    return [text];
   }
   const nodes = [];
   const ids = new Map();
@@ -261,6 +275,116 @@ function keepChatPlace(change) {
   if (atBottom) box.scrollTop = box.scrollHeight;
   else if (anchor) box.scrollTop += anchor.getBoundingClientRect().top - box.getBoundingClientRect().top - offset;
 }
+
+// An activation is unique even when a branch is left and quickly reselected. Only it can publish its view.
+let appView;
+let appToolsBlocked = false;
+const appToolBodies = new Map();
+const appHeader = $("app-header");
+const appNotice = $("app-notice");
+
+function appFailure(view, error) {
+  // A tool may fail while building an entry; update the notice after the transcript's own scroll adjustment.
+  queueMicrotask(() => {
+    if (appView !== view || !appNotice.hidden) return;
+    keepChatPlace(() => {
+      appNotice.textContent = "App view could not render; chat still works. " + (error?.message ?? String(error));
+      appNotice.hidden = false;
+    });
+  });
+}
+
+async function refreshAppHeader(view = appView) {
+  if (!view?.module?.header) return;
+  const el = document.createElement("div");
+  view.header = el;
+  try {
+    await view.module.header(el);
+    if (appView !== view || view.header !== el) return;
+    keepChatPlace(() => {
+      if (!el.isEqualNode(appHeader.firstChild)) appHeader.replaceChildren(el);
+      appHeader.hidden = !el.hasChildNodes();
+    });
+  } catch (error) {
+    if (appView === view && view.header === el) {
+      keepChatPlace(() => { appHeader.hidden = true; });
+      appFailure(view, error);
+    }
+  }
+}
+
+async function loadAppView(view) {
+  try {
+    const module = await import("/apps/" + view.id + "/branch.js");
+    if (appView !== view) return;
+    view.module = module;
+    keepChatPlace(refreshAppTools);
+    void refreshAppHeader(view);
+  } catch (error) { appFailure(view, error); }
+}
+
+function syncAppView() {
+  const id = current()?.app;
+  if (appView?.id === id && (!appView || appView.branch === app.branch)) return;
+  // The server names only apps it explicitly registered and opened, never a URL from chat or app data.
+  appView = id && /^[a-z0-9-]+$/.test(id) ? { id, branch: app.branch } : undefined;
+  keepChatPlace(() => {
+    appNotice.hidden = appHeader.hidden = true;
+    appHeader.replaceChildren();
+    refreshAppTools();
+  });
+  if (appView) void loadAppView(appView);
+}
+
+function toolCallFor(entry, result) {
+  const start = app.entries.indexOf(entry);
+  for (let i = start; i >= 0; i--) {
+    const candidate = app.entries[i];
+    if (candidate.conversationId !== entry.conversationId) continue;
+    const messages = candidate.model || [];
+    const end = i === start ? messages.indexOf(result) : messages.length;
+    for (let j = end - 1; j >= 0; j--) {
+      const message = messages[j];
+      if (!isToolRound(message)) continue;
+      const calls = message.content.filter(block => block.type === "toolCall" && block.id === result.toolCallId);
+      return calls.length === 1 && calls[0].name === result.toolName ? calls[0] : undefined;
+    }
+  }
+}
+
+function renderAppTool(body, slot) {
+  const view = appView?.module?.renderTool ? appView : undefined;
+  if (!view && !slot.card) return;
+  const call = view ? toolCallFor(slot.entry, slot.result) : undefined;
+  if (slot.view === view && slot.call === call) return;
+  if (body.isConnected) {
+    const selection = document.getSelection();
+    if (body.contains(document.activeElement) || (selection.rangeCount && !selection.isCollapsed
+      && selection.getRangeAt(0).intersectsNode(body))) {
+      appToolsBlocked = true;
+      return;
+    }
+  }
+  slot.view = view;
+  slot.call = call;
+  let card;
+  try {
+    card = view?.module.renderTool(call, slot.result);
+    if (card != null && (!(card instanceof Node) || card.parentNode)) throw new Error("Expected a detached tool card");
+  } catch (error) { card = undefined; appFailure(view, error); }
+  if (slot.card || card) body.replaceChildren(card ?? slot.text);
+  slot.card = card;
+}
+
+function refreshAppTools() {
+  appToolsBlocked = false;
+  for (const [body, slot] of appToolBodies) renderAppTool(body, slot);
+}
+
+function retryAppTools() { if (appToolsBlocked) keepChatPlace(refreshAppTools); }
+document.addEventListener("selectionchange", retryAppTools);
+$("entries").addEventListener("focusout", () => queueMicrotask(retryAppTools));
+document.addEventListener("visibilitychange", () => { if (!document.hidden) void refreshAppHeader(); });
 
 function stopRunWatch() {
   if (!openedRun) return;
@@ -529,8 +653,8 @@ function entryNode(entry, message) {
 function entryNodes(entries) {
   const nodes = [];
   for (const entry of entries) {
-    if (entry.kind === ${JSON.stringify(upgradeEntryKind)} && entry.data && typeof entry.data.text === "string") {
-      nodes.push(entryNode(entry, { role: "upgrade", content: entry.data.text }));
+    if ((entry.kind === ${JSON.stringify(upgradeEntryKind)} || entry.kind === appEntryKind) && typeof entry.data?.text === "string") {
+      nodes.push(entryNode(entry, { role: entry.kind === appEntryKind ? "app" : "upgrade", content: entry.data.text }));
     }
     for (const message of entry.model || []) {
       if (isToolRound(message) && message.content.some(isPiCall)
@@ -554,6 +678,7 @@ function renderEntries() {
   transcriptRevision++;
   $("older").disabled = false;
   keepAtBottom(() => {
+    appToolBodies.clear();
     $("entries").replaceChildren(...entryNodes(app.entries));
     $("older").hidden = app.before === null;
     renderLive();
@@ -603,15 +728,19 @@ function connect(id) {
     } else {
       return;
     }
+    const finished = !!app.live.run && !frame.busy;
     app.live = frame.live || {};
     const branch = current();
     if (branch) {
-      const wasBusy = branch.busy;
       branch.busy = frame.busy;
       branch.cost = frame.usage.cost;
-      if (wasBusy && !frame.busy) refreshBranches();
     }
     if (frame.type === "state") renderEntries(); else appendEntries(frame.appended);
+    // A replacement state can follow a restart; an app notice can come from the CLI or another tab.
+    if (finished || frame.type === "state" || frame.appended.some(entry => entry.kind === appEntryKind)) {
+      void refreshBranches().catch(() => {});
+    }
+    if (finished) void refreshAppHeader();
     renderBranches();
     resolveOpenedRun();
   });
@@ -620,11 +749,17 @@ function connect(id) {
   });
 }
 
+let branchRequest = 0;
+let branchResponse = 0;
 async function refreshBranches() {
+  const request = ++branchRequest;
   const { branches, totalCost } = await api("/api/branches");
+  if (request < branchResponse) return;
+  branchResponse = request;
   app.branches = branches;
   app.totalCost = totalCost;
   renderBranches();
+  syncAppView();
 }
 
 async function selectBranch(id) {
@@ -636,6 +771,7 @@ async function selectBranch(id) {
   history.replaceState(null, "", "#" + id);
   renderEntries();
   renderBranches();
+  syncAppView();
   connect(id);
 }
 
@@ -735,6 +871,7 @@ $("older").addEventListener("click", guard(async () => {
     const box = $("transcript");
     const { scrollHeight, scrollTop } = box;
     $("entries").prepend(...entryNodes(page.entries));
+    refreshAppTools();
     $("older").hidden = app.before === null;
     box.scrollTop = scrollTop + box.scrollHeight - scrollHeight;
   } finally {

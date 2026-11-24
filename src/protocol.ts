@@ -12,11 +12,24 @@ export const upgradeCommand = "/upgrade";
 /** The kind of a transcript entry about an upgrade: `data.text` is shown to people and is not model context. */
 export const upgradeEntryKind = "aipatty.upgrade";
 
-/** The text of an upgrade entry. */
-export function upgradeText(entry: Pick<EntryRecord, "kind" | "data">): string | undefined {
+export const connectCommand = "/connect";
+export const disconnectCommand = "/disconnect";
+export const appEntryKind = "aipatty.app";
+
+export function appCommand(content: string): { connect: boolean; args: string[] } | undefined {
+  const [command, ...args] = content.trim().split(/\s+/);
+  if (command === connectCommand || command === disconnectCommand) return { connect: command === connectCommand, args };
+}
+
+/** Operator notices are visible in the transcript, not model context. */
+export function operatorText(entry: Pick<EntryRecord, "kind" | "data">): string | undefined {
   const { data } = entry;
-  if (entry.kind !== upgradeEntryKind || !data || typeof data !== "object" || Array.isArray(data)) return undefined;
+  if ((entry.kind !== upgradeEntryKind && entry.kind !== appEntryKind) || !data || typeof data !== "object" || Array.isArray(data)) return undefined;
   return typeof data.text === "string" ? data.text : undefined;
+}
+
+export function upgradeText(entry: Pick<EntryRecord, "kind" | "data">): string | undefined {
+  if (entry.kind === upgradeEntryKind) return operatorText(entry);
 }
 
 /** `completed` means the run finished and any required PR and review passed the host's checks. */

@@ -114,7 +114,7 @@ node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT"
 ```
 
 The option derives `$ROOT/data` (or `$ROOT/faux` in faux mode), `$ROOT/pi`, `$ROOT/work`, and `$ROOT/runs`.
-The database, ownership lock, and run logs live in the data directory; Pi auth, model cache, settings and jobs
+The databases, ownership lock, and run logs live in the data directory; Pi auth, model cache, settings and jobs
 live in the Pi directory. The pinned CLI and extensions live in the release. Model scratch lives in `work`;
 disposable Pi workspaces live in `runs`. The browser's run pane reads a bounded excerpt from `data/logs/runs/`
 (or `logs/runs/` under the configured data directory), not the disposable clone. Removing an archive leaves the
@@ -173,6 +173,31 @@ phone or laptop. No Caddy or change to the listener is needed. The CLI still use
 
 To remove the default HTTPS route, run `tailscale serve --https=443 off` on the mini. Drop
 `--tailscale-origin` the next time you start aipatty. The SSH forward is unaffected.
+
+## Gym pilot
+
+Gym needs no settings or separate service. It opens `apps/gym/gym.sqlite` under the server's data directory
+(`$ROOT/data/apps/gym/gym.sqlite` on a root install). The phone page is `/apps/gym/` on the same SSH-forwarded
+or Tailscale Serve origin as chat. Keep that origin private: the page is accessible to anyone who can reach
+chat, not just to connected branches. See [how to log and coach](CONNECTED-GYM-APP.md#try-it).
+
+For an isolated browser demo in a review checkout after installing dependencies, start an empty Faux host:
+
+```sh
+TRIAL=$(mktemp -d)
+AIPATTY_FAUX=1 node src/main.ts --install-dir "$TRIAL" --port 0
+```
+
+Use the localhost port printed in the terminal. Faux echoes chat and can simulate one tool call, for example
+`call gym_query {"sql":"SELECT count(*) FROM workouts"}` on a connected branch. It is not a real coach. Stop the
+trial with Ctrl-C. Do not point a review checkout at a live install's data or Pi settings.
+
+If `/connect` reports Gym unavailable, check the shown data directory and server stderr (in
+`$ROOT/upgrade/server.log` after an upgrade, otherwise in the startup terminal or wherever stderr is redirected).
+Check the directory and SQLite file, repair permissions or restore a known-good copy with the server stopped,
+then restart. Existing attachments restore automatically. Do not delete the log just to clear the warning.
+Back up Gym separately, for example by copying `gym.sqlite` with the server stopped. `/upgrade` backs up only
+`aipatty.sqlite` and does not roll back Gym schema changes; keep them additive.
 
 ## Optional coding extensions
 
@@ -253,7 +278,7 @@ Everything the upgrade keeps is in `$ROOT/upgrade/`:
 | --- | --- |
 | `upgrade.log` | What the supervisor did, with times. |
 | `server.log` | The output of the servers the supervisor started. |
-| `backup.sqlite` | The database as the old release left it at the last switch. Replaced by the next upgrade. |
+| `backup.sqlite` | The conversation database (`aipatty.sqlite`) as the old release left it at the last switch. Replaced by the next upgrade. |
 | `pending.json` | Present only between the switch and the new release passing its health check. |
 | `result.json` | An outcome waiting for a running server to post it. |
 

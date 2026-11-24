@@ -4,12 +4,12 @@ import { createServer, STATUS_CODES, type IncomingMessage, type ServerResponse }
 import type { Duplex } from "node:stream";
 import WebSocket, { WebSocketServer } from "ws";
 import { LOOPBACK } from "./config.ts";
-import { HttpError, type AgentHost } from "./host.ts";
+import type { AgentHost } from "./host.ts";
+import { HttpError, jsonBody, pageHeaders, requireMethod, sendJson } from "./http.ts";
 import { pageCss, pageHtml, pageJs } from "./page.ts";
-import { messageText, piRunApiPath, piRunId, shutdownHeader, streamState, streamUpdate, upgradeCommand, type StreamFrame } from "./protocol.ts";
+import { appCommand, messageText, piRunApiPath, piRunId, shutdownHeader, streamState, streamUpdate, upgradeCommand, type StreamFrame } from "./protocol.ts";
 import { transcriptPage } from "./transcript.ts";
 
-const maxBody = 64 * 1024;
 const defaultPage = 50;
 const maxPage = 100;
 const defaultHeartbeatMs = 30_000;
@@ -20,11 +20,6 @@ interface Streams {
   readonly controllers: Set<AbortController>;
   /** Sockets that answered the last ping, or opened after it. */
   readonly alive: WeakSet<WebSocket>;
-}
-
-function sendJson(res: ServerResponse, status: number, value: unknown): void {
-  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
-  res.end(JSON.stringify(value));
 }
 
 function errorResponse(error: unknown): { status: number; message: string } {
@@ -65,30 +60,6 @@ function positiveInt(value: string | null, field: string, max = Number.MAX_SAFE_
   return number;
 }
 
-async function jsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
-  if (Number(req.headers["content-length"]) > maxBody) throw new HttpError(413, "Request body too large");
-  if (req.headers["content-type"]?.split(";")[0].trim().toLowerCase() !== "application/json") {
-    throw new HttpError(415, "Expected application/json");
-  }
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req.iterator({ destroyOnReturn: false })) {
-    size += chunk.length;
-    if (size > maxBody) throw new HttpError(413, "Request body too large");
-    chunks.push(chunk);
-  }
-  let value: unknown;
-  try {
-    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)));
-  } catch {
-    throw new HttpError(400, "Invalid JSON body");
-  }
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new HttpError(400, "Expected an object");
-  }
-  return value as Record<string, unknown>;
-}
-
 function messageDraft({ content, requestId, whenBusy }: Record<string, unknown>): InputSubmissionDraft {
   if (typeof content !== "string" || !content.trim()) throw new HttpError(400, "Expected non-empty content");
   if (requestId !== undefined && (typeof requestId !== "string" || !requestId.trim() || requestId.length > 256)) {
@@ -109,12 +80,6 @@ async function conversationPage(conversation: Conversation, params: URLSearchPar
   if (before === undefined) return state;
 
   return { ...state, ...await transcriptPage(conversation, ctx, limit, before) };
-}
-
-function requireMethod(req: IncomingMessage, res: ServerResponse, method: string): void {
-  if (req.method === method) return;
-  res.setHeader("Allow", method);
-  throw new HttpError(405, "Method not allowed");
 }
 
 async function handleHttp(
@@ -144,9 +109,7 @@ async function handleHttp(
     res.writeHead(200, {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
-      "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
-      "X-Content-Type-Options": "nosniff",
-      "Referrer-Policy": "no-referrer",
+      ...pageHeaders,
     });
     res.end(pageHtml);
     return;
@@ -160,6 +123,22 @@ async function handleHttp(
       "X-Content-Type-Options": "nosniff",
     });
     res.end(js ? pageJs : pageCss);
+    return;
+  }
+  const appRoute = /^\/apps\/([a-z0-9-]+)(\/.*)?$/.exec(pathname);
+  if (appRoute) {
+    const [, id, path = "/"] = appRoute;
+    const app = agent.apps.get(id);
+    if (!app) throw new HttpError(404, "App not found");
+    if (!app.opened) throw new HttpError(503, `${app.title} is unavailable. ${app.unavailable}`);
+    for (const [name, value] of Object.entries(pageHeaders)) res.setHeader(name, value);
+    try {
+      await app.opened.handle(req, res, path);
+    } catch (error) {
+      if (error instanceof HttpError) throw error;
+      console.error(`${app.title} request failed:`, error);
+      throw new HttpError(500, `${app.title} request failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
     return;
   }
   if (pathname === "/api/branches") {
@@ -202,7 +181,13 @@ async function handleHttp(
       sendJson(res, 202, { upgrade: "started" });
       return;
     }
-    const submission = await agent.submit(conversation, messageDraft(body));
+    const draft = messageDraft(body);
+    const command = typeof draft.content === "string" ? appCommand(draft.content) : undefined;
+    if (command) {
+      sendJson(res, 202, { appNotice: await agent.appCommand(conversation, command) });
+      return;
+    }
+    const submission = await agent.submit(conversation, draft);
     sendJson(res, 202, { submissionId: submission.id });
   } else if (action === "abort") {
     await agent.abort(conversation);
@@ -399,6 +384,7 @@ export async function startApi(agent: AgentHost, health: Health, port: number, {
   const server = createServer({ requestTimeout: 30_000, headersTimeout: 10_000 }, (req, res) => {
     void handleHttp(agent, health, req, res, tailscale, shutdown, onUpgrade).catch(error => {
       if (res.destroyed) return;
+      if (res.headersSent) { res.destroy(); return; }
       const { status, message } = errorResponse(error);
       if (!req.complete) res.shouldKeepAlive = false;
       sendJson(res, status, { error: message });

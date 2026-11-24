@@ -10,7 +10,7 @@ import { test, type TestContext } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { startApi } from "../src/api.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
-import { piRunApiPath, upgradeEntryKind, type PiRunSnapshot } from "../src/protocol.ts";
+import { appCommand, piRunApiPath, upgradeEntryKind, type PiRunSnapshot } from "../src/protocol.ts";
 import { archivedPiRun, checkout, fauxConfig, fixture, realConfig, until } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
@@ -634,4 +634,184 @@ test("a click on another branch lands while the current branch is streaming", { 
   assert.equal(onSide.current, "Side");
   assert.deepEqual(browser.errors, []);
   await host.abort(root);
+});
+
+test("phone Gym logs, corrects and deletes a workout, and connected chat sees it", { skip: !chrome, timeout: 60_000 }, async t => {
+  const host = await openHost(fauxConfig(await fixture(t)));
+  const api = await startApi(host, health, 0);
+  t.after(async () => { await api.close(); await host.close(); });
+  const base = `http://127.0.0.1:${api.port}`;
+  const { id } = await host.fork((await host.conversation("root"))!, { title: "Training" });
+  const chat = `${base}/#${id}`;
+  const browser = await openBrowser(t);
+  await browser.viewport(390, 844);
+  await browser.emulateTouch();
+  await browser.navigate(chat);
+  const click = (selector: string) => browser.evaluate(`document.querySelector(${JSON.stringify(selector)}).click()`);
+  const text = (selector: string) => browser.evaluate<string | undefined>(`document.querySelector(${JSON.stringify(selector)})?.textContent`);
+  const set = (selector: string, value: string) => browser.evaluate(`(() => {
+    const el = document.querySelector(${JSON.stringify(selector)});
+    el.value = ${JSON.stringify(value)};
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  })()`);
+  const send = async (text: string) => { await set("#input", text); await click("#send"); };
+  const workout = "<img src=x> Squat";
+  const plan = "Add 5 lb next week.\n<b>Rest on Friday</b>";
+  await waitFor(browser, "Training", value => value.title === "Training");
+  await send("/connect gym");
+  await until(() => text("#app-header"), text => text?.includes("Open Gym") === true);
+  assert.match((await text(".entry.app"))!, /Connected this branch to Gym/);
+  assert.equal(await browser.evaluate("document.querySelector('#app-header a').getAttribute('href')"), `/apps/gym/?branch=${id}`);
+  await send(`call gym_save_plan ${JSON.stringify({ plan })}`);
+  await until(() => text(".gym-tool-card"), text => text?.includes("Plan saved") === true);
+
+  await browser.navigate(`${base}/apps/gym/?branch=${id}`);
+  await until(() => text("#plan"), text => text === plan);
+  assert.equal(await browser.evaluate("document.querySelector('#plan b') === null && document.documentElement.scrollWidth === innerWidth"), true);
+  await set("#workout-date", "2026-11-24");
+  await set("#exercise", workout);
+  await set("#reps", "5");
+  await set("#amount", "100");
+  await set("#unit", "lb");
+  await click("#add-set");
+  await set("#exercise", "Plank");
+  await set("#reps", "");
+  await set("#amount", "60");
+  await set("#unit", "sec");
+  await click("#add-set");
+  await click("#save-workout");
+  await until(() => text("#status"), text => text === "Workout saved.");
+  assert.match((await text("#recent-workouts"))!, /2026-11-24 · 2 sets/);
+  assert.deepEqual(await browser.evaluate("[...document.querySelector('#exercise').list.options].map(o => o.value)"), [workout, "Plank"]);
+  assert.equal(await browser.evaluate("document.querySelector('#recent-workouts img') === null"), true);
+  await click('[data-action="edit-workout"]');
+  await click('[aria-label="Edit set 1"]');
+  await set("#exercise", workout.toLowerCase());
+  await set("#amount", "105");
+  await click("#add-set");
+  assert.match((await text("#draft-sets"))!, /105 lb.*Plank · 60 sec/s);
+  await click("#save-workout");
+  await until(() => text("#status"), text => text === "Workout saved.");
+  assert.equal(await browser.evaluate("document.querySelectorAll('#recent-workouts article').length"), 1);
+  assert.equal(await browser.evaluate("document.querySelector('#chat-link').getAttribute('href')"), `/#${id}`);
+
+  await browser.navigate(chat);
+  await until(() => text("#app-header"), text => text?.includes("Last workout: 2026-11-24") === true);
+  assert.match((await text("#app-header"))!, /Plan: Add 5 lb/);
+  await send(`call gym_query ${JSON.stringify({ sql: "SELECT exercise, amount, unit FROM sets ORDER BY position" })}`);
+  await until(() => browser.evaluate("[...document.querySelectorAll('.gym-tool-card')].some(card => card.textContent.includes('105'))"));
+  assert.equal(await browser.evaluate("document.querySelector('#transcript img') === null"), true);
+  await waitFor(browser, "a completed query", value => value.messages.some(message => message.startsWith("Faux tool result: {\"columns\"")));
+  await send("/disconnect gym");
+  await until(() => browser.evaluate("document.querySelector('#app-header').hidden && document.querySelectorAll('.gym-tool-card').length === 0"));
+  await waitFor(browser, "the detach notice", value => value.messages.some(message => message.startsWith("Disconnected Gym")));
+
+  await browser.navigate(`${base}/apps/gym/?branch=${id}`);
+  await until(() => text("#plan"), text => text === plan);
+  await browser.evaluate("window.confirm = () => true");
+  await click('[data-action="delete-workout"]');
+  await until(() => text("#status"), text => text === "Workout deleted.");
+  assert.equal(await text("#recent-workouts"), "No workouts logged yet.");
+  assert.equal(await text("#plan"), plan);
+  assert.deepEqual(browser.errors, []);
+});
+
+test("late or broken app views leave history, selection, Pi cards and chat usable", { skip: !chrome, timeout: 60_000 }, async t => {
+  const dir = await fixture(t);
+  const host = await openHost(fauxConfig(dir));
+  const api = await startApi(host, health, 0);
+  t.after(async () => { await api.close(); await host.close(); });
+  const base = `http://127.0.0.1:${api.port}`;
+  const root = (await host.conversation("root"))!;
+  const { id } = await host.fork(root, { title: "Training" });
+  const attached = (await host.conversation(String(id)))!;
+  const archive = "20261124T150000-abcdabcd";
+  await archivedPiRun(dir, archive, { summary: "Pi archive still works." });
+  await attached.commit(async tx => {
+    for (let i = 0; i < 52; i++) {
+      await tx.appendEntry(attached.id, { kind: "test", model: [{ role: "user", content: `Older ${i}`, timestamp: 0 }] });
+    }
+    await tx.appendEntry(attached.id, { kind: "test", model: [{
+      role: "toolResult", toolName: "pi", toolCallId: "fixture-run", isError: false,
+      content: [{ type: "text", text: "Historical Pi" }], details: { runId: archive }, timestamp: 0,
+    }] });
+  }, ctx);
+  await host.appCommand(attached, appCommand("/connect gym")!);
+  await say(host, String(id), 'call gym_query {"sql":"SELECT 19 AS test"}');
+  await say(host, String(id), 'call gym_save_plan {"plan":"A plan"}');
+
+  const requested = Promise.withResolvers<void>();
+  const deliver = Promise.withResolvers<void>();
+  t.after(() => deliver.resolve());
+  const gym = host.apps.get("gym")!.opened!;
+  const normalHandler = gym.handle;
+  gym.handle = async (req, res, path) => {
+    if (path !== "/branch.js") return normalHandler(req, res, path);
+    requested.resolve();
+    await deliver.promise;
+    res.writeHead(200, { "Content-Type": "text/javascript", "Cache-Control": "no-store" });
+    res.end(`export async function header(el) {
+      const label = await new Promise(resolve => (window.gymHeaders ??= []).push(resolve));
+      el.textContent = label;
+    }
+    export function renderTool(call, result) {
+      if (result.toolName === "gym_save_plan") throw new Error("test renderer broke");
+      if (call?.name !== "gym_query") return;
+      const card = document.createElement("div");
+      card.textContent = "Test query card";
+      return card;
+    }`);
+  };
+  const browser = await openBrowser(t);
+  await browser.viewport(1150, 800);
+  await browser.navigate(`${base}/#${id}`);
+  await requested.promise;
+  await waitFor(browser, "the old and new workout exchange", value => value.messages.includes("Saved the current plan."));
+  await browser.evaluate("document.querySelector('#older').click()");
+  await until(() => browser.evaluate("document.querySelector('#older').hidden"));
+  const saved = await browser.evaluate<{ count: number; selected: string }>(`(() => {
+    const entries = document.querySelector('#entries');
+    const result = [...entries.querySelectorAll('.toolResult')].find(el => el.textContent.includes('"rows"')).lastChild;
+    window.keptPi = entries.querySelector('.pi-call');
+    window.keptOld = entries.firstElementChild;
+    const selection = getSelection();
+    selection.selectAllChildren(result);
+    document.querySelector('#transcript').scrollTop = 350;
+    return { count: entries.children.length, selected: selection.toString() };
+  })()`);
+  assert.match(saved.selected, /"rows":\[\[19\]\]/);
+  deliver.resolve();
+  await until(() => browser.evaluate("document.querySelector('#app-notice').textContent.includes('test renderer broke')"));
+  assert.deepEqual(await browser.evaluate(`({
+    count: document.querySelector('#entries').children.length,
+    selected: getSelection().toString(),
+    preserved: window.keptOld.isConnected && window.keptPi.isConnected,
+    scrollTop: document.querySelector('#transcript').scrollTop
+  })`), { ...saved, preserved: true, scrollTop: 350 });
+  await browser.evaluate("getSelection().removeAllRanges()");
+  await until(() => browser.evaluate("document.querySelector('#entries').textContent.includes('Test query card')"));
+  await browser.evaluate("window.keptPi.click()");
+  await until(() => browser.evaluate("document.querySelector('#pi-run-view').textContent.includes('Pi archive still works.')"));
+  await browser.evaluate("document.querySelector('#pi-run-close').click()");
+  const branchClick = (id: number) => browser.evaluate(`document.querySelector('[data-branch="${id}"]').click()`);
+  await until(() => browser.evaluate("window.gymHeaders?.length === 1"));
+  await branchClick(root.id);
+  await branchClick(id);
+  await until(() => browser.evaluate("window.gymHeaders?.length === 2"));
+  await browser.evaluate("window.gymHeaders[1]('current header'); window.gymHeaders[0]('stale header')");
+  await until(() => browser.evaluate("document.querySelector('#app-header').textContent === 'current header'"));
+
+  gym.handle = async (req, res, path) => {
+    if (path !== "/branch.js") return normalHandler(req, res, path);
+    res.writeHead(200, { "Content-Type": "text/javascript", "Cache-Control": "no-store" });
+    res.end("export const =");
+  };
+  await browser.navigate("about:blank");
+  await browser.navigate(`${base}/#${id}`);
+  await until(() => browser.evaluate("!document.querySelector('#app-notice').hidden"));
+  assert.equal(await browser.evaluate("document.querySelector('#app-header').hidden"), true);
+  await browser.evaluate("document.querySelector('#input').value = 'still chatting'; document.querySelector('#send').click()");
+  await waitFor(browser, "a reply after the bad import", value => value.messages.includes("Faux reply: still chatting"));
+  assert.deepEqual(browser.errors, []);
 });

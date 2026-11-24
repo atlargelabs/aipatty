@@ -1,6 +1,7 @@
-# Connected apps: Gym pilot plan
+# Connected apps: Gym pilot
 
-**Proposal, not shipped.** Try "connected apps" in aipatty with one real app. A connected app is a module that:
+**Implemented for review in [PR #41](https://github.com/atlargelabs/aipatty/pull/41), not deployed.** The
+stop/go decision still depends on Steve's two-workout trial. A connected app is a module that:
 
 - adds tools and instructions to the branches it is connected to;
 - controls a header and its own tool cards on those branches;
@@ -9,6 +10,20 @@
 
 Gym is the first app: Steve logs workouts on a phone page, and the chat on a connected branch is the coach.
 If an app fails, aipatty carries on as normal chat.
+
+## Try it
+
+1. Fork a branch for coaching, then send `/connect gym` in it. `/connect` lists apps and the branch's attachment.
+   From the CLI, use `aipatty --branch <id> send '/connect gym'`. Main stays normal chat unless explicitly connected.
+2. Tap **Open Gym** at the top of the branch or bookmark `/apps/gym/` on the same aipatty origin. Set the date,
+   enter an exercise, reps and weight or a time, and tap **Add set** for each set; tap **Save workout** to log the
+   list. To correct a set, tap **Edit** on a recent workout and on the set, then **Update set** and **Save workout**.
+3. Ask the coach about progress or describe a workout you completed and ask it to log it. To change the current
+   plan, ask it to save the plan explicitly. **Back to chat** returns to the branch when the page was opened from it.
+4. Send `/disconnect gym` to remove the coach tools and Gym view; this does not delete the log or disconnect forks.
+
+Recent workouts are the newest 20 by workout date. The header and tool cards show previews; the phone page shows
+the full current plan. Use a separate data directory when trying a test release; see [INSTALL.md](INSTALL.md#gym-pilot).
 
 ## The seam
 
@@ -67,7 +82,7 @@ marker stays, so the branch is a Gym branch again once the app opens.
 
 | Failure | What happens |
 |---|---|
-| App fails to open at startup, for example a corrupt database | The error is logged, and its branches run as normal chat. `/connect` shows the app as unavailable with the error and the log path. Each affected branch gets one transcript notice. |
+| App fails to open at startup, for example a corrupt database | The error is logged, and its branches run as normal chat. `/connect` shows the app as unavailable with the data path, error and server log location. Each affected branch gets one transcript notice for that server start, as does a fork created while bypassed. |
 | The app is fixed and aipatty restarts | Its branches are Gym branches again, with nothing to redo. |
 | A tool throws | The model sees an ordinary tool error and the turn continues. |
 | The page handler throws | That request returns a 500 with the message. Nothing else is affected. |
@@ -79,6 +94,9 @@ Not handled, as decisions:
   aipatty down until launchd restarts it. Apps are reviewed code in the repo, not installed at runtime.
 - **Upgrade rollback:** `/upgrade` snapshots and restores only `aipatty.sqlite`. The Gym database is not rolled
   back on a failed upgrade, so its schema changes must stay additive.
+- **Scope, not access control:** attachment selects coach tools and instructions, not access to private data.
+  Anyone who can reach aipatty can open the Gym page; the normal host tools still have the service account's
+  file permissions. Coaching turns can put workout data in the conversation and send it to the selected model.
 
 ## Branch formatting
 
@@ -122,7 +140,7 @@ The page and the tools call the same functions in the Gym module.
 
 | Tool | Effect |
 |---|---|
-| `gym_query` | Runs any SQL on a read-only connection, with a row cap. The schema is in the instructions. |
+| `gym_query` | Runs one SELECT on a read-only Gym connection. Joins, ordinary CTEs and common analytic functions work; writes, attachments, PRAGMAs and other databases do not. Returns up to 100 rows and 32 KiB; this caps the result, not query execution time. The schema is in the instructions. |
 | `gym_save_workout` | The same upsert the page uses. |
 | `gym_delete_workout` | Deletes one workout by ID. |
 | `gym_save_plan` | Replaces the plan text. |

@@ -37,7 +37,7 @@ no daemon and no service registration.
   last-known-good release for rollback.
   - `$ROOT/work/`: working directory of aipatty's own tools, for inspection and scratch, not PR work.
   - `$ROOT/runs/`: disposable workspaces for [`pi` runs](#pi-runs).
-  - `$ROOT/data/`: SQLite, logs, and later MCP configuration and sign-ins.
+  - `$ROOT/data/`: conversation SQLite, connected app data under `apps/`, logs, and later MCP configuration and sign-ins.
   - `$ROOT/upgrade/`: the database backup of the last upgrade, its pending record, and the logs of the supervisor
     and of the servers it starts.
   - `$ROOT/pi/`: shared Pi sign-in, model cache, delegates settings and jobs.
@@ -47,7 +47,16 @@ no daemon and no service registration.
   remain unchanged. It adds no environment variable or API. Launch from any cwd with
   `node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT"`. State stays outside releases on redeploy and
   rollback; see [INSTALL.md](INSTALL.md) for the first install, upgrades and fresh cutover.
-- **Conversations:** one root plus forks. Each has a title and its own model.
+- **Conversations:** one root plus forks. Each has a title, its own model, and optionally one connected app.
+
+### Connected apps
+
+The [Gym pilot](CONNECTED-GYM-APP.md) is one reviewed module in the server, not a plugin platform. Send
+`/connect gym` to add tools, instructions and a small Gym view to a branch without replacing its chat tools.
+Forks copy that attachment and share the app's log. The phone page and coach use the same SQLite store outside
+the conversation database. If Gym cannot open, its branches fall back to chat and keep the attachment for the
+next restart. `/upgrade` does not back up or roll back app data. The next decision is Steve's two-workout trial,
+not building a second app.
 
 ### Pi installation
 
@@ -203,7 +212,7 @@ release runs as it starts. The code is `src/upgrade-supervisor.ts` and `src/upgr
    runbook does by hand: clone, check out, `npm ci --ignore-scripts`. The old server keeps running. If this fails,
    or `main` is already running, the supervisor reports and ends, and the server admits messages again. CI on
    `main` is the test gate; the upgrade does not run the suite again.
-3. **Switch.** The supervisor stops the old server, backs up the SQLite database, writes `upgrade/pending.json`,
+3. **Switch.** The supervisor stops the old server, backs up the conversation database (`aipatty.sqlite`), writes `upgrade/pending.json`,
    points `deploy/current` at the new release and starts it.
 4. **Health check.** Every server checks itself as it starts, locally and without a model call: the saved model is
    in the catalog, every branch can be read, and the release's pinned Pi CLI and extensions are installed. `/health`
