@@ -88,10 +88,14 @@ Run one SELECT (WITH is fine). A final semicolon is optional; do not put comment
         }
         const match = /^\/api\/workouts\/([^/]+)$/.exec(path);
         if (!match) throw new HttpError(404, "Gym page not found");
-        requireMethod(req, res, "PUT", "DELETE");
+        requireMethod(req, res, "GET", "PUT", "DELETE");
         const id = match[1];
         try {
-          if (req.method === "DELETE") {
+          if (req.method === "GET") {
+            const workout = store.workout({ id });
+            if (!workout) throw new HttpError(404, "This workout is no longer in the log. Reload Gym to refresh the list.");
+            sendJson(res, 200, workout);
+          } else if (req.method === "DELETE") {
             sendJson(res, 200, store.deleteWorkout({ id }));
           } else {
             const body = await jsonBody(req);

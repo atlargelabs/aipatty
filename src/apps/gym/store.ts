@@ -39,6 +39,7 @@ export function openGymStore(dataDir: string) {
     const deleteWorkout = db.prepare("DELETE FROM workouts WHERE id = ?");
     const clearSets = db.prepare("DELETE FROM sets WHERE workout_id = ?");
     const putSet = db.prepare("INSERT INTO sets(workout_id, position, exercise, reps, amount, unit) VALUES (?, ?, ?, ?, ?, ?)");
+    const getWorkout = db.prepare("SELECT id, date FROM workouts WHERE id = ?");
     const getSets = db.prepare("SELECT exercise, reps, amount, unit FROM sets WHERE workout_id = ? ORDER BY position");
     const recent = db.prepare("SELECT id, date FROM workouts ORDER BY date DESC, rowid DESC LIMIT ?");
     const distinctExercises = db.prepare(`
@@ -48,9 +49,9 @@ export function openGymStore(dataDir: string) {
     const putPlan = db.prepare("INSERT INTO plan(id, text) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET text = excluded.text");
     const query = openQuery(path);
 
-    const recentWorkouts = (limit: number): Workout[] =>
-      (recent.all(limit) as Pick<Workout, "id" | "date">[])
-        .map(({ id, date }) => ({ id, date, sets: getSets.all(id) as GymSet[] }));
+    type WorkoutRow = Pick<Workout, "id" | "date">;
+    const withSets = ({ id, date }: WorkoutRow): Workout => ({ id, date, sets: getSets.all(id) as GymSet[] });
+    const recentWorkouts = (limit: number) => (recent.all(limit) as WorkoutRow[]).map(withSets);
 
     return {
       query: query.run,
@@ -62,6 +63,11 @@ export function openGymStore(dataDir: string) {
           workouts: recentWorkouts(recentLimit),
           exercises: distinctExercises.all(exerciseLimit).map(row => row.exercise as string),
         };
+      },
+      workout(input: unknown): Workout | undefined {
+        const { id } = readDelete(input);
+        const row = getWorkout.get(id) as WorkoutRow | undefined;
+        return row && withSets(row);
       },
       saveWorkout(input: unknown): Workout {
         const { id, date, sets: rawSets } = readWorkout(input);

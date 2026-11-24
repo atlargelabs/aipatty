@@ -367,13 +367,16 @@ function renderAppTool(body, slot) {
   }
   slot.view = view;
   slot.call = call;
-  let card;
   try {
-    card = view?.module.renderTool(call, slot.result);
+    const card = view?.module.renderTool(call, slot.result);
     if (card != null && (!(card instanceof Node) || card.parentNode)) throw new Error("Expected a detached tool card");
-  } catch (error) { card = undefined; appFailure(view, error); }
-  if (slot.card || card) body.replaceChildren(card ?? slot.text);
-  slot.card = card;
+    if (slot.card || card) body.replaceChildren(card ?? slot.text);
+    slot.card = card;
+  } catch (error) {
+    if (slot.card) body.replaceChildren(slot.text);
+    slot.card = undefined;
+    appFailure(view, error);
+  }
 }
 
 function refreshAppTools() {

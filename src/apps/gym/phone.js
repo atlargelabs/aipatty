@@ -71,10 +71,16 @@ function exerciseNames() {
 function updateSuggestions() {
   $("exercises").replaceChildren(...Array.from(exerciseNames().values(), name => new Option(name, name)));
 }
+function pendingSet() {
+  if (!setDirty && position === null) return false;
+  say(position === null ? "Tap Add set to include the fields, or Clear fields to discard them." : "Tap Update set or Cancel set edit first.");
+  return true;
+}
 function renderDraft() {
   $("draft-sets").replaceChildren(...sets.map((set, i) => {
     const row = node("li");
     const edit = button("Edit", "edit-set", () => {
+      if (pendingSet()) return;
       position = i;
       exercise.value = set.exercise;
       reps.value = set.reps ?? "";
@@ -132,12 +138,12 @@ function lock(value) {
   for (const button of recent.querySelectorAll("button")) button.disabled = value;
 }
 async function run(action) {
-  if (busy) return;
+  if (busy) return false;
   busy = true;
   lock(true);
   say("");
-  try { await action(); }
-  catch (error) { say(error instanceof Error ? error.message : String(error)); }
+  try { await action(); return true; }
+  catch (error) { say(error instanceof Error ? error.message : String(error)); return false; }
   finally { busy = false; lock(false); }
 }
 async function refresh() {
@@ -155,10 +161,12 @@ async function refresh() {
     actions.append(
       button("Edit", "edit-workout", () => {
         if ((dirty || setDirty) && !confirm("Discard your unsaved workout changes?")) return;
-        say("");
-        begin(workout);
-        date.focus();
-        $("workout-heading").scrollIntoView({ block: "start" });
+        // Open the current workout, not the copy from when the page (perhaps an old tab) was loaded.
+        void run(async () => begin(await api("workouts/" + workout.id))).then(opened => {
+          if (!opened) return;
+          date.focus();
+          $("workout-heading").scrollIntoView({ block: "start" });
+        });
       }),
       button("Delete", "delete-workout", () => {
         if (!confirm("Delete the workout on " + workout.date + "?")) return;
@@ -181,10 +189,7 @@ async function refreshAfter(message) {
 }
 $("save-workout").addEventListener("click", () => {
   if (!date.reportValidity()) return;
-  if (setDirty || position !== null) {
-    say(position === null ? "Tap Add set to include the fields, or Clear fields to discard them." : "Tap Update set or Cancel set edit before saving.");
-    return;
-  }
+  if (pendingSet()) return;
   if (!sets.length) { say("Add at least one set before saving."); exercise.focus(); return; }
   void run(async () => {
     await api("workouts/" + id, "PUT", { date: date.value, sets });

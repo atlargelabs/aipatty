@@ -685,12 +685,23 @@ test("phone Gym logs, corrects and deletes a workout, and connected chat sees it
   assert.match((await text("#recent-workouts"))!, /2026-11-24 · 2 sets/);
   assert.deepEqual(await browser.evaluate("[...document.querySelector('#exercise').list.options].map(o => o.value)"), [workout, "Plank"]);
   assert.equal(await browser.evaluate("document.querySelector('#recent-workouts img') === null"), true);
+  // The coach made a correction after the phone rendered its recent list. Editing another set must keep it.
+  const workoutId = await browser.evaluate<string>("document.querySelector('#recent-workouts article').dataset.workoutId");
+  await say(host, String(id), `call gym_save_workout ${JSON.stringify({
+    id: workoutId, date: "2026-11-24", sets: [
+      { exercise: workout, reps: 5, amount: 100, unit: "lb" },
+      { exercise: "Plank", amount: 75, unit: "sec" },
+    ],
+  })}`);
   await click('[data-action="edit-workout"]');
+  await until(() => text("#workout-heading"), text => text === "Edit workout");
   await click('[aria-label="Edit set 1"]');
   await set("#exercise", workout.toLowerCase());
   await set("#amount", "105");
+  await click('[aria-label="Edit set 2"]');
+  assert.match((await text("#status"))!, /Update set or Cancel set edit/);
   await click("#add-set");
-  assert.match((await text("#draft-sets"))!, /105 lb.*Plank · 60 sec/s);
+  assert.match((await text("#draft-sets"))!, /105 lb.*Plank · 75 sec/s);
   await click("#save-workout");
   await until(() => text("#status"), text => text === "Workout saved.");
   assert.equal(await browser.evaluate("document.querySelectorAll('#recent-workouts article').length"), 1);
@@ -756,7 +767,7 @@ test("late or broken app views leave history, selection, Pi cards and chat usabl
       el.textContent = label;
     }
     export function renderTool(call, result) {
-      if (result.toolName === "gym_save_plan") throw new Error("test renderer broke");
+      if (result.toolName === "gym_save_plan") return document.implementation.createHTMLDocument();
       if (call?.name !== "gym_query") return;
       const card = document.createElement("div");
       card.textContent = "Test query card";
@@ -782,7 +793,8 @@ test("late or broken app views leave history, selection, Pi cards and chat usabl
   })()`);
   assert.match(saved.selected, /"rows":\[\[19\]\]/);
   deliver.resolve();
-  await until(() => browser.evaluate("document.querySelector('#app-notice').textContent.includes('test renderer broke')"));
+  await until(() => browser.evaluate("document.querySelector('#app-notice').textContent.includes('replaceChildren')"));
+  assert.equal(await browser.evaluate("document.querySelector('#entries').textContent.includes('Saved the current plan.')"), true);
   assert.deepEqual(await browser.evaluate(`({
     count: document.querySelector('#entries').children.length,
     selected: getSelection().toString(),

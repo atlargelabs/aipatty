@@ -131,8 +131,9 @@ The page is `/apps/gym/` and is built for the phone.
   matched case-insensitively.
 - **Recent workouts:** each can be edited or deleted.
 - **Plan:** the current plan is shown as text, with a link back to chat.
-- **API:** save is `PUT /apps/gym/api/workouts/<id>` with the whole workout and a client-generated ID, as an
-  upsert. `DELETE` removes one.
+- **API:** Edit uses `GET /apps/gym/api/workouts/<id>` for the current saved workout. Save uses `PUT` at that
+  URL with the whole workout and a client-generated ID, as an upsert. `DELETE` removes one. Once the editor
+  is open, avoid editing the same workout in chat until the phone save finishes; a save replaces the whole list.
 
 ## Gym tools
 

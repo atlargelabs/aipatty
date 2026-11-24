@@ -165,6 +165,7 @@ test("Gym phone and coach share one log, with an explicit idle-only attachment t
   assert.equal((await (await request(workoutsPath)).json() as { workouts: unknown[] }).workouts.length, 1);
   assert.equal((await request(phoneWorkout, "DELETE")).status, 200);
   assert.equal((await request(phoneWorkout, "DELETE")).status, 200);
+  assert.equal((await request(phoneWorkout)).status, 404, "an old recent-workout card cannot open a deleted workout");
 
   const attachedPoint = (await page(id)).entries.at(-1)!.id;
   const cli = (...args: string[]) => promisify(execFile)(process.execPath, [
