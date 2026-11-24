@@ -180,8 +180,8 @@ Deferred until something needs them: a read-only research mode and repos other t
 - **API:** bound to `127.0.0.1`, with no listen address to configure. List branches, send, steer, abort, fork, set
   the model, stream live output, and `/health` with the running commit.
 - **Page:** branch list, transcript, input box, fork button, model picker, cost, and a read-only pane for the exact
-  Pi run behind a tool call. It shows archived results or a manually refreshed snapshot, not an interactive terminal.
-  Add a Gmail switch when Gmail ships.
+  Pi run behind a tool call. It shows archived results or automatically follows new output while the run is active
+  and you're at the bottom. It is not an interactive terminal. Add a Gmail switch when Gmail ships.
 - **CLI:** the same API from a terminal.
 - **Auth:** SSH or the tailnet's access policy. The server has no login of its own. HTTP and WebSocket requests
   must name the loopback listener or the single configured HTTPS origin, and any browser `Origin` must match.
