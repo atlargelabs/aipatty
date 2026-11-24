@@ -8,6 +8,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import type { Config } from "./config.ts";
+import { readManagedDelegateSettings } from "./managed-pi/policy.ts";
 import { instructions, taskPrompt } from "./pi-prompt.ts";
 import { addUsage, githubLink, readReport, RunTrace, usageKey, type JobUsage, type Review } from "./pi-trace.ts";
 import { readPiRunSnapshot, runLogParts } from "./pi-run-view.ts";
@@ -172,33 +173,15 @@ async function readJson<T>(path: string): Promise<T | undefined> {
   return JSON.parse(text) as T;
 }
 
-/** Delegates reads the trusted setting itself. Check it without editing it or using the legacy fallback. */
-async function reviewerProblem(pi: Config["pi"]): Promise<string | undefined> {
-  const missingFile = (error: NodeJS.ErrnoException) => {
-    // Do not mistake permission errors (or other filesystem failures) for a missing install.
+/** Check this release's reviewer before cloning for PR work; delegates loads the same pinned path. */
+async function reviewerProblem(path: string): Promise<string | undefined> {
+  const pinned = await stat(path).catch((error: NodeJS.ErrnoException) => {
     if (!isMissing(error) && error.code !== "ENOTDIR") throw error;
     return undefined;
-  };
-  const pinned = await realpath(pi.reviewExtension).catch(missingFile);
-  if (!pinned || !(await stat(pinned).catch(missingFile))?.isFile()) {
-    return `The pinned review extension is missing or not a file at ${pi.reviewExtension}. Run npm ci --ignore-scripts in the running release.`;
+  });
+  if (!pinned?.isFile()) {
+    return `The pinned review extension is missing or not a file at ${path}. Run npm ci --ignore-scripts in the running release.`;
   }
-  const path = join(pi.agentDir, "settings.json");
-  const fix = `Set delegates.reviewExtension in ${path} to an absolute path to ${pi.reviewExtension} `
-    + "(use the absolute deploy/current path for managed releases; see docs/INSTALL.md).";
-  let configured: unknown;
-  try {
-    configured = (await readJson<{ delegates?: { reviewExtension?: unknown } }>(path))?.delegates?.reviewExtension;
-  } catch (error) {
-    return `The review settings could not be read: ${clip(message(error), 200)}. ${fix}`;
-  }
-  if (typeof configured !== "string" || !isAbsolute(configured) || configured !== resolve(configured)) {
-    return `The review extension setting is missing or is not a normalized absolute file path. ${fix}`;
-  }
-  // The stable deploy/current path is usually a symlink; compare the files it selects, not the path spelling.
-  const selected = await realpath(configured).catch(missingFile);
-  if (!selected) return `The configured review extension at ${configured} cannot be resolved. ${fix}`;
-  if (selected !== pinned) return `The configured review extension at ${configured} does not match the running release. ${fix}`;
 }
 
 /**
@@ -905,8 +888,9 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     };
     // The server's own setting must not reach the checkout's tests, which refuse a stray AIPATTY_ variable.
     for (const name of Object.keys(env)) if (name.startsWith("AIPATTY_")) delete env[name];
-    // pi-web-search must resolve its config from the trusted Pi agent dir, never a checkout-relative override.
+    // The managed CLI selects its own search config. Only the coordinator may bootstrap a delegate child.
     delete env.PI_WEB_SEARCH_CONFIG;
+    delete env.PI_DELEGATE_BOOTSTRAP;
     delete env.PATTY_CLAUDE_CODE_MODEL;
 
     /** Run a setup command as part of the run: in its own process group, recorded, and stopped with the run. */
@@ -934,8 +918,13 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       await mkdir(saved.workspace, { recursive: true, mode: 0o700 });
       // Nothing starts without the record a later process needs to stop it.
       await write();
-      if (request.pr) {
-        const problem = await reviewerProblem(pi);
+      try {
+        readManagedDelegateSettings(pi.settings);
+      } catch (error) {
+        problems.push(message(error));
+      }
+      if (request.pr && !problems.length) {
+        const problem = await reviewerProblem(pi.reviewExtension);
         if (problem) problems.push(problem);
       }
       const repo = join(saved.workspace, "repo");

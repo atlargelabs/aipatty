@@ -39,10 +39,10 @@ in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits fo
   `delegates`, `just-web-fetch` (managed `web_fetch`) and `pi-web-search` (`web_search`, plus `url_context` on
   supported models). The default stays `openai/gpt-6.2-sol`. An explicit `model: "claude-code/<model-id>"`
   opts that run into the experimental Claude Code provider; there is no automatic Claude discovery or fallback
-  on OpenAI runs. Nothing loads by discovery: no checkout settings, extensions, skills, context files or MCP
-  servers. Pi shares the server's Pi directory, sign-in and `delegates` settings. Set `delegates.maxParallel`
-  to `10` in that directory's `settings.json` for ten concurrent top-level delegates **per Pi** (not a shared
-  pool or a cap on all nested jobs). See [the operator setup](docs/INSTALL.md#enable-ten-delegates-per-pi).
+  on OpenAI runs. Top-level resource discovery stays off. Managed runs ignore both the checkout's and the
+  Pi directory's `settings.json`. The release supplies `delegates.maxParallel: 10` for ten concurrent
+  top-level delegates **per Pi** (not a shared pool or a cap on all nested jobs); `maxThinkers` stays six.
+  See [managed policy and state](docs/INSTALL.md#managed-pi-policy-and-state).
 - **Rules.** Pi is told the git and issue workflow: an issue, a task branch and a PR that links the issue;
   `npm run check` and `npm test` before every push; a `crmanager` review of the final commit, repeated until it
   has no P0 or P1 finding; and that only Steve merges.
@@ -79,15 +79,15 @@ in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits fo
   call's result was already committed in its branch, that spend is not charged there again.
 
 A run needs `git`, `gh`, a GitHub login for the account running the server, and the Pi sign-in. For a PR run,
-`delegates.reviewExtension` in the selected Pi directory's `settings.json` must be an absolute path to the
-running release's `node_modules/@earendil-works/pi-review/review.ts`. The host checks it before cloning; a
-missing path or an older or shared copy is refused. Only the `crmanager` job loads pi-review. Non-PR runs do
-not require this setting. See [the runbook](docs/INSTALL.md) for the exact path and rollout steps.
+the host checks the running release's `node_modules/@earendil-works/pi-review/review.ts` before cloning.
+Only `crmanager` loads it, by absolute path to that release. No reviewer setting or update to the Pi state
+directory is needed. See [the runbook](docs/INSTALL.md) for rollout and older-release rollback.
 
 Web and Claude Code extensions are for the top-level coding run only, not conversations, delegates, or the
 reviewer. Fetch needs operator-installed Chrome/Chromium, trafilatura, and a filtering egress proxy; managed
 runs do not load fetch hooks.
-Search needs a provider/account with native search and can incur separate usage. Claude Code needs its own CLI
+Search uses the current coding model if it supports native search, ignores local search settings, and can incur
+separate usage. Claude Code needs its own CLI
 and service-account subscription login. See [optional coding extensions](docs/INSTALL.md#optional-coding-extensions)
 for prerequisites, configuration, and data/usage boundaries.
 
@@ -149,7 +149,7 @@ The server takes six command-line options:
 | `--port <n>` | `8790` | Listen port. `0` asks the operating system for a free one, which the server prints |
 | `--install-dir <path>` | Unset | Derive the state directories below from one installation root |
 | `--data-dir <path>` | `~/.aipatty/data` (`~/.aipatty/faux` in faux mode) | Where the conversation database, the ownership lock and the run logs live |
-| `--pi-dir <path>` | `~/.pi/agent` | The Pi directory, shared with the pinned CLI: its login file `auth.json`, its cached model catalog `models-store.json`, which the server only reads, and the `delegates` settings and jobs |
+| `--pi-dir <path>` | `~/.pi/agent` | The Pi state directory, shared with the pinned CLI: its login file `auth.json`, its cached model catalog `models-store.json` (which the server only reads), and `delegates` jobs |
 | `--work-dir <path>` | `~/.aipatty/work` | Where the model's own file and shell tools start |
 | `--runs-dir <path>` | `~/.aipatty/runs` | Where each `pi` run gets its disposable workspace |
 
@@ -157,8 +157,8 @@ The defaults in the table apply when `--install-dir` is omitted. With it, the se
 in faux mode), `pi/`, `work/`, and `runs/` under that root. Each individual directory option overrides only its
 corresponding derived path. Paths may be absolute, relative to the starting directory, or start with `~`; quote
 paths containing spaces. Blank paths are rejected. The root option is server-only: there is no new environment
-variable, CLI client option, or API setting. The Pi CLI and its pinned extensions come from the running release,
-not the state root.
+variable, CLI client option, or API setting. The Pi CLI, pinned extensions and managed settings come from the
+running release, not the state root.
 
 For a service install, the recommended root is `~/aipatty` in the service account's own home, not a new
 runtime default. Set `ROOT="$HOME/aipatty"` or choose another writable absolute path. The first release step
@@ -169,11 +169,10 @@ branch protection described in the runbook.
 
 Keep committed-main releases in `$ROOT/deploy/<sha>` with a `deploy/current` symlink and launch
 `node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT"`. Explicitly set `PI_CODING_AGENT_DIR="$ROOT/pi"`
-when using the pinned Pi CLI for login or model-cache updates. Set `delegates.reviewExtension` to the absolute
-path through `deploy/current` so it follows deployment and rollback between pinned releases. Deploy later
-releases with [`/upgrade`](#upgrade); by hand, stop and wait before repointing `current`. Follow
-[the runbook](docs/INSTALL.md) for first installs, migrating existing settings,
-rollback to releases with an unpinned reviewer, and development without `deploy/current`.
+when using the raw pinned Pi CLI for login or model-cache updates. Keep any existing Pi settings for
+standalone use or rollback; managed runs don't use or write them. Deploy later releases with [`/upgrade`](#upgrade);
+by hand, stop and wait before repointing `current`. Follow [the runbook](docs/INSTALL.md) for first installs,
+rollback to older releases, and development without `deploy/current`.
 
 The server also takes one environment variable, `AIPATTY_FAUX`: `1` uses the fake model. An empty value counts as unset.
 

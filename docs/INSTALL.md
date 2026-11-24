@@ -55,48 +55,24 @@ ROOT="$HOME/aipatty"
    PI_CODING_AGENT_DIR="$ROOT/pi" node "$ROOT/deploy/current/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js" auth login openai
    ```
 
-4. **`delegates` settings**, in `$ROOT/pi/settings.json`. Its jobs and clones live under `$ROOT/pi/delegates/jobs/`.
-   Checkout settings are not read, so the checks live here. The release's `npm ci` installs the pinned
-   `pi-review`; do not run `pi install` or add it to Pi's `packages` settings. For `reviewExtension`, use the
-   actual absolute value of `$ROOT/deploy/current/node_modules/@earendil-works/pi-review/review.ts`, with the
-   `current` component intact. The example assumes `ROOT=/Users/aipatty/aipatty`; JSON does not expand `$ROOT`
-   or `~`. If you use `--pi-dir`, edit `settings.json` in that directory instead.
+### Managed Pi policy and state
 
-   ```json
-   {
-     "delegates": {
-       "version": 1,
-       "maxParallel": 10,
-       "reviewExtension": "/Users/aipatty/aipatty/deploy/current/node_modules/@earendil-works/pi-review/review.ts",
-       "publication": { "repository": "atlargelabs/aipatty", "remote": "origin", "baseBranch": "main", "requiredChecks": [] },
-       "environment": {
-         "setup": [{ "name": "dependencies", "command": "npm ci --ignore-scripts", "timeoutMs": 600000 }],
-         "checks": [
-           { "name": "typecheck", "command": "npm run check", "timeoutMs": 120000 },
-           { "name": "tests", "command": "npm test", "timeoutMs": 600000 }
-         ]
-       }
-     }
-   }
-   ```
+| Path | What lives there |
+| --- | --- |
+| `$ROOT/deploy/<sha>/src/managed-pi/settings.json` | Managed delegates policy: publication to `atlargelabs/aipatty` on `origin` against `main`, `npm ci --ignore-scripts` setup, and required local checks `npm run check` and `npm test`. Review changes to this file in the repository, not on the Mac mini. |
+| `$ROOT/deploy/<sha>/node_modules/` | Pinned Pi and extensions. The host checks this release's `@earendil-works/pi-review/review.ts` before cloning for a PR run; only `crmanager` loads it. No `pi install`, `packages` entry, or operator-supplied `reviewExtension` path is needed. |
+| `$ROOT/pi/` (or `--pi-dir`) | Pi sign-in and refresh lock, model catalog cache, delegate jobs and clones under `delegates/jobs/`, and runtime files. No managed policy migration or credentials copy. |
 
-   The host checks this path resolves to the running release's pinned file before cloning for a PR run.
-   Only `crmanager` loads the reviewer. Non-PR investigation does not require this setting.
+Each Pi gets `delegates.maxParallel: 10` for concurrent top-level calls and batch width. It is not a global
+pool or a hard total for nested jobs. The pinned `maxThinkers` default stays six. The managed launcher uses
+Pi's built-in settings defaults in memory. Neither `<pi-dir>/settings.json` nor a checkout's `.pi/settings.json`
+is used or edited for managed runs. Do not add a settings file for them. Keep any existing file for standalone
+Pi or [rollback](#first-deploy-with-release-owned-pi-settings).
 
-### Enable ten delegates per Pi
-
-**Existing installs:** when deploying this release, stop the service as in [Stop](#stop) and wait for it to
-exit. Edit `$ROOT/pi/settings.json` (or `settings.json` under the configured `--pi-dir`) once. Inside the
-existing `"delegates"` object, add `"maxParallel": 10` (or change that key's value to the number `10`).
-If the object does not exist yet, add `"delegates": { "maxParallel": 10 }` to the top-level object. Keep
-valid JSON and preserve all other keys and values, including the reviewer path and checks. If the value is
-already `10`, no edit is needed. Then deploy/start as usual. The host does not write this setting or change
-the extension's default, and upgrading without the edit does not prevent Pi from running.
-
-The pinned extension reads this trusted setting independently in each Pi. It limits concurrent top-level
-delegates and the batch width per Pi; ten is **not** a shared limit across conversation branches or a hard cap
-on all nested jobs. Leave `maxThinkers` as it is (six by default). Do not put the setting in a checkout's
-`.pi/settings.json`; managed Pi does not load it.
+Provision machine-specific executables and network settings separately, in the service account's trusted
+environment, not in the release. For example, use `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` for Pi HTTP
+traffic if needed instead of legacy `settings.json`'s `httpProxy`. The separate fetch egress proxy is described
+below. Managed Pi does not import legacy `settings.json` API keys; use the normal pinned CLI for sign-in.
 
 For example, to refresh the shared model cache with the pinned CLI, run:
 
@@ -113,20 +89,17 @@ node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT"
 ```
 
 The option derives `$ROOT/data` (or `$ROOT/faux` in faux mode), `$ROOT/pi`, `$ROOT/work`, and `$ROOT/runs`.
-The database, ownership lock, and run logs live in the data directory; Pi auth, model cache, settings and jobs
-live in the Pi directory. The pinned CLI and extensions live in the release. Model scratch lives in `work`;
-disposable Pi workspaces live in `runs`. The browser's run pane reads a bounded excerpt from `data/logs/runs/`
+The database, ownership lock, and run logs live in the data directory; Pi auth, model cache and jobs live in
+the Pi directory. The pinned CLI, extensions and managed settings live in the release. Model scratch lives in
+`work`; disposable Pi workspaces live in `runs`. The browser's run pane reads a bounded excerpt from `data/logs/runs/`
 (or `logs/runs/` under the configured data directory), not the disposable clone. Removing an archive leaves the
 chat intact but removes its replay. An individual directory option overrides its derived path. Omitting the
 root leaves the legacy defaults unchanged. The option is server-only; it adds no environment variable or API.
 The server forwards its configured Pi directory to Pi subprocesses; bootstrap commands must set it explicitly.
 
-For development or a checkout without `deploy/current`, use the literal absolute path to that checkout's
-`node_modules/@earendil-works/pi-review/review.ts` (from the checkout root, print it with
-`printf '%s\n' "$(pwd -P)/node_modules/@earendil-works/pi-review/review.ts"`). Set `delegates.reviewExtension`
-in the selected Pi directory's `settings.json` (`~/.pi/agent/settings.json` if neither `--install-dir` nor
-`--pi-dir` is given). Prefer a separate `--pi-dir` for development to avoid changing another checkout's or
-service's settings. If launching a different checkout against the same settings, update the path while stopped.
+A development checkout uses its own installed reviewer and versioned policy the same way, without
+`deploy/current`. Use a separate `--pi-dir` to isolate its login, caches and jobs from the service if needed.
+The raw CLI used for sign-in and updating the cache is still ordinary standalone Pi, not the managed launcher.
 
 From the laptop, using its own checkout for the CLI:
 
@@ -156,13 +129,15 @@ in aipatty's durable conversations, delegate jobs, or `crmanager` reviews.
   prerequisites fail only the fetch call. The adapter ignores `just-web-fetch.json` and disables all fetch hook
   directories and event-bus registration. Complete extracts are temporary files in the Pi agent dir; archived
   tool events may retain web content.
-- **`web_search`:** uses the coding model if supported, or an explicitly configured search model in the trusted
-  Pi agent dir (`$ROOT/pi/web-search.json` for a root install, or the selected `--pi-dir`). That file accepts
-  `{"provider":"<provider>","model":"<model-id>"}`; `PI_WEB_SEARCH_CONFIG` is ignored in managed runs. The
-  extension sends queries and any supplied URLs to the selected provider using its Pi auth and routing. Native
-  search and `url_context` availability depend on the model, provider and account. A working chat subscription
-  does not guarantee native search. There is no fallback or automatic sign-in; search may incur separate usage
-  outside the run's reported model cost. Do not send private URLs, code or credentials as queries.
+- **`web_search`:** uses the coding model if supported. Managed Pi ignores both the machine's
+  `PI_WEB_SEARCH_CONFIG` and the Pi directory's `web-search.json`. It points the extension at the running
+  release's `src/managed-pi/web-search.json`, intentionally absent here: at this pin an absent file selects the
+  current model, whereas `{}` is invalid. A future release could opt into a different provider/model by shipping
+  a valid `{"provider":"<provider>","model":"<model-id>"}` there. The extension sends queries and any supplied
+  URLs to the selected provider using its Pi auth and routing. Native search and `url_context` depend on the
+  model, provider and account. A working chat subscription does not guarantee native search. There is no
+  fallback or automatic sign-in; search may incur separate usage outside the run's reported model cost.
+  Do not send private URLs, code or credentials as queries.
 - **Claude Code (experimental):** only an explicit `model: "claude-code/<model-id>"` in a top-level `pi` call enables
   it. The operator must provision Claude Code on the service account's `PATH` (or set an absolute
   `PI_CLAUDE_CODE_COMMAND`) and sign it in under that account with a supported Claude subscription. Aipatty does
@@ -233,28 +208,25 @@ points at the old release; fix the cause and [start](#start) it.
 `node src/cli.ts health` lists under `problems` what the startup health check found; an empty list is healthy. A
 release started by hand runs with its problems listed, so they can be fixed. A release started by an upgrade must
 have none. Old releases stay in `$ROOT/deploy/`; delete the ones you no longer want, keeping `current` and the one
-before it. The [reviewer setting](#first-deploy-from-a-release-with-an-unpinned-reviewer) follows `current` and
-needs no change between pinned releases.
+before it. Every release with release-owned policy uses its own reviewer and settings, with no shared path to
+update on upgrade or rollback.
 
-## First deploy from a release with an unpinned reviewer
+## First deploy with release-owned Pi settings
 
-For an existing root, stage the new release with `npm ci --ignore-scripts`, then [stop](#stop) the old
-server and wait for it to exit. Before starting the new release:
+Keep the same Pi directory and leave any `settings.json`, `web-search.json`, and old reviewer files in place.
+There is **no `maxParallel` edit, reviewer-path edit, installation of global extensions, or settings migration**.
+Use the normal upgrade or, by hand, install with `npm ci --ignore-scripts`, [stop](#stop) and wait, repoint
+`current`, start with the same directory options, and verify the commit and `problems` with `health`. Follow
+[the run state cutover](#pi-run-state-cutover-and-rollback) below when coming from a singleton release.
 
-1. Note the old `delegates.reviewExtension` value (usually absent). Keep the old reviewer checkout under
-   the Pi directory's `git/github.com/earendil-works/pi-review/` (or the previously configured file) if you
-   may roll back to the old release. Keeping the files does not make the new release use them.
-2. In the same shared `settings.json`, set just `delegates.reviewExtension` to the absolute `deploy/current`
-   reviewer path shown above. Preserve the rest of the delegates configuration, including publication and
-   checks. If the old `pi install` left a `pi-review` entry in `packages`, remove only that entry; no package
-   registration is needed for either release, and you should not uninstall the retained reviewer.
-3. Repoint `current` to the new release, start with the same configuration, and verify its commit with `health`.
-
-Between pinned releases, leave the setting unchanged. To roll back to a release older than the pin, stop and
-wait first, then restore the previous `delegates.reviewExtension` value (delete the key if the old release
-used the fallback) before repointing `current` and restarting. PR runs on the old release need that legacy
-reviewer file; if it was not retained, restore it before running PR work there. On returning to a pinned
-release, set the `deploy/current` value again while stopped. No release edits the setting for you.
+On rollback to another release with managed settings, just select that release; the reviewer is resolved from
+its actual checkout, not through `current`. A rollback to an **older** release that reads local settings uses
+its retained file as before. The old pinned-reviewer runbook required an absolute `deploy/current` path to
+`node_modules/@earendil-works/pi-review/review.ts` in `delegates.reviewExtension`. Older unpinned releases may
+instead use an explicit legacy path or the retained `git/github.com/earendil-works/pi-review/review.ts` under
+`--pi-dir`. If an older release was never configured on this host or its legacy settings are no longer present,
+use that release's own `docs/INSTALL.md` while stopped to restore its settings and reviewer before running PR
+work. Returning to this release needs no edit. No release moves the login, cache or job directory.
 
 ## Pi run state cutover and rollback
 
@@ -272,8 +244,7 @@ For a same-root first deploy, let all branches finish (or abort their runs and w
 results to be committed). Do not start more runs. [Stop](#stop) the old release and wait for it to exit before
 changing `current` and starting the new release with the same data, Pi and runs directories. If a valid old
 singleton checkpoint remains after shutdown, the new release can recover it with those same directories;
-it never relaunches the call. Make the [one-time delegates setting edit](#enable-ten-delegates-per-pi) while
-stopped.
+it never relaunches the call. Leave the Pi state and legacy settings in place.
 
 **Before rolling back to a singleton release or switching to a fresh root**, likewise drain all Pi runs and
 wait for the tool results in their branches. Stop and wait for the server to exit, then inspect both `pi-run.json`
@@ -284,17 +255,16 @@ or roots or delete the evidence.** An old binary cannot see `pi-runs/`, and a fr
 state. Restart the release that can read the records, with the same data, Pi and runs directories, to finish
 recovery and let the interrupted tool results commit. If a checkpoint is damaged or still cannot be cleared,
 stop and investigate using the console diagnostics, saved process identities and run logs; do not bypass the
-hold. Drain, stop and recheck before repointing `current` or switching roots. Keep the data and logs for rollback;
-the ten-delegate setting is also supported by the previous pinned release.
+hold. Drain, stop and recheck before repointing `current` or switching roots. Keep the data and logs for rollback.
 
 ## Fresh cutover from an old installation
 
 Drain and verify the old state as described in [Pi run state cutover and rollback](#pi-run-state-cutover-and-rollback)
 before changing roots.
 
-Only then start with a fresh root: do not migrate conversations. Reauthenticate with the pinned CLI as above and
-set up delegates (including its pinned reviewer path) in the new Pi directory. Verify `health` reports
-the expected SHA, `node src/cli.ts log` shows an empty transcript, and a send succeeds. Then exercise the actual Pi
+Only then start with a fresh root: do not migrate conversations. Reauthenticate with the pinned CLI as above.
+The release already supplies delegates policy and the reviewer. Verify `health` reports the expected SHA,
+`node src/cli.ts log` shows an empty transcript, and a send succeeds. Then exercise the actual Pi
 run and review loop below. Only after all of those checks succeed, identify and delete old paths **confirmed** to be
 owned solely by aipatty, if no longer needed. Never blindly delete `~/.pi`: it may contain other state. Preserve the
 account's SSH keys and configuration, Git configuration, and `gh` login and settings.
@@ -308,15 +278,11 @@ account's SSH keys and configuration, Git configuration, and `gh` login and sett
 4. Deploy with [`/upgrade`](#upgrade). From a release that predates the command, deploy by hand once: make a
    release of the new committed `main` as in "First release", without changing the current
    symlink yet. Follow [Stop](#stop) and wait for the process to exit, then point `$ROOT/deploy/current` at the new
-   release and start it again with the same root. Do not repoint while the server or a review is running: the
-   reviewer setting follows `current`. For the first deploy over an unpinned release, make the
-   [one-time reviewer setting change](#first-deploy-from-a-release-with-an-unpinned-reviewer) while stopped.
-   For the per-branch release, also [enable ten delegates per Pi](#enable-ten-delegates-per-pi).
-   Keep the previous release for rollback; preserve `$ROOT/data`,
-   `$ROOT/pi`, `$ROOT/work`, and `$ROOT/runs` across both redeploy and rollback.
+   release and start it again with the same root. Do not repoint while the server or a review is running.
+   Keep the previous release for rollback; preserve `$ROOT/data`, `$ROOT/pi`, `$ROOT/work`, and `$ROOT/runs`
+   across both redeploy and rollback.
 5. `node src/cli.ts health` reports the new commit, and `node src/cli.ts log` still has the conversation. Send it
    another message. For manual rollback, [drain and verify Pi run state](#pi-run-state-cutover-and-rollback),
    repoint `current` at the retained release after shutdown and those checks, restart with the same root, and
-   verify its SHA and conversation. Keep the same reviewer setting
-   when rolling back between pinned releases; for an older release, restore its previous reviewer setting while
-   stopped as described above. Ensure releases are compatible with the shared state.
+   verify its SHA and conversation. [Only older releases](#first-deploy-with-release-owned-pi-settings) need
+   their retained local settings and reviewer configuration. Ensure releases are compatible with the shared state.

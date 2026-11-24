@@ -40,7 +40,8 @@ no daemon and no service registration.
   - `$ROOT/data/`: SQLite, logs, and later MCP configuration and sign-ins.
   - `$ROOT/upgrade/`: the database backup of the last upgrade, its pending record, and the logs of the supervisor
     and of the servers it starts.
-  - `$ROOT/pi/`: shared Pi sign-in, model cache, delegates settings and jobs.
+  - `$ROOT/pi/`: shared Pi sign-in, model cache, delegate jobs and runtime files. Managed settings live in
+    `deploy/<sha>/src/managed-pi/settings.json`, not in state.
 
   The server-only `--install-dir` derives these four state paths (using `$ROOT/faux` instead of
   `$ROOT/data` in faux mode); each individual directory option takes precedence. Without it the legacy defaults
@@ -54,7 +55,11 @@ no daemon and no service registration.
 Aipatty installs its own copy of the upstream `@earendil-works/pi-coding-agent` 1.6.0 as an exact-version runtime
 npm dependency. Commit the lockfile and install with `npm ci --ignore-scripts`. Launch the executable from the
 running release by absolute path, never via `PATH` or `npx`. Do not fork Pi or update it in place with `pi update`;
-bump the dependency through a reviewed PR so rolling back aipatty also rolls back its Pi CLI.
+bump the dependency through a reviewed PR so rolling back aipatty also rolls back its Pi CLI. The pin has no
+supported CLI settings override. The managed entry adapts one digest-checked module at launch, using the
+CLI's in-memory defaults and skipping migration of `settings.json` API keys. The launcher keeps the actual
+bundled CLI, `PI_CODING_AGENT_DIR`, flags, JSON output and process lifecycle. Delegates re-execute that same
+managed entry. Recheck both compatibility adapters when updating their pins.
 
 Use a dedicated Pi agent directory owned by the `aipatty` account, outside the release and run directories. The
 legacy default is `~/.pi/agent`; the root install derives `$ROOT/pi`. Point the host and CLI at the same
@@ -71,7 +76,9 @@ Pi runs use release-pinned extensions. The top-level CLI loads them only by expl
 ambient extensions and the checkout's settings and executable resources stay disabled:
 
 - **`delegates`** (`github.com/stephenchestnut/delegates`): the `delegate` and `delegate_parallel` tools, with the
-  `thinker`, `thinktank`, `worker`, `prmanager` and `crmanager` profiles. The run loads it with `-e`.
+  `thinker`, `thinktank`, `worker`, `prmanager` and `crmanager` profiles. A small, source-checked adapter gives
+  the coordinator release settings instead of the pin's hardwired local settings reader. The pinned children
+  receive the coordinator's frozen configuration and existing tool allowlists through bootstrap.
 - **`pi-review`** (`github.com/earendil-works/pi-review`): the `/review` command. The run does not load it.
   `delegates` loads it inside a `crmanager` job and runs `/review` there without its interactive UI.
 
@@ -80,8 +87,9 @@ ambient extensions and the checkout's settings and executable resources stay dis
   and `puppeteer-core` (no Puppeteer config discovery). Fetch requires a connection-time filtering egress proxy;
   it never falls back to direct browsing. npm aliases its legacy peers to the current release's
   versions; the bundled loader resolves those imports to the running Pi modules, not a second client or auth store.
-- **`pi-web-search`** (npm): top-level `web_search` and model-scoped `url_context`. Overrides come only from
-  `web-search.json` in the trusted Pi agent dir. The tool uses a supported native provider, not a fallback model.
+- **`pi-web-search`** (npm): top-level `web_search` and model-scoped `url_context`. The launcher pins any
+  routing override to the release; without one, search uses the current model if supported, never a fallback.
+  Local `web-search.json` and a shell override of its path are ignored.
 - **`pi-claude-code`** (`github.com/earendil-works/pi-claude-code`): experimental, top-level opt-in with
   `model: "claude-code/<model-id>"`. An async extension factory validates the CLI login and discovers and registers
   the requested account model before Pi selects it. OpenAI defaults and reviewer behavior do not change.
@@ -91,8 +99,9 @@ full Git SHAs or exact npm versions. Each release installs its own copies with `
 rollback rolls the extensions back too. See [INSTALL.md](INSTALL.md#optional-coding-extensions) for optional
 provisioning and usage boundaries.
 
-`delegates` reads its settings from the service account's `settings.json` in the Pi agent directory, not from the
-checkout:
+The managed coordinator reads `src/managed-pi/settings.json` from the immutable running release. It refuses
+missing or malformed policy instead of falling back to `settings.json` in the shared state or `.pi/settings.json`
+in a task checkout:
 
 - **Parallel delegates:** `delegates.maxParallel: 10` in the trusted settings gives each Pi its own limit of
   ten concurrent top-level delegates and bounds its batch width. `maxThinkers` is unchanged (default six);
@@ -100,10 +109,9 @@ checkout:
 - **Publication:** `atlargelabs/aipatty` as the one authorized repository, with base branch `main`.
 - **Models:** none set. The extension's defaults are on the `openai` provider: `openai/gpt-6.2-sol` for every
   profile except `crmanager`, which reviews with `openai/gpt-6.2-astra`.
-- **Review extension:** `delegates.reviewExtension` names the pinned `review.ts` by absolute path through
-  `deploy/current` for service installs, or directly into the running checkout for development. Before cloning for
-  a PR, the host checks that it resolves to the running release's pinned file. There is no shared reviewer
-  fallback for PR runs in pinned releases, and the top-level run does not load pi-review.
+- **Review extension:** the adapter supplies the absolute path to the running release's pinned `review.ts`, not
+  via `deploy/current`; the host checks that file before cloning for PR work. There is no shared reviewer fallback,
+  and the top-level run does not load pi-review.
 - **Checks:** `npm ci --ignore-scripts` as setup, and `npm run check` and `npm test` as required checks. A
   `prmanager` refuses to submit with no checks configured, and the copy in the repo's `.pi/settings.json` is not
   read because checkout settings stay untrusted.
@@ -111,9 +119,9 @@ checkout:
 `delegates` keeps its jobs, logs, and `prmanager` and `crmanager` clones in `delegates/jobs/` under the agent
 directory, outside `runs/`.
 
-The settings file is shared and never rewritten by the host. The stable path follows `current` on deploy and
-rollback between pinned releases; stop the server and wait for it to exit before repointing the symlink or
-changing the setting. See [INSTALL.md](INSTALL.md) for the first pinned deploy and rollback to older releases.
+Keep any legacy Pi settings bytes for standalone Pi and rollback to older releases. No settings edit is needed
+between releases with managed policy. Auth, its refresh lock, model cache and delegate jobs stay in the same Pi
+state directory. See [INSTALL.md](INSTALL.md) for cutover and rollback.
 
 ## Tools the model gets
 
@@ -135,8 +143,8 @@ the tool result, and operator logs remain available.
 1. **Request and workspace:** reserve the calling conversation ID before any asynchronous work. Refuse a
    second call on that branch through startup, execution and cleanup. Other branches need no run coordination.
    Create `runs/<run-id>/` and write the run's checkpoint in `data/pi-runs/<run-id>.json` before spawning.
-   For a PR run, check the configured reviewer matches the running release. `atlargelabs/aipatty` is the only allowed repo for now. Clone it with the service account's GitHub access
-   and record the resolved base SHA.
+   Check the release policy and, for a PR run, the pinned reviewer file before cloning. `atlargelabs/aipatty` is
+   the only allowed repo for now. Clone it with the service account's GitHub access and record the resolved base SHA.
 2. **Launch:** use the pinned CLI in one-shot JSON mode (`--mode json --no-session`). Collect structured events and
    stderr separately. Use `openai/gpt-6.2-sol` unless the call names another model. Disable automatic loading of
    checkout settings and executable resources, extensions, and MCP, then load the pinned
@@ -270,8 +278,8 @@ from a release that predates `/upgrade`, which is one more manual deploy. See
 - **Manual app install, as the service account:** assume an existing standard `aipatty` account with a writable
   home and user-accessible Node 26 or newer, Git, and `gh`. Follow [INSTALL.md](INSTALL.md) to set up its
   `~/aipatty` root, install releases, set up the model sign-in with the release's Pi CLI, configure `pattycaik`'s
-  SSH key and `gh` login, and write the [`delegates` settings](#pi-extensions) into its Pi agent directory. None
-  of this needs `sudo` or a macOS administrator account. No global Pi install or copy of Steve's dotfiles is needed.
+  SSH key and `gh` login. [`Delegates` policy](#pi-extensions) ships with the release. None of this needs `sudo`
+  or a macOS administrator account. No global Pi install or copy of Steve's dotfiles is needed.
 - **GitHub maintainer work:** confirm `pattycaik` has write, not admin, access and `main` has the `protect-main`
   ruleset with the CI check required before enabling PR publication. These are repository permissions, separate
   from macOS administrator access. Only Steve merges PRs.

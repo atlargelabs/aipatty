@@ -176,7 +176,7 @@ test("/upgrade moves to the latest main, keeps the conversation and reports in t
 
 for (const [what, changes, reason] of [
   ["exits as it starts", { "src/main.ts": (text: string) => `throw new Error("broken release");\n${text}` }, /exited during startup \(1\)[^]*broken release/],
-  ["fails its health check", { "src/config.ts": (text: string) => text.replace("dist/bundle/cli.js", "dist/bundle/gone.js") }, /Health check failed: Pi CLI: ENOENT/],
+  ["ships incomplete managed Pi settings", { "src/managed-pi/settings.json": '{"delegates":{"maxParallel":10}}' }, /Health check failed: Managed Pi settings: Invalid managed Pi settings/],
 ] as const) {
   test(`a new release that ${what} is rolled back to the old release and its database`, { timeout }, async t => {
     const f = await install(t);

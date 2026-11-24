@@ -2,8 +2,7 @@ import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readdir, readFile, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
@@ -41,7 +40,6 @@ async function setup(t: TestContext, installRoot = false): Promise<Config> {
   const reviewExtension = join(dir, "release", reviewerEntry);
   await mkdir(dirname(reviewExtension), { recursive: true });
   await writeFile(reviewExtension, "");
-  await reviewSetting(config, reviewExtension);
   return {
     ...config,
     pi: {
@@ -52,8 +50,6 @@ async function setup(t: TestContext, installRoot = false): Promise<Config> {
 }
 
 const reviewerEntry = "node_modules/@earendil-works/pi-review/review.ts";
-const reviewSetting = (config: Config, reviewExtension: unknown) =>
-  writeFile(join(config.pi.agentDir, "settings.json"), JSON.stringify({ delegates: { maxParallel: 10, reviewExtension } }));
 const stateDir = (config: Config) => join(config.dataDir, "pi-runs");
 const checkpointFile = (config: Config, id: string) => join(stateDir(config), `${id}.json`);
 const pendingRecords = async (config: Config) => (await readdir(stateDir(config))).filter(name => name.endsWith(".json")).sort();
@@ -124,12 +120,14 @@ test("an install-root run forwards its Pi directory and loads only the pinned co
   await github(config, openPr);
   await scenario(config, [...review("c1", "job-review"), assistant(report()), settled]);
   const runs = await openPiRuns(config);
-  const searchOverride = process.env.PI_WEB_SEARCH_CONFIG;
-  process.env.PI_WEB_SEARCH_CONFIG = "checkout-web-search.json";
-  t.after(() => {
-    if (searchOverride === undefined) delete process.env.PI_WEB_SEARCH_CONFIG;
-    else process.env.PI_WEB_SEARCH_CONFIG = searchOverride;
-  });
+  for (const name of ["PI_WEB_SEARCH_CONFIG", "PI_DELEGATE_BOOTSTRAP"]) {
+    const previous = process.env[name];
+    process.env[name] = "inherited-override";
+    t.after(() => {
+      if (previous === undefined) delete process.env[name];
+      else process.env[name] = previous;
+    });
+  }
   const outcome = await runs.run(request({ task: "Add the thing.\nSecond line.", model: "openai/gpt-6.2-astra", thinking: "low" }));
   assert.equal(outcome.status, "completed", JSON.stringify(outcome));
 
@@ -145,6 +143,7 @@ test("an install-root run forwards its Pi directory and loads only the pinned co
   assert.ok(!argv.some(arg => ["--approve", "-a", "--skill", "--session", "--continue"].includes(arg)));
   assert.equal(launch.env.PI_CODING_AGENT_DIR, config.pi.agentDir);
   assert.equal(launch.env.PI_WEB_SEARCH_CONFIG, undefined);
+  assert.equal(launch.env.PI_DELEGATE_BOOTSTRAP, undefined);
   assert.equal(launch.env.PATTY_CLAUDE_CODE_MODEL, undefined);
   assert.equal(launch.env.PATTY_RUN_ID, outcome.runId);
   assert.deepEqual(Object.keys(launch.env).filter(name => name.startsWith("AIPATTY_")), []);
@@ -427,107 +426,39 @@ test("missing sign-in or model, a provider error, and malformed output are failu
   assert.deepEqual(await readdir(config.runsDir), []);
 });
 
-test("PR runs refuse missing or mismatched reviewer settings before cloning, without using the old shared copy", async t => {
+test("preflight refuses a broken release before cloning and never falls back to local settings", async t => {
   const config = await setup(t);
-  const settings = join(config.pi.agentDir, "settings.json");
-  const legacy = join(config.pi.agentDir, "git/github.com/earendil-works/pi-review/review.ts");
-  await mkdir(dirname(legacy), { recursive: true });
-  await writeFile(legacy, "");
-  // Any attempted clone would produce a different error. No Pi launch or GitHub call should follow.
-  const runs = await openPiRuns({ ...config, pi: { ...config.pi, git: join(config.dataDir, "not-git") } });
-  const refused = async (reason: RegExp, guidance = "delegates.reviewExtension") => {
-    const outcome = await runs.run(request());
+  const settings = join(config.dataDir, "missing-release-settings.json");
+  const legacy = join(config.pi.agentDir, "settings.json");
+  const oldPolicy = JSON.stringify({ delegates: { reviewExtension: config.pi.reviewExtension, maxParallel: 1 } });
+  await writeFile(legacy, oldPolicy);
+  // Any attempted clone would produce a different error; neither Pi nor GitHub should be called.
+  const pi = { ...config.pi, settings, git: join(config.dataDir, "not-git") };
+  const runs = await openPiRuns({ ...config, pi });
+  const refused = async (reason: RegExp, pr = true) => {
+    const outcome = await runs.run(request({ pr }));
     assert.equal(outcome.status, "failed");
     assert.equal(outcome.problems.length, 1);
     assert.match(outcome.problems[0]!, reason);
-    assert.ok(outcome.problems[0]!.includes(guidance));
-    assert.ok(outcome.problems[0]!.includes(config.pi.reviewExtension));
   };
-
-  await rm(settings);
-  await refused(/setting is missing/);
-  await reviewSetting(config, undefined);
-  await refused(/setting is missing/);
+  await refused(/Invalid managed Pi settings at .*missing-release-settings\.json.*ENOENT/);
   await writeFile(settings, "not JSON");
-  await refused(/review settings could not be read/);
-  await reviewSetting(config, "./review.ts");
-  await refused(/not a normalized absolute file path/);
-  await reviewSetting(config, legacy);
-  await refused(/does not match the running release/);
-  await reviewSetting(config, join(checkout, "package.json"));
-  await refused(/does not match the running release/);
-  await reviewSetting(config, `${config.pi.reviewExtension}.gone`);
-  await refused(/cannot be resolved/);
-  const loop = join(config.dataDir, "review-link-loop");
-  await symlink(loop, loop);
-  await reviewSetting(config, loop);
-  const linkFailure = await runs.run(request());
-  assert.equal(linkFailure.status, "failed");
-  assert.match(linkFailure.problems.join("\n"), /ELOOP.*review-link-loop/);
-  await reviewSetting(config, config.pi.reviewExtension);
+  await refused(/Invalid managed Pi settings .*SyntaxError/, false);
+  await writeFile(settings, JSON.stringify({ delegates: { version: 1, maxParallel: 10 } }));
+  await refused(/expected the managed delegates limit, publication guard rails, setup and both required checks/);
+
+  await writeFile(settings, await readFile(config.pi.settings));
   await rm(config.pi.reviewExtension);
-  await refused(/pinned review extension is missing/, "npm ci --ignore-scripts");
+  await refused(/pinned review extension is missing.*npm ci --ignore-scripts/);
   await mkdir(config.pi.reviewExtension);
-  await refused(/pinned review extension is missing or not a file/, "npm ci --ignore-scripts");
+  await refused(/pinned review extension is missing or not a file/);
   assert.ok(!existsSync(join(config.pi.agentDir, "fake-launches.jsonl")));
   assert.deepEqual(await readdir(config.runsDir), []);
 
-  // Investigation still works without a pinned reviewer and does not need the reviewer setting.
-  await rm(settings);
+  // Investigation still works without a pinned reviewer. Legacy bytes are not a managed input or output.
   await scenario(config, [assistant(report({ pr: null, issue: null })), settled]);
   assert.equal((await (await openPiRuns(config)).run(request({ pr: false }))).status, "completed");
-});
-
-test("deploy/current selects the running release's reviewer on deploy and rollback without editing settings", async t => {
-  const config = await setup(t, true);
-  // Node does not strip TypeScript in the usual test fixture directory under node_modules.
-  const deploy = await mkdtemp(join(tmpdir(), "aipatty deploy-"));
-  t.after(() => rm(deploy, { recursive: true, force: true }));
-  const current = join(deploy, "current");
-  const old = join(deploy, "old");
-  const next = join(deploy, "new");
-  for (const release of [old, next]) {
-    await mkdir(join(release, "src"), { recursive: true });
-    await copyFile(join(checkout, "src/config.ts"), join(release, "src/config.ts"));
-    const review = join(release, reviewerEntry);
-    await mkdir(dirname(review), { recursive: true });
-    await writeFile(review, "");
-  }
-  const select = async (release: string) => {
-    await rm(current, { force: true });
-    await symlink(release, current);
-  };
-  // Use a fresh Node process as on restart, so import.meta.url comes from the actual release, not the symlink.
-  const startedThroughCurrent = async () => {
-    const { stdout } = await exec(process.execPath, ["--input-type=module", "-e", `
-      import { readConfig } from './current/src/config.ts';
-      console.log(readConfig([], {}).pi.reviewExtension);
-    `], { cwd: deploy });
-    return stdout.trim();
-  };
-  await github(config, openPr);
-  await scenario(config, [...review("c1", "r1"), assistant(report()), settled]);
-  await reviewSetting(config, join(current, reviewerEntry));
-  const settings = join(config.pi.agentDir, "settings.json");
-  const original = await readFile(settings, "utf8");
-  const start = (reviewExtension: string) => openPiRuns({ ...config, pi: { ...config.pi, reviewExtension } });
-
-  await select(old);
-  const oldReviewer = await startedThroughCurrent();
-  assert.equal(oldReviewer, await realpath(join(old, reviewerEntry)));
-  assert.equal((await (await start(oldReviewer)).run(request())).status, "completed");
-  await select(next);
-  const nextReviewer = await startedThroughCurrent();
-  assert.equal(nextReviewer, await realpath(join(next, reviewerEntry)));
-  assert.equal((await (await start(nextReviewer)).run(request())).status, "completed");
-  // A process still bound to the old release must not accept a repointed alias.
-  const stale = await (await start(oldReviewer)).run(request());
-  assert.equal(stale.status, "failed");
-  assert.match(stale.problems.join("\n"), /does not match the running release/);
-  await select(old);
-  assert.equal(await startedThroughCurrent(), oldReviewer);
-  assert.equal((await (await start(oldReviewer)).run(request())).status, "completed");
-  assert.equal(await readFile(settings, "utf8"), original);
+  assert.equal(await readFile(legacy, "utf8"), oldPolicy);
 });
 
 test("a branch reserves its Pi slot synchronously during startup, rejects same-branch calls, and reuses it after cleanup", async t => {

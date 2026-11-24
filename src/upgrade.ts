@@ -10,6 +10,8 @@ import { accessSync, closeSync, existsSync, mkdirSync, openSync, realpathSync, r
 import { join } from "node:path";
 import { readConfig, type Config } from "./config.ts";
 import { HttpError, type AgentHost } from "./host.ts";
+import { delegatesSource, piSettingsSource } from "./managed-pi/pins.ts";
+import { managedPi, readManagedDelegateSettings } from "./managed-pi/policy.ts";
 import { ownLock } from "./ownership.ts";
 import { upgradeEntryKind } from "./protocol.ts";
 import { readJson, upgradeFiles, type Pending, type Result } from "./upgrade-supervisor.ts";
@@ -79,10 +81,11 @@ export async function selfCheck(agent: AgentHost, config: Config): Promise<strin
       await branch.entries({}, 1, undefined, ctx);
     }
   });
-  const { cli, extension, reviewExtension } = config.pi;
-  for (const [what, path] of [["Pi CLI", cli], ["Delegates extension", extension], ["Review extension", reviewExtension]]) {
-    await check(what, () => accessSync(path));
-  }
+  const { cli, extension, reviewExtension, settings } = config.pi;
+  await check("Pi CLI", () => { accessSync(cli); accessSync(managedPi.bundleCli); piSettingsSource(); });
+  await check("Delegates extension", () => { accessSync(extension); delegatesSource(); });
+  await check("Review extension", () => accessSync(reviewExtension));
+  await check("Managed Pi settings", () => readManagedDelegateSettings(settings));
   return problems;
 }
 

@@ -1,13 +1,17 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
-import { readConfig } from "../src/config.ts";
+import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
+import { readConfig, type PiConfig } from "../src/config.ts";
 import { checkout } from "./helpers.ts";
+
+const exec = promisify(execFile);
 
 async function setup(t: TestContext) {
   // In production the stage is not under the release's node_modules: test real absolute/virtual resolution.
@@ -17,11 +21,12 @@ async function setup(t: TestContext) {
   await Promise.all([agentDir, cwd, home, temp].map(path => mkdir(path)));
   const pi = readConfig(["--pi-dir", agentDir], {}).pi;
   const env: NodeJS.ProcessEnv = {
-    HOME: home, TMPDIR: temp, PATH: "/usr/bin:/bin", PI_CODING_AGENT_DIR: pi.agentDir, PI_TELEMETRY: "0",
+    HOME: home, TMPDIR: temp, PATH: "/usr/bin:/bin", PI_CODING_AGENT_DIR: pi.agentDir, PI_TELEMETRY: "0", PI_OFFLINE: "1",
     PI_SKIP_VERSION_CHECK: "1", NODE_DISABLE_COMPILE_CACHE: "1", PUPPETEER_EXECUTABLE_PATH: join(dir, "missing-browser"),
+    GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0",
   };
-  const run = async (extensions: string[], model: string[], extraEnv = {}) => {
-    const child = spawn(pi.node, [pi.cli, "--offline", "--mode", "json", "--no-session", "--thinking", "off",
+  const run = async (extensions: string[], model: string[], extraEnv = {}, cli = pi.cli) => {
+    const child = spawn(pi.node, [cli, "--offline", "--mode", "json", "--no-session", "--thinking", "off",
       "--no-approve", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-mcp",
       ...extensions.flatMap(path => ["-e", path]), ...model,
     ], { cwd, env: { ...env, ...extraEnv }, signal: AbortSignal.timeout(20_000), killSignal: "SIGKILL" });
@@ -37,6 +42,21 @@ async function setup(t: TestContext) {
     return { code, stdout, stderr };
   };
   return { dir, agentDir, cwd, pi, env, run };
+}
+
+// Isolated releases as started through deploy/current. Reuse only the unchanged package pins, not the
+// managed sources, policy or reviewer. No GitHub or installation commands are used by these smokes.
+async function stage(dir: string, sha: string) {
+  const release = join(dir, "deploy", sha);
+  await mkdir(join(release, "node_modules/@earendil-works"), { recursive: true });
+  await cp(join(checkout, "src/managed-pi"), join(release, "src/managed-pi"), { recursive: true });
+  await cp(join(checkout, "src/config.ts"), join(release, "src/config.ts"));
+  for (const relative of ["node_modules/pi-delegates", "node_modules/@earendil-works/pi-coding-agent"]) {
+    await symlink(join(checkout, relative), join(release, relative));
+  }
+  const reviewer = "node_modules/@earendil-works/pi-review";
+  await cp(join(checkout, reviewer), join(release, reviewer), { recursive: true });
+  return release;
 }
 
 function events(stdout: string) {
@@ -89,12 +109,13 @@ printf '# Fixture Markdown\\n'
     apiKey: "fixture-key", models: [{ id: "search-model", name: "Local search fixture" }],
   } } }));
   await writeFile(join(agentDir, "web-search.json"), JSON.stringify({ provider: "fixture-search", model: "search-model" }));
-  await writeFile(join(cwd, "web-search.json"), JSON.stringify({ provider: "must-not-load", model: "bad" }));
+  const ambientSearch = join(cwd, "web-search.json");
+  await writeFile(ambientSearch, JSON.stringify({ provider: "must-not-load", model: "bad" }));
 
   for (const mode of ["missing extractor", "missing egress", "invalid egress", "missing Chrome", "stub Chrome"]) {
     if (mode !== "missing extractor") await writeFile(join(agentDir, "just-web-fetch.json"), JSON.stringify({ extensionsDir: checkoutHooks }));
     const result = await run([pi.extension, pi.webFetchExtension, pi.webSearchExtension, join(checkout, "test/fixtures/pi-extension-smoke.ts")],
-      ["--model", "fixture/coding"], { FIXTURE_MARKER: marker, FIXTURE_TOOLS: tools,
+      ["--model", "fixture/coding"], { FIXTURE_MARKER: marker, FIXTURE_TOOLS: tools, PI_WEB_SEARCH_CONFIG: ambientSearch,
         ...(mode !== "missing extractor" ? { PI_WEB_FETCH_TRAFILATURA: extractor } : {}),
         ...(mode !== "missing egress" ? { PI_WEB_FETCH_EGRESS_PROXY: mode === "invalid egress" ? "direct://" : "http://127.0.0.1:9" } : {}),
         ...(mode === "stub Chrome" ? { PUPPETEER_EXECUTABLE_PATH: browser, FIXTURE_CHECK_EXTRACTOR: "1",
@@ -122,8 +143,8 @@ printf '# Fixture Markdown\\n'
       else assert.match(fetch, /Browser error:/);
     }
     const search = JSON.stringify(outcomes.find(event => event.toolName === "web_search"));
-    assert.match(search, /Fixture search result/);
-    assert.match(search, /Fixture source/);
+    assert.match(search, /The current model coding .* does not support native web search/);
+    assert.match(search, /will not switch to another configured model automatically/);
     assert.ok(trace.some(event => event.type === "message_end" && event.message?.role === "assistant"
       && event.message.stopReason === "stop" && JSON.stringify(event.message.content).includes("unrelated coding turn completed")));
     await assert.rejects(readFile(marker), { code: "ENOENT" });
@@ -137,12 +158,160 @@ printf '# Fixture Markdown\\n'
   }
   // Only the explicit local extraction fixture ran; failed browser/preflight calls never start it.
   assert.equal(await readFile(extractorCalls, "utf8"), `${await realpath(agentDir)}\n`);
-  assert.equal(requests.length, 5);
-  for (const req of requests) {
-    assert.equal(req.url, "/responses");
-    assert.equal(req.authorization, "Bearer fixture-key");
-    assert.deepEqual(JSON.parse(req.body).tools, [{ type: "web_search" }]);
+  assert.deepEqual([...requests], [], "ambient settings must not redirect web search");
+
+  // Opting into a different provider in the release (rather than in shared state) still works.
+  const release = await stage(dir, "with-search-policy");
+  await writeFile(join(release, "src/managed-pi/web-search.json"), JSON.stringify({ provider: "fixture-search", model: "search-model" }));
+  const result = await run([pi.webFetchExtension, pi.webSearchExtension, join(checkout, "test/fixtures/pi-extension-smoke.ts")],
+    ["--model", "fixture/coding"], { FIXTURE_MARKER: marker, FIXTURE_TOOLS: tools, PI_WEB_SEARCH_CONFIG: ambientSearch },
+    join(release, "src/managed-pi/cli.ts"));
+  assert.equal(result.code, 0, result.stderr);
+  const search = JSON.stringify(events(result.stdout).find(event => event.type === "tool_execution_end" && event.toolName === "web_search"));
+  assert.match(search, /Fixture search result/);
+  assert.match(search, /Fixture source/);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]!.url, "/responses");
+  assert.equal(requests[0]!.authorization, "Bearer fixture-key");
+  assert.deepEqual(JSON.parse(requests[0]!.body).tools, [{ type: "web_search" }]);
+});
+
+test("bundled Pi and real delegate children use release policy through upgrade and rollback", { timeout: 60_000 }, async t => {
+  const { dir, agentDir, cwd, pi, env, run } = await setup(t);
+  const git = (...args: string[]) => exec("git", ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", ...args], { cwd, env });
+  const settings = join(agentDir, "settings.json"), auth = join(agentDir, "auth.json");
+  const jobs = join(agentDir, "delegates/jobs"), seen = new Set<string>();
+  const marker = join(dir, "ambient-executable-ran"), shell = join(dir, "ambient-shell"), extension = join(cwd, ".pi/ambient.ts");
+  await writeFile(shell, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\nexit 2\n`, { mode: 0o700 });
+  await mkdir(join(cwd, ".pi"));
+  await writeFile(extension, `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'extension ran'); export default () => {};`);
+  await writeFile(join(cwd, ".pi/settings.json"), JSON.stringify({
+    shellPath: shell, defaultProjectTrust: "always", packages: ["./.pi"], extensions: [extension],
+    delegates: { maxParallel: 32, maxThinkers: 32, reviewExtension: extension, environment: { checks: [], exemption: "checkout" } },
+  }));
+  await git("init", "--quiet", "--initial-branch=main");
+  await git("add", ".pi");
+  await git("commit", "--quiet", "-m", "fixture");
+
+  // The parent has a scripted in-process provider. Its children really spawn the bundle with only pinned
+  // delegates/codemode. A loopback provider gives those children a deterministic reply without a login.
+  const requests: Array<{ auth?: string; body: { messages: unknown[]; tools: { function: { name: string } }[] } }> = [];
+  const server = createServer(async (req, res) => {
+    req.setEncoding("utf8");
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    requests.push({ auth: req.headers.authorization, body: JSON.parse(body) });
+    const reply = { id: "fixture", model: "reply", choices: [{ index: 0, delta: { content: "Fixture child completed" }, finish_reason: "stop" }] };
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.end(`data: ${JSON.stringify(reply)}\n\ndata: [DONE]\n\n`);
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  await writeFile(join(agentDir, "models.json"), JSON.stringify({ providers: { "fixture-child": {
+    api: "openai-completions", baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    apiKey: "fixture-fallback", models: [{ id: "reply", name: "Local delegate fixture" }],
+  } } }));
+  const smoke = async (selected: PiConfig, expectedAuth: string, parallel = 10, legacyRun = false) => {
+    const result = await run([selected.extension, join(checkout, "test/fixtures/pi-delegates-smoke.ts")],
+      ["--model", "fixture/coding"], {}, selected.cli);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stderr, "");
+    const trace = events(result.stdout);
+    if (!legacyRun) {
+      const shell = trace.find(event => event.toolName === "bash" && event.type === "tool_execution_end");
+      assert.deepEqual(shell?.result?.content, [{ type: "text", text: "managed-shell" }]);
+    }
+    assert.match(JSON.stringify(trace.find(event => event.toolName === "delegate_parallel" && event.type === "tool_execution_end")), /Fixture child completed/);
+    const added = (await readdir(jobs)).filter(id => !seen.has(id));
+    assert.equal(added.length, 2);
+    for (const id of added) {
+      seen.add(id);
+      const job = JSON.parse(await readFile(join(jobs, id, "job.json"), "utf8"));
+      assert.equal(job.execution, "stopped", JSON.stringify({ profile: job.profileName, error: job.error }));
+      assert.equal(job.summary, "Fixture child completed");
+      assert.equal(job.config.maxParallel, parallel);
+      assert.equal(job.config.maxThinkers, 6);
+      assert.equal(job.config.reviewExtension, selected.reviewExtension);
+      assert.equal(job.config.profiles.crmanager.permissions, "read-only");
+      assert.equal(job.config.profiles.crmanager.workspace, "clone");
+      if (!legacyRun) {
+        const { publication, environment, extensions } = job.config;
+        assert.deepEqual(publication, { repository: "atlargelabs/aipatty", remote: "origin", baseBranch: "main", requiredChecks: [],
+          ciTimeoutMs: 600_000, allowUnpublishedBase: false });
+        assert.deepEqual(environment.setup.map((step: { command: string }) => step.command), ["npm ci --ignore-scripts"]);
+        assert.deepEqual(environment.checks.map((step: { command: string }) => step.command), ["npm run check", "npm test"]);
+        assert.deepEqual(extensions, []);
+      }
+    }
+    assert.equal(requests.length, 2);
+    const review = requests.find(req => req.body.tools.some(tool => tool.function.name === "delegate_review_diff"));
+    assert.ok(review);
+    assert.match(JSON.stringify(review.body.messages), /Delegated scope: Commit [0-9a-f]{40}/);
+    assert.deepEqual(review.body.tools.map(tool => tool.function.name).sort(), ["codemode", "delegate_review_diff", "find", "grep", "ls", "read"]);
+    assert.ok(requests.every(req => req.auth === `Bearer ${expectedAuth}`), JSON.stringify(requests.map(req => req.auth)));
+    requests.length = 0;
+  };
+
+  await smoke(pi, "fixture-fallback"); // No legacy settings or auth file.
+  await assert.rejects(readFile(settings), { code: "ENOENT" });
+  await writeFile(settings, "{}\n");
+  await smoke(pi, "fixture-fallback");
+  assert.equal(await readFile(settings, "utf8"), "{}\n");
+  const old = await stage(dir, "first"), next = await stage(dir, "next"), current = join(dir, "deploy/current");
+  const relativeReview = "node_modules/@earendil-works/pi-review/review.ts";
+  const legacy = JSON.stringify({ shellPath: shell, apiKeys: { unused: "must-not-migrate" },
+    delegates: { maxParallel: 1, reviewExtension: join(current, relativeReview), environment: { checks: [], setup: [] },
+      publication: { repository: "fixture/not-authorized", baseBranch: "other", requiredChecks: [] } } }, null, 2) + "\n";
+  await writeFile(settings, legacy);
+  await rm(auth, { force: true });
+  const select = async (release: string): Promise<PiConfig> => {
+    await rm(current, { force: true });
+    await symlink(release, current);
+    const { stdout } = await exec(pi.node, ["--input-type=module", "-e", `
+      import { readConfig } from ${JSON.stringify(pathToFileURL(join(current, "src/config.ts")).href)};
+      console.log(JSON.stringify(readConfig(["--pi-dir", ${JSON.stringify(agentDir)}], {}).pi));
+    `], { env });
+    const selected = JSON.parse(stdout) as PiConfig;
+    assert.equal(selected.reviewExtension, join(await realpath(release), relativeReview));
+    assert.equal(selected.agentDir, agentDir);
+    return selected;
+  };
+  const first = await select(old);
+  await smoke(first, "fixture-fallback"); // apiKeys migration must not consume or rewrite the old settings.
+  const cleanAuth = await readFile(auth, "utf8").catch(error => {
+    if (error.code !== "ENOENT") throw error;
+    return "{}";
+  });
+  assert.deepEqual(JSON.parse(cleanAuth), {});
+  assert.equal(await readFile(settings, "utf8"), legacy);
+
+  const fixtureAuth = '{ "fixture-child": {"type":"api_key", "key":"fixture-shared-state"} }\n';
+  await writeFile(auth, fixtureAuth);
+  await smoke(await select(next), "fixture-shared-state");
+  await smoke(first, "fixture-shared-state"); // Repointing current doesn't change an already selected release.
+  await smoke(await select(old), "fixture-shared-state");
+  assert.equal(await readFile(settings, "utf8"), legacy);
+  assert.equal(await readFile(auth, "utf8"), fixtureAuth);
+  await assert.rejects(readFile(marker), { code: "ENOENT" });
+
+  // The raw CLI (as used by standalone Pi and older releases) still reads the retained legacy settings.
+  await smoke({ ...first, cli: join(old, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"),
+    extension: join(old, "node_modules/pi-delegates/src/index.ts"), reviewExtension: join(current, relativeReview) },
+    "fixture-shared-state", 1, true);
+  assert.equal(await readFile(settings, "utf8"), legacy);
+  assert.equal(await readFile(auth, "utf8"), fixtureAuth);
+
+  const incomplete = await stage(dir, "bad-settings");
+  const broken = await select(incomplete);
+  await rm(broken.settings);
+  for (const reason of [/ENOENT/, /expected the managed delegates limit/]) {
+    const result = await run([broken.extension], ["--model", "fixture/coding"], {}, broken.cli);
+    assert.equal(result.code, 1, result.stdout);
+    assert.match(result.stderr, /Invalid managed Pi settings at .*bad-settings/);
+    assert.match(result.stderr, reason);
+    await writeFile(broken.settings, '{"delegates":{"version":1,"maxParallel":10}}');
   }
+  assert.equal((await readdir(jobs)).length, seen.size);
 });
 
 test("bundled Pi discovers and selects an explicit Claude Code model using only a stub executable", { timeout: 30_000 }, async t => {

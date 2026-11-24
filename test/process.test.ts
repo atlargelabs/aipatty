@@ -280,8 +280,9 @@ test("legacy server settings and AIPATTY_FAUX as the only environment setting", 
   // A run uses this release's own pinned CLI and extensions by absolute path, never ones found on PATH.
   assert.deepEqual(pi, {
     node: process.execPath,
-    cli: join(checkout, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"),
-    extension: join(checkout, "node_modules/pi-delegates/src/index.ts"),
+    cli: join(checkout, "src/managed-pi/cli.ts"),
+    extension: join(checkout, "src/managed-pi/delegates.ts"),
+    settings: join(checkout, "src/managed-pi/settings.json"),
     webFetchExtension: join(checkout, "src/extensions/just-web-fetch.ts"),
     webSearchExtension: join(checkout, "node_modules/pi-web-search/src/index.ts"),
     claudeCodeExtension: join(checkout, "src/extensions/claude-code.ts"),
@@ -289,7 +290,7 @@ test("legacy server settings and AIPATTY_FAUX as the only environment setting", 
     agentDir: join(homedir(), ".pi/agent"),
     repo: "atlargelabs/aipatty", repoUrl: "git@github.com:atlargelabs/aipatty.git", git: "git", gh: "gh",
   });
-  for (const entry of [pi.cli, pi.extension, pi.webFetchExtension, pi.webSearchExtension, pi.claudeCodeExtension, pi.reviewExtension]) {
+  for (const entry of [pi.cli, pi.extension, pi.settings, pi.webFetchExtension, pi.webSearchExtension, pi.claudeCodeExtension, pi.reviewExtension]) {
     assert.ok(existsSync(entry), `missing pinned entry: ${entry}`);
   }
   const dirs = readConfig(["--pi-dir", "~/elsewhere", "--work-dir", "~/w", "--runs-dir=/tmp/r"], {});

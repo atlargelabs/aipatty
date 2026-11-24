@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { managedPi, release, repo } from "./managed-pi/policy.ts";
 
 /** Server settings. */
 export interface Config {
@@ -25,17 +25,18 @@ export interface Config {
 export interface PiConfig {
   /** The Node binary that runs this server. */
   node: string;
-  /** The pinned Pi CLI of this release. */
+  /** The managed entry for this release's pinned Pi CLI. */
   cli: string;
-  /** The pinned delegates extension of this release. */
+  /** The managed delegates entry and its release policy file. */
   extension: string;
+  settings: string;
   /** Top-level only: the managed just-web-fetch adapter, pinned pi-web-search, and opt-in Claude Code adapter. */
   webFetchExtension: string;
   webSearchExtension: string;
   claudeCodeExtension: string;
   /** The pinned pi-review entry point of this release, loaded only by crmanager. */
   reviewExtension: string;
-  /** The Pi agent directory the CLI shares with the server: sign-in, model cache, delegates settings and jobs. */
+  /** The Pi agent directory the CLI shares with the server: sign-in, model cache and delegate jobs. */
   agentDir: string;
   /** The only repository a run may work on, and the URL it is cloned from with the service account's access. */
   repo: string;
@@ -47,9 +48,6 @@ export interface PiConfig {
   /** How long to wait before asking GitHub again for a PR's linked issues; the tests shorten it. */
   retryMs?: number;
 }
-
-/** The checkout this server runs from. */
-const release = fileURLToPath(new URL("../", import.meta.url));
 
 /** The only address the server listens on. Other machines reach it through an SSH port forward. */
 export const LOOPBACK = "127.0.0.1";
@@ -120,15 +118,16 @@ export function readConfig(args: readonly string[] = process.argv.slice(2), env:
     runsDir: absolutePath(values["runs-dir"] ?? (root === undefined ? "~/.aipatty/runs" : join(root, "runs"))),
     pi: {
       node: process.execPath,
-      cli: join(release, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"),
-      extension: join(release, "node_modules/pi-delegates/src/index.ts"),
+      cli: managedPi.cli,
+      extension: managedPi.extension,
+      settings: managedPi.settings,
       webFetchExtension: join(release, "src/extensions/just-web-fetch.ts"),
       webSearchExtension: join(release, "node_modules/pi-web-search/src/index.ts"),
       claudeCodeExtension: join(release, "src/extensions/claude-code.ts"),
-      reviewExtension: join(release, "node_modules/@earendil-works/pi-review/review.ts"),
+      reviewExtension: managedPi.reviewExtension,
       agentDir: piDir,
-      repo: "atlargelabs/aipatty",
-      repoUrl: "git@github.com:atlargelabs/aipatty.git",
+      repo,
+      repoUrl: `git@github.com:${repo}.git`,
       git: "git",
       gh: "gh",
     },
