@@ -507,7 +507,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         let job: JobManifest | undefined;
         if (file) try {
           const type = await file.stat();
-          if (!type.isFile() || type.nlink !== 1) throw new Error("not an independent regular manifest");
+          // Another branch can atomically replace the path after open; this descriptor still has its complete snapshot.
+          if (!type.isFile() || type.nlink > 1) throw new Error("not an independent regular manifest");
           job = JSON.parse(await file.readFile("utf8"));
         } finally {
           await file.close();
