@@ -113,11 +113,16 @@ The pane shows its status and elapsed time when known, recent tool starts and fi
 Pi stderr, and the final result. It links only to PRs and issues the host confirmed, and shows the confirmed PR head
 and reviewed SHA **at the time of the run**, not current GitHub state.
 
-Use **Refresh** for a new snapshot while Pi runs; there is no live terminal, automatic following, or input to Pi.
-Refused requests have no run. A completed run's result remains readable after its clone is deleted if its archive
-is retained. Output depends on the available logs and is a bounded excerpt, not a complete transcript. It can
-contain sensitive information printed by the run. Anyone allowed to reach aipatty, including through Tailscale
-Serve if enabled, can read these archives.
+The pane opens at the bottom and checks for new output about every 1.5 seconds while the run is active. Scroll
+up to freeze the excerpt you're reading, even as newer output replaces older lines on the server. The status can
+still change while the excerpt is frozen. Scroll back to the bottom or use **Jump to latest** to show the newest
+snapshot and resume following. The pane stops checking when it receives a final snapshot or you close it or
+switch branches. This is a read-only viewer, not a terminal: you can't send input to Pi from it.
+
+Refused requests have no run. A finished run opens at the bottom too and remains readable after its clone is
+deleted if its archive is retained. Output depends on the available logs and is a bounded excerpt, not a complete
+transcript. It can contain sensitive information printed by the run. Anyone allowed to reach aipatty, including
+through Tailscale Serve if enabled, can read these archives.
 
 ## Install
 
