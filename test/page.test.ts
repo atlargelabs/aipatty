@@ -368,8 +368,17 @@ test("the Pi run pane follows snapshots, freezes while reading, and stops watchi
     (await tx.doc(LiveDoc, root.id)).tools = [{ name: "pi", callId: "current", status: "running", details: { runId: first } }];
   }, ctx);
   await next();
-  await reply(snapshot(["first output"]));
-  await atLatest("first output 39");
+  const initialSnapshot = snapshot(["first output"]);
+  await reply({ ...initialSnapshot, durationMs: 1000 });
+  const initial = await atLatest("first output 39");
+  await browser.viewport(1100, 470);
+  assert.ok((await atLatest("first output 39")).top > initial.top);
+  await browser.evaluate(`window.logBeforeTick = document.querySelector('#pi-run-data pre');
+    window.statusBeforeTick = document.querySelector('#pi-run-message').firstChild`);
+  await next();
+  await reply({ ...initialSnapshot, durationMs: 2500 });
+  await atLatest("running · 0m 2s");
+  assert.equal(await browser.evaluate("window.logBeforeTick.isConnected && window.statusBeforeTick.isConnected"), true);
   await next();
   await reply(snapshot(["first output", "appended output"]));
   await atLatest("appended output 39");
@@ -385,7 +394,10 @@ test("the Pi run pane follows snapshots, freezes while reading, and stops watchi
   await next();
   assert.deepEqual(await pane(), reading);
   assert.equal(await browser.evaluate("window.reading.isConnected"), true);
-  await browser.evaluate(`const view = document.querySelector('#pi-run-view'); view.scrollTop = view.scrollHeight`);
+  await browser.evaluate(`{
+    const view = document.querySelector('#pi-run-view');
+    view.scrollTop = view.scrollHeight - view.clientHeight - 2;
+  }`);
   const resumed = await atLatest("latest tail 39");
   assert.doesNotMatch(resumed.text, /superseded tail|first output/);
   assert.match(resumed.text, /Activity truncated/);

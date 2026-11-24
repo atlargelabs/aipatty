@@ -54,7 +54,7 @@ export const pageHtml = `<!doctype html>
     </div>
     <div id="pi-run-view" tabindex="0" aria-label="Run details">
       <p id="pi-run-task" hidden></p>
-      <p id="pi-run-message" role="status"></p>
+      <p><span id="pi-run-message" role="status"></span><span id="pi-run-elapsed"></span></p>
       <div id="pi-run-data"></div>
     </div>
   </aside>
@@ -232,9 +232,11 @@ function resolveRun(source) {
 }
 
 let openedRun;
+const runPane = $("pi-run");
 const runView = $("pi-run-view");
 const runJump = $("pi-run-jump");
 const runPollMs = 1500;
+const runBottomTolerance = 4;
 const narrowPane = matchMedia("(max-width: 900px)");
 function syncPane() {
   const inert = !!openedRun && narrowPane.matches;
@@ -262,18 +264,19 @@ function keepChatPlace(change) {
 function stopRunWatch() {
   if (!openedRun) return;
   clearTimeout(openedRun.timer);
-  openedRun.controller.abort();
+  openedRun.cancelRequest?.();
   openedRun = undefined;
 }
 
 function openRun(button, source) {
   const alreadyOpen = !!openedRun;
   stopRunWatch();
-  openedRun = { button, source, controller: new AbortController() };
-  if (!alreadyOpen) keepChatPlace(() => { $("pi-run").hidden = false; });
+  openedRun = { button, source, elapsed: "" };
+  if (!alreadyOpen) keepChatPlace(() => { runPane.hidden = false; });
   $("pi-run-task").textContent = source.title || "";
   $("pi-run-task").hidden = !source.title;
   $("pi-run-data").replaceChildren();
+  setText($("pi-run-elapsed"), "");
   runJump.hidden = true;
   runView.scrollTop = 0;
   syncPane();
@@ -285,7 +288,7 @@ function closeRun(restoreFocus = true) {
   if (!openedRun) return;
   const { button } = openedRun;
   stopRunWatch();
-  keepChatPlace(() => { $("pi-run").hidden = true; });
+  keepChatPlace(() => { runPane.hidden = true; });
   $("pi-run-data").replaceChildren();
   syncPane();
   if (restoreFocus && button.isConnected) button.focus({ preventScroll: true });
@@ -310,14 +313,19 @@ function resolveOpenedRun() {
 
 async function pollRun(open, active) {
   const { id, durationMs } = open.run;
-  const signal = AbortSignal.any([open.controller.signal, AbortSignal.timeout(10000)]);
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), 10000);
+  open.cancelRequest = () => {
+    clearTimeout(deadline);
+    controller.abort();
+  };
   try {
-    const snapshot = await api(piRunApiPath + id, { signal });
+    const snapshot = await api(piRunApiPath + id, { signal: controller.signal });
     if (openedRun !== open) return;
     const status = snapshot.status.replaceAll("_", " ");
     const ms = snapshot.durationMs ?? durationMs;
-    const elapsed = ms === undefined ? "" : " · " + Math.floor(ms / 60000) + "m " + Math.floor(ms / 1000) % 60 + "s";
-    open.message = snapshot.runId + " · " + status + elapsed;
+    open.elapsed = ms === undefined ? "" : " · " + Math.floor(ms / 60000) + "m " + Math.floor(ms / 1000) % 60 + "s";
+    open.message = snapshot.runId + " · " + status;
     open.latest = snapshot;
     open.logKey = JSON.stringify([snapshot.result, snapshot.activity, snapshot.stderr]);
     active = snapshot.status === "running";
@@ -327,6 +335,10 @@ async function pollRun(open, active) {
     active = active && error.status !== 404;
     open.message = (open.latest ? "Could not refresh run " : "Could not open run ") + id + ": " + error.message
       + (active ? " Retrying…" : "");
+    open.elapsed = "";
+  } finally {
+    clearTimeout(deadline);
+    open.cancelRequest = undefined;
   }
   syncRunScroll();
   // Wait for the entire response before scheduling the next fetch.
@@ -337,22 +349,35 @@ function syncRunScroll(jump = false) {
   const open = openedRun;
   if (!open) return;
   // Read the actual position before touching the DOM. A scroll event may still be queued.
-  const following = jump || open.shownLogKey === undefined
-    || runView.scrollHeight - runView.clientHeight - runView.scrollTop <= 4;
+  const bottom = runView.scrollHeight - runView.clientHeight;
+  const near = runView.scrollTop + runBottomTolerance;
+  const { clientWidth: width, clientHeight: height } = runPane;
+  // Resizing can move the bottom without scrolling. Follow if we're still at the old bottom.
+  const resizedAtBottom = (width !== open.width || height !== open.height) && near >= open.bottom;
+  const following = jump || open.shownLogKey === undefined || near >= bottom || resizedAtBottom;
+  open.width = width;
+  open.height = height;
+  open.bottom = bottom;
   const restoreFocus = following && document.activeElement === runJump;
   runJump.hidden = following;
   if (!following) return;
 
   const message = $("pi-run-message");
+  const elapsed = $("pi-run-elapsed");
   const statusChanged = open.message !== undefined && message.textContent !== open.message;
+  const elapsedChanged = elapsed.textContent !== open.elapsed;
   if (statusChanged) setText(message, open.message);
+  if (elapsedChanged) setText(elapsed, open.elapsed);
   const logChanged = open.logKey !== open.shownLogKey;
   // Leave the log nodes alone if only the elapsed time changed, or while the reader is away from the bottom.
   if (logChanged) {
     renderRun(open.latest);
     open.shownLogKey = open.logKey;
   }
-  if (jump || statusChanged || logChanged) runView.scrollTop = runView.scrollHeight;
+  if (jump || resizedAtBottom || statusChanged || elapsedChanged || logChanged) {
+    runView.scrollTop = runView.scrollHeight;
+    open.bottom = runView.scrollHeight - runView.clientHeight;
+  }
   if (restoreFocus) runView.focus({ preventScroll: true });
 }
 
@@ -409,6 +434,7 @@ function renderRun(snapshot) {
 
 narrowPane.addEventListener("change", syncPane);
 runView.addEventListener("scroll", () => syncRunScroll());
+new ResizeObserver(() => syncRunScroll()).observe(runPane);
 runJump.addEventListener("click", () => syncRunScroll(true));
 $("pi-run-close").addEventListener("click", () => closeRun());
 document.addEventListener("keydown", event => {
