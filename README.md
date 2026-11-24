@@ -111,8 +111,9 @@ and reviewed SHA **at the time of the run**, not current GitHub state.
 
 Use **Refresh** for a new snapshot while Pi runs; there is no live terminal, automatic following, or input to Pi.
 Refused requests have no run. A completed run's result remains readable after its clone is deleted if its archive
-is retained. Output depends on the available logs and is a bounded excerpt, not a complete transcript. It can contain sensitive
-information printed by the run, so treat the pane like the rest of the loopback/SSH-only API.
+is retained. Output depends on the available logs and is a bounded excerpt, not a complete transcript. It can
+contain sensitive information printed by the run. Anyone allowed to reach aipatty, including through Tailscale
+Serve if enabled, can read these archives.
 
 ## Install
 

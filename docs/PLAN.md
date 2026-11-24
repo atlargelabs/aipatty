@@ -9,7 +9,7 @@ conversation.
 | Area | Decision |
 | --- | --- |
 | Base | A small host of our own on the `@earendil-works/pi-durable` library. Not p2 or p3; p2's plugins are reference code only. |
-| Remote access | HTTP and WebSocket on loopback only, one crude web page, and a CLI client. The laptop reaches them through an SSH port forward; the phone's route is not settled (see [Remote access](#remote-access)). No notifications. |
+| Remote access | HTTP and WebSocket listen on loopback only. SSH forwarding serves the CLI or browser; optional Tailscale Serve gives the phone and laptop a private browser URL (see [Remote access](#remote-access)). No notifications. |
 | Merging | Only Steve merges PRs in `atlargelabs/aipatty`. |
 | Upgrade | Explicit, never automatic: Steve sends `/upgrade`. If rollback also fails, Steve uses SSH or remote desktop. |
 | GitHub identity | The `pattycaik` account with write access, behind a ruleset on `main`. Other repos only when Steve directs it. |
@@ -255,8 +255,8 @@ from a release that predates `/upgrade`, which is one more manual deploy. See
    end-to-end test with `/upgrade` and verify the originating branch reports the new SHA. The tests cover a release
    that fails its health check, where the old release and conversation come back with the failure reported. This
    is the self-upgrade milestone.
-5. **After self-upgrade:** phone access, MCP configuration and OAuth, the per-branch switch, and Gmail. Add research
-   mode, concurrent runs, hooks, or more repos only when needed.
+5. **After self-upgrade:** MCP configuration and OAuth, the per-branch switch, and Gmail. Add research mode,
+   concurrent runs, hooks, or more repos only when needed.
 
 ## Setup responsibilities
 
