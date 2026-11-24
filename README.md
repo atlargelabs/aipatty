@@ -65,10 +65,11 @@ in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits fo
   counted from the start of the clone), stops Pi and the processes it started, its delegates included. The result
   reports what the run had done. Once Pi has finished and the host is checking the result, the run ends as it
   ended. Stopping one branch does not stop another's run.
-- **Cleanup.** Every run's events, error output, prompt and result are kept in `logs/runs/<run-id>/` in the data
-  directory, with the logs of its delegate jobs. The workspace and the delegates' clones are deleted. Logs can
-  hold private data. The host saves the result there and indexes it by the tool's task under `pi-outcomes/`
-  before clearing the run's checkpoint in `pi-runs/<run-id>.json`.
+- **Cleanup.** New runs write events, error output and prompts to `logs/runs/<run-id>/` in the data directory.
+  Delegates write their logs there too, directly under `delegates/<job-id>/` while they run. Cleanup keeps the
+  final job manifests there and deletes the run workspace and delegate clones. Logs can hold private data.
+  The host archives the result and indexes it by task under `pi-outcomes/` before clearing the run's
+  checkpoint in `pi-runs/<run-id>.json`.
 - **Restart.** Runs do not survive the server. On the next start, before conversations resume, the server
   independently stops and cleans up interrupted runs and reports each call as `interrupted` in its own branch,
   with any known PR link. It never runs the calls again; an already settled run keeps its result.

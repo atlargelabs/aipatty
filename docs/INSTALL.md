@@ -55,8 +55,9 @@ ROOT="$HOME/aipatty"
    PI_CODING_AGENT_DIR="$ROOT/pi" node "$ROOT/deploy/current/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js" auth login openai
    ```
 
-4. **`delegates` settings**, in `$ROOT/pi/settings.json`. Its jobs and clones live under `$ROOT/pi/delegates/jobs/`.
-   Checkout settings are not read, so the checks live here. The release's `npm ci` installs the pinned
+4. **`delegates` settings**, in `$ROOT/pi/settings.json`. Job state and clones live under `$ROOT/pi/delegates/jobs/`.
+   New Aipatty runs write delegate logs directly to `$ROOT/data/logs/runs/<run-id>/delegates/<job-id>/`
+   (under `--data-dir` if overridden). No settings change is needed for log placement. Checkout settings are not read, so the checks live here. The release's `npm ci` installs the pinned
    `pi-review`; do not run `pi install` or add it to Pi's `packages` settings. For `reviewExtension`, use the
    actual absolute value of `$ROOT/deploy/current/node_modules/@earendil-works/pi-review/review.ts`, with the
    `current` component intact. The example assumes `ROOT=/Users/aipatty/aipatty`; JSON does not expand `$ROOT`
@@ -266,6 +267,7 @@ Use the **actual configured data directory** for these checks: usually `$ROOT/da
 | `pi-runs/<run-id>.json` | Pending run checkpoint, from startup through cleanup; contains the branch, task and process ownership evidence. |
 | `pi-run.json` | Pending checkpoint from a singleton release. The new release reads and recovers it in place; do not copy or rename it into `pi-runs/`. |
 | `logs/runs/<run-id>/result.json` | Primary settled result and usage, archived before the checkpoint is cleared. `reconciled.json`, if present, is an intermediate cleanup checkpoint, not a terminal result. |
+| `logs/runs/<run-id>/delegates/<job-id>/` | Live delegate diagnostics and, after cleanup, the final job manifest. Old interrupted runs still recover logs from their job directories without removing the originals. |
 | `pi-outcomes/<task-id>.json` | Pointer from a durable task to its run's archive. The old shared `pi-outcomes.json` is still read for older calls. |
 
 For a same-root first deploy, let all branches finish (or abort their runs and wait for cleanup and the tool
