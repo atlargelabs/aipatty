@@ -231,7 +231,7 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
     const button = [...document.querySelectorAll('.assistant .pi-call')].find(button => button.textContent.includes(${JSON.stringify(label)}));
     button.click();
   })()`);
-  const paneText = () => browser.evaluate<string>(`document.querySelector('#pi-run-view').textContent`);
+  const paneText = () => browser.evaluate<string>(`document.querySelector('#pi-run').textContent`);
   const shows = async (text: string) => {
     try { return await until(paneText, value => value.includes(text)); }
     catch { assert.fail(`Expected ${text} in the pane; found ${await paneText()}; errors: ${browser.errors.join(", ")}`); }
@@ -353,6 +353,7 @@ test("the Pi run pane follows snapshots, freezes while reading, and stops watchi
       bottom: view.scrollHeight - view.clientHeight - view.scrollTop < 2,
       jump: !document.querySelector('#pi-run-jump').hidden };
   })()`);
+  const banner = () => browser.evaluate<string>(`document.querySelector('#pi-run > .run-status').textContent`);
   const atLatest = (text: string) => until(pane, value => value.text.includes(text) && value.top > 0 && value.bottom && !value.jump);
   const click = (selector: string) => browser.evaluate(`document.querySelector(${JSON.stringify(selector)}).click()`);
   const pause = async () => {
@@ -361,7 +362,7 @@ test("the Pi run pane follows snapshots, freezes while reading, and stops watchi
   };
 
   await click(".assistant .pi-call");
-  assert.match((await pane()).text, /Waiting for this call/);
+  assert.match(await banner(), /Waiting for this call/);
   assert.deepEqual(await requests(), []);
   assert.equal(await browser.evaluate(`[...document.querySelectorAll('#pi-run button')].some(button => button.textContent === 'Refresh')`), false);
   await root.commit(async tx => {
@@ -377,7 +378,7 @@ test("the Pi run pane follows snapshots, freezes while reading, and stops watchi
     window.statusBeforeTick = document.querySelector('#pi-run-message').firstChild`);
   await next();
   await reply({ ...initialSnapshot, durationMs: 2500 });
-  await atLatest("running · 0m 2s");
+  await until(banner, text => text.includes("running · 0m 2s"));
   assert.equal(await browser.evaluate("window.logBeforeTick.isConnected && window.statusBeforeTick.isConnected"), true);
   await next();
   await reply(snapshot(["first output", "appended output"]));
@@ -390,6 +391,8 @@ test("the Pi run pane follows snapshots, freezes while reading, and stops watchi
   await next();
   await reply({ error: "Temporary failure" }, 503);
   await next();
+  assert.match(await banner(), /Retrying/);
+  assert.deepEqual(await pane(), reading);
   await reply(snapshot(["latest tail"], { truncated: true }));
   await next();
   assert.deepEqual(await pane(), reading);
@@ -407,12 +410,13 @@ test("the Pi run pane follows snapshots, freezes while reading, and stops watchi
   await sleep(1800);
   assert.equal((await requests()).length, count);
   await reply(snapshot(["final tail"], { status: "completed" }));
+  await until(banner, text => text.includes("completed"));
   await sleep(1800);
   assert.equal((await requests()).length, count);
   assert.deepEqual(await pane(), beforeCompletion);
   await browser.evaluate(`document.querySelector('#pi-run-jump').focus()`);
   await browser.key("Enter");
-  assert.match((await atLatest("final tail 39")).text, /completed/);
+  await atLatest("final tail 39");
   assert.equal(await browser.evaluate(`document.activeElement.id`), "pi-run-view");
 
   const stale = count;

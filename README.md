@@ -114,10 +114,10 @@ Pi stderr, and the final result. It links only to PRs and issues the host confir
 and reviewed SHA **at the time of the run**, not current GitHub state.
 
 The pane opens at the bottom and checks for new output about every 1.5 seconds while the run is active. Scroll
-up to freeze the excerpt you're reading, even as newer output replaces older lines on the server. Scroll back to
-the bottom or use **Jump to latest** to show the newest snapshot and resume following. The pane stops checking
-when it receives a final snapshot or you close it or switch branches. This is a read-only viewer, not a terminal:
-you can't send input to Pi from it.
+up to freeze the excerpt you're reading, even as newer output replaces older lines on the server. The status can
+still change while the excerpt is frozen. Scroll back to the bottom or use **Jump to latest** to show the newest
+snapshot and resume following. The pane stops checking when it receives a final snapshot or you close it or
+switch branches. This is a read-only viewer, not a terminal: you can't send input to Pi from it.
 
 Refused requests have no run. A finished run opens at the bottom too and remains readable after its clone is
 deleted if its archive is retained. Output depends on the available logs and is a bounded excerpt, not a complete

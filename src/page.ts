@@ -52,9 +52,9 @@ export const pageHtml = `<!doctype html>
       <button id="pi-run-jump" type="button" aria-controls="pi-run-view" hidden>Jump to latest</button>
       <button id="pi-run-close" type="button" aria-label="Close Pi run">Close</button>
     </div>
+    <p class="run-status"><span id="pi-run-message" role="status"></span><span id="pi-run-elapsed"></span></p>
     <div id="pi-run-view" tabindex="0" aria-label="Run details">
       <p id="pi-run-task" hidden></p>
-      <p><span id="pi-run-message" role="status"></span><span id="pi-run-elapsed"></span></p>
       <div id="pi-run-data"></div>
     </div>
   </aside>
@@ -100,6 +100,7 @@ button { font: inherit; padding: .3rem .7rem; }
 .run-controls { display: flex; align-items: center; gap: .5rem; padding: .5rem .8rem; border-bottom: 1px solid #ddd; }
 .run-controls h2 { flex: 1; font-size: 1rem; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #pi-run-jump { white-space: nowrap; }
+.run-status { flex: none; height: calc(2.9em + .4rem); margin: 0; padding: .2rem .8rem; overflow: auto; overflow-wrap: anywhere; }
 #pi-run-view { overflow: auto; padding: .5rem .8rem; overflow-wrap: anywhere; }
 #pi-run-view h3 { font-size: .95rem; margin-bottom: .35rem; }
 #pi-run-view p { white-space: pre-wrap; }
@@ -271,12 +272,11 @@ function stopRunWatch() {
 function openRun(button, source) {
   const alreadyOpen = !!openedRun;
   stopRunWatch();
-  openedRun = { button, source, elapsed: "" };
+  openedRun = { button, source };
   if (!alreadyOpen) keepChatPlace(() => { runPane.hidden = false; });
   $("pi-run-task").textContent = source.title || "";
   $("pi-run-task").hidden = !source.title;
   $("pi-run-data").replaceChildren();
-  setText($("pi-run-elapsed"), "");
   runJump.hidden = true;
   runView.scrollTop = 0;
   syncPane();
@@ -294,20 +294,28 @@ function closeRun(restoreFocus = true) {
   if (restoreFocus && button.isConnected) button.focus({ preventScroll: true });
 }
 
+// Reserve space outside the log for polling status so it stays visible without shifting the reading position.
+function setRunStatus(text, elapsed = "", detail = "") {
+  const message = $("pi-run-message");
+  setText(message, text);
+  if (message.title !== detail) message.title = detail;
+  setText($("pi-run-elapsed"), elapsed);
+}
+
 function resolveOpenedRun() {
   const open = openedRun;
   if (!open || open.run) return;
   const run = resolveRun(open.source);
   if (!run.id) {
     if (run.settled) open.run = run;
-    setText($("pi-run-message"), run.settled ? "This request did not start a Pi run. See the tool result in chat."
+    setRunStatus(run.settled ? "This request did not start a Pi run. See the tool result in chat."
       : run.pending ? "Waiting for this call to start a Pi run…"
       : "No Pi run record is available for this call.");
     return;
   }
   // Stay on this exact ID even if the live slot disappears or the transcript resyncs.
   open.run = run;
-  setText($("pi-run-message"), "Loading Pi run…");
+  setRunStatus("Loading Pi run…");
   void pollRun(open, run.pending);
 }
 
@@ -324,8 +332,8 @@ async function pollRun(open, active) {
     if (openedRun !== open) return;
     const status = snapshot.status.replaceAll("_", " ");
     const ms = snapshot.durationMs ?? durationMs;
-    open.elapsed = ms === undefined ? "" : " · " + Math.floor(ms / 60000) + "m " + Math.floor(ms / 1000) % 60 + "s";
-    open.message = snapshot.runId + " · " + status;
+    const elapsed = ms === undefined ? "" : " · " + Math.floor(ms / 60000) + "m " + Math.floor(ms / 1000) % 60 + "s";
+    setRunStatus(snapshot.runId + " · " + status, elapsed);
     open.latest = snapshot;
     open.logKey = JSON.stringify([snapshot.result, snapshot.activity, snapshot.stderr]);
     active = snapshot.status === "running";
@@ -333,9 +341,10 @@ async function pollRun(open, active) {
     if (openedRun !== open) return;
     // The host writes the archive before releasing the active slot; 404 means there is no run to follow.
     active = active && error.status !== 404;
-    open.message = (open.latest ? "Could not refresh run " : "Could not open run ") + id + ": " + error.message
-      + (active ? " Retrying…" : "");
-    open.elapsed = "";
+    const detail = (open.latest ? "Could not refresh run " : "Could not open run ") + id + ": " + error.message;
+    if (!open.latest) setText($("pi-run-data"), detail);
+    setRunStatus(active ? "Could not get new output. Retrying…"
+      : open.latest ? "Run unavailable. Updates stopped." : "Could not open Pi run.", "", detail);
   } finally {
     clearTimeout(deadline);
     open.cancelRequest = undefined;
@@ -362,19 +371,13 @@ function syncRunScroll(jump = false) {
   runJump.hidden = following;
   if (!following) return;
 
-  const message = $("pi-run-message");
-  const elapsed = $("pi-run-elapsed");
-  const statusChanged = open.message !== undefined && message.textContent !== open.message;
-  const elapsedChanged = elapsed.textContent !== open.elapsed;
-  if (statusChanged) setText(message, open.message);
-  if (elapsedChanged) setText(elapsed, open.elapsed);
   const logChanged = open.logKey !== open.shownLogKey;
   // Leave the log nodes alone if only the elapsed time changed, or while the reader is away from the bottom.
   if (logChanged) {
     renderRun(open.latest);
     open.shownLogKey = open.logKey;
   }
-  if (jump || resizedAtBottom || statusChanged || elapsedChanged || logChanged) {
+  if (jump || resizedAtBottom || logChanged) {
     runView.scrollTop = runView.scrollHeight;
     open.bottom = runView.scrollHeight - runView.clientHeight;
   }
