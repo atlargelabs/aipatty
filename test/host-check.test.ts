@@ -7,25 +7,25 @@ import { startApi } from "../src/api.ts";
 import { openHost } from "../src/host.ts";
 import { fixture, fauxConfig } from "./helpers.ts";
 
+function probes(base: string) {
+  const http = (headers: Record<string, string>) => new Promise<number | undefined>((resolve, reject) => {
+    get(`http://${base}/health`, { headers }, res => { res.resume(); resolve(res.statusCode); }).on("error", reject);
+  });
+  const stream = (headers: Record<string, string>) => new Promise<number | undefined>((resolve, reject) => {
+    const ws = new WebSocket(`ws://${base}/api/conversations/root/stream`, { headers });
+    ws.once("error", reject);
+    ws.once("open", () => { resolve(101); ws.close(); });
+    ws.once("unexpected-response", (req, res) => { resolve(res.statusCode); req.destroy(); });
+  });
+  return [[http, 200], [stream, 101]] as const;
+}
+
 test("HTTP and WS require a loopback name and the listener port, and a same-origin Origin if there is one", async t => {
   const agent = await openHost(fauxConfig(await fixture(t)));
   const api = await startApi(agent, { ok: true, startedAt: "now", version: "test", commit: "test" }, 0);
   t.after(async () => { await api.close(); await agent.harness.close(ctx); });
   const base = `127.0.0.1:${api.port}`;
-  function http(headers: Record<string, string>) {
-    return new Promise<number | undefined>((resolve, reject) => {
-      get(`http://${base}/health`, { headers }, res => { res.resume(); resolve(res.statusCode); }).on("error", reject);
-    });
-  }
-  function stream(headers: Record<string, string>) {
-    return new Promise<number | undefined>((resolve, reject) => {
-      const ws = new WebSocket(`ws://${base}/api/conversations/root/stream`, { headers });
-      ws.once("error", reject);
-      ws.once("open", () => { resolve(101); ws.close(); });
-      ws.once("unexpected-response", (req, res) => { resolve(res.statusCode); req.destroy(); });
-    });
-  }
-  for (const [probe, ok] of [[http, 200], [stream, 101]] as const) {
+  for (const [probe, ok] of probes(base)) {
     const name = `localhost:${api.port}`;
     assert.equal(await probe({ Host: base }), ok);
     assert.equal(await probe({ Host: base, Origin: `http://${base}` }), ok);
@@ -40,12 +40,24 @@ test("HTTP and WS require a loopback name and the listener port, and a same-orig
     assert.equal(await probe({ Host: base, Origin: "http://other.test" }), 403);
     assert.equal(await probe({ Host: name, Origin: `http://${base}` }), 403);
     assert.equal(await probe({ Host: base, Origin: `https://${base}` }), 403);
+    assert.equal(await probe({ Host: "mini.example.ts.net", Origin: "https://mini.example.ts.net" }), 403);
   }
 });
 
-test("the server listens on loopback only", async t => {
+test("a configured Serve origin works for HTTP and WS without changing the loopback listener", async t => {
   const agent = await openHost(fauxConfig(await fixture(t)));
-  const api = await startApi(agent, { ok: true, startedAt: "now", version: "test", commit: "test" }, 0);
+  const host = "mini.example.ts.net", tailscaleOrigin = `https://${host}`;
+  const api = await startApi(agent, { ok: true, startedAt: "now", version: "test", commit: "test" }, 0, { tailscaleOrigin });
   t.after(async () => { await api.close(); await agent.harness.close(ctx); });
   assert.deepEqual(api.address, { address: "127.0.0.1", family: "IPv4", port: api.port });
+  const base = `127.0.0.1:${api.port}`;
+  for (const [probe, ok] of probes(base)) {
+    assert.equal(await probe({ Host: base, Origin: `http://${base}` }), ok);
+    assert.equal(await probe({ Host: host }), ok);
+    assert.equal(await probe({ Host: host, Origin: tailscaleOrigin }), ok);
+    assert.equal(await probe({ Host: host, Origin: `http://${host}` }), 403);
+    assert.equal(await probe({ Host: host, Origin: `http://${base}` }), 403);
+    assert.equal(await probe({ Host: base, Origin: tailscaleOrigin }), 403);
+    assert.equal(await probe({ Host: "other.example.ts.net", Origin: tailscaleOrigin, "X-Forwarded-Host": host }), 403);
+  }
 });

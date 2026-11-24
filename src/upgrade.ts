@@ -137,6 +137,7 @@ export function upgradeRequest(agent: AgentHost, config: Config, release: string
         const child = spawn(process.execPath, [
           join(release, "src/upgrade-supervisor.ts"), "start",
           "--install-dir", root, "--port", String(port()), "--branch", String(conversation.id),
+          ...(config.tailscaleOrigin ? ["--tailscale-origin", config.tailscaleOrigin] : []),
         ], { detached: true, stdio: ["ignore", log, log] });
         await once(child, "spawn");
         // The supervisor ends while this server still runs only when it did not get as far as stopping it.

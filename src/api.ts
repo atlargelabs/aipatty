@@ -37,15 +37,16 @@ function errorResponse(error: unknown): { status: number; message: string } {
 const loopbackNames = [LOOPBACK, "localhost"];
 
 /**
- * The request's URL, once its Host names this listener and its Origin, if any, is the same origin. A page on another
- * site that points its own name at this address, or sends a cross-site request, fails one of the two.
+ * The request's URL, once its Host names this listener or the configured Tailscale Serve endpoint, and its Origin,
+ * if any, matches. Serve preserves Host when proxying to a TCP port; no forwarded headers are trusted.
  */
-function requestUrl(req: IncomingMessage): URL {
+function requestUrl(req: IncomingMessage, tailscale?: URL): URL {
   const authority = req.headers.host?.toLowerCase();
   const port = req.socket.localPort;
   const name = loopbackNames.find(n => authority === `${n}:${port}` || (port === 80 && authority === n));
-  if (!name || req.headersDistinct.host?.length !== 1) throw new HttpError(403, "Untrusted Host");
-  const origin = `http://${name}${port === 80 ? "" : `:${port}`}`;
+  const origin = name ? `http://${name}${port === 80 ? "" : `:${port}`}`
+    : tailscale && authority === tailscale.host ? tailscale.origin : undefined;
+  if (!origin || req.headersDistinct.host?.length !== 1) throw new HttpError(403, "Untrusted Host");
   const origins = req.headersDistinct.origin;
   if (origins && (origins.length !== 1 || origins[0] !== origin)) {
     throw new HttpError(403, "Origin is not same-origin");
@@ -118,9 +119,9 @@ function requireMethod(req: IncomingMessage, res: ServerResponse, method: string
 
 async function handleHttp(
   agent: AgentHost, health: Health, req: IncomingMessage, res: ServerResponse,
-  shutdown?: (res: ServerResponse) => void, upgrade?: (conversation: Conversation) => Promise<void>,
+  tailscale?: URL, shutdown?: (res: ServerResponse) => void, upgrade?: (conversation: Conversation) => Promise<void>,
 ) {
-  const { pathname, searchParams } = requestUrl(req);
+  const { pathname, searchParams } = requestUrl(req, tailscale);
   if (pathname === "/api/shutdown" && shutdown) {
     requireMethod(req, res, "POST");
     const marker = req.headersDistinct[shutdownHeader];
@@ -327,8 +328,9 @@ async function stream(socket: WebSocket, streams: Streams, conversation: Convers
 
 async function handleUpgrade(
   agent: AgentHost, wss: WebSocketServer, streams: Streams, req: IncomingMessage, socket: Duplex, head: Buffer,
+  tailscale?: URL,
 ) {
-  const { pathname, searchParams } = requestUrl(req);
+  const { pathname, searchParams } = requestUrl(req, tailscale);
   const route = /^\/api\/conversations\/([^/]+)\/stream$/.exec(pathname);
   if (!route) throw new HttpError(404, "Not found");
   const conversation = await agent.conversation(route[1]);
@@ -367,8 +369,9 @@ export interface Health {
  * not linger.
  */
 export async function startApi(agent: AgentHost, health: Health, port: number, {
-  heartbeatMs = defaultHeartbeatMs, onShutdown, onUpgrade,
-}: { heartbeatMs?: number; onShutdown?: () => void; onUpgrade?: (conversation: Conversation) => Promise<void> } = {}) {
+  heartbeatMs = defaultHeartbeatMs, tailscaleOrigin, onShutdown, onUpgrade,
+}: { heartbeatMs?: number; tailscaleOrigin?: string; onShutdown?: () => void; onUpgrade?: (conversation: Conversation) => Promise<void> } = {}) {
+  const tailscale = tailscaleOrigin === undefined ? undefined : new URL(tailscaleOrigin);
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 });
   const streams: Streams = { controllers: new Set(), alive: new WeakSet() };
   const heartbeat = setInterval(() => {
@@ -394,7 +397,7 @@ export async function startApi(agent: AgentHost, health: Health, port: number, {
     sendJson(res, 202, { status: "shutdown-requested" });
   });
   const server = createServer({ requestTimeout: 30_000, headersTimeout: 10_000 }, (req, res) => {
-    void handleHttp(agent, health, req, res, shutdown, onUpgrade).catch(error => {
+    void handleHttp(agent, health, req, res, tailscale, shutdown, onUpgrade).catch(error => {
       if (res.destroyed) return;
       const { status, message } = errorResponse(error);
       if (!req.complete) res.shouldKeepAlive = false;
@@ -406,7 +409,7 @@ export async function startApi(agent: AgentHost, health: Health, port: number, {
     const onError = () => socket.destroy();
     socket.on("error", onError);
     upgrading.add(socket);
-    void handleUpgrade(agent, wss, streams, req, socket, head).catch(error => {
+    void handleUpgrade(agent, wss, streams, req, socket, head, tailscale).catch(error => {
       if (socket.destroyed) return;
       const { status, message } = errorResponse(error);
       const body = JSON.stringify({ error: message });

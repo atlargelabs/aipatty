@@ -50,6 +50,19 @@ test("each explicit path overrides just its root-derived default, regardless of 
   }
 });
 
+test("the Tailscale option accepts one HTTPS origin, not a URL with credentials, a path, or a wildcard", () => {
+  const origin = "https://mini.example.ts.net";
+  assert.equal(readConfig([], {}).tailscaleOrigin, undefined);
+  for (const input of [origin, origin + "/", origin + ":8443"]) {
+    assert.equal(readConfig(["--tailscale-origin", input], {}).tailscaleOrigin, new URL(input).origin);
+  }
+  for (const input of ["", origin.replace("https:", "http:"), origin + "/chat", origin + "/?x", origin + "/#x",
+    "https://user@mini.example.ts.net", "https://*.example.ts.net", "https://mini.example.ts.net.evil.test"]) {
+    // The URL parser accepts wildcard-looking hosts, but Serve URLs are single DNS names.
+    assert.throws(() => readConfig(["--tailscale-origin", input], {}), /--tailscale-origin must be the HTTPS origin/);
+  }
+});
+
 test("install root requires a nonblank path and does not introduce an environment setting", () => {
   for (const value of ["", " ", "\t\n"]) {
     assert.throws(() => readConfig(["--install-dir", value], {}), /--install-dir needs a path/);

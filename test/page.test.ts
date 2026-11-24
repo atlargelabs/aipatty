@@ -60,6 +60,7 @@ async function openBrowser(t: TestContext, flags: string[] = []) {
   let nextId = 0;
   const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   const errors: string[] = [];
+  const loaded = new Set<string>();
   socket.onmessage = event => {
     const message = JSON.parse(String(event.data));
     if (message.id !== undefined) {
@@ -67,6 +68,8 @@ async function openBrowser(t: TestContext, flags: string[] = []) {
       pending.delete(message.id);
       if (message.error) waiter?.reject(new Error(message.error.message));
       else waiter?.resolve(message.result);
+    } else if (message.method === "Page.lifecycleEvent" && message.params.name === "load") {
+      loaded.add(message.params.loaderId);
     } else if (message.method === "Runtime.exceptionThrown") {
       const details = message.params.exceptionDetails;
       errors.push(details.exception?.description ?? details.text);
@@ -88,10 +91,16 @@ async function openBrowser(t: TestContext, flags: string[] = []) {
   };
   await send("Runtime.enable");
   await send("Page.enable");
+  await send("Page.setLifecycleEventsEnabled", { enabled: true });
   return {
     errors,
     evaluate,
-    navigate: (url: string) => send("Page.navigate", { url }),
+    async navigate(url: string) {
+      const { loaderId, errorText } = await send("Page.navigate", { url }) as { loaderId?: string; errorText?: string };
+      if (errorText) throw new Error(`Could not navigate to ${url}: ${errorText}`);
+      // The command can return before the new document is ready. A same-document navigation has no new loader.
+      if (loaderId) await until(() => loaded.has(loaderId));
+    },
     viewport: (width: number, height: number) => send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false }),
     async key(key: "Enter" | "Escape", modifiers = 0) {
       const params = { key, code: key, windowsVirtualKeyCode: key === "Enter" ? 13 : 27, modifiers };
@@ -118,8 +127,8 @@ async function waitFor(browser: Awaited<ReturnType<typeof openBrowser>>, what: s
   let last: Shown | undefined;
   try {
     return await until(async () => (last = await browser.evaluate<Shown>(shown)), done);
-  } catch {
-    assert.fail(`The page never showed ${what}. It showed ${JSON.stringify(last)}; script errors: ${JSON.stringify(browser.errors)}`);
+  } catch (error) {
+    throw new Error(`The page never showed ${what}. It showed ${JSON.stringify(last)}; script errors: ${JSON.stringify(browser.errors)}`, { cause: error });
   }
 }
 
