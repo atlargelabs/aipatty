@@ -2,7 +2,7 @@
 // `fake-scenario.json` in the agent directory, and records how it was launched in `fake-launches.jsonl` there.
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 const agentDir = process.env.PI_CODING_AGENT_DIR;
@@ -33,12 +33,15 @@ for (const step of scenario.steps ?? []) {
   }
   if (step.job) {
     const dir = join(agentDir, "delegates", "jobs", step.job.id);
+    const rules = process.argv[process.argv.indexOf("--append-system-prompt") + 1];
+    const logDir = join(dirname(rules), "delegates", step.job.id);
+    mkdirSync(logDir, { recursive: true, mode: 0o700 });
     mkdirSync(join(dir, "workspace", "src"), { recursive: true });
     writeFileSync(join(dir, "workspace", "src", "file.ts"), "clone");
-    writeFileSync(join(dir, "child-1.log"), "delegate log");
+    writeFileSync(join(logDir, "child-1.log"), step.job.log ?? "delegate log");
     writeFileSync(join(dir, "lease.json"), JSON.stringify({ pid: process.pid }));
-    writeFileSync(join(dir, "job.json"), JSON.stringify({
-      id: step.job.id, ownerSession: step.job.session ?? sessionId, parentId: step.job.parentId,
+    writeFileSync(join(dir, "job.json"), step.job.damaged ? "{ damaged" : JSON.stringify({
+      id: step.job.id, logDir, ownerSession: step.job.session ?? sessionId, parentId: step.job.parentId,
       startedAt: step.job.startedAt, finishedAt: step.job.finishedAt,
       usage: step.job.usage ?? { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: step.job.cost ?? 0, turns: 1 },
       workspace: { kind: "clone", path: join(dir, "workspace"), source: step.job.source ?? process.cwd() },

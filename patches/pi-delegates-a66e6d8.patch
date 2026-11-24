@@ -1,0 +1,322 @@
+diff --git a/src/aipatty-log-file.ts b/src/aipatty-log-file.ts
+new file mode 100644
+index 0000000..7565a2d
+--- /dev/null
++++ b/src/aipatty-log-file.ts
+@@ -0,0 +1,24 @@
++import * as fs from "node:fs";
++import { dirname } from "node:path";
++
++/** Managed log paths are canonical. Reject links and special files, including during continuation. */
++export function openLog(file: string, append = false): number {
++	const dir = dirname(file);
++	if (fs.realpathSync(dir) !== dir) throw new Error("Refusing a linked delegate log directory");
++	const { O_CREAT, O_WRONLY, O_APPEND, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
++	const fd = fs.openSync(file, O_CREAT | O_WRONLY | O_NOFOLLOW | O_NONBLOCK | (append ? O_APPEND : 0), 0o600);
++	try {
++		const stat = fs.fstatSync(fd);
++		if (!stat.isFile() || stat.nlink !== 1) throw new Error("Not an independent regular log file");
++		if (!append) fs.ftruncateSync(fd);
++		return fd;
++	} catch (error) {
++		fs.closeSync(fd);
++		throw error;
++	}
++}
++
++export function writeLog(file: string, text: string): void {
++	const fd = openLog(file);
++	try { fs.writeFileSync(fd, text); } finally { fs.closeSync(fd); }
++}
+diff --git a/src/delivery/verification.ts b/src/delivery/verification.ts
+index 2014fd4..f42c4bd 100644
+--- a/src/delivery/verification.ts
++++ b/src/delivery/verification.ts
+@@ -9,6 +9,7 @@ export const policyHash = (job: Job): string =>
+ export async function verify(
+ 	job: Job,
+ 	runtime: Runtime,
++	stateDir: string,
+ 	signal: AbortSignal,
+ 	save: () => void,
+ ): Promise<Verification> {
+@@ -21,7 +22,7 @@ export async function verify(
+ 			throw new Error(
+ 				"No verification policy configured. Set environment.checks or an explicit exemption reason.",
+ 			);
+-		const before = await candidateTree(runtime, job.workspace.path, job.logDir, signal);
++		const before = await candidateTree(runtime, job.workspace.path, stateDir, signal);
+ 		for (const [i, check] of checks.entries()) {
+ 			const log = path.join(job.logDir, `verify-${Date.now()}-${i}.log`);
+ 			const r = await runtime.execute({
+@@ -35,7 +36,7 @@ export async function verify(
+ 			v.checks.push({ name: check.name, code: r.interrupted ? 124 : r.code, log });
+ 			save();
+ 		}
+-		const after = await candidateTree(runtime, job.workspace.path, job.logDir, signal);
++		const after = await candidateTree(runtime, job.workspace.path, stateDir, signal);
+ 		v.fingerprint = after;
+ 		v.policyHash = policyHash(job);
+ 		v.status = before !== after ? "stale" : v.checks.some((c) => c.code !== 0) ? "failed" : "passed";
+diff --git a/src/delivery/workflow.ts b/src/delivery/workflow.ts
+index 98af6df..3154c74 100644
+--- a/src/delivery/workflow.ts
++++ b/src/delivery/workflow.ts
+@@ -1,4 +1,4 @@
+-import * as fs from "node:fs";
++import { writeLog } from "../aipatty-log-file.ts";
+ import * as path from "node:path";
+ import type { Delivery, Job } from "../types.ts";
+ import type { Runtime } from "../runtime/interface.ts";
+@@ -30,6 +30,7 @@ export function validateSubmission(input: unknown): Submission {
+ export async function submit(
+ 	job: Job,
+ 	runtime: Runtime,
++	stateDir: string,
+ 	input: Submission,
+ 	signal: AbortSignal,
+ 	save: () => void,
+@@ -49,7 +50,7 @@ export async function submit(
+ 			job.config.publication?.remote ?? "origin",
+ 			signal,
+ 		);
+-		const tree = await candidateTree(runtime, job.workspace.path, job.logDir, signal);
++		const tree = await candidateTree(runtime, job.workspace.path, stateDir, signal);
+ 		const scope = job.config.environment.allowedPaths;
+ 		if (scope) {
+ 			const changed = (
+@@ -126,7 +127,7 @@ export async function submit(
+ 			d.treeSha = tree;
+ 			save();
+ 		}
+-		if (d.treeSha !== tree || (await candidateTree(runtime, job.workspace.path, job.logDir, signal)) !== tree)
++		if (d.treeSha !== tree || (await candidateTree(runtime, job.workspace.path, stateDir, signal)) !== tree)
+ 			throw new Error("Candidate changed during finalization; verify again");
+ 		delete d.error;
+ 		if (job.profile.delivery === "candidate") {
+@@ -164,7 +165,7 @@ export async function submit(
+ 			`Candidate: ${d.commitSha}`,
+ 		].join("\n");
+ 		const file = path.join(job.logDir, "pr-body.md");
+-		fs.writeFileSync(file, body, { mode: 0o600 });
++		writeLog(file, body);
+ 		d.prUrl = await ensurePr(job, runtime, s.summary.split(/\r?\n/)[0].trim().slice(0, 120), file, signal);
+ 		d.status = "pr-open";
+ 		save();
+diff --git a/src/index.ts b/src/index.ts
+index 0856bae..5abbdd5 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -6,6 +6,7 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil
+ import { Type } from "typebox";
+ import { loadConfig, migrateSettings, readSettings, resolveConfig } from "./config.ts";
+ import { Coordinator } from "./runner.ts";
++import { logRoot } from "./aipatty-run.ts";
+ import { reviewPrompt } from "./review-bridge.ts";
+ import { request } from "./control.ts";
+ import { PARENT_GUIDANCE } from "./profiles.ts";
+@@ -176,6 +177,7 @@ export default function delegates(pi: ExtensionAPI) {
+ 		currentContext = ctx;
+ 		return (coordinator ??= new Coordinator({
+ 			agentDir,
++			logRoot,
+ 			extensionPath: fileURLToPath(import.meta.url),
+ 			sessionId: ctx.sessionManager.getSessionId(),
+ 			piCommand: invocationCommand(),
+diff --git a/src/review.ts b/src/review.ts
+index ec39a1d..b7f3b0b 100644
+--- a/src/review.ts
++++ b/src/review.ts
+@@ -41,7 +41,7 @@ async function reviewGit(runtime: Runtime, cwd: string, args: string[], signal:
+ const patchFlags = ["--no-ext-diff", "--no-textconv", "--no-color"];
+ 
+ /** Recreate the index and working diff in the clone, without running git add in the source. */
+-async function snapshot(runtime: Runtime, workspace: Workspace, logDir: string, signal: AbortSignal): Promise<void> {
++async function snapshot(runtime: Runtime, workspace: Workspace, signal: AbortSignal): Promise<void> {
+ 	const { source, path: clone } = workspace;
+ 	const head = await git(runtime, source, ["rev-parse", "HEAD"], signal);
+ 	if (head !== workspace.baseSha) throw new Error("Source HEAD changed before the uncommitted review snapshot");
+@@ -57,8 +57,9 @@ async function snapshot(runtime: Runtime, workspace: Workspace, logDir: string,
+ 	const untracked = (await capture(["ls-files", "-z", "--others", "--exclude-standard"])).split("\0").filter(Boolean);
+ 	for (const [name, patch, flags] of [["staged", staged, ["--index"]], ["unstaged", unstaged, []]] as const) {
+ 		if (!patch) continue;
+-		const file = path.join(logDir, `review-${name}.patch`);
+-		fs.writeFileSync(file, patch, { mode: 0o600 });
++		// This is a git apply input, not a diagnostic. The disposable clone owns it.
++		const file = path.join(clone, ".git", `review-${name}.patch`);
++		fs.writeFileSync(file, patch, { mode: 0o600, flag: "wx" });
+ 		try {
+ 			await git(runtime, clone, ["apply", "--whitespace=nowarn", ...flags, "--", file], signal);
+ 		} finally {
+@@ -99,7 +100,7 @@ export function pullRequest(ref: string, remoteUrl?: string): { number: string;
+ 	return { number, repo };
+ }
+ 
+-export async function prepareReview(runtime: Runtime, request: ReviewRequest, workspace: Workspace, logDir: string, signal: AbortSignal): Promise<PreparedReview> {
++export async function prepareReview(runtime: Runtime, request: ReviewRequest, workspace: Workspace, signal: AbortSignal): Promise<PreparedReview> {
+ 	const { kind, focus } = request;
+ 	const clone = workspace.path;
+ 	const localCommit = async (ref: string) => {
+@@ -118,7 +119,7 @@ export async function prepareReview(runtime: Runtime, request: ReviewRequest, wo
+ 		delete workspace.branch;
+ 	};
+ 	if (kind === "uncommitted") {
+-		await snapshot(runtime, workspace, logDir, signal);
++		await snapshot(runtime, workspace, signal);
+ 		return { kind, focus, args: "uncommitted", scope: `Uncommitted snapshot from ${workspace.baseSha}` };
+ 	}
+ 	if (kind === "commit") {
+diff --git a/src/runner.ts b/src/runner.ts
+index 6045899..33f5f74 100644
+--- a/src/runner.ts
++++ b/src/runner.ts
+@@ -4,6 +4,7 @@ import { randomBytes, randomUUID } from "node:crypto";
+ import { ControlServer } from "./control.ts";
+ import { validateInvocation } from "./config.ts";
+ import { JobStore, isActive } from "./jobs.ts";
++import { writeLog } from "./aipatty-log-file.ts";
+ import { allowedTools, profilePrompt } from "./profiles.ts";
+ import { createRuntime, truncate } from "./runtime/host.ts";
+ import type { Runtime } from "./runtime/interface.ts";
+@@ -32,6 +33,7 @@ interface Owner {
+ }
+ export interface CoordinatorOptions {
+ 	agentDir: string;
++	logRoot: string;
+ 	extensionPath: string;
+ 	sessionId: string;
+ 	piCommand: { executable: string; args: string[] };
+@@ -84,6 +86,17 @@ export class Coordinator {
+ 		this.options = options;
+ 		this.store = new JobStore(options.agentDir);
+ 	}
++	private logDir(id: string, previous?: Job): string {
++		const root = this.options.logRoot;
++		if (!/^[a-f0-9-]{36}$/.test(id) || !path.isAbsolute(root) || fs.realpathSync(root) !== root)
++			throw new Error("Invalid Aipatty delegate log path");
++		const dir = path.join(root, id);
++		if (previous) {
++			if (previous.logDir !== dir || !fs.lstatSync(dir).isDirectory())
++				throw new Error("Continuation does not have a log directory in this Aipatty run");
++		} else fs.mkdirSync(dir, { mode: 0o700 });
++		return dir;
++	}
+ 	private start(): Promise<void> {
+ 		return (this.starting ??= this.server.start(async (r, signal) => {
+ 			const running = this.active.get(r.jobId);
+@@ -140,11 +153,11 @@ export class Coordinator {
+ 							job.config.publication?.remote ?? "origin",
+ 							combined,
+ 						);
+-						return verify(job, running.runtime, combined, () => this.save(job));
++						return verify(job, running.runtime, this.store.dir(job.id), combined, () => this.save(job));
+ 					});
+ 				case "submit":
+ 					return this.exclusive(job, () =>
+-						submit(job, running.runtime, validateSubmission(r.args), combined, () => this.save(job)),
++						submit(job, running.runtime, this.store.dir(job.id), validateSubmission(r.args), combined, () => this.save(job)),
+ 					);
+ 				default:
+ 					throw new Error("Unknown delegate control operation");
+@@ -373,6 +386,7 @@ export class Coordinator {
+ 					fs.realpathSync(job.workspace.source) !== (await this.workspaceKey(runtime, cwd))
+ 				)
+ 					throw new Error("Continuation workspace/source identity mismatch");
++				job.logDir = this.logDir(id, job);
+ 				job.profile = profile;
+ 				job.invocation = invocation;
+ 				job.execution = "preparing";
+@@ -386,9 +400,10 @@ export class Coordinator {
+ 				job.delivery.status = "not-requested";
+ 				job.ownerSession = this.options.sessionId;
+ 			} else {
+-				const dir = this.store.createDir(id);
+-				release = this.store.claim(id);
+ 				const key = await this.workspaceKey(runtime, cwd);
++				const logDir = this.logDir(id);
++				this.store.createDir(id);
++				release = this.store.claim(id);
+ 				job = {
+ 					version: 1,
+ 					id,
+@@ -406,7 +421,7 @@ export class Coordinator {
+ 					verification: { status: "not-run", checks: [] },
+ 					delivery: { status: "not-requested" },
+ 					submissions: 0,
+-					logDir: dir,
++					logDir,
+ 				};
+ 			}
+ 		} catch (error) {
+@@ -461,7 +476,7 @@ export class Coordinator {
+ 				job.workspace = await createClone(
+ 					runtime,
+ 					reviewRequest ? { ...base, subdir: "" } : base,
+-					job.logDir,
++					this.store.dir(id),
+ 					id,
+ 					invocation.name,
+ 					reviewRequest ? "origin" : config.publication?.remote ?? "origin",
+@@ -469,12 +484,12 @@ export class Coordinator {
+ 				);
+ 				this.save(job);
+ 				if (reviewRequest && reviewExtension) {
+-					const prepared = await prepareReview(runtime, reviewRequest, job.workspace, job.logDir, combined);
++					const prepared = await prepareReview(runtime, reviewRequest, job.workspace, combined);
+ 					if (job.workspace.excludedDirtyChanges) prepared.scope += "; uncommitted caller changes excluded";
+ 					running.review = { ...prepared, extension: reviewExtension };
+ 					this.save(job);
+ 				} else {
+-					const before = await candidateTree(runtime, job.workspace.path, job.logDir, combined);
++					const before = await candidateTree(runtime, job.workspace.path, this.store.dir(id), combined);
+ 					for (const [i, setup] of config.environment.setup.entries()) {
+ 						const r = await runtime.execute({
+ 							executable: "/bin/sh",
+@@ -486,7 +501,7 @@ export class Coordinator {
+ 						});
+ 						if (r.code || r.interrupted) throw new Error(`Setup ${setup.name} failed; see job logs`);
+ 					}
+-					if ((await candidateTree(runtime, job.workspace.path, job.logDir, combined)) !== before)
++					if ((await candidateTree(runtime, job.workspace.path, this.store.dir(id), combined)) !== before)
+ 						throw new Error(
+ 							"Setup changed candidate source files; inspect the retained workspace before continuation",
+ 						);
+@@ -499,7 +514,7 @@ export class Coordinator {
+ 				reserved = true;
+ 			}
+ 			const promptFile = path.join(job.logDir, "prompt.md");
+-			fs.writeFileSync(promptFile, profilePrompt(profile, config), { mode: 0o600 });
++			writeLog(promptFile, profilePrompt(profile, config));
+ 			const bootstrap: Bootstrap = {
+ 				version: 1,
+ 				socket: this.server.socket,
+@@ -612,7 +627,7 @@ export class Coordinator {
+ 					combined,
+ 				);
+ 				if (
+-					(await candidateTree(runtime, job.workspace.path, job.logDir, combined)) !== job.delivery.treeSha
++					(await candidateTree(runtime, job.workspace.path, this.store.dir(id), combined)) !== job.delivery.treeSha
+ 				) {
+ 					job.delivery.status = "blocked";
+ 					throw new Error("Candidate changed after submission");
+diff --git a/src/runtime/host.ts b/src/runtime/host.ts
+index 9f92b4b..e8ebf8a 100644
+--- a/src/runtime/host.ts
++++ b/src/runtime/host.ts
+@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
+ import { StringDecoder } from "node:string_decoder";
+ import * as fs from "node:fs";
+ import type { Command, CommandResult, Runtime } from "./interface.ts";
++import { openLog } from "../aipatty-log-file.ts";
+ 
+ export function truncate(text: string, bytes: number): string {
+ 	const buffer = Buffer.from(text);
+@@ -35,7 +36,7 @@ export class HostRuntime implements Runtime {
+ 		c.signal?.throwIfAborted();
+ 		if (process.platform === "win32")
+ 			throw new Error("Host runtime currently supports macOS/Linux process-group supervision only");
+-		const log = c.log ? fs.openSync(c.log, "a", 0o600) : undefined;
++		const log = c.log ? openLog(c.log, true) : undefined;
+ 		return await new Promise((resolve, reject) => {
+ 			let stdout = "",
+ 				stderr = "",

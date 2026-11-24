@@ -2,7 +2,7 @@ import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -45,7 +45,7 @@ async function setup(t: TestContext, installRoot = false): Promise<Config> {
   return {
     ...config,
     pi: {
-      ...config.pi, cli: join(checkout, "test/fixtures/fake-pi.mjs"), extension: join(dir, "pinned-delegates/index.ts"), reviewExtension,
+      ...config.pi, cli: join(checkout, "test/fixtures/fake-pi.mjs"), reviewExtension,
       repoUrl: origin, gh: join(checkout, "test/fixtures/fake-gh.mjs"), pollMs: 50, retryMs: 10,
     },
   };
@@ -117,6 +117,7 @@ const spawned = async (config: Config) => (await readFile(join(config.pi.agentDi
   .trim().split("\n").filter(Boolean).map(Number);
 
 const explicitExtensions = (argv: string[]) => argv.filter((_, index) => ["-e", "--extension"].includes(argv[index - 1]));
+const stagedDelegates = (cwd: string) => join(dirname(cwd), "managed-delegates/src/index.ts");
 
 test("an install-root run forwards its Pi directory and loads only the pinned coding extensions in a disposable clone", async t => {
   const config = await setup(t, true);
@@ -137,7 +138,7 @@ test("an install-root run forwards its Pi directory and loads only the pinned co
   assert.equal(more.length, 0);
   const { argv } = launch;
   assert.deepEqual(argv.slice(0, 8), ["--mode", "json", "--no-session", "--model", "openai/gpt-6.2-astra", "--thinking", "low", "--no-approve"]);
-  assert.deepEqual(explicitExtensions(argv), [config.pi.extension, config.pi.webFetchExtension, config.pi.webSearchExtension]);
+  assert.deepEqual(explicitExtensions(argv), [stagedDelegates(launch.cwd), config.pi.webFetchExtension, config.pi.webSearchExtension]);
   assert.ok(!argv.includes("--provider"));
   for (const flag of ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-mcp"]) {
     assert.ok(argv.includes(flag), flag);
@@ -174,7 +175,7 @@ test("only an explicit Claude Code request adds the Claude provider and constrai
   const outcome = await (await openPiRuns(config)).run(request({ pr: false, model: "claude-code/fixture-sonnet" }));
   assert.equal(outcome.status, "completed", JSON.stringify(outcome));
   const [launch] = await launches(config);
-  assert.deepEqual(explicitExtensions(launch.argv), [config.pi.extension, config.pi.webFetchExtension, config.pi.webSearchExtension,
+  assert.deepEqual(explicitExtensions(launch.argv), [stagedDelegates(launch.cwd), config.pi.webFetchExtension, config.pi.webSearchExtension,
     config.pi.claudeCodeExtension]);
   assert.equal(launch.argv[launch.argv.indexOf("--provider") + 1], "claude-code");
   assert.equal(launch.argv[launch.argv.indexOf("--model") + 1], "fixture-sonnet");
@@ -553,11 +554,113 @@ test("a branch reserves its Pi slot synchronously during startup, rejects same-b
   assert.equal((await runs.run(request({ conversationId: 3, taskId: 103, pr: false }))).status, "completed");
 });
 
+test("pinned Pi writes live nested, verification, continuation and review logs directly to the run archive", { timeout: 60_000 }, async t => {
+  const config = await setup(t);
+  const { cli, reviewExtension } = readConfig([], {}).pi;
+  // Keep the coordinator's Unix socket path below the macOS limit.
+  const home = await mkdtemp("/tmp/aipatty-pi-");
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const launcher = join(home, "pi.mjs");
+  const faux = join(checkout, "test/fixtures/pi-delegate-logs-smoke.ts");
+  // The actual CLI and delegate protocol run in both parent and child. The wrapper adds the offline provider
+  // to the isolated review child only; normal children load it as a trusted test extension.
+  await writeFile(launcher, `
+    if (process.argv.at(-1) === "/delegates-review") process.argv.splice(-2, 0, "-e", ${JSON.stringify(faux)});
+    await import(${JSON.stringify(cli)});`);
+  Object.assign(config.pi, { cli: launcher, webFetchExtension: faux, reviewExtension });
+  const finish = join(home, "finish-check");
+  const settings = JSON.stringify({ delegates: {
+    reviewExtension,
+    profiles: {
+      prmanager: { model: "fixture/coding", delivery: "candidate" },
+      thinker: { model: "fixture/coding" }, crmanager: { model: "fixture/coding" },
+    },
+    extensions: [{ path: faux, readOnly: true, tools: [] }],
+    environment: {
+      setup: [{ name: "fixture", command: "printf 'setup fixture\\n'" }],
+      checks: [{ name: "fixture", command: `printf 'verification fixture\\n'; head -c 131072 /dev/zero; while [ ! -e '${finish}' ]; do sleep 0.05; done` }],
+    },
+  } });
+  await writeFile(join(config.pi.agentDir, "settings.json"), settings);
+  const script = `
+    import { openPiRuns } from ${JSON.stringify(join(checkout, "src/pi-run.ts"))};
+    const runs = await openPiRuns(${JSON.stringify(config)});
+    const outcome = await runs.run(${JSON.stringify(request({ pr: false, model: "fixture/coding", thinking: "off", timeoutMs: 40_000 }))});
+    console.log(JSON.stringify(outcome));`;
+  const running = exec(process.execPath, ["--input-type=module", "-e", script], {
+    env: { HOME: home, PATH: "/usr/bin:/bin", TMPDIR: home, PI_OFFLINE: "1", NODE_DISABLE_COMPILE_CACHE: "1" },
+    timeout: 50_000,
+  });
+  const logs = join(config.dataDir, "logs/runs"), jobs = join(config.pi.agentDir, "delegates/jobs");
+  let ended: string | undefined;
+  void running.then(({ stdout, stderr }) => { ended = `${stdout}\n${stderr}`; }, error => { ended = String(error); });
+  const list = (dir: string) => readdir(dir).catch(error => {
+    if (error.code !== "ENOENT") throw error;
+    return [];
+  });
+  const observe = async () => {
+    if (ended !== undefined) throw new Error(`The run ended before live logs were observed: ${ended}`);
+    const [runId] = await list(logs);
+    if (!runId) return;
+    const archive = join(logs, runId, "delegates");
+    for (const id of await list(archive)) {
+      const jobLogs = join(archive, id);
+      const verify = (await readdir(jobLogs)).find(name => name.startsWith("verify-"));
+      if (verify && (await stat(join(jobLogs, verify))).size >= 131072) return { id, archive, jobLogs, verify };
+    }
+  };
+  let live: Awaited<ReturnType<typeof observe>>;
+  try {
+    live = await until(observe, Boolean, 25_000);
+    assert.ok(live);
+    const { id, archive, jobLogs, verify } = live;
+    assert.equal(await readFile(join(jobLogs, "setup-0.log"), "utf8"), "setup fixture\n");
+    assert.ok((await readFile(join(jobLogs, verify))).subarray(0, 20).toString().startsWith("verification fixture"));
+    assert.equal((await stat(jobLogs)).mode & 0o777, 0o700);
+    assert.equal((await stat(join(jobLogs, verify))).mode & 0o777, 0o600);
+    assert.deepEqual((await readdir(join(jobs, id))).sort(), ["job.json", "lease.json", "workspace", "workspace-owner.json"]);
+    assert.ok(!existsSync(join(jobLogs, "job.json")), "the archive is not the JobStore");
+    const research = (await readdir(archive)).filter(dir => dir !== id);
+    assert.equal(research.length, 2);
+    for (const child of research) {
+      assert.ok((await readdir(join(archive, child))).some(name => name.startsWith("child-")));
+      assert.deepEqual(await readdir(join(jobs, child)), ["job.json"]);
+    }
+  } finally {
+    await writeFile(finish, "go");
+    await running.catch(() => {});
+  }
+  const { id, archive, jobLogs, verify } = live;
+  const { stdout } = await running;
+  const outcome = JSON.parse(stdout) as RunOutcome;
+  assert.equal(outcome.status, "completed", JSON.stringify(outcome));
+  assert.equal(outcome.usageComplete, true, JSON.stringify(outcome));
+  assert.equal(await readFile(join(config.pi.agentDir, "settings.json"), "utf8"), settings);
+  assert.deepEqual(await readdir(config.runsDir), []);
+  assert.deepEqual(await pendingRecords(config), []);
+  const files = await readdir(jobLogs);
+  assert.equal(files.filter(name => name.startsWith("child-")).length, 2, "the continuation keeps the job's attempt logs");
+  assert.ok(files.includes(verify));
+  const manifests = await Promise.all((await readdir(archive)).map(async jobId => {
+    const saved = JSON.parse(await readFile(join(archive, jobId, "job.json"), "utf8"));
+    assert.equal(saved.id, jobId);
+    assert.equal(saved.logDir, await realpath(join(archive, jobId)));
+    assert.ok(existsSync(join(jobs, jobId, "discarded")));
+    assert.ok(!existsSync(join(jobs, jobId, "lease.json")) && !existsSync(join(jobs, jobId, "workspace")));
+    return saved;
+  }));
+  assert.equal(manifests.find(job => job.id === id)?.summary, "Continued candidate.");
+  assert.equal(manifests.filter(job => job.parentId === id && job.summary === "Research result.").length, 2);
+  assert.equal(manifests.find(job => job.profileName === "crmanager")?.summary, "Overall verdict: correct");
+});
+
 test("abort and timeout stop Pi and its delegates' processes, keep the logs, and delete the workspace and delegate clones", { timeout: 60_000 }, async t => {
   const config = await setup(t);
   const steps: Step[] = [
     assistant("Working.", 0.5, "toolUse"),
     ...delegate("c1", { id: "job-done", profile: "worker", task: "Do part.", cost: 1 }),
+    // A job the run reported is the run's even with its manifest damaged.
+    { job: { id: "job-done", damaged: true, log: "reported delegate log" } },
     { emit: { type: "tool_execution_start", toolCallId: "c2", toolName: "delegate", args: { profile: "prmanager", name: "job", task: "Publish." } } },
     // What the cut-off call left: a running job and the job it started, each with its own spend so far, and a
     // finished job whose spend already includes its child's.
@@ -582,6 +685,7 @@ test("abort and timeout stop Pi and its delegates' processes, keep the logs, and
       assert.ok(existsSync(join(jobs, id, "job.json")) && existsSync(join(jobs, id, "discarded")) && !existsSync(join(jobs, id, "lease.json")), id);
       assert.equal(await readFile(join(outcome.logDir, "delegates", id, "child-1.log"), "utf8"), "delegate log");
       assert.ok(!existsSync(join(outcome.logDir, "delegates", id, "workspace")));
+      assert.ok(!existsSync(join(jobs, id, "child-1.log")));
     }
     assert.ok(existsSync(join(jobs, "job-unrelated/workspace/src/file.ts")), "another session's clone is not this run's");
     assert.equal(await readFile(join(outcome.logDir, "delegates/job-done/child-1.log"), "utf8"), "reported delegate log");
@@ -603,11 +707,7 @@ test("abort and timeout stop Pi and its delegates' processes, keep the logs, and
   await mkdir(jobs, { recursive: true });
   await symlink(victim, join(jobs, "linked"));
 
-  // A job the run reported is the run's even with its manifest damaged: its logs are kept and its clone goes.
-  await mkdir(join(jobs, "job-done", "workspace"), { recursive: true });
-  await writeFile(join(jobs, "job-done", "job.json"), "{ damaged");
-  await writeFile(join(jobs, "job-done", "child-1.log"), "reported delegate log");
-  // Nor is an old job's damaged manifest this run's problem.
+  // An old job's damaged manifest is not this run's problem.
   await mkdir(join(jobs, "ancient"));
   await writeFile(join(jobs, "ancient", "job.json"), "{ damaged");
   await utimes(join(jobs, "ancient", "job.json"), new Date(0), new Date(0));
@@ -655,8 +755,13 @@ test("after a crash, the next start stops each surviving run, cleans up, and rep
     const checkpoint = await until(async () => JSON.parse(await readFile(checkpointFile(config, id), "utf8")),
       saved => saved.procs.length >= 2);
     assert.equal(checkpoint.asOf, 0, "new records keep the legacy numeric field without an ownership cutoff");
-    const event = checkpoint.conversationId === 7 ? prUrl : "Working on B.";
-    await until(async () => (await readFile(join(checkpoint.logDir, "events.jsonl"), "utf8")).includes(event));
+    assert.equal(checkpoint.delegateLogs, "direct");
+    const first = checkpoint.conversationId === 7;
+    await until(async () => (await readFile(join(checkpoint.logDir, "events.jsonl"), "utf8")).includes(first ? prUrl : "Working on B."));
+    assert.deepEqual(await readdir(join(checkpoint.logDir, "delegates")), [first ? "job-running-a" : "job-running-b"]);
+    const jobId = first ? "job-running-a" : "job-running-b";
+    assert.equal(await readFile(join(checkpoint.logDir, "delegates", jobId, "child-1.log"), "utf8"), "delegate log");
+    assert.ok(!existsSync(join(config.pi.agentDir, "delegates/jobs", jobId, "child-1.log")));
   }
   host.kill("SIGKILL");
   await exited;
@@ -1222,8 +1327,10 @@ test("restart completes cleanup after a spend checkpoint without counting the sa
   const job = join(config.pi.agentDir, "delegates/jobs/interrupted-job");
   await mkdir(join(job, "workspace"), { recursive: true });
   await writeFile(join(job, "job.json"), JSON.stringify({
-    workspace: { source: saved.workspace }, usage: { cost: 0.5 },
+    id: "interrupted-job", summary: "Already charged.", workspace: { source: saved.workspace }, usage: { cost: 0.5 },
   }));
+  await writeFile(join(job, "child-1.log"), "legacy log");
+  await symlink(join(job, "workspace"), join(job, "linked-workspace"));
   const checkpoint = join(saved.logDir, "reconciled.json");
   await writeFile(checkpoint, JSON.stringify({
     taskId: saved.taskId, conversationId: saved.conversationId, reconciled: true,
@@ -1250,6 +1357,43 @@ test("restart completes cleanup after a spend checkpoint without counting the sa
   assert.deepEqual(await pendingRecords(config), []);
   assert.ok(!existsSync(join(job, "workspace")));
   assert.ok(!existsSync(checkpoint));
+  const archive = join(saved.logDir, "delegates/interrupted-job");
+  assert.equal(await readFile(join(archive, "child-1.log"), "utf8"), "legacy log");
+  assert.equal(await readFile(join(job, "child-1.log"), "utf8"), "legacy log", "leave legacy originals in place");
+  assert.equal(JSON.parse(await readFile(join(archive, "job.json"), "utf8")).summary, "Already charged.");
+  assert.ok(!(await readdir(archive)).some(name => name.includes("workspace")));
+});
+
+test("direct recovery leaves linked destinations untouched and never copies logs from job state", async t => {
+  const config = await setup(t);
+  const saved = await savedRun(config, "20260101T000000-deadbeef", 1, 101);
+  await writeFile(checkpointFile(config, saved.runId), JSON.stringify({ ...saved, delegateLogs: "direct" }));
+  const id = "f2d9112b-2bfb-4930-89e4-4f431f158b98";
+  const state = join(config.pi.agentDir, "delegates/jobs", id);
+  const outside = join(config.dataDir, "outside");
+  const archive = join(saved.logDir, "delegates", id);
+  await mkdir(join(state, "workspace"), { recursive: true });
+  await mkdir(outside);
+  await mkdir(dirname(archive));
+  await writeFile(join(state, "job.json"), JSON.stringify({ id, logDir: outside, usage: { cost: 0.5 }, workspace: { source: saved.workspace } }));
+  await writeFile(join(state, "left-in-state.log"), "not a direct log");
+  await writeFile(join(outside, "job.json"), "leave me");
+  await symlink(outside, archive);
+  t.mock.method(console, "error", () => {});
+  const held = await (await openPiRuns(config)).settled(saved.taskId);
+  assert.match(held!.problems.join("\n"), /not a local directory/);
+  assert.ok(existsSync(join(state, "workspace")));
+  assert.equal(await readFile(join(outside, "job.json"), "utf8"), "leave me");
+  await rm(archive);
+  await mkdir(archive);
+  await writeFile(join(archive, "child-1.log"), "partial log");
+  const outcome = await (await openPiRuns(config)).settled(saved.taskId);
+  assert.equal(outcome?.usage.cost.total, 0.5);
+  assert.deepEqual((await readdir(archive)).sort(), ["child-1.log", "job.json"]);
+  assert.equal(await readFile(join(archive, "child-1.log"), "utf8"), "partial log");
+  assert.equal(await readFile(join(outside, "job.json"), "utf8"), "leave me");
+  assert.ok(!existsSync(join(state, "workspace")));
+  assert.deepEqual(await pendingRecords(config), []);
 });
 
 test("manifest I/O failure holds cleanup for a possible owned job, not for a discarded job or old unrelated clone", async t => {

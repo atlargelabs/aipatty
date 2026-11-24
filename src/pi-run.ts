@@ -1,13 +1,14 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { createReadStream, createWriteStream, type WriteStream } from "node:fs";
-import { copyFile, cp, lstat, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { constants, createReadStream, createWriteStream, type WriteStream } from "node:fs";
+import { copyFile, cp, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { delimiter, isAbsolute, join, resolve, sep } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import type { Config } from "./config.ts";
+import { stageDelegates } from "./pi-delegates.ts";
 import { instructions, taskPrompt } from "./pi-prompt.ts";
 import { addUsage, githubLink, readReport, RunTrace, usageKey, type JobUsage, type Review } from "./pi-trace.ts";
 import { readPiRunSnapshot, runLogParts } from "./pi-run-view.ts";
@@ -69,6 +70,8 @@ interface SavedRun {
   startedAt: string;
   workspace: string;
   logDir: string;
+  /** Absent on old checkpoints whose delegate logs are still beside their JobStore manifests. */
+  delegateLogs?: "direct";
   /** The Pi process, once it runs. */
   pid?: number;
   procs: [number, string][];
@@ -98,6 +101,7 @@ interface ActiveRun {
 
 /** A delegate job's manifest, as far as the host reads it. */
 interface JobManifest {
+  id?: string;
   parentId?: string;
   ownerSession?: string;
   startedAt?: string;
@@ -336,8 +340,23 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
   const outcomeDir = join(config.dataDir, "pi-outcomes");
   const outcomeIndex = (taskId: number) => join(outcomeDir, `${taskId}.json`);
   const logRoot = join(config.dataDir, ...runLogParts);
-  const jobsDir = join(pi.agentDir, "delegates", "jobs");
-  await mkdir(logRoot, { recursive: true, mode: 0o700 });
+  const jobStoreParts = ["delegates", "jobs"];
+  const jobsDir = join(pi.agentDir, ...jobStoreParts);
+  // A configured data/agent directory may be an alias. Don't follow links below it.
+  const directories = async (base: string, parts: readonly string[], create = false) => {
+    let path = base;
+    for (const part of parts) {
+      path = join(path, part);
+      if (create) await mkdir(path, { mode: 0o700 }).catch(error => {
+        if (error.code !== "EEXIST") throw error;
+      });
+      if (!(await lstat(path)).isDirectory()) throw new Error(`${path} is not a local directory`);
+    }
+    return path;
+  };
+  const archiveDirectory = (runId: string) => directories(config.dataDir, [...runLogParts, runId]);
+  await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
+  await directories(config.dataDir, runLogParts, true);
   await mkdir(config.runsDir, { recursive: true, mode: 0o700 });
 
   const inside = (parent: string, child: string) => resolve(child).startsWith(resolve(parent) + sep);
@@ -375,7 +394,11 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
   };
   /** The copy in a run's log directory, if it is that run's and that call's. */
   const logged = async (runId: string, saved?: SavedRun, file = "result.json"): Promise<Archived | undefined> => {
-    const copy = await readJson<Archived>(join(logRoot, runId, file));
+    const dir = await archiveDirectory(runId).catch(error => {
+      if (!isMissing(error)) throw error;
+    });
+    if (!dir) return undefined;
+    const copy = await readJson<Archived>(join(dir, file));
     if (copy === undefined) return undefined;
     if (!isKept(copy) || !Number.isSafeInteger(copy.taskId) || copy.outcome.runId !== runId
       || (saved && (copy.taskId !== saved.taskId || (copy.conversationId !== undefined && copy.conversationId !== saved.conversationId)))) {
@@ -409,8 +432,8 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     await mkdir(outcomeDir, { recursive: true, mode: 0o700 });
     await writeJson(outcomeIndex(saved.taskId), saved.runId);
   };
-  const recordOutcome = (saved: SavedRun, outcome: RunOutcome, reconciled: boolean, file: string) =>
-    writeJson(join(saved.logDir, file), { outcome, reconciled, taskId: saved.taskId, conversationId: saved.conversationId });
+  const recordOutcome = async (saved: SavedRun, outcome: RunOutcome, reconciled: boolean, file: string) =>
+    writeJson(join(await archiveDirectory(saved.runId), file), { outcome, reconciled, taskId: saved.taskId, conversationId: saved.conversationId });
   const rememberOutcome = async (saved: SavedRun, outcome: RunOutcome, reconciled: boolean) => {
     await recordOutcome(saved, outcome, reconciled, "result.json");
     await indexOutcome(saved);
@@ -467,18 +490,30 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
    */
   async function findJobs(saved: SavedRun, trace: RunTrace): Promise<{ jobs: Map<string, JobManifest>; ours: Set<string> }> {
     const jobs = new Map<string, JobManifest>();
-    const ids = await readdir(jobsDir).catch(error => {
+    const ids = await directories(pi.agentDir, jobStoreParts).then(path => readdir(path)).catch(error => {
       if (isMissing(error)) return [] as string[];
       throw error;
     });
     for (const id of ids) {
+      if (!validRunId(id)) continue;
       const dir = join(jobsDir, id);
       // A job directory that is a link could lead anywhere.
       if (!await ownDir(jobsDir, dir)) continue;
       const manifest = join(dir, "job.json");
       try {
-        const job = await readJson<JobManifest>(manifest);
-        if (job && typeof job === "object") jobs.set(id, job);
+        const file = await open(manifest, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK).catch(error => {
+          if (!isMissing(error)) throw error;
+        });
+        let job: JobManifest | undefined;
+        if (file) try {
+          const type = await file.stat();
+          // Another branch can atomically replace the path after open; this descriptor still has its complete snapshot.
+          if (!type.isFile() || type.nlink > 1) throw new Error("not an independent regular manifest");
+          job = JSON.parse(await file.readFile("utf8"));
+        } finally {
+          await file.close();
+        }
+        if (job && typeof job === "object" && (job.id === undefined || job.id === id)) jobs.set(id, job);
         // A job the run reported is the run's, with or without a manifest: its logs are kept and its clone goes.
         else if (trace.countedJobs.has(id)) jobs.set(id, {});
       } catch (error) {
@@ -548,25 +583,41 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     }
   }
 
-  /** Keep the jobs' logs, then delete their clones, which the extension leaves in the agent directory. */
-  async function discardJobs(saved: SavedRun, ours: Set<string>): Promise<void> {
+  /** Old interrupted runs alone still have logs beside their operational state. Leave those originals in place. */
+  async function keepLegacyJob(dir: string, destination: string): Promise<void> {
+    await cp(dir, destination, {
+      recursive: true, force: true,
+      filter: async (source, target) => {
+        if (source === join(dir, "workspace")) return false;
+        const type = await lstat(source);
+        if (!type.isFile() && (!type.isDirectory() || source === join(dir, "job.json"))) return false;
+        const existing = await typeOf(target);
+        if (existing && !(type.isDirectory() ? existing.isDirectory() : existing.isFile() && existing.nlink === 1)) {
+          throw new Error(`unsafe legacy log destination ${target}`);
+        }
+        return true;
+      },
+    });
+  }
+
+  /** Leave direct logs where they were written; keep only the final job.json beside them before discarding state. */
+  async function discardJobs(saved: SavedRun, jobs: Map<string, JobManifest>, ours: Set<string>): Promise<void> {
     for (const id of ours) {
       const dir = join(jobsDir, id);
       const clone = join(dir, "workspace");
-      // The logs are kept before the clone goes. A copy that fails stops the cleanup, with the job left as it is;
-      // a manifest that cannot be read is left out, so that the logs beside it are still kept.
-      const keep = (manifest: boolean) => cp(dir, join(saved.logDir, "delegates", id), {
-        recursive: true, force: true,
-        filter: source => source !== clone && !inside(clone, source) && (manifest || source !== join(dir, "job.json")),
-      });
       try {
-        await keep(true).catch(() => keep(false));
+        const job = jobs.get(id);
+        if (!saved.delegateLogs || job?.id === id) {
+          const destination = await directories(await archiveDirectory(saved.runId), ["delegates", id], true);
+          if (saved.delegateLogs === "direct") await writeJson(join(destination, "job.json"), job);
+          else await keepLegacyJob(dir, destination);
+        }
       } catch (error) {
-        throw new Error(`the logs of delegate job ${id} could not be kept from ${dir}: ${message(error)}`);
+        throw new Error(`the archive of delegate job ${id} could not be kept: ${message(error)}`);
       }
       if (await ownDir(dir, clone)) await rm(clone, { recursive: true, force: true });
       await rm(join(dir, "lease.json"), { force: true });
-      await writeFile(join(dir, "discarded"), new Date().toISOString(), { mode: 0o600 }).catch(() => {});
+      await writeFile(join(dir, "discarded"), new Date().toISOString(), { mode: 0o600, flag: "wx" }).catch(() => {});
     }
   }
 
@@ -595,7 +646,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         // Keep the spend before deleting its sources, but do not publish a terminal result until cleanup ends.
         await recordOutcome(saved, outcome, true, "reconciled.json");
       }
-      await discardJobs(saved, ours);
+      await discardJobs(saved, jobs, ours);
       // Only the directory this host made for the run, never a path a damaged record names.
       if (saved.workspace !== join(config.runsDir, saved.runId)) throw new Error(`${saved.workspace} is not this run's workspace`);
       if (await ownDir(config.runsDir, saved.workspace)) {
@@ -722,6 +773,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       && validRunId(run.runId) && run.workspace === join(config.runsDir, run.runId) && run.logDir === join(logRoot, run.runId)
       && Number.isSafeInteger(run.conversationId) && Number.isSafeInteger(run.taskId)
       && typeof run.pr === "boolean" && typeof run.startedAt === "string"
+      && (run.delegateLogs === undefined || run.delegateLogs === "direct")
       && (run.pid === undefined || Number.isSafeInteger(run.pid))
       && typeof run.asOf === "number" && Array.isArray(run.groups) && run.groups.every(Number.isSafeInteger)
       && Array.isArray(run.procs) && run.procs.every(proc => Array.isArray(proc) && proc.length === 2
@@ -811,7 +863,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       if (pending) outcome = interrupted(pending.outcome);
       const split = lineSplitter((line, whole) => trace.line(line, whole));
       try {
-        for await (const chunk of createReadStream(join(saved.logDir, "events.jsonl"))) split.write(chunk as Buffer);
+        for await (const chunk of createReadStream(join(await archiveDirectory(saved.runId), "events.jsonl"))) split.write(chunk as Buffer);
       } catch (error) {
         if (!isMissing(error)) throw new Error(`its events could not be read: ${message(error)}`);
       }
@@ -930,8 +982,9 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     };
 
     try {
-      await mkdir(saved.logDir, { recursive: true, mode: 0o700 });
-      await mkdir(saved.workspace, { recursive: true, mode: 0o700 });
+      await directories(config.dataDir, runLogParts);
+      await mkdir(saved.logDir, { mode: 0o700 });
+      await mkdir(saved.workspace, { mode: 0o700 });
       // Nothing starts without the record a later process needs to stop it.
       await write();
       if (request.pr) {
@@ -959,6 +1012,12 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         if (!run.stop) problems.push(`Could not clone ${pi.repo} at ${request.base}: ${clip(message(error), 600)}`);
       }
       if (baseSha && !run.stop) {
+        await mkdir(pi.agentDir, { recursive: true, mode: 0o700 });
+        await directories(pi.agentDir, jobStoreParts, true);
+        const delegateLogs = await directories(await archiveDirectory(saved.runId), ["delegates"], true);
+        const extension = await stageDelegates(pi.extension, saved.workspace, await realpath(delegateLogs),
+          (args, cwd) => command(pi.git, args, cwd));
+        if (run.stop) throw new Error("the run was stopped");
         const input = {
           runId: saved.runId, repo: pi.repo, branch: request.conversationId, task: request.task, base: request.base, baseSha,
           pr: request.pr, timeoutMinutes: Math.max(1, Math.round(request.timeoutMs / 60_000)),
@@ -973,7 +1032,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         const child = spawn(pi.node, [
           pi.cli, "--mode", "json", "--no-session", "--model", claude ?? request.model, "--thinking", request.thinking,
           // Only pinned release extensions, never resources or executable settings discovered in the checkout.
-          "--no-approve", "--no-extensions", "-e", pi.extension, "-e", pi.webFetchExtension, "-e", pi.webSearchExtension,
+          "--no-approve", "--no-extensions", "-e", extension, "-e", pi.webFetchExtension, "-e", pi.webSearchExtension,
           "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-mcp", "--append-system-prompt", rules,
           ...(claude === undefined ? [] : ["--provider", "claude-code", "-e", pi.claudeCodeExtension]),
         ], { cwd: repo, env: claude === undefined ? env : {
@@ -1143,7 +1202,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       const saved: SavedRun = {
         runId, conversationId: request.conversationId, taskId: request.taskId, pr: request.pr,
         startedAt: new Date().toISOString(), workspace: join(config.runsDir, runId), logDir: join(logRoot, runId),
-        procs: [], groups: [], asOf: 0,
+        delegateLogs: "direct", procs: [], groups: [], asOf: 0,
       };
       const run: ActiveRun = { saved, owned: newOwned(), finalizing: false, kill: () => {}, done: Promise.resolve(undefined) };
       // Reserve before execute can yield, including when two tool calls arrive in one model batch.

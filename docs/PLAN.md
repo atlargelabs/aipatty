@@ -71,7 +71,10 @@ Pi runs use release-pinned extensions. The top-level CLI loads them only by expl
 ambient extensions and the checkout's settings and executable resources stay disabled:
 
 - **`delegates`** (`github.com/stephenchestnut/delegates`): the `delegate` and `delegate_parallel` tools, with the
-  `thinker`, `thinktank`, `worker`, `prmanager` and `crmanager` profiles. The run loads it with `-e`.
+  `thinker`, `thinktank`, `worker`, `prmanager` and `crmanager` profiles. The pinned package has no log-root
+  option. The host applies [a small patch](../patches/pi-delegates-a66e6d8.patch) to a disposable copy of its
+  source and loads that copy with `-e`. The patch takes a host-generated path for this run only, without
+  changing the release or standalone Pi. Update the patch with any delegates pin change.
 - **`pi-review`** (`github.com/earendil-works/pi-review`): the `/review` command. The run does not load it.
   `delegates` loads it inside a `crmanager` job and runs `/review` there without its interactive UI.
 
@@ -108,8 +111,8 @@ checkout:
   `prmanager` refuses to submit with no checks configured, and the copy in the repo's `.pi/settings.json` is not
   read because checkout settings stay untrusted.
 
-`delegates` keeps its jobs, logs, and `prmanager` and `crmanager` clones in `delegates/jobs/` under the agent
-directory, outside `runs/`.
+`delegates` keeps job manifests, leases, workspace ownership and clones in `delegates/jobs/` under the agent
+directory. For new Aipatty runs, delegates write diagnostics directly to `data/logs/runs/<run-id>/delegates/<job-id>/`.
 
 The settings file is shared and never rewritten by the host. The stable path follows `current` on deploy and
 rollback between pinned releases; stop the server and wait for it to exit before repointing the symlink or
@@ -159,9 +162,10 @@ the tool result, and operator logs remain available.
    its delegates' usage, to the calling branch once, and mark it incomplete when it cannot be recovered. Bound the
    runtime and tool-result size.
 5. **Abort and cleanup:** on abort or timeout, stop Pi and its child processes, delegates included, before
-   releasing the run slot. On exit, retain the transcript and diagnostics in `data/logs/runs/`, including the logs
-   of the run's delegate jobs. Then delete the disposable workspace and the clones those jobs left under the agent
-   directory, which `delegates` does not remove itself. Write the terminal archive before the task-to-run
+   releasing the run slot. The transcript and diagnostics are written into `data/logs/runs/<run-id>/` during
+   execution. On exit the host archives each owned job's final manifest and discards the run workspace, delegate
+   leases and clones. Only old interrupted runs still need a copy of legacy job logs; their originals stay in
+   place. Write the terminal archive before the task-to-run
    pointer in `data/pi-outcomes/` and before removing the checkpoint. Treat logs as private service data.
 6. **Restart:** after taking the data-directory lock and before resuming conversations, independently recover
    each interrupted run, including a legacy `data/pi-run.json` if present. Use run-specific process proof to stop
