@@ -121,7 +121,7 @@ const shown = `({
   title: document.getElementById("title").textContent,
   current: document.querySelector("#branch-list li.current div")?.textContent ?? null,
   hash: location.hash,
-  messages: [...document.querySelectorAll("#entries .entry")].map(entry => entry.lastChild.textContent),
+  messages: [...document.querySelectorAll("#entries .message-body")].map(body => body.innerText),
 })`;
 
 /** Wait until the page shows `done`; on timeout, fail with what it showed and any script errors. */
@@ -175,6 +175,120 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
   assert.deepEqual(browser.errors, []);
 });
 
+test("user and assistant Markdown renders on narrow screens without creating unsafe DOM", { skip: !chrome, timeout: 60_000 }, async t => {
+  const host = await openHost(fauxConfig(await fixture(t)));
+  const serve = "https://operator.example.invalid";
+  const api = await startApi(host, health, 0, { tailscaleOrigin: serve });
+  t.after(async () => { await api.close(); await host.close(); });
+  const base = `http://127.0.0.1:${api.port}`;
+  const longCode = "const value = " + "x".repeat(200);
+  const raw = '<img src="/markdown-image-probe" onerror="window.bad = true">';
+  const source = [
+    "## Heading", "", "A **strong** and *emphasized* `word`.", "Next line.", "",
+    "> quoted", "", "- one", "- two", "", "1. first", "2. second", "", "```js", longCode, "```", "",
+    '[site](https://example.org/path "&quot; onclick=&quot;literal") <http://example.com/>', "",
+    raw, '<a id="raw-link" href="/api/shutdown">raw link</a>', "",
+    "![remote](https://example.org/image.png) ![local](/markdown-image-probe)", "",
+    "[js](JaVaScRiPt:alert%281%29) [entity](java&#x73;cript&colon;alert%281%29)",
+    "[control](<java&#x09;script:alert%281%29>) [encoded](java%73cript%3Aalert%281%29) [data](data:text/html,hello)",
+    "[empty]() [relative](/api/shutdown) [fragment](#1) [protocol relative](//example.org)",
+    `[internal](${base}/api/shutdown) [alias](http://localhost:${api.port}/api/shutdown) [serve](${serve}/api/shutdown)`,
+    "[credentials](https://someone@example.org/)",
+  ].join("\n");
+  const root = (await host.conversation("root"))!;
+  await root.commit(tx => tx.appendEntry(root.id, { kind: "test", model: [
+    { role: "user", content: [{ type: "text", text: source }, { type: "image", mimeType: "image/png", data: "AA==" }], timestamp: 0 },
+    fauxAssistantMessage(source),
+  ] }), ctx);
+
+  const browser = await openBrowser(t);
+  await browser.viewport(390, 600);
+  await browser.navigate(base);
+  await waitFor(browser, "both Markdown messages", state => state.messages.length === 2);
+  for (const role of ["user", "assistant"]) {
+    const rendered = await browser.evaluate(`(() => {
+      const body = document.querySelector('#entries .${role} .message-body');
+      const md = body.querySelector('.message-markdown');
+      const pre = md.querySelector('pre');
+      const transcript = document.querySelector('#transcript');
+      pre.scrollLeft = 80;
+      return {
+        heading: md.querySelector('h2').textContent,
+        paragraph: md.querySelector('p').innerText,
+        emphasis: ['strong', 'em', 'p code', 'blockquote'].map(tag => md.querySelector(tag).textContent.trim()),
+        items: [...md.querySelectorAll('li')].map(li => li.textContent),
+        code: pre.querySelector('code').textContent,
+        scrolls: pre.scrollLeft > 0 && transcript.scrollWidth === transcript.clientWidth,
+        links: [...md.querySelectorAll('a[href]')].map(a => [a.textContent, a.getAttribute('href'), a.target, a.rel]),
+        unsafe: !!body.querySelector('img, script, #raw-link, [onerror], [onclick], [style]'),
+        raw: md.textContent.includes(${JSON.stringify(raw)}),
+        image: md.textContent.includes('[image]'),
+        attachment: [...body.children].some(child => child.textContent === '[image]'),
+      };
+    })()`);
+    assert.deepEqual(rendered, {
+      heading: "Heading", paragraph: "A strong and emphasized word.\nNext line.",
+      emphasis: ["strong", "emphasized", "word", "quoted"], items: ["one", "two", "first", "second"],
+      code: longCode + "\n", scrolls: true,
+      links: [["site", "https://example.org/path", "_blank", "noopener noreferrer"],
+        ["http://example.com/", "http://example.com/", "_blank", "noopener noreferrer"]],
+      unsafe: false, raw: true, image: true, attachment: role === "user",
+    });
+  }
+  assert.deepEqual(browser.errors, []);
+});
+
+test("streaming formats prose while hiding tools; settled calls and results stay literal", { skip: !chrome, timeout: 60_000 }, async t => {
+  const host = await openHost(fauxConfig(await fixture(t)));
+  const api = await startApi(host, health, 0);
+  t.after(async () => { await api.close(); await host.close(); });
+  const root = (await host.conversation("root"))!;
+  const command = "echo **private arg** and `literal code`";
+  const opening = "## Working\n\n~~~txt\n" + "x".repeat(200) + "\n~~~";
+  const round = fauxAssistantMessage([
+    { type: "thinking", thinking: "## Hidden reasoning" },
+    { type: "text", text: opening + "\n\n~~~txt\nStill an open fence" },
+    fauxToolCall("bash", { command }, { id: "shell" }),
+    { type: "text", text: "**After the call**" },
+  ], { stopReason: "toolUse" });
+  const browser = await openBrowser(t);
+  await browser.viewport(390, 600);
+  await browser.navigate(`http://127.0.0.1:${api.port}/`);
+  await waitFor(browser, "the main branch", state => state.current === "Main");
+  const publish = (message: ReturnType<typeof fauxAssistantMessage>) => root.commit(async tx => {
+    (await tx.doc(LiveDoc, root.id)).generation = { attempt: 1, message: JSON.parse(JSON.stringify(message)) };
+  }, ctx);
+  await publish(fauxAssistantMessage(opening));
+  await until(() => browser.evaluate(`!!document.querySelector('#live pre')`));
+  await browser.evaluate(`window.streamedCode = document.querySelector('#live pre'); window.streamedCode.scrollLeft = 80;`);
+  await publish(round);
+  await until(() => browser.evaluate(`document.querySelector('#live strong')?.textContent === 'After the call'`));
+  assert.deepEqual(await browser.evaluate(`(() => {
+    const live = document.querySelector('#live .entry');
+    const [first, second] = live.querySelectorAll('pre');
+    return [live.querySelector('h2').textContent, second.textContent,
+      first === window.streamedCode && first.scrollLeft === 80, !/private arg|bash|Hidden reasoning/.test(live.textContent)];
+  })()`), ["Working", "Still an open fence", true, true]);
+
+  const result = "# Literal result\n**not emphasis**\n`not code`";
+  await root.commit(async tx => {
+    delete (await tx.doc(LiveDoc, root.id)).generation;
+    await tx.appendEntry(root.id, { kind: "test", model: [round, {
+      role: "toolResult", toolName: "bash", toolCallId: "shell", content: [{ type: "text", text: result }],
+      timestamp: 0, isError: false,
+    }] });
+  }, ctx);
+  await waitFor(browser, "the settled call and result", state => state.messages.length === 2);
+  assert.deepEqual(await browser.evaluate(`(() => {
+    const [before, tool, after] = document.querySelector('#entries .assistant .message-body').children;
+    const result = document.querySelector('#entries .toolResult .message-body');
+    return [[...before.querySelectorAll('pre')].at(-1).textContent, tool.textContent, tool.childElementCount,
+      after.querySelector('strong').textContent, result.textContent, result.childElementCount,
+      document.querySelector('#live').childElementCount];
+  })()`), ["Still an open fence", `→ bash ${JSON.stringify({ command })}`, 0, "After the call", result, 0, 0]);
+  assert.deepEqual(browser.errors, []);
+});
+
 test("Pi calls open the exact archive across pages and forks, without rebuilding the chat", { skip: !chrome, timeout: 60_000 }, async t => {
   const dir = await fixture(t);
   const host = await openHost(fauxConfig(dir));
@@ -185,7 +299,7 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   const duplicate = "20260101T040404-dddddddd";
   const markup = '<img src="x" onerror="window.bad = true">';
   const firstArchive = await archivedPiRun(dir, first, { summary: "First archive " + markup }, JSON.stringify({
-    type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Visible activity" }] },
+    type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Visible **activity**" }] },
   }) + "\n");
   await writeFile(join(firstArchive, "stderr.log"), "x".repeat(15_000) + "recent diagnostic");
   await archivedPiRun(dir, second, { summary: "Second archive", status: "failed", durationMs: 65_000 });
@@ -199,13 +313,15 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   const forkAt = await root.commit(async tx => {
     await tx.appendEntry(root.id, { kind: "test", model: [{ role: "user", content: `→ pi {"runId":"${second}"}`, timestamp: 0 }] });
     await tx.appendEntry(root.id, { kind: "test", model: [fauxAssistantMessage([
-      { type: "text", text: 'Pasted → pi {} stays plain' },
-      call("First task\nDo not show the rest of the task", "first"), call("Second task", "second"),
+      { type: "text", text: "Pasted → pi {} is **prose**" },
+      call("First task **literal**\nDo not show the rest of the task", "first"),
+      { type: "text", text: "### Between calls" },
+      call("Second task", "second"),
       fauxToolCall("bash", { command: "echo fixture" }, { id: "shell" }),
     ], { stopReason: "toolUse" })] });
     // Parallel results can arrive in a different order than the calls.
     await exchange(tx, "pi", "second", "second result", second);
-    await exchange(tx, "pi", "first", "first result", first);
+    await exchange(tx, "pi", "first", "first **result**", first);
     return (await exchange(tx, "bash", "shell", "fixture")).id;
   }, ctx);
   const side = await host.fork(root, { title: "Forked history", at: forkAt });
@@ -247,6 +363,13 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   assert.equal(await browser.evaluate(`document.querySelectorAll('.user .pi-call').length`), 0);
   assert.equal(await browser.evaluate(`document.querySelector('#entries').textContent.includes('→ bash {"command":"echo fixture"}')`), true);
   assert.equal(await browser.evaluate(`document.querySelector('#entries').textContent.includes('Do not show the rest of the task')`), false);
+  assert.deepEqual(await browser.evaluate(`(() => {
+    const first = document.querySelector('.assistant .pi-call');
+    const result = [...document.querySelectorAll('.toolResult .message-body')].find(body => body.textContent.includes('first **result**'));
+    return [first.parentElement.previousElementSibling.querySelector('strong').textContent, first.textContent,
+      first.childElementCount, first.parentElement.nextElementSibling.querySelector('h3').textContent,
+      !!result, !!result?.querySelector('strong')];
+  })()`), ["prose", "Open Pi run · First task **literal**", 0, "Between calls", true, false]);
 
   // This desktop width wraps the controls when the side pane narrows the transcript.
   await browser.viewport(905, 850);
@@ -260,14 +383,14 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   await browser.key("Enter");
   const content = await shows("First archive");
   assert.match(content, /completed · 0m 2s/);
-  assert.ok(content.includes(markup) && content.includes("Visible activity"));
+  assert.ok(content.includes(markup) && content.includes("Visible **activity**"));
   assert.match(content.trimEnd(), /Pi stderr\[Earlier stderr omitted\][^]*recent diagnostic$/);
   assert.equal(await browser.evaluate(`(() => {
     const view = document.querySelector('#pi-run-view');
     return view.scrollTop > 0 && view.scrollHeight - view.clientHeight - view.scrollTop < 2;
   })()`), true);
   assert.equal(await browser.evaluate(`(${chatOffset}) === window.entryOffset`), true);
-  assert.equal(await browser.evaluate(`!!document.querySelector('#pi-run img') || !!window.bad`), false);
+  assert.equal(await browser.evaluate(`!!document.querySelector('#pi-run img, #pi-run strong') || !!window.bad`), false);
   assert.equal(await browser.evaluate(`document.querySelector('main').getBoundingClientRect().right <= document.querySelector('#pi-run').getBoundingClientRect().left`), true);
   await browser.key("Escape");
   assert.equal(await browser.evaluate(`document.querySelector('#pi-run').hidden && document.activeElement === window.openerButton`), true);
@@ -453,9 +576,10 @@ test("an upgrade's report appears in the open transcript", { skip: !chrome, time
   await waitFor(browser, "the main branch", value => value.messages.length === 2);
 
   const root = (await host.conversation("root"))!;
-  await root.commit(tx => tx.appendEntry(root.id, { kind: upgradeEntryKind, data: { text: "Upgrade complete." } }), ctx);
+  const report = "## Upgrade complete.\n**Literal status**";
+  await root.commit(tx => tx.appendEntry(root.id, { kind: upgradeEntryKind, data: { text: report } }), ctx);
   const after = await waitFor(browser, "the upgrade report", value => value.messages.length === 3);
-  assert.deepEqual(after.messages, ["on main", "Faux reply: on main", "Upgrade complete."]);
+  assert.deepEqual(after.messages, ["on main", "Faux reply: on main", report]);
   assert.deepEqual(browser.errors, []);
 });
 

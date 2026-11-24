@@ -374,7 +374,13 @@ test("the web page is served with a strict policy and its script and style", asy
   assert.equal(page.status, 200);
   assert.match(page.headers.get("content-type")!, /text\/html/);
   assert.match(page.headers.get("content-security-policy")!, /default-src 'none'; script-src 'self'/);
-  assert.match(await page.text(), /<script src="\/app\.js" defer><\/script>/);
+  assert.match(await page.text(), /<script src="\/markdown-it\.js" defer><\/script>\s*<script src="\/app\.js" defer><\/script>/);
+  const markdown = await fetch(base + "/markdown-it.js");
+  assert.equal(markdown.status, 200);
+  assert.equal(markdown.headers.get("content-type"), "text/javascript; charset=utf-8");
+  assert.equal(markdown.headers.get("x-content-type-options"), "nosniff");
+  assert.ok((await markdown.arrayBuffer()).byteLength > 0);
+  assert.equal((await fetch(base + "/markdown-it.js.map")).status, 404);
   const script = await fetch(base + "/app.js");
   assert.match(script.headers.get("content-type")!, /text\/javascript/);
   // The script must parse: a syntax error would leave the page blank.

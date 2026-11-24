@@ -1,11 +1,13 @@
 import { BACKGROUND_CONTEXT as ctx, withAbortSignal } from "@earendil-works/chord/context";
 import type { Conversation, EntryId, InputSubmissionDraft, Submission, SubmissionId } from "@earendil-works/pi-durable";
+import { readFileSync } from "node:fs";
 import { createServer, STATUS_CODES, type IncomingMessage, type ServerResponse } from "node:http";
+import { createRequire } from "node:module";
 import type { Duplex } from "node:stream";
 import WebSocket, { WebSocketServer } from "ws";
 import { LOOPBACK } from "./config.ts";
 import { HttpError, type AgentHost } from "./host.ts";
-import { pageCss, pageHtml, pageJs } from "./page.ts";
+import { markdownScriptPath, pageCss, pageHtml, pageJs } from "./page.ts";
 import { messageText, piRunApiPath, piRunId, shutdownHeader, streamState, streamUpdate, upgradeCommand, type StreamFrame } from "./protocol.ts";
 import { transcriptPage } from "./transcript.ts";
 
@@ -13,6 +15,8 @@ const maxBody = 64 * 1024;
 const defaultPage = 50;
 const maxPage = 100;
 const defaultHeartbeatMs = 30_000;
+// Resolve the pinned release's classic browser bundle, not a path from the request.
+const markdownScript = readFileSync(createRequire(import.meta.url).resolve("markdown-it/browser"));
 
 /** What the listener keeps about its open streams, so a close or a silent client can end them. */
 interface Streams {
@@ -151,15 +155,16 @@ async function handleHttp(
     res.end(pageHtml);
     return;
   }
-  if (pathname === "/app.js" || pathname === "/app.css") {
+  if (pathname === "/app.js" || pathname === "/app.css" || pathname === markdownScriptPath) {
     requireMethod(req, res, "GET");
-    const js = pathname === "/app.js";
+    const body = pathname === markdownScriptPath ? markdownScript : pathname === "/app.css" ? pageCss
+      : pageJs(tailscale ? [...loopbackNames, tailscale.hostname] : loopbackNames);
     res.writeHead(200, {
-      "Content-Type": js ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8",
+      "Content-Type": pathname === "/app.css" ? "text/css; charset=utf-8" : "text/javascript; charset=utf-8",
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
     });
-    res.end(js ? pageJs : pageCss);
+    res.end(body);
     return;
   }
   if (pathname === "/api/branches") {

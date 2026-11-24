@@ -1,8 +1,10 @@
 /**
  * The crude web page: branch list, transcript, input box, fork, rename, model picker and cost. Served by the API
- * with a strict CSP, so the script is a separate same-origin file and every value is rendered as text.
+ * with a strict CSP and same-origin scripts. Only conversation prose is rendered as Markdown.
  */
 import { piRunApiPath, piRunId, upgradeEntryKind } from "./protocol.ts";
+
+export const markdownScriptPath = "/markdown-it.js";
 
 export const pageHtml = `<!doctype html>
 <html lang="en">
@@ -11,6 +13,7 @@ export const pageHtml = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>aipatty</title>
 <link rel="stylesheet" href="/app.css">
+<script src="${markdownScriptPath}" defer></script>
 <script src="/app.js" defer></script>
 </head>
 <body>
@@ -88,6 +91,18 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .entry .role { display: block; font-size: .75rem; color: #777; margin-bottom: .2rem; }
 .entry .fork-here { float: right; font-size: .75rem; }
 .entry.inherited { opacity: .7; }
+.message-markdown { display: flow-root; white-space: normal; }
+.message-markdown :where(p, ul, ol, blockquote, pre, h1, h2, h3, h4, h5, h6) { margin: .55rem 0; }
+.message-markdown > :first-child { margin-top: 0; }
+.message-markdown > :last-child { margin-bottom: 0; }
+.message-markdown h1 { font-size: 1.35rem; }
+.message-markdown h2 { font-size: 1.2rem; }
+.message-markdown :is(h3, h4, h5, h6) { font-size: 1rem; }
+.message-markdown :is(ul, ol) { padding-inline-start: 1.5rem; }
+.message-markdown blockquote { border-inline-start: 3px solid #b9c2ce; padding-inline-start: .65rem; }
+.message-markdown code { font: .9em ui-monospace, monospace; background: #f0f0f0; border-radius: 4px; padding: .1em .25em; }
+.message-markdown pre { overflow-x: auto; white-space: pre; overflow-wrap: normal; background: #f0f0f0; border-radius: 4px; padding: .55rem; }
+.message-markdown pre code { padding: 0; background: none; }
 #live .entry { border-style: dashed; }
 #run-failure { background: #fff4e5; color: #8a4b00; }
 #composer { display: flex; gap: .5rem; padding: .6rem .8rem; border-top: 1px solid #ddd; background: #fff; }
@@ -116,12 +131,38 @@ button { font: inherit; padding: .3rem .7rem; }
 }
 `;
 
-export const pageJs = `"use strict";
+export const pageJs = (appHostnames: readonly string[]) => `"use strict";
 const $ = id => document.getElementById(id);
 const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const piRunId = ${piRunId};
 const piRunApiPath = ${JSON.stringify(piRunApiPath)};
 const app = { branch: null, branches: [], totalCost: 0, entries: [], before: null, live: {}, socket: null, models: [] };
+
+// No raw HTML or plugins. Disable tables to avoid their generated inline alignment styles.
+const markdown = window.markdownit({ html: false, breaks: true }).disable("table");
+const appHostnames = ${JSON.stringify(appHostnames.map(host => host.replace(/\.$/, "")))};
+markdown.validateLink = href => {
+  if (!/^https?:\\/\\//i.test(href)) return false;
+  try {
+    const url = new URL(href);
+    return !url.username && !url.password && !appHostnames.includes(url.hostname.replace(/\\.$/, ""));
+  } catch { return false; }
+};
+markdown.renderer.rules.link_open = (tokens, index, options, _env, renderer) => {
+  // The parser can produce an empty href (e.g. [label]()); don't navigate back to the app.
+  if (!markdown.validateLink(tokens[index].attrGet("href") || "")) return "<a>";
+  tokens[index].attrSet("target", "_blank");
+  tokens[index].attrSet("rel", "noopener noreferrer");
+  return renderer.renderToken(tokens, index, options);
+};
+markdown.renderer.rules.image = () => "[image]";
+
+function markdownNode(text) {
+  const div = document.createElement("div");
+  div.className = "message-markdown";
+  div.innerHTML = markdown.render(text);
+  return div;
+}
 
 function money(value) { return "$" + value.toFixed(value > 0 && value < 0.01 ? 4 : 2); }
 
@@ -155,10 +196,25 @@ function blockText(block) {
   return "";
 }
 
-/** The in-flight generation is still text: partial tool arguments are not a durable call yet. */
-function messageText(message) {
-  if (typeof message.content === "string") return message.content;
-  return (message.content || []).map(blockText).filter(Boolean).join("\\n");
+// Combine adjacent prose, but never continue Markdown across a tool call or an image placeholder.
+function visibleParts(content) {
+  if (typeof content === "string") return content ? [{ type: "text", text: content }] : [];
+  const parts = [];
+  let lines = [];
+  const flush = () => {
+    if (lines.length) parts.push({ type: "text", text: lines.join("\\n") });
+    lines = [];
+  };
+  for (const block of content || []) {
+    if (block.type === "text") {
+      if (block.text) lines.push(block.text);
+    } else if (block.type === "toolCall" || block.type === "image") {
+      flush();
+      parts.push(block);
+    }
+  }
+  flush();
+  return parts;
 }
 
 function isPiCall(block) { return block.type === "toolCall" && block.name === "pi"; }
@@ -184,29 +240,30 @@ function runButton(label, source) {
 }
 
 function messageNodes(entry, message) {
-  if (!isToolRound(message) || !message.content.some(isPiCall)) {
-    const text = document.createTextNode(messageText(message));
+  if (message.role !== "user" && message.role !== "assistant") {
+    const text = typeof message.content === "string" ? message.content
+      : (message.content || []).map(blockText).filter(Boolean).join("\\n");
     const id = isPiResult(message) ? runIdOf(message.details) : undefined;
-    return id ? [runButton("Open Pi run", { id, durationMs: message.durationMs }), document.createTextNode("\\n"), text] : [text];
+    if (id) return [runButton("Open Pi run", { id, durationMs: message.durationMs }), document.createTextNode("\\n" + text)];
+    return text || message.role === "upgrade" ? [document.createTextNode(text)] : [];
   }
-  const nodes = [];
+  const parts = visibleParts(message.content);
+  const piRound = isToolRound(message);
   const ids = new Map();
-  for (const block of message.content) {
+  if (piRound) for (const block of parts) {
     if (block.type === "toolCall") ids.set(block.id, (ids.get(block.id) || 0) + 1);
   }
-  for (const block of message.content) {
-    let node;
-    if (isPiCall(block)) {
+  return parts.map(block => {
+    if (block.type === "text") return markdownNode(block.text);
+    const line = document.createElement("div");
+    if (piRound && isPiCall(block)) {
       const title = taskTitle(block.arguments?.task);
       // Duplicate IDs in one round are ambiguous; only the result's own run ID can address it.
-      if (ids.get(block.id) > 1) node = "→ pi (duplicate call ID; open the run from its result)";
-      else node = runButton("Open Pi run" + (title ? " · " + title : ""), { entry, callId: block.id, title });
-    } else node = blockText(block);
-    if (!node) continue;
-    if (nodes.length) nodes.push(document.createTextNode("\\n"));
-    nodes.push(typeof node === "string" ? document.createTextNode(node) : node);
-  }
-  return nodes;
+      if (ids.get(block.id) > 1) line.textContent = "→ pi (duplicate call ID; open the run from its result)";
+      else line.append(runButton("Open Pi run" + (title ? " · " + title : ""), { entry, callId: block.id, title }));
+    } else line.textContent = blockText(block);
+    return line;
+  });
 }
 
 // Follow the durable exchange, not a run ID printed by a model or a tool error. A result may be on
@@ -512,6 +569,8 @@ function renderBranches() {
 }
 
 function entryNode(entry, message) {
+  const nodes = messageNodes(entry, message);
+  if (!nodes.length) return;
   const div = document.createElement("div");
   div.className = "entry " + message.role + (entry.conversationId !== app.branch ? " inherited" : "");
   const role = document.createElement("span");
@@ -522,7 +581,10 @@ function entryNode(entry, message) {
   fork.className = "fork-here";
   fork.textContent = "Fork here";
   fork.addEventListener("click", guard(() => forkAt(entry.id)));
-  div.append(fork, role, ...messageNodes(entry, message));
+  const body = document.createElement("div");
+  body.className = "message-body";
+  body.append(...nodes);
+  div.append(fork, role, body);
   return div;
 }
 
@@ -533,8 +595,8 @@ function entryNodes(entries) {
       nodes.push(entryNode(entry, { role: "upgrade", content: entry.data.text }));
     }
     for (const message of entry.model || []) {
-      if (isToolRound(message) && message.content.some(isPiCall)
-          || isPiResult(message) && runIdOf(message.details) || messageText(message)) nodes.push(entryNode(entry, message));
+      const node = entryNode(entry, message);
+      if (node) nodes.push(node);
     }
   }
   return nodes;
@@ -568,22 +630,42 @@ function appendEntries(entries) {
   });
 }
 
+// Keep the unchanged prefix of a streaming Markdown segment in place (including code scroll positions).
+function updateLiveMarkdown(node, text) {
+  const before = [...node.childNodes];
+  const after = [...markdownNode(text).childNodes];
+  let first = 0;
+  while (first < before.length && first < after.length && before[first].isEqualNode(after[first])) first++;
+  for (const child of before.slice(first)) child.remove();
+  node.append(...after.slice(first));
+}
+
+let liveProse = [];
 function renderLive() {
   $("abort").disabled = !app.live.run;
   const failure = app.live.runFailure;
   setText($("run-failure"), failure ? "Run failed: " + failure.reason + (failure.detail ? ": " + failure.detail : "") : "");
   $("run-failure").hidden = !failure;
   const live = $("live");
-  const message = app.live.generation && app.live.generation.message;
-  const text = message ? messageText(message) : "";
-  if (!text) { live.replaceChildren(); return; }
+  const message = app.live.generation?.message;
+  // A partial tool call separates live prose but is not part of the preview. Its literal label belongs in the transcript.
+  const prose = visibleParts(message?.content).filter(block => block.type === "text").map(block => block.text);
+  const previous = liveProse;
+  if (prose.length === previous.length && prose.every((text, index) => text === previous[index])) return;
+  liveProse = prose;
+  if (!prose.length) { live.replaceChildren(); return; }
   let div = live.firstElementChild;
   if (!div) {
     div = document.createElement("div");
     div.className = "entry assistant";
     live.append(div);
   }
-  setText(div, text);
+  prose.forEach((text, index) => {
+    const node = div.children[index];
+    if (!node) div.append(markdownNode(text));
+    else if (text !== previous[index]) updateLiveMarkdown(node, text);
+  });
+  while (div.children.length > prose.length) div.lastElementChild.remove();
 }
 
 function connect(id) {
