@@ -102,6 +102,7 @@ async function openBrowser(t: TestContext, flags: string[] = []) {
       if (loaderId) await until(() => loaded.has(loaderId));
     },
     viewport: (width: number, height: number) => send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false }),
+    emulateTouch: () => send("Emulation.setTouchEmulationEnabled", { enabled: true }),
     async key(key: "Enter" | "Escape", modifiers = 0) {
       const params = { key, code: key, windowsVirtualKeyCode: key === "Enter" ? 13 : 27, modifiers };
       await send("Input.dispatchKeyEvent", { type: "keyDown", ...params, ...(key === "Enter" && { text: "\r" }) });
@@ -311,7 +312,7 @@ test("an upgrade's report appears in the open transcript", { skip: !chrome, time
   assert.deepEqual(browser.errors, []);
 });
 
-test("Enter sends a draft and Shift+Enter inserts a newline in the composer", { skip: !chrome, timeout: 60_000 }, async t => {
+test("composer Enter starts a new line on touch-first input and sends on desktop", { skip: !chrome, timeout: 60_000 }, async t => {
   const host = await openHost(fauxConfig(await fixture(t)));
   const api = await startApi(host, health, 0);
   t.after(async () => { await api.close(); await host.close(); });
@@ -320,6 +321,8 @@ test("Enter sends a draft and Shift+Enter inserts a newline in the composer", { 
   await waitFor(browser, "the main branch", state => state.current === "Main");
 
   const input = `document.getElementById('input')`;
+  const touchFirst = `matchMedia('(hover: none) and (pointer: coarse)').matches`;
+  assert.equal(await browser.evaluate(touchFirst), false);
   await browser.evaluate(`${input}.focus(); ${input}.value = 'first';`);
   await browser.key("Enter", 8); // DevTools uses bit 8 for Shift.
   assert.equal(await browser.evaluate(`${input}.value`), "first\n");
@@ -349,6 +352,33 @@ test("Enter sends a draft and Shift+Enter inserts a newline in the composer", { 
   await browser.key("Enter");
   const after = await waitFor(browser, "the sent multiline draft", state => state.messages.length === 2);
   assert.equal(after.messages[0], "first\nsecond");
+
+  // Change the primary input without reloading or resizing the page.
+  await browser.emulateTouch();
+  assert.equal(await browser.evaluate(touchFirst), true);
+  const draftCleared = () => until(() => browser.evaluate(`${input}.value === ''`));
+  await draftCleared();
+  await browser.evaluate(`
+    window.submitEvents = 0;
+    ${input}.form.addEventListener('submit', () => { window.submitEvents++; });
+    ${input}.value = 'touch first';
+    ${input}.focus();
+  `);
+  await browser.key("Enter");
+  assert.deepEqual(await browser.evaluate(`[${input}.value, window.submitEvents]`), ["touch first\n", 0]);
+  await browser.evaluate(`${input}.value += 'touch second'; document.getElementById('send').click()`);
+  const clicked = await waitFor(browser, "the multiline draft sent by the button", state => state.messages.length === 4);
+  assert.equal(clicked.messages[2], "touch first\ntouch second");
+
+  let count = 4;
+  for (const [modifier, name] of [[2, "Ctrl"], [4, "Cmd"]] as const) { // DevTools bits for Ctrl and Meta.
+    await draftCleared();
+    await browser.evaluate(`${input}.value = '${name} shortcut'; ${input}.focus()`);
+    await browser.key("Enter", modifier);
+    count += 2;
+    const sent = await waitFor(browser, `the draft sent by ${name}+Enter`, state => state.messages.length === count);
+    assert.equal(sent.messages[count - 2], `${name} shortcut`);
+  }
   assert.deepEqual(browser.errors, []);
 });
 
