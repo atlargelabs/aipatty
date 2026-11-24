@@ -58,9 +58,10 @@ running release by absolute path, never via `PATH` or `npx`. Do not fork Pi or u
 bump the dependency through a reviewed PR so rolling back aipatty also rolls back its Pi CLI. The pin has no
 supported CLI settings override. The managed entry adapts two digest-checked modules at launch: it uses
 Pi's in-memory defaults, skips migration of `settings.json` API keys, and disables `models.json` provider
-configuration and discovery of `SYSTEM.md` prompt overrides. The launcher keeps the actual bundle, the
-shared catalog cache and auth, `PI_CODING_AGENT_DIR`, flags, JSON output and process lifecycle. Delegates
-re-execute that same managed entry. Recheck the compatibility adapters when updating their pins.
+configuration and discovery of `SYSTEM.md` prompt overrides. Delegates use context instructions from their
+checkout only, not the state directory or ancestors. The launcher keeps the actual bundle, the shared catalog
+cache and auth, `PI_CODING_AGENT_DIR`, flags, JSON output and process lifecycle. Delegates re-execute that
+same managed entry. Recheck the compatibility adapters when updating their pins.
 
 Use a dedicated Pi agent directory owned by the `aipatty` account, outside the release and run directories. The
 legacy default is `~/.pi/agent`; the root install derives `$ROOT/pi`. Point the host and CLI at the same

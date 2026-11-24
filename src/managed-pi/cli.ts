@@ -17,6 +17,26 @@ settings = replaceSection(settings, "if(existsSync19(settingsPath))try{let conte
 settings = replaceSection(settings, "discoverSystemPromptFile(){let projectPath=", "isUnderPath(target,root)",
   "discoverSystemPromptFile(){return undefined}discoverAppendSystemPromptFile(){return undefined}");
 
+// The top level already passes --no-context-files. Keep checkout instructions for delegates and reviews,
+// without inheriting them from the agent dir, checkout ancestors, or links out of the checkout.
+settings = settings.replace("function loadContextFileFromDir(dir){", "function loadContextFileFromDir(dir,root){")
+  .replace("if(existsSync13(filePath))try{if(!statSync7(filePath).isFile())continue;",
+    "if(existsSync13(filePath))try{if(!isPathWithin(root,canonicalizePath(filePath))||!statSync7(filePath).isFile())continue;");
+settings = replaceSection(settings, "function findShadowedContextFile(cwd){", "var DefaultResourceLoader=", `
+function loadProjectContextFiles(options){
+  const cwd=canonicalizePath(resolvePath(options.cwd));
+  const root=findGitPaths(cwd)?.repoDir;
+  const files=[];
+  if(!root)return files;
+  for(let dir=cwd;;dir=dirname12(dir)){
+    const file=loadContextFileFromDir(dir,root);
+    if(file)files.unshift(file);
+    if(dir===root)break;
+  }
+  return files;
+}
+`);
+
 // models.json is another config input, not the model catalog cache. Don't load provider overrides from it,
 // but keep Pi's file-backed model cache and AuthStorage at the same state paths.
 const models = replaceSection(piModelsSource(), "modelsPath=options.modelsPath===null?void 0:", "builtinModelDataGeneratedAt=",

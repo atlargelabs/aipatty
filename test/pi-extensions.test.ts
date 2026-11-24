@@ -188,9 +188,16 @@ test("bundled Pi and real delegate children use release policy through upgrade a
     delegates: { maxParallel: 32, maxThinkers: 32, reviewExtension: extension, environment: { checks: [], exemption: "checkout" } },
   }));
   const ambientPrompt = "standalone system prompt must not reach managed Pi";
+  const ambientContext = "standalone agent instructions must not reach managed delegates";
+  const ancestor = "unrelated parent instructions must not reach managed delegates";
+  const projectContext = "fixture checkout instructions still reach managed delegates";
   await writeFile(join(agentDir, "SYSTEM.md"), ambientPrompt);
+  await writeFile(join(agentDir, "AGENTS.md"), ambientContext);
+  await writeFile(join(dir, "AGENTS.md"), ancestor);
+  await writeFile(join(cwd, "AGENTS.md"), projectContext);
+  await symlink(join(agentDir, "AGENTS.md"), join(cwd, "AGENTS.override.md"));
   await git("init", "--quiet", "--initial-branch=main");
-  await git("add", ".pi");
+  await git("add", ".pi", "AGENTS.md", "AGENTS.override.md");
   await git("commit", "--quiet", "-m", "fixture");
 
   // The parent uses a scripted provider. The children use Pi's real Azure transport pointed at loopback via
@@ -257,7 +264,13 @@ test("bundled Pi and real delegate children use release policy through upgrade a
     assert.deepEqual(review.body.tools.map(tool => tool.name).sort(), ["codemode", "delegate_review_diff", "find", "grep", "ls", "read"]);
     assert.ok(requests.every(req => req.auth === expectedAuth), JSON.stringify(requests.map(req => req.auth)));
     assert.ok(requests.every(req => req.url?.includes("/responses") && !req.url.includes("/ambient")), JSON.stringify(requests.map(req => req.url)));
-    if (!legacyRun) assert.ok(requests.every(req => !JSON.stringify(req.body.input).includes(ambientPrompt)));
+    if (!legacyRun) {
+      for (const req of requests) {
+        const prompt = JSON.stringify(req.body.input);
+        assert.ok(prompt.includes(projectContext));
+        for (const outside of [ambientPrompt, ambientContext, ancestor]) assert.ok(!prompt.includes(outside), outside);
+      }
+    }
     requests.length = 0;
   };
 
