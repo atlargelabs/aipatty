@@ -16,9 +16,9 @@ export async function api(path, method = "GET", body) {
     signal: AbortSignal.timeout(10_000),
     ...(body === undefined ? {} : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   });
+  if (response.ok) return response.json();
   const result = await response.json().catch(() => null);
-  if (!response.ok || !result) throw new Error(result?.error || "Gym request failed (HTTP " + response.status + ").");
-  return result;
+  throw new Error(result?.error || "Gym request failed (HTTP " + response.status + ").");
 }
 
 export function setLine({ exercise, reps, amount, unit }) {

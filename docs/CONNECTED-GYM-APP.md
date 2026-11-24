@@ -23,7 +23,8 @@ If an app fails, aipatty carries on as normal chat.
 4. Send `/disconnect gym` to remove the coach tools and Gym view; this does not delete the log or disconnect forks.
 
 Recent workouts are the newest 20 by workout date. The header and tool cards show previews; the phone page shows
-the full current plan. Use a separate data directory when trying a test release; see [INSTALL.md](INSTALL.md#gym-pilot).
+the full current plan. Unsaved drafts live only in the page, so save before closing or reloading it. Use a separate
+data directory when trying a test release; see [INSTALL.md](INSTALL.md#gym-pilot).
 
 ## The seam
 

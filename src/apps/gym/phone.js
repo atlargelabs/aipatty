@@ -71,6 +71,9 @@ function exerciseNames() {
 function updateSuggestions() {
   $("exercises").replaceChildren(...Array.from(exerciseNames().values(), name => new Option(name, name)));
 }
+function mayDiscardDraft() {
+  return !(dirty || setDirty) || confirm("Discard your unsaved workout changes?");
+}
 function pendingSet() {
   if (!setDirty && position === null) return false;
   say(position === null ? "Tap Add set to include the fields, or Clear fields to discard them." : "Tap Update set or Cancel set edit first.");
@@ -160,7 +163,7 @@ async function refresh() {
     actions.className = "actions";
     actions.append(
       button("Edit", "edit-workout", () => {
-        if ((dirty || setDirty) && !confirm("Discard your unsaved workout changes?")) return;
+        if (!mayDiscardDraft()) return;
         // Open the current workout, not the copy from when the page (perhaps an old tab) was loaded.
         void run(async () => begin(await api("workouts/" + workout.id))).then(opened => {
           if (!opened) return;
@@ -200,8 +203,9 @@ $("save-workout").addEventListener("click", () => {
   });
 });
 $("reset-workout").addEventListener("click", () => {
-  if (!(dirty || setDirty) || confirm("Discard your unsaved workout changes?")) { begin(); say(""); }
+  if (mayDiscardDraft()) { begin(); say(""); }
 });
+$("chat-link").addEventListener("click", event => { if (!mayDiscardDraft()) event.preventDefault(); });
 
 function refreshOnReturn() {
   if (!editingWorkout && !dirty && !setDirty) date.value = today();

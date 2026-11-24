@@ -659,6 +659,7 @@ test("phone Gym logs, corrects and deletes a workout, and connected chat sees it
   const workout = "<img src=x> Squat";
   const plan = "Add 5 lb next week.\n<b>Rest on Friday</b>";
   const latestPlan = "Add 10 lb next week.\n<b>Rest on Friday</b>";
+  const reconnectPlan = "Repeat the last workout before increasing weight.";
   await waitFor(browser, "Training", value => value.title === "Training");
   await send("/connect gym");
   await until(() => text("#app-header"), text => text?.includes("Open Gym") === true);
@@ -681,6 +682,10 @@ test("phone Gym logs, corrects and deletes a workout, and connected chat sees it
   await set("#amount", "60");
   await set("#unit", "sec");
   await click("#add-set");
+  await browser.evaluate("window.confirm = message => { window.warned = message; return false; }");
+  await click("#chat-link");
+  assert.match(await browser.evaluate<string>("window.warned"), /Discard your unsaved/);
+  assert.equal(await browser.evaluate("document.querySelectorAll('#draft-sets li').length"), 2);
   await click("#save-workout");
   await until(() => text("#status"), text => text === "Workout saved.");
   assert.match((await text("#recent-workouts"))!, /2026-11-24 · 2 sets/);
@@ -715,6 +720,10 @@ test("phone Gym logs, corrects and deletes a workout, and connected chat sees it
   await browser.navigate(chat);
   await until(() => text("#app-header"), text => text?.includes("Last workout: 2026-11-24") === true);
   assert.match((await text("#app-header"))!, /Plan: Add 10 lb/);
+  // A coaching turn can finish while this tab is disconnected; the restored header must match the new transcript.
+  await browser.evaluate("app.socket.close()");
+  await say(host, String(id), `call gym_save_plan ${JSON.stringify({ plan: reconnectPlan })}`);
+  await until(() => text("#app-header"), text => text?.includes(reconnectPlan) === true);
   await send(`call gym_query ${JSON.stringify({ sql: "SELECT exercise, amount, unit FROM sets ORDER BY position" })}`);
   await until(() => browser.evaluate("[...document.querySelectorAll('.gym-tool-card')].some(card => card.textContent.includes('105'))"));
   assert.equal(await browser.evaluate("document.querySelector('#transcript img') === null"), true);
@@ -724,7 +733,7 @@ test("phone Gym logs, corrects and deletes a workout, and connected chat sees it
   await waitFor(browser, "the detach notice", value => value.messages.some(message => message.startsWith("Disconnected Gym")));
 
   await browser.navigate(`${base}/apps/gym/?branch=${id}`);
-  await until(() => text("#plan"), text => text === latestPlan);
+  await until(() => text("#plan"), text => text === reconnectPlan);
   const workoutPath = `${base}/apps/gym/api/workouts/${workoutId}`;
   const saved = await (await fetch(workoutPath)).json() as object;
   assert.equal((await fetch(workoutPath, { method: "PUT", headers: { "Content-Type": "application/json" },
@@ -735,7 +744,7 @@ test("phone Gym logs, corrects and deletes a workout, and connected chat sees it
   await until(() => text("#status"), text => text === "Workout deleted.");
   assert.match(await browser.evaluate<string>("window.confirmedDelete"), /2026-11-25/);
   assert.equal(await text("#recent-workouts"), "No workouts logged yet.");
-  assert.equal(await text("#plan"), latestPlan);
+  assert.equal(await text("#plan"), reconnectPlan);
   assert.deepEqual(browser.errors, []);
 });
 

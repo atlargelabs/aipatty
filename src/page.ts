@@ -126,7 +126,7 @@ const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max
 const piRunId = ${piRunId};
 const piRunApiPath = ${JSON.stringify(piRunApiPath)};
 const appEntryKind = ${JSON.stringify(appEntryKind)};
-const app = { branch: null, branches: [], totalCost: 0, entries: [], before: null, live: {}, socket: null, models: [] };
+const app = { branch: null, branches: [], totalCost: 0, entries: [], before: null, live: {}, socket: null, seenState: false, models: [] };
 
 function money(value) { return "$" + value.toFixed(value > 0 && value < 0.01 ? 4 : 2); }
 
@@ -723,7 +723,9 @@ function connect(id) {
   socket.addEventListener("message", event => {
     if (app.socket !== socket) return;
     const frame = JSON.parse(event.data);
+    const replacement = frame.type === "state" && app.seenState;
     if (frame.type === "state") {
+      app.seenState = true;
       app.entries = frame.entries;
       app.before = frame.before;
     } else if (frame.type === "update") {
@@ -740,10 +742,13 @@ function connect(id) {
     }
     if (frame.type === "state") renderEntries(); else appendEntries(frame.appended);
     // A replacement state can follow a restart; an app notice can come from the CLI or another tab.
-    if (finished || frame.type === "state" || frame.appended.some(entry => entry.kind === appEntryKind)) {
-      void refreshBranches().catch(() => {});
+    const appChanged = frame.type === "update" && frame.appended.some(entry => entry.kind === appEntryKind);
+    if (finished || frame.type === "state" || appChanged) {
+      void refreshBranches().catch(error => {
+        if (appChanged && app.socket === socket) notice("Could not refresh the app attachment. Reload to retry: " + error.message);
+      });
     }
-    if (finished) void refreshAppHeader();
+    if (finished || replacement) void refreshAppHeader();
     renderBranches();
     resolveOpenedRun();
   });
@@ -771,6 +776,7 @@ async function selectBranch(id) {
   app.entries = [];
   app.before = null;
   app.live = {};
+  app.seenState = false;
   history.replaceState(null, "", "#" + id);
   renderEntries();
   renderBranches();
