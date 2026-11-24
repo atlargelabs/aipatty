@@ -255,8 +255,8 @@ from a release that predates `/upgrade`, which is one more manual deploy. See
    end-to-end test with `/upgrade` and verify the originating branch reports the new SHA. The tests cover a release
    that fails its health check, where the old release and conversation come back with the failure reported. This
    is the self-upgrade milestone.
-5. **After self-upgrade:** MCP configuration and OAuth, the per-branch switch, and Gmail. Add research mode,
-   concurrent runs, hooks, or more repos only when needed.
+5. **After self-upgrade:** phone access, MCP configuration and OAuth, the per-branch switch, and Gmail. Add research
+   mode, concurrent runs, hooks, or more repos only when needed.
 
 ## Setup responsibilities
 
