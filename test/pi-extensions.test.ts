@@ -196,8 +196,14 @@ test("bundled Pi and real delegate children use release policy through upgrade a
   await writeFile(join(dir, "AGENTS.md"), ancestor);
   await writeFile(join(cwd, "AGENTS.md"), projectContext);
   await symlink(join(agentDir, "AGENTS.md"), join(cwd, "AGENTS.override.md"));
+  const reviewGuidelines = join(cwd, "REVIEW_GUIDELINES.md");
+  const ownGuidelines = "fixture checkout review guideline";
+  const outsideGuidelines = "external guidelines must not reach crmanager";
+  await writeFile(reviewGuidelines, ownGuidelines);
+  await mkdir(join(agentDir, ".pi"));
+  await writeFile(join(agentDir, "REVIEW_GUIDELINES.md"), outsideGuidelines);
   await git("init", "--quiet", "--initial-branch=main");
-  await git("add", ".pi", "AGENTS.md", "AGENTS.override.md");
+  await git("add", ".pi", "AGENTS.md", "AGENTS.override.md", "REVIEW_GUIDELINES.md");
   await git("commit", "--quiet", "-m", "fixture");
 
   // The parent uses a scripted provider. The children use Pi's real Azure transport pointed at loopback via
@@ -225,6 +231,7 @@ test("bundled Pi and real delegate children use release policy through upgrade a
     lastModified: (getBuiltinModelDataGeneratedAt() ?? Date.now()) + 1_000 } });
   const modelsStore = join(agentDir, "models-store.json");
   await writeFile(modelsStore, cache);
+  let expectOwnGuidelines = true;
   const smoke = async (selected: PiConfig, expectedAuth: string, parallel = 10, legacyRun = false) => {
     const result = await run([selected.extension, join(checkout, "test/fixtures/pi-delegates-smoke.ts")],
       ["--model", "fixture/coding"], {}, selected.cli);
@@ -265,6 +272,8 @@ test("bundled Pi and real delegate children use release policy through upgrade a
     assert.ok(requests.every(req => req.auth === expectedAuth), JSON.stringify(requests.map(req => req.auth)));
     assert.ok(requests.every(req => req.url?.includes("/responses") && !req.url.includes("/ambient")), JSON.stringify(requests.map(req => req.url)));
     if (!legacyRun) {
+      assert.equal(JSON.stringify(review.body.input).includes(ownGuidelines), expectOwnGuidelines);
+      assert.ok(!JSON.stringify(review.body.input).includes(outsideGuidelines));
       for (const req of requests) {
         const prompt = JSON.stringify(req.body.input);
         assert.ok(prompt.includes(projectContext));
@@ -280,6 +289,10 @@ test("bundled Pi and real delegate children use release policy through upgrade a
   await smoke(pi, "fixture-fallback");
   assert.equal(await readFile(settings, "utf8"), "{}\n");
   const old = await stage(dir, "first"), next = await stage(dir, "next"), current = join(dir, "deploy/current");
+  await rm(reviewGuidelines);
+  await symlink(join(agentDir, "REVIEW_GUIDELINES.md"), reviewGuidelines);
+  await git("commit", "--quiet", "-am", "attempt to link guidelines outside checkout");
+  expectOwnGuidelines = false;
   const relativeReview = "node_modules/@earendil-works/pi-review/review.ts";
   const legacy = JSON.stringify({ shellPath: shell, apiKeys: { unused: "must-not-migrate" },
     delegates: { maxParallel: 1, reviewExtension: join(current, relativeReview), environment: { checks: [], setup: [] },
@@ -317,6 +330,8 @@ test("bundled Pi and real delegate children use release policy through upgrade a
   await writeFile(auth, fixtureAuth);
   await smoke(await select(next), "fixture-shared-state");
   await smoke(first, "fixture-shared-state"); // Repointing current doesn't change an already selected release.
+  await git("rm", "-r", ".pi");
+  await git("commit", "--quiet", "-m", "no project policy directory");
   await smoke(await select(old), "fixture-shared-state");
   assert.equal(await readFile(settings, "utf8"), legacy);
   assert.equal(await readFile(auth, "utf8"), fixtureAuth);

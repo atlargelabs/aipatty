@@ -82,7 +82,8 @@ ambient extensions and the checkout's settings and executable resources stay dis
   the coordinator release settings instead of the pin's hardwired local settings reader. The pinned children
   receive the coordinator's frozen configuration and existing tool allowlists through bootstrap.
 - **`pi-review`** (`github.com/earendil-works/pi-review`): the `/review` command. The run does not load it.
-  `delegates` loads it inside a `crmanager` job and runs `/review` there without its interactive UI.
+  `delegates` loads it inside a `crmanager` job and runs `/review` there without its interactive UI. The
+  managed loader bounds the pinned reviewer's guideline lookup to the review clone.
 
 - **`just-web-fetch`** (`github.com/stephenchestnut/just-web-fetch`): top-level `web_fetch`. A small, source-checked
   adapter removes its own config, executable hook discovery and event-bus hooks, and uses preinstalled extraction

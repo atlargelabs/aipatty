@@ -35,7 +35,7 @@ export function readManagedDelegateSettings(path = managedPi.settings) {
     const settings: unknown = JSON.parse(readFileSync(path, "utf8"));
     if (hasKeys(settings, "delegates") && hasKeys(settings.delegates, "version", "maxParallel", "publication", "environment")) {
       const { version, maxParallel, publication, environment } = settings.delegates;
-      if (version === 1 && maxParallel === 10
+      if (version === 1 && typeof maxParallel === "number" && Number.isInteger(maxParallel) && maxParallel >= 1 && maxParallel <= 32
         && hasKeys(publication, "repository", "remote", "baseBranch", "requiredChecks")
         && publication.repository === repo && publication.remote === "origin" && publication.baseBranch === "main"
         && Array.isArray(publication.requiredChecks) && publication.requiredChecks.every(c => typeof c === "string" && c.trim())

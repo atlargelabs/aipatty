@@ -37,6 +37,17 @@ function loadProjectContextFiles(options){
 }
 `);
 
+// The pinned reviewer has an independent guideline lookup. Let Pi's own TS loader evaluate the restricted
+// source at the original pinned filename, so its imports and the coordinator's review identity stay unchanged.
+const pinsUrl = new URL("./pins.ts", import.meta.url).href;
+settings = `import { managedReviewSource } from ${JSON.stringify(pinsUrl)};\n${settings}`;
+settings = replaceSection(settings, "factory=await createJitiImpl(import.meta.url,", ';if(typeof factory=="function")', `
+loader=createJitiImpl(import.meta.url,{moduleCache:!1,...resolutionOptions}),
+filename=canonicalizePath(extensionPath),
+factory=pathsEqual(filename,canonicalizePath(${JSON.stringify(managedPi.reviewExtension)}))
+  ? (await loader.evalModule(managedReviewSource(),{id:filename,filename,ext:".ts",async:!0,forceTranspile:!0})).default
+  : await loader.import(filename,{default:!0})`);
+
 // models.json is another config input, not the model catalog cache. Don't load provider overrides from it,
 // but keep Pi's file-backed model cache and AuthStorage at the same state paths.
 const models = replaceSection(piModelsSource(), "modelsPath=options.modelsPath===null?void 0:", "builtinModelDataGeneratedAt=",

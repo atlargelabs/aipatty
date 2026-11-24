@@ -67,8 +67,8 @@ Each Pi gets `delegates.maxParallel: 10` for concurrent top-level calls and batc
 pool or a hard total for nested jobs. The pinned `maxThinkers` default stays six. The managed launcher uses
 Pi's built-in settings defaults in memory. Neither `<pi-dir>/settings.json` nor a checkout's `.pi/settings.json`
 is used or edited for managed runs. Managed Pi also skips provider overrides from `models.json` and ambient
-`SYSTEM.md` and `APPEND_SYSTEM.md` discovery. Delegate context instructions such as `AGENTS.md` come from
-within the job's checkout, not the Pi state directory or the checkout's parents. This does not disable the
+`SYSTEM.md` and `APPEND_SYSTEM.md` discovery. Delegate context (`AGENTS.md` and the reviewer's
+`REVIEW_GUIDELINES.md`) comes from within the job's checkout, not the state directory or its parents. This does not disable the
 shared `models-store.json` catalog cache or ordinary provider login and environment configuration. Do not
 add local policy files for managed runs; keep existing files for standalone Pi or
 [rollback](#first-deploy-with-release-owned-pi-settings).
