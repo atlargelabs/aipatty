@@ -584,12 +584,12 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
 
   /** Old interrupted runs alone still have logs beside their operational state. Leave those originals in place. */
   async function keepLegacyJob(dir: string, destination: string): Promise<void> {
-    const keep = (manifest: boolean) => cp(dir, destination, {
+    await cp(dir, destination, {
       recursive: true, force: true,
       filter: async (source, target) => {
-        if (source === join(dir, "workspace") || (!manifest && source === join(dir, "job.json"))) return false;
+        if (source === join(dir, "workspace")) return false;
         const type = await lstat(source);
-        if (!type.isFile() && !type.isDirectory()) return false;
+        if (!type.isFile() && (!type.isDirectory() || source === join(dir, "job.json"))) return false;
         const existing = await typeOf(target);
         if (existing && !(type.isDirectory() ? existing.isDirectory() : existing.isFile() && existing.nlink === 1)) {
           throw new Error(`unsafe legacy log destination ${target}`);
@@ -597,7 +597,6 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         return true;
       },
     });
-    await keep(true).catch(() => keep(false));
   }
 
   /** Leave direct logs where they were written; keep only the final job.json beside them before discarding state. */

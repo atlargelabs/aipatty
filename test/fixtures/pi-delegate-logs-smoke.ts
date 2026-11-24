@@ -1,7 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { fauxAssistantMessage as message, fauxProvider, fauxToolCall as call } from "@earendil-works/pi-ai";
 
-const model = "fixture/coding";
 const candidate = { profile: "prmanager", name: "Candidate", task: "first candidate attempt" };
 
 export default function (pi: ExtensionAPI) {
@@ -17,7 +16,8 @@ export default function (pi: ExtensionAPI) {
         const job = JSON.parse(text ?? "null");
         return message(call("delegate", { ...candidate, task: "continued candidate attempt", continue: job.id }));
       },
-      message(call("delegate", { profile: "crmanager", name: "Review", task: "/review commit HEAD" })),
+      message(call("bash", { command: "printf 'review this fixture\\n' >> README.md" })),
+      message(call("delegate", { profile: "crmanager", name: "Review", task: "/review uncommitted" })),
       message('<result>\n{"summary":"Offline delegates finished.","issue":null,"pr":null,"remaining":[]}\n</result>'),
     ]);
   } else if (task.includes("first candidate attempt")) {
@@ -28,7 +28,7 @@ export default function (pi: ExtensionAPI) {
     ]);
   } else if (task === "/delegates-review") {
     faux.setResponses([({ messages }) => {
-      if (!JSON.stringify(messages).includes("Delegated scope: Commit")) throw new Error("Missing pinned review prompt");
+      if (!JSON.stringify(messages).includes("Delegated scope: Uncommitted snapshot")) throw new Error("Missing pinned review prompt");
       return message("Overall verdict: correct");
     }]);
   } else {

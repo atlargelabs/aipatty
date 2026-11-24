@@ -124,28 +124,50 @@ index 0856bae..5abbdd5 100644
  			sessionId: ctx.sessionManager.getSessionId(),
  			piCommand: invocationCommand(),
 diff --git a/src/review.ts b/src/review.ts
-index ec39a1d..7ee1e05 100644
+index ec39a1d..b7f3b0b 100644
 --- a/src/review.ts
 +++ b/src/review.ts
-@@ -4,6 +4,7 @@ import { git, githubRepository } from "./delivery/git.ts";
- import type { Runtime } from "./runtime/interface.ts";
- import type { Invocation, Workspace } from "./types.ts";
- import { inside } from "./workspace.ts";
-+import { writeLog } from "./aipatty-log-file.ts";
+@@ -41,7 +41,7 @@ async function reviewGit(runtime: Runtime, cwd: string, args: string[], signal:
+ const patchFlags = ["--no-ext-diff", "--no-textconv", "--no-color"];
  
- export type ReviewRequest = { focus: string } & (
- 	| { kind: "commit" | "branch" | "pr"; ref: string }
-@@ -58,7 +59,7 @@ async function snapshot(runtime: Runtime, workspace: Workspace, logDir: string,
+ /** Recreate the index and working diff in the clone, without running git add in the source. */
+-async function snapshot(runtime: Runtime, workspace: Workspace, logDir: string, signal: AbortSignal): Promise<void> {
++async function snapshot(runtime: Runtime, workspace: Workspace, signal: AbortSignal): Promise<void> {
+ 	const { source, path: clone } = workspace;
+ 	const head = await git(runtime, source, ["rev-parse", "HEAD"], signal);
+ 	if (head !== workspace.baseSha) throw new Error("Source HEAD changed before the uncommitted review snapshot");
+@@ -57,8 +57,9 @@ async function snapshot(runtime: Runtime, workspace: Workspace, logDir: string,
+ 	const untracked = (await capture(["ls-files", "-z", "--others", "--exclude-standard"])).split("\0").filter(Boolean);
  	for (const [name, patch, flags] of [["staged", staged, ["--index"]], ["unstaged", unstaged, []]] as const) {
  		if (!patch) continue;
- 		const file = path.join(logDir, `review-${name}.patch`);
+-		const file = path.join(logDir, `review-${name}.patch`);
 -		fs.writeFileSync(file, patch, { mode: 0o600 });
-+		writeLog(file, patch);
++		// This is a git apply input, not a diagnostic. The disposable clone owns it.
++		const file = path.join(clone, ".git", `review-${name}.patch`);
++		fs.writeFileSync(file, patch, { mode: 0o600, flag: "wx" });
  		try {
  			await git(runtime, clone, ["apply", "--whitespace=nowarn", ...flags, "--", file], signal);
  		} finally {
+@@ -99,7 +100,7 @@ export function pullRequest(ref: string, remoteUrl?: string): { number: string;
+ 	return { number, repo };
+ }
+ 
+-export async function prepareReview(runtime: Runtime, request: ReviewRequest, workspace: Workspace, logDir: string, signal: AbortSignal): Promise<PreparedReview> {
++export async function prepareReview(runtime: Runtime, request: ReviewRequest, workspace: Workspace, signal: AbortSignal): Promise<PreparedReview> {
+ 	const { kind, focus } = request;
+ 	const clone = workspace.path;
+ 	const localCommit = async (ref: string) => {
+@@ -118,7 +119,7 @@ export async function prepareReview(runtime: Runtime, request: ReviewRequest, wo
+ 		delete workspace.branch;
+ 	};
+ 	if (kind === "uncommitted") {
+-		await snapshot(runtime, workspace, logDir, signal);
++		await snapshot(runtime, workspace, signal);
+ 		return { kind, focus, args: "uncommitted", scope: `Uncommitted snapshot from ${workspace.baseSha}` };
+ 	}
+ 	if (kind === "commit") {
 diff --git a/src/runner.ts b/src/runner.ts
-index 6045899..bd10527 100644
+index 6045899..33f5f74 100644
 --- a/src/runner.ts
 +++ b/src/runner.ts
 @@ -4,6 +4,7 @@ import { randomBytes, randomUUID } from "node:crypto";
@@ -235,7 +257,13 @@ index 6045899..bd10527 100644
  					id,
  					invocation.name,
  					reviewRequest ? "origin" : config.publication?.remote ?? "origin",
-@@ -474,7 +489,7 @@ export class Coordinator {
+@@ -469,12 +484,12 @@ export class Coordinator {
+ 				);
+ 				this.save(job);
+ 				if (reviewRequest && reviewExtension) {
+-					const prepared = await prepareReview(runtime, reviewRequest, job.workspace, job.logDir, combined);
++					const prepared = await prepareReview(runtime, reviewRequest, job.workspace, combined);
+ 					if (job.workspace.excludedDirtyChanges) prepared.scope += "; uncommitted caller changes excluded";
  					running.review = { ...prepared, extension: reviewExtension };
  					this.save(job);
  				} else {

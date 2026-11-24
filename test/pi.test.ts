@@ -594,12 +594,16 @@ test("pinned Pi writes live nested, verification, continuation and review logs d
   const logs = join(config.dataDir, "logs/runs"), jobs = join(config.pi.agentDir, "delegates/jobs");
   let ended: string | undefined;
   void running.then(({ stdout, stderr }) => { ended = `${stdout}\n${stderr}`; }, error => { ended = String(error); });
+  const list = (dir: string) => readdir(dir).catch(error => {
+    if (error.code !== "ENOENT") throw error;
+    return [];
+  });
   const observe = async () => {
     if (ended !== undefined) throw new Error(`The run ended before live logs were observed: ${ended}`);
-    const [runId] = await readdir(logs).catch(() => []);
+    const [runId] = await list(logs);
     if (!runId) return;
     const archive = join(logs, runId, "delegates");
-    for (const id of await readdir(archive).catch(() => [])) {
+    for (const id of await list(archive)) {
       const jobLogs = join(archive, id);
       const verify = (await readdir(jobLogs)).find(name => name.startsWith("verify-"));
       if (verify && (await stat(join(jobLogs, verify))).size >= 131072) return { id, archive, jobLogs, verify };
