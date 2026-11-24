@@ -104,7 +104,8 @@ its identity was remembered.
 
 Open `http://127.0.0.1:8790/` (or the port given with `--port`) for the branch list, transcript, input box, fork (of the whole branch, or
 at a completed exchange with "Fork here"), rename, search, model and thinking pickers, and cost. In the message box,
-Enter sends and Shift+Enter inserts a newline. ⌘/Ctrl+Enter also sends when Shift is not held.
+Enter sends on desktop and inserts a newline when the primary pointer is coarse and cannot hover (touch-first).
+Shift+Enter inserts a newline in either case. Use the Send button or ⌘/Ctrl+Enter (without Shift or Alt) to send.
 
 Use **Open Pi run** on a `pi` call (or its result) to inspect that run beside the conversation. On a narrow screen
 it uses the full screen; Close or Esc goes back to the same place in chat. Inherited calls open the original run.

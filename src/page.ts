@@ -615,6 +615,7 @@ $("input").addEventListener("keydown", event => {
   if (event.key !== "Enter" || event.shiftKey || event.altKey) return;
   // Safari can report isComposing=false on the Enter that commits an IME candidate.
   if (event.isComposing || event.keyCode === 229) return;
+  if (!event.ctrlKey && !event.metaKey && window.matchMedia("(hover: none) and (pointer: coarse)").matches) return;
   event.preventDefault();
   if (!event.repeat) $("composer").requestSubmit();
 });
