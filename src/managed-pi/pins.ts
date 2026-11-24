@@ -32,7 +32,10 @@ async function loadProjectReviewGuidelines(cwd: string): Promise<string | null> 
     if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) return null;
     if (!(await fs.stat(file)).isFile()) return null;
     return (await fs.readFile(file, "utf8")).trim() || null;
-  } catch { return null; }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
 }
 
 `);
