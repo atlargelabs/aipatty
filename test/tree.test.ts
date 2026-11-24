@@ -302,34 +302,32 @@ test("fork_branch reports the committed branch ID when first message admission f
   assert.deepEqual(await texts(host, String(child.id)), []);
 });
 
-test("a call cancelled while it waits behind an abort does nothing when its turn comes", async t => {
+test("a call cancelled while it waits behind its branch's abort does nothing when its turn comes", async t => {
   const { host } = await server(t);
   const root = (await host.conversation("root"))!;
-  const fork = await host.fork(root, { title: "Fork" });
-  const branch = (await host.conversation(String(fork.id)))!;
   await host.submit(root, { type: "input", content: "x".repeat(900) });
   await until(async () => (await host.branch(root)).busy);
 
-  // What an aborted fork_branch or set_model call does: the abort holds the admission line until the turn has ended,
-  // the call queues behind it, and the abort cancels the call's context.
+  // The abort holds this branch's admission line until the turn has ended. The calls wait behind it,
+  // and the abort can cancel their context while they wait.
   const { context, cancel } = withCancel(ctx);
   const aborting = host.abort(root);
   const queued = Promise.allSettled([
-    host.submit(branch, { type: "input", content: "too late" }, context),
-    host.setModel({ provider: "faux", modelId: "faux-1" }, branch, context),
-    host.setThinking("low", branch, context),
+    host.submit(root, { type: "input", content: "too late" }, context),
+    host.setModel({ provider: "faux", modelId: "faux-1" }, root, context),
+    host.setThinking("low", root, context),
   ]);
   cancel();
   await aborting;
   assert.deepEqual((await queued).map(result => result.status), ["rejected", "rejected", "rejected"]);
-  await branch.waitForIdle(ctx);
-  assert.deepEqual(await texts(host, String(fork.id)), [], "the cancelled message never started a turn");
-  assert.equal((await host.modelStatus(branch)).thinking, "high");
+  await root.waitForIdle(ctx);
+  assert.ok(!(await texts(host, "root")).some(text => text.includes("too late")), "the cancelled message never started a turn");
+  assert.equal((await host.modelStatus(root)).thinking, "high");
 
   // Without a cancelled context the same calls go through.
-  await host.setThinking("low", branch);
-  assert.equal((await host.modelStatus(branch)).thinking, "low");
-  await say(host, String(fork.id), "in time");
+  await host.setThinking("low", root);
+  assert.equal((await host.modelStatus(root)).thinking, "low");
+  await say(host, "root", "in time");
 });
 
 test("fork cancellation during point lookup prevents creation", async t => {

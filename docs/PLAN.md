@@ -94,6 +94,9 @@ provisioning and usage boundaries.
 `delegates` reads its settings from the service account's `settings.json` in the Pi agent directory, not from the
 checkout:
 
+- **Parallel delegates:** `delegates.maxParallel: 10` in the trusted settings gives each Pi its own limit of
+  ten concurrent top-level delegates and bounds its batch width. `maxThinkers` is unchanged (default six);
+  nested work is not subject to a single hard total cap. No budget is shared across Pi runs.
 - **Publication:** `atlargelabs/aipatty` as the one authorized repository, with base branch `main`.
 - **Models:** none set. The extension's defaults are on the `openai` provider: `openai/gpt-6.2-sol` for every
   profile except `crmanager`, which reviews with `openai/gpt-6.2-astra`.
@@ -117,7 +120,7 @@ changing the setting. See [INSTALL.md](INSTALL.md) for the first pinned deploy a
 | Tool | What it does |
 | --- | --- |
 | `read`, `write`, `edit`, `bash`, `codemode`, `tool_search` | pi-durable built-ins, working in `work/`. |
-| `pi` | Runs one Pi session on a bounded coding task in a fresh clone and returns the result to the calling branch. One run at a time across all branches. Inside the run Pi may delegate the work, and always delegates the review. |
+| `pi` | Runs one Pi session on a bounded coding task in a fresh clone and returns the result to the calling branch. At most one run per conversation branch; branches run independently. Inside the run Pi may delegate the work, and always delegates the review of a PR. |
 | `fork_branch`, `list_branches`, `read_branch`, `set_model` | Tree management, plus paging and text search over any branch. |
 | `mcp_status`, `mcp_reload`, `mcp_sign_in` | Later: server state, re-reading `mcp.json`, and OAuth by link. |
 
@@ -129,9 +132,10 @@ Pi does not receive aipatty's MCP tools.
 Every `pi` call starts a fresh session. A later run does not inherit the session or checkout. Published issues and PRs,
 the tool result, and operator logs remain available.
 
-1. **Request and workspace:** refuse if another run is active. Record the run ID, calling branch, requested
-   outcome, and base, then create `runs/<run-id>/`. For a PR run, check the configured reviewer matches the running
-   release. `atlargelabs/aipatty` is the only allowed repo for now. Clone it with the service account's GitHub access
+1. **Request and workspace:** reserve the calling conversation ID before any asynchronous work. Refuse a
+   second call on that branch through startup, execution and cleanup. Other branches need no run coordination.
+   Create `runs/<run-id>/` and write the run's checkpoint in `data/pi-runs/<run-id>.json` before spawning.
+   For a PR run, check the configured reviewer matches the running release. `atlargelabs/aipatty` is the only allowed repo for now. Clone it with the service account's GitHub access
    and record the resolved base SHA.
 2. **Launch:** use the pinned CLI in one-shot JSON mode (`--mode json --no-session`). Collect structured events and
    stderr separately. Use `openai/gpt-6.2-sol` unless the call names another model. Disable automatic loading of
@@ -157,12 +161,15 @@ the tool result, and operator logs remain available.
 5. **Abort and cleanup:** on abort or timeout, stop Pi and its child processes, delegates included, before
    releasing the run slot. On exit, retain the transcript and diagnostics in `data/logs/runs/`, including the logs
    of the run's delegate jobs. Then delete the disposable workspace and the clones those jobs left under the agent
-   directory, which `delegates` does not remove itself. Treat logs as private service data.
-6. **Restart:** after taking the data-directory lock and before resuming conversations, stop any surviving processes
-   owned by interrupted runs and finish cleanup. Report the call as `interrupted`, with any known PR link. Never
-   rerun a call or repeat publication automatically.
+   directory, which `delegates` does not remove itself. Write the terminal archive before the task-to-run
+   pointer in `data/pi-outcomes/` and before removing the checkpoint. Treat logs as private service data.
+6. **Restart:** after taking the data-directory lock and before resuming conversations, independently recover
+   each interrupted run, including a legacy `data/pi-run.json` if present. Use run-specific process proof to stop
+   survivors and finish cleanup. Report the call as `interrupted` with any known PR link, or return its already
+   settled result. Never replay a call or repeat publication automatically. Known cleanup failures hold only
+   their branch; ambiguous ownership blocks new runs and preserves the records for inspection.
 
-Deferred until something needs them: a read-only research mode, concurrent runs, and repos other than aipatty.
+Deferred until something needs them: a read-only research mode and repos other than aipatty.
 
 ## Remote access
 
@@ -242,9 +249,9 @@ from a release that predates `/upgrade`, which is one more manual deploy. See
    CLI and web page, per-branch models and cost, and `/health` reporting the commit.
 2. **Done: the Pi tool.** [CI](#guard-rails), the Pi packages at 1.6.0 with the [pinned Pi CLI](#pi-installation)
    and [extensions](#pi-extensions), pi-durable's coding tools, codemode and tool search in
-   `work/`, and the [run contract](#pi-runs) with the git/issue workflow. Tested with a fake CLI: a second run
-   refused, missing auth or model, malformed output, false success, abort, child cleanup, restart, the launch
-   loading only the explicit release entries, delegate usage charged once, delegate clones removed, and a result not
+   `work/`, and the [run contract](#pi-runs) with the git/issue workflow. Tested with a fake CLI: same-branch
+   refusal, independent runs in two branches, missing auth or model, malformed output, false success, abort,
+   child cleanup, restart, explicit release extensions, delegate usage charged once, delegate clones removed, and a result not
    reported as reviewed when its review is missing, has important findings, or covers a different SHA from the PR
    head. Step 3 is the live end-to-end proof of the review and deploy loop.
 3. **Install on the mini and prove the loop by hand.** From the laptop over SSH, ask aipatty for a small change to
@@ -256,7 +263,7 @@ from a release that predates `/upgrade`, which is one more manual deploy. See
    that fails its health check, where the old release and conversation come back with the failure reported. This
    is the self-upgrade milestone.
 5. **After self-upgrade:** phone access, MCP configuration and OAuth, the per-branch switch, and Gmail. Add research
-   mode, concurrent runs, hooks, or more repos only when needed.
+   mode, hooks, or more repos only when needed.
 
 ## Setup responsibilities
 

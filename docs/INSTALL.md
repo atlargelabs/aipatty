@@ -66,6 +66,7 @@ ROOT="$HOME/aipatty"
    {
      "delegates": {
        "version": 1,
+       "maxParallel": 10,
        "reviewExtension": "/Users/aipatty/aipatty/deploy/current/node_modules/@earendil-works/pi-review/review.ts",
        "publication": { "repository": "atlargelabs/aipatty", "remote": "origin", "baseBranch": "main", "requiredChecks": [] },
        "environment": {
@@ -81,6 +82,21 @@ ROOT="$HOME/aipatty"
 
    The host checks this path resolves to the running release's pinned file before cloning for a PR run.
    Only `crmanager` loads the reviewer. Non-PR investigation does not require this setting.
+
+### Enable ten delegates per Pi
+
+**Existing installs:** when deploying this release, stop the service as in [Stop](#stop) and wait for it to
+exit. Edit `$ROOT/pi/settings.json` (or `settings.json` under the configured `--pi-dir`) once. Inside the
+existing `"delegates"` object, add `"maxParallel": 10` (or change that key's value to the number `10`).
+If the object does not exist yet, add `"delegates": { "maxParallel": 10 }` to the top-level object. Keep
+valid JSON and preserve all other keys and values, including the reviewer path and checks. If the value is
+already `10`, no edit is needed. Then deploy/start as usual. The host does not write this setting or change
+the extension's default, and upgrading without the edit does not prevent Pi from running.
+
+The pinned extension reads this trusted setting independently in each Pi. It limits concurrent top-level
+delegates and the batch width per Pi; ten is **not** a shared limit across conversation branches or a hard cap
+on all nested jobs. Leave `maxThinkers` as it is (six by default). Do not put the setting in a checkout's
+`.pi/settings.json`; managed Pi does not load it.
 
 For example, to refresh the shared model cache with the pinned CLI, run:
 
@@ -240,20 +256,41 @@ used the fallback) before repointing `current` and restarting. PR runs on the ol
 reviewer file; if it was not retained, restore it before running PR work there. On returning to a pinned
 release, set the `deploy/current` value again while stopped. No release edits the setting for you.
 
+## Pi run state cutover and rollback
+
+Use the **actual configured data directory** for these checks: usually `$ROOT/data`, or the override
+`--data-dir`. For example, the old runbook used `--data-dir ~/data`, so check `~/data`, not the new root.
+
+| Path under the data directory | Purpose |
+| --- | --- |
+| `pi-runs/<run-id>.json` | Pending run checkpoint, from startup through cleanup; contains the branch, task and process ownership evidence. |
+| `pi-run.json` | Pending checkpoint from a singleton release. The new release reads and recovers it in place; do not copy or rename it into `pi-runs/`. |
+| `logs/runs/<run-id>/result.json` | Primary settled result and usage, archived before the checkpoint is cleared. `reconciled.json`, if present, is an intermediate cleanup checkpoint, not a terminal result. |
+| `pi-outcomes/<task-id>.json` | Pointer from a durable task to its run's archive. The old shared `pi-outcomes.json` is still read for older calls. |
+
+For a same-root first deploy, let all branches finish (or abort their runs and wait for cleanup and the tool
+results to be committed). Do not start more runs. [Stop](#stop) the old release and wait for it to exit before
+changing `current` and starting the new release with the same data, Pi and runs directories. If a valid old
+singleton checkpoint remains after shutdown, the new release can recover it with those same directories;
+it never relaunches the call. Make the [one-time delegates setting edit](#enable-ten-delegates-per-pi) while
+stopped.
+
+**Before rolling back to a singleton release or switching to a fresh root**, likewise drain all Pi runs and
+wait for the tool results in their branches. Stop and wait for the server to exit, then inspect both `pi-run.json`
+and `pi-runs/` in the old/currently configured data directory. The legacy file should be absent and there
+should be no pending records in `pi-runs/` (the directory may be absent or empty; `*.json.<uuid>.tmp` files
+are not committed records). **If any checkpoint remains or the state cannot be read, do not switch releases
+or roots or delete the evidence.** An old binary cannot see `pi-runs/`, and a fresh root cannot see the old
+state. Restart the release that can read the records, with the same data, Pi and runs directories, to finish
+recovery and let the interrupted tool results commit. If a checkpoint is damaged or still cannot be cleared,
+stop and investigate using the console diagnostics, saved process identities and run logs; do not bypass the
+hold. Drain, stop and recheck before repointing `current` or switching roots. Keep the data and logs for rollback;
+the ten-delegate setting is also supported by the previous pinned release.
+
 ## Fresh cutover from an old installation
 
-While still on the old server with its old configuration, finish any active Pi runs or abort them and wait for
-cleanup to settle. Do not start more runs. Check for a pending `pi-run.json` in the **actual old configured data
-directory**: the old runbook used `--data-dir ~/data`, so check `~/data/pi-run.json` in that case, not the new
-`$ROOT/data` or the legacy default unless that was the path actually used.
-
-Stop the old server as above (use Ctrl-C or `SIGTERM` if the old release lacks `shutdown`), wait for it to exit,
-and check that old path again. Shutdown during a Pi run deliberately leaves its record and cleanup for recovery
-on the next start; a fresh root cannot see that record. **If `pi-run.json` remains after shutdown, do not delete it
-or proceed with the cutover.** Restart the old server with the same old configuration (including its data, Pi,
-and runs directories) to finish recovery. Confirm the record is gone, then shut down the old server and recheck
-that it is still gone before starting the new one.
-If recovery cannot clear the record, stop and investigate; do not bypass it by switching roots or deleting old state.
+Drain and verify the old state as described in [Pi run state cutover and rollback](#pi-run-state-cutover-and-rollback)
+before changing roots.
 
 Only then start with a fresh root: do not migrate conversations. Reauthenticate with the pinned CLI as above and
 set up delegates (including its pinned reviewer path) in the new Pi directory. Verify `health` reports
@@ -273,11 +310,13 @@ account's SSH keys and configuration, Git configuration, and `gh` login and sett
    symlink yet. Follow [Stop](#stop) and wait for the process to exit, then point `$ROOT/deploy/current` at the new
    release and start it again with the same root. Do not repoint while the server or a review is running: the
    reviewer setting follows `current`. For the first deploy over an unpinned release, make the
-   [one-time settings change](#first-deploy-from-a-release-with-an-unpinned-reviewer) while stopped.
+   [one-time reviewer setting change](#first-deploy-from-a-release-with-an-unpinned-reviewer) while stopped.
+   For the per-branch release, also [enable ten delegates per Pi](#enable-ten-delegates-per-pi).
    Keep the previous release for rollback; preserve `$ROOT/data`,
    `$ROOT/pi`, `$ROOT/work`, and `$ROOT/runs` across both redeploy and rollback.
 5. `node src/cli.ts health` reports the new commit, and `node src/cli.ts log` still has the conversation. Send it
-   another message. For manual rollback, follow [Stop](#stop), repoint `current` at the retained release once the
-   process exits, restart with the same root, and verify its SHA and conversation. Keep the same reviewer setting
+   another message. For manual rollback, [drain and verify Pi run state](#pi-run-state-cutover-and-rollback),
+   repoint `current` at the retained release after shutdown and those checks, restart with the same root, and
+   verify its SHA and conversation. Keep the same reviewer setting
    when rolling back between pinned releases; for an older release, restore its previous reviewer setting while
    stopped as described above. Ensure releases are compatible with the shared state.

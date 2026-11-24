@@ -24,8 +24,8 @@ export function piExtension(getRuns: () => PiRuns) {
     name: "pi",
     description: "Run one Pi coding session on a bounded task in a fresh clone of atlargelabs/aipatty, aipatty's own repository, and wait "
       + "for its result. Use it for every change that should become a PR: Pi opens an issue, a task branch and a PR, runs the "
-      + "checks, and has a crmanager delegate review the final commit. Only Steve merges. One run at a time across all "
-      + "branches; a second call is refused. Every run starts fresh and sees nothing of this conversation or of earlier "
+      + "checks, and has a crmanager delegate review the final commit. Only Steve merges. At most one run per conversation "
+      + "branch (including cleanup); other branches run independently. Every run starts fresh and sees nothing of this conversation or of earlier "
       + "runs, so put all the context it needs in `task`: the goal, the relevant decisions, and what done means. "
       + "The result reports the PR and its head commit as confirmed with GitHub, and whether the last review covered "
       + "that commit; a result that says NOT REVIEWED or lists problems is not finished work. The run's cost is charged to this branch.",
@@ -65,8 +65,13 @@ export function piExtension(getRuns: () => PiRuns) {
   const afterPi = hook(ToolTask, {
     async afterTool(call, written, api) {
       if (call.name !== "pi" || call.parent || !written.diagnostics?.some(diagnostic => ended.has(diagnostic.code ?? ""))) return undefined;
-      const outcome = await getRuns().settled(api.taskId);
-      return outcome ? result(outcome) : undefined;
+      try {
+        const outcome = await getRuns().settled(api.taskId, api.conversationId);
+        return outcome ? result(outcome) : undefined;
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        return { ...written, isError: true, output: [...(written.output ?? []), { type: "text", text: `Pi outcome recovery failed: ${reason}` }] };
+      }
     },
   });
 

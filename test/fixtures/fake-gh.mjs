@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // A stand-in for `gh`: answers `pr view` and `issue view` from `fake-gh.json` in the working directory.
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { setTimeout as sleep } from "node:timers/promises";
 
 const [kind, verb, number] = process.argv.slice(2);
 appendFileSync("fake-gh-calls.txt", process.argv.slice(2).join(" ") + "\n");
@@ -8,7 +9,8 @@ let known = {};
 try {
   known = JSON.parse(readFileSync("fake-gh.json", "utf8"));
 } catch {}
-if (known.delayMs) await new Promise(resolve => setTimeout(resolve, known.delayMs));
+if (known.waitFor) while (!existsSync(known.waitFor)) await sleep(10);
+if (known.delayMs) await sleep(known.delayMs);
 if (kind === "api") {
   // `api repos/<owner>/<name>/issues/<n>/events`: the PR's timeline events.
   const issue = /\/issues\/(\d+)\/events/.exec(verb)?.[1];
