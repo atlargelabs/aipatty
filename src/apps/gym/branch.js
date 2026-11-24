@@ -47,12 +47,14 @@ export function renderTool(call, result) {
       if (typeof details?.plan === "string") return card(details.plan.length ? "Plan saved" : "Plan cleared", preview(details.plan, 240));
       return;
     case "gym_query": {
-      try {
-        const { columns, rows, truncated } = JSON.parse(result.content.find(block => block.type === "text")?.text);
-        const summary = rows.length + (rows.length === 1 ? " row" : " rows") + (truncated ? " (result capped)" : "");
-        const line = values => values.slice(0, 4).map(value => value === null ? "NULL" : preview(value, 28)).join(" · ") + (values.length > 4 ? " · …" : "");
-        return card("Gym query · " + summary, line(columns), ...rows.slice(0, 3).map(line), ...(rows.length > 3 ? ["…"] : []));
-      } catch { return; } // Fall back to the original result if there is no complete Gym query payload.
+      let data;
+      // Old or shortened tool text may not contain a complete payload; leave it readable as-is.
+      try { data = JSON.parse(result.content.find(block => block.type === "text")?.text); }
+      catch { return; }
+      const { columns, rows, truncated } = data;
+      const summary = rows.length + (rows.length === 1 ? " row" : " rows") + (truncated ? " (result capped)" : "");
+      const line = values => values.slice(0, 4).map(value => value === null ? "NULL" : preview(value, 28)).join(" · ") + (values.length > 4 ? " · …" : "");
+      return card("Gym query · " + summary, line(columns), ...rows.slice(0, 3).map(line), ...(rows.length > 3 ? ["…"] : []));
     }
   }
 }

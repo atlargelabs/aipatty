@@ -658,6 +658,7 @@ test("phone Gym logs, corrects and deletes a workout, and connected chat sees it
   const send = async (text: string) => { await set("#input", text); await click("#send"); };
   const workout = "<img src=x> Squat";
   const plan = "Add 5 lb next week.\n<b>Rest on Friday</b>";
+  const latestPlan = "Add 10 lb next week.\n<b>Rest on Friday</b>";
   await waitFor(browser, "Training", value => value.title === "Training");
   await send("/connect gym");
   await until(() => text("#app-header"), text => text?.includes("Open Gym") === true);
@@ -685,6 +686,10 @@ test("phone Gym logs, corrects and deletes a workout, and connected chat sees it
   assert.match((await text("#recent-workouts"))!, /2026-11-24 · 2 sets/);
   assert.deepEqual(await browser.evaluate("[...document.querySelector('#exercise').list.options].map(o => o.value)"), [workout, "Plank"]);
   assert.equal(await browser.evaluate("document.querySelector('#recent-workouts img') === null"), true);
+  await say(host, String(id), `call gym_save_plan ${JSON.stringify({ plan: latestPlan })}`);
+  // Returning to an already open phone tab refreshes its plan and list, without a document reload.
+  await browser.evaluate("document.dispatchEvent(new Event('visibilitychange'))");
+  await until(() => text("#plan"), text => text === latestPlan);
   // The coach made a correction after the phone rendered its recent list. Editing another set must keep it.
   const workoutId = await browser.evaluate<string>("document.querySelector('#recent-workouts article').dataset.workoutId");
   await say(host, String(id), `call gym_save_workout ${JSON.stringify({
@@ -709,7 +714,7 @@ test("phone Gym logs, corrects and deletes a workout, and connected chat sees it
 
   await browser.navigate(chat);
   await until(() => text("#app-header"), text => text?.includes("Last workout: 2026-11-24") === true);
-  assert.match((await text("#app-header"))!, /Plan: Add 5 lb/);
+  assert.match((await text("#app-header"))!, /Plan: Add 10 lb/);
   await send(`call gym_query ${JSON.stringify({ sql: "SELECT exercise, amount, unit FROM sets ORDER BY position" })}`);
   await until(() => browser.evaluate("[...document.querySelectorAll('.gym-tool-card')].some(card => card.textContent.includes('105'))"));
   assert.equal(await browser.evaluate("document.querySelector('#transcript img') === null"), true);
@@ -719,12 +724,18 @@ test("phone Gym logs, corrects and deletes a workout, and connected chat sees it
   await waitFor(browser, "the detach notice", value => value.messages.some(message => message.startsWith("Disconnected Gym")));
 
   await browser.navigate(`${base}/apps/gym/?branch=${id}`);
-  await until(() => text("#plan"), text => text === plan);
-  await browser.evaluate("window.confirm = () => true");
+  await until(() => text("#plan"), text => text === latestPlan);
+  const workoutPath = `${base}/apps/gym/api/workouts/${workoutId}`;
+  const saved = await (await fetch(workoutPath)).json() as object;
+  assert.equal((await fetch(workoutPath, { method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...saved, date: "2026-11-25" }),
+  })).status, 200);
+  await browser.evaluate("window.confirm = message => { window.confirmedDelete = message; return true; }");
   await click('[data-action="delete-workout"]');
   await until(() => text("#status"), text => text === "Workout deleted.");
+  assert.match(await browser.evaluate<string>("window.confirmedDelete"), /2026-11-25/);
   assert.equal(await text("#recent-workouts"), "No workouts logged yet.");
-  assert.equal(await text("#plan"), plan);
+  assert.equal(await text("#plan"), latestPlan);
   assert.deepEqual(browser.errors, []);
 });
 
@@ -793,7 +804,7 @@ test("late or broken app views leave history, selection, Pi cards and chat usabl
   })()`);
   assert.match(saved.selected, /"rows":\[\[19\]\]/);
   deliver.resolve();
-  await until(() => browser.evaluate("document.querySelector('#app-notice').textContent.includes('replaceChildren')"));
+  await until(() => browser.evaluate("!document.querySelector('#app-notice').hidden"));
   assert.equal(await browser.evaluate("document.querySelector('#entries').textContent.includes('Saved the current plan.')"), true);
   assert.deepEqual(await browser.evaluate(`({
     count: document.querySelector('#entries').children.length,

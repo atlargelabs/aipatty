@@ -169,8 +169,10 @@ async function refresh() {
         });
       }),
       button("Delete", "delete-workout", () => {
-        if (!confirm("Delete the workout on " + workout.date + "?")) return;
         void run(async () => {
+          const current = await api("workouts/" + workout.id);
+          const exercise = current.sets[0]?.exercise;
+          if (!confirm("Delete the workout on " + current.date + (exercise ? " · " + exercise : "") + "?")) return;
           await api("workouts/" + workout.id, "DELETE");
           if (editingWorkout && id === workout.id) begin();
           card.remove();
@@ -201,6 +203,12 @@ $("reset-workout").addEventListener("click", () => {
   if (!(dirty || setDirty) || confirm("Discard your unsaved workout changes?")) { begin(); say(""); }
 });
 
+function refreshOnReturn() {
+  if (!editingWorkout && !dirty && !setDirty) date.value = today();
+  void run(refresh);
+}
+
 begin();
 void run(refresh);
-window.addEventListener("pageshow", event => { if (event.persisted) void run(refresh); });
+window.addEventListener("pageshow", event => { if (event.persisted) refreshOnReturn(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshOnReturn(); });
