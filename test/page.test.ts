@@ -1,15 +1,16 @@
 import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import type { Tx } from "@earendil-works/pi-durable";
+import { LiveDoc, type Tx } from "@earendil-works/pi-durable";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 import { startApi } from "../src/api.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
-import { upgradeEntryKind } from "../src/protocol.ts";
+import { piRunApiPath, upgradeEntryKind, type PiRunSnapshot } from "../src/protocol.ts";
 import { archivedPiRun, checkout, fauxConfig, fixture, realConfig, until } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
@@ -261,6 +262,10 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   assert.match(content, /completed · 0m 2s/);
   assert.ok(content.includes(markup) && content.includes("Visible activity"));
   assert.match(content.trimEnd(), /Pi stderr\[Earlier stderr omitted\][^]*recent diagnostic$/);
+  assert.equal(await browser.evaluate(`(() => {
+    const view = document.querySelector('#pi-run-view');
+    return view.scrollTop > 0 && view.scrollHeight - view.clientHeight - view.scrollTop < 2;
+  })()`), true);
   assert.equal(await browser.evaluate(`(${chatOffset}) === window.entryOffset`), true);
   assert.equal(await browser.evaluate(`!!document.querySelector('#pi-run img') || !!window.bad`), false);
   assert.equal(await browser.evaluate(`document.querySelector('main').getBoundingClientRect().right <= document.querySelector('#pi-run').getBoundingClientRect().left`), true);
@@ -293,6 +298,132 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   assert.equal(await browser.evaluate(`document.querySelector('main').inert && document.querySelector('#pi-run').getBoundingClientRect().width === 390`), true);
   await browser.evaluate(`document.querySelector('#pi-run-close').click()`);
   assert.equal(await browser.evaluate(`!document.querySelector('main').inert && document.querySelector('#transcript').scrollTop === window.chatTop`), true);
+  assert.deepEqual(browser.errors, []);
+});
+
+test("the Pi run pane follows snapshots, freezes while reading, and stops watching", { skip: !chrome, timeout: 60_000 }, async t => {
+  const host = await openHost(fauxConfig(await fixture(t)));
+  const api = await startApi(host, health, 0);
+  t.after(async () => { await api.close(); await host.close(); });
+  const root = (await host.conversation("root"))!;
+  const first = "20260102T010101-aaaaaaaa", second = "20260102T020202-bbbbbbbb";
+  await root.commit(async tx => {
+    await tx.appendEntry(root.id, { kind: "test", model: [{
+      role: "toolResult", toolName: "pi", toolCallId: "old", content: [{ type: "text", text: "Old result" }],
+      timestamp: 0, isError: false, details: { runId: second },
+    }] });
+    await tx.appendEntry(root.id, { kind: "test", model: [fauxAssistantMessage([
+      fauxToolCall("pi", { task: "Current task" }, { id: "current" }),
+    ], { stopReason: "toolUse" })] });
+    (await tx.doc(LiveDoc, root.id)).tools = [{ name: "pi", callId: "current", status: "pending" }];
+  }, ctx);
+
+  const browser = await openBrowser(t);
+  await browser.viewport(1100, 600);
+  await browser.navigate(`http://127.0.0.1:${api.port}/`);
+  await waitFor(browser, "the current Pi call", state => state.messages.length === 2);
+  // Keep real browser timers and the conversation WS. Control only the snapshot responses, including allowing
+  // a cancelled request to finish late so the stale-pane guard is exercised independently of fetch's abort.
+  await browser.evaluate(`(() => {
+    const fetch = window.fetch;
+    window.runRequests = [];
+    window.fetch = (path, init) => path.startsWith(${JSON.stringify(piRunApiPath)})
+      ? new Promise(reply => window.runRequests.push({ path, signal: init.signal, reply }))
+      : fetch(path, init);
+  })()`);
+  const requests = () => browser.evaluate<string[]>("window.runRequests.map(request => request.path)");
+  let count = 0;
+  const next = async (id = first) => {
+    const seen = await until(requests, paths => paths.length > count);
+    assert.equal(seen[count++], piRunApiPath + id);
+    assert.equal(seen.length, count);
+  };
+  const reply = (body: PiRunSnapshot | { error: string }, status = 200, index = count - 1) =>
+    browser.evaluate(`window.runRequests[${index}].reply(Response.json(${JSON.stringify(body)}, { status: ${status} }))`);
+  const snapshot = (labels: string[], { runId = first, status = "running", truncated = false }: {
+    runId?: string; status?: PiRunSnapshot["status"]; truncated?: boolean;
+  } = {}): PiRunSnapshot => ({
+    runId, status, activity: { truncated, incomplete: false, items: labels.map(label => ({
+      kind: "text", output: { text: Array.from({ length: 40 }, (_, i) => `${label} ${i}`).join("\n"), truncated: false },
+    })) },
+  });
+  const pane = () => browser.evaluate<{ text: string; top: number; bottom: boolean; jump: boolean }>(`(() => {
+    const view = document.querySelector('#pi-run-view');
+    return { text: view.textContent, top: view.scrollTop,
+      bottom: view.scrollHeight - view.clientHeight - view.scrollTop < 2,
+      jump: !document.querySelector('#pi-run-jump').hidden };
+  })()`);
+  const atLatest = (text: string) => until(pane, value => value.text.includes(text) && value.top > 0 && value.bottom && !value.jump);
+  const click = (selector: string) => browser.evaluate(`document.querySelector(${JSON.stringify(selector)}).click()`);
+  const pause = async () => {
+    await browser.evaluate(`document.querySelector('#pi-run-view').scrollTop = 95`);
+    return until(pane, value => value.top === 95 && value.jump);
+  };
+
+  await click(".assistant .pi-call");
+  assert.match((await pane()).text, /Waiting for this call/);
+  assert.deepEqual(await requests(), []);
+  assert.equal(await browser.evaluate(`[...document.querySelectorAll('#pi-run button')].some(button => button.textContent === 'Refresh')`), false);
+  await root.commit(async tx => {
+    (await tx.doc(LiveDoc, root.id)).tools = [{ name: "pi", callId: "current", status: "running", details: { runId: first } }];
+  }, ctx);
+  await next();
+  await reply(snapshot(["first output"]));
+  await atLatest("first output 39");
+  await next();
+  await reply(snapshot(["first output", "appended output"]));
+  await atLatest("appended output 39");
+
+  const reading = await pause();
+  await browser.evaluate(`window.reading = document.querySelector('#pi-run-data pre')`);
+  await next();
+  await reply(snapshot(["superseded tail"], { truncated: true }));
+  await next();
+  await reply({ error: "Temporary failure" }, 503);
+  await next();
+  await reply(snapshot(["latest tail"], { truncated: true }));
+  await next();
+  assert.deepEqual(await pane(), reading);
+  assert.equal(await browser.evaluate("window.reading.isConnected"), true);
+  await browser.evaluate(`const view = document.querySelector('#pi-run-view'); view.scrollTop = view.scrollHeight`);
+  const resumed = await atLatest("latest tail 39");
+  assert.doesNotMatch(resumed.text, /superseded tail|first output/);
+  assert.match(resumed.text, /Activity truncated/);
+
+  const beforeCompletion = await pause();
+  // A slow request must not trigger a second one while still in flight.
+  await sleep(1800);
+  assert.equal((await requests()).length, count);
+  await reply(snapshot(["final tail"], { status: "completed" }));
+  await sleep(1800);
+  assert.equal((await requests()).length, count);
+  assert.deepEqual(await pane(), beforeCompletion);
+  await browser.evaluate(`document.querySelector('#pi-run-jump').focus()`);
+  await browser.key("Enter");
+  assert.match((await atLatest("final tail 39")).text, /completed/);
+  assert.equal(await browser.evaluate(`document.activeElement.id`), "pi-run-view");
+
+  const stale = count;
+  await click(".assistant .pi-call");
+  await next();
+  await click(".toolResult .pi-call");
+  await next(second);
+  assert.equal(await browser.evaluate(`window.runRequests[${stale}].signal.aborted`), true);
+  await reply(snapshot(["other run"], { runId: second, status: "completed" }));
+  const other = await atLatest("other run 39");
+  await reply(snapshot(["stale response"]), 200, stale);
+  await sleep(1800);
+  assert.deepEqual(await pane(), other);
+  assert.equal((await requests()).length, count);
+
+  await click(".assistant .pi-call");
+  await next();
+  await reply(snapshot(["reopened"]));
+  await atLatest("reopened 39");
+  await click("#pi-run-close");
+  await sleep(1800);
+  assert.equal((await requests()).length, count);
+  assert.equal(await browser.evaluate(`document.querySelector('#pi-run').hidden`), true);
   assert.deepEqual(browser.errors, []);
 });
 
