@@ -1,11 +1,13 @@
 import { BACKGROUND_CONTEXT as ctx, withCancel } from "@earendil-works/chord/context";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { stripTypeScriptTypes } from "node:module";
 import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { startApi } from "../src/api.ts";
 import type { BranchInfo } from "../src/branches.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
+import { pageModules } from "../src/page.ts";
 import { messageText, type ConversationPage } from "../src/protocol.ts";
 import { checkout, fauxConfig, fixture, realConfig, until } from "./helpers.ts";
 
@@ -374,11 +376,19 @@ test("the web page is served with a strict policy and its script and style", asy
   assert.equal(page.status, 200);
   assert.match(page.headers.get("content-type")!, /text\/html/);
   assert.match(page.headers.get("content-security-policy")!, /default-src 'none'; script-src 'self'/);
-  assert.match(await page.text(), /<script src="\/app\.js" defer><\/script>/);
-  const script = await fetch(base + "/app.js");
-  assert.match(script.headers.get("content-type")!, /text\/javascript/);
-  // The script must parse: a syntax error would leave the page blank.
-  new Function(await script.text());
+  assert.match(await page.text(), /<script type="module" src="\/app\.js"><\/script>/);
+  // Every script must parse, and import only scripts that are served: either failure would leave the page blank.
+  const scripts = ["/app.js", ...Object.keys(pageModules)];
+  for (const path of scripts) {
+    const script = await fetch(base + path);
+    assert.match(script.headers.get("content-type")!, /text\/javascript/, path);
+    const source = await script.text();
+    assert.doesNotThrow(() => stripTypeScriptTypes(source), path);
+    for (const [, from] of source.matchAll(/^import .* from "(.+)";$/gm)) {
+      assert.ok(scripts.includes(new URL(from, base + path).pathname), `${path} imports ${from}`);
+    }
+  }
+  assert.equal((await fetch(base + "/web/nothing.ts")).status, 404);
   assert.equal((await fetch(base + "/app.css")).status, 200);
   assert.equal((await fetch(base + "/", { method: "POST" })).status, 405);
 });

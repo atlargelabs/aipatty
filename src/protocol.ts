@@ -3,29 +3,18 @@ import { contentText, type Message } from "@earendil-works/pi-ai";
 import type { ConversationView, EntryRecord, LiveState, ModelRef, UsageState } from "@earendil-works/pi-durable";
 import type { RunOutcome } from "./pi-run.ts";
 
+// Shared with the page's own modules, which cannot import this file.
+export { piRunApiPath, piRunId, upgradeEntryKind, upgradeText } from "./web/shared.ts";
+
 /** Non-safelisted marker: an ordinary browser form cannot send it. */
 export const shutdownHeader = "x-aipatty-shutdown";
 
 /** The message that asks the server to upgrade itself instead of going to the model. */
 export const upgradeCommand = "/upgrade";
 
-/** The kind of a transcript entry about an upgrade: `data.text` is shown to people and is not model context. */
-export const upgradeEntryKind = "aipatty.upgrade";
-
-/** The text of an upgrade entry. */
-export function upgradeText(entry: Pick<EntryRecord, "kind" | "data">): string | undefined {
-  const { data } = entry;
-  if (entry.kind !== upgradeEntryKind || !data || typeof data !== "object" || Array.isArray(data)) return undefined;
-  return typeof data.text === "string" ? data.text : undefined;
-}
-
 /** `completed` means the run finished and any required PR and review passed the host's checks. */
 export const runStatuses = ["completed", "failed", "aborted", "timed_out", "interrupted"] as const;
 export type RunStatus = typeof runStatuses[number];
-export const piRunApiPath = "/api/pi-runs/";
-/** A timestamp to the second, then eight hex digits (see the generator in pi-run.ts). */
-export const piRunId = /^\d{8}T\d{6}-[0-9a-f]{8}$/;
-
 export interface PiRunText {
   text: string;
   truncated: boolean;

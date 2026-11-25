@@ -226,27 +226,37 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   const html = await fetch(base);
   assert.equal(html.headers.get("content-security-policy"), "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
   await browser.navigate(base);
-  await waitFor(browser, "50 newest entries", state => state.messages.length === 50);
-  const click = async (label: string) => browser.evaluate(`(() => {
-    const button = [...document.querySelectorAll('.assistant .pi-call')].find(button => button.textContent.includes(${JSON.stringify(label)}));
-    button.click();
-  })()`);
+  // The newest 50 entries: two of them are assistant messages that each made two calls, a card apiece.
+  await waitFor(browser, "the cards of the 50 newest entries", state => state.messages.length === 52);
+  const runButtons = `[...document.querySelectorAll('.toolResult button[data-action="openPane"]')]`;
+  const click = async (label: string) => browser.evaluate(`${runButtons}.find(button => button.textContent.includes(${JSON.stringify(label)})).click()`);
   const paneText = () => browser.evaluate<string>(`document.querySelector('#pi-run').textContent`);
   const shows = async (text: string) => {
     try { return await until(paneText, value => value.includes(text)); }
     catch { assert.fail(`Expected ${text} in the pane; found ${await paneText()}; errors: ${browser.errors.join(", ")}`); }
   };
-  // The first result has its own control even though its call isn't on this page yet.
-  assert.equal(await browser.evaluate(`document.querySelectorAll('.toolResult .pi-call').length`), 3);
-  await browser.evaluate(`document.querySelector('.toolResult .pi-call').click()`);
+  // A result has its own control even though its call isn't on this page yet. A refused request has none.
+  const labels = () => browser.evaluate<string[]>(`${runButtons}.map(button => button.textContent)`);
+  assert.deepEqual(await labels(), ["Open Pi run", "Open Pi run · Missing archive", "Open Pi run"]);
+  await browser.evaluate(`${runButtons}[0].click()`);
   await shows("First archive");
   await browser.evaluate(`document.querySelector('#pi-run-close').click(); window.kept = document.querySelector('#entries .entry'); document.querySelector('#older').click()`);
   await until(() => browser.evaluate(`document.querySelector('#older').hidden`));
+  // The older page brings the first result's call, so its card gains the task's first line and stays in place.
+  // A call's ID used twice in one message names neither task. Results can arrive in another order than the calls.
   assert.equal(await browser.evaluate("window.kept.isConnected"), true);
-  assert.equal(await browser.evaluate(`document.querySelectorAll('.assistant .pi-call').length`), 4);
-  assert.equal(await browser.evaluate(`document.querySelectorAll('.user .pi-call').length`), 0);
-  assert.equal(await browser.evaluate(`document.querySelector('#entries').textContent.includes('→ bash {"command":"echo fixture"}')`), true);
-  assert.equal(await browser.evaluate(`document.querySelector('#entries').textContent.includes('Do not show the rest of the task')`), false);
+  assert.deepEqual(await labels(), [
+    "Open Pi run · Second task", "Open Pi run · First task", "Open Pi run · Missing archive", "Open Pi run",
+  ]);
+  assert.equal(await browser.evaluate(`document.querySelectorAll('.entry:not(.toolResult) button[data-action="openPane"]').length`), 0);
+  // An assistant message is a card for its text and one for each call, in the order it wrote them.
+  assert.deepEqual(await browser.evaluate(`[...document.querySelectorAll('#entries .entry')].slice(0, 5).map(card => [card.className, card.lastChild.textContent])`), [
+    ["entry prose user", `→ pi {"runId":"${second}"}`],
+    ["entry prose assistant", "Pasted → pi {} stays plain"],
+    ["entry toolCall assistant", '→ pi {"task":"First task\\nDo not show the rest of the task"}'],
+    ["entry toolCall assistant", '→ pi {"task":"Second task"}'],
+    ["entry toolCall assistant", '→ bash {"command":"echo fixture"}'],
+  ]);
 
   // This desktop width wraps the controls when the side pane narrows the transcript.
   await browser.viewport(905, 850);
@@ -254,7 +264,7 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   await browser.evaluate(`
     document.querySelector('#transcript').scrollTop = 0;
     window.entryOffset = ${chatOffset};
-    window.openerButton = document.querySelector('.assistant .pi-call');
+    window.openerButton = ${runButtons}.find(button => button.textContent.includes("First task"));
     window.openerButton.focus({ preventScroll: true });
   `);
   await browser.key("Enter");
@@ -277,20 +287,18 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   assert.match(failed, /No activity log available/);
   await click("Missing archive");
   await shows("archive unavailable");
-  await click("Refused");
-  await shows("did not start a Pi run");
-  // A partial aborted message and ambiguous calls aren't controls; the real result still opens its own run.
+  // An aborted message's call has no result and so no control; the result of an ambiguous call opens its own run.
   assert.equal(await browser.evaluate(`document.querySelector('#entries').textContent.includes('Unfinished task')`), true);
-  await browser.evaluate(`[...document.querySelectorAll('.toolResult')].find(entry => entry.textContent.includes('duplicate result')).querySelector('.pi-call').click()`);
+  await browser.evaluate(`[...document.querySelectorAll('.toolResult')].find(entry => entry.textContent.includes('duplicate result')).querySelector('button[data-action="openPane"]').click()`);
   await shows("Duplicate-ID archive");
 
   // A branch change closes the pane. A reload of the fork reads the original exchange, not the later reused ID.
   await browser.evaluate(`document.querySelector('[data-branch="${side.id}"]').click()`);
-  await waitFor(browser, "the fork", state => state.current === "Forked history" && state.messages.length === 5);
+  await waitFor(browser, "the fork", state => state.current === "Forked history" && state.messages.length === 8);
   assert.equal(await browser.evaluate(`document.querySelector('#pi-run').hidden`), true);
   await browser.navigate("about:blank");
   await browser.navigate(base + "/#" + side.id);
-  await waitFor(browser, "reloaded fork", state => state.current === "Forked history" && state.messages.length === 5);
+  await waitFor(browser, "reloaded fork", state => state.current === "Forked history" && state.messages.length === 8);
   await browser.viewport(390, 480);
   await browser.evaluate(`document.querySelector('#transcript').scrollTop = 85; window.chatTop = document.querySelector('#transcript').scrollTop`);
   await click("First task");
@@ -361,7 +369,11 @@ test("the Pi run pane follows snapshots, freezes while reading, and stops watchi
     return until(pane, value => value.top === 95 && value.jump);
   };
 
-  await click(".assistant .pi-call");
+  // A call that has not finished has a card of its own after the transcript, which opens the run as it happens.
+  const liveRun = '#live .liveTool button[data-action="openPane"]', oldRun = '.toolResult button[data-action="openPane"]';
+  assert.equal(await browser.evaluate(`document.querySelector(${JSON.stringify(liveRun)}).textContent`), "Open Pi run · Current task");
+  await browser.evaluate(`window.liveButton = document.querySelector(${JSON.stringify(liveRun)})`);
+  await click(liveRun);
   assert.match(await banner(), /Waiting for this call/);
   assert.deepEqual(await requests(), []);
   assert.equal(await browser.evaluate(`[...document.querySelectorAll('#pi-run button')].some(button => button.textContent === 'Refresh')`), false);
@@ -369,6 +381,7 @@ test("the Pi run pane follows snapshots, freezes while reading, and stops watchi
     (await tx.doc(LiveDoc, root.id)).tools = [{ name: "pi", callId: "current", status: "running", details: { runId: first } }];
   }, ctx);
   await next();
+  assert.equal(await browser.evaluate("window.liveButton.isConnected"), true, "a change of the live state keeps the card's button");
   const initialSnapshot = snapshot(["first output"]);
   await reply({ ...initialSnapshot, durationMs: 1000 });
   const initial = await atLatest("first output 39");
@@ -420,9 +433,9 @@ test("the Pi run pane follows snapshots, freezes while reading, and stops watchi
   assert.equal(await browser.evaluate(`document.activeElement.id`), "pi-run-view");
 
   const stale = count;
-  await click(".assistant .pi-call");
+  await click(liveRun);
   await next();
-  await click(".toolResult .pi-call");
+  await click(oldRun);
   await next(second);
   assert.equal(await browser.evaluate(`window.runRequests[${stale}].signal.aborted`), true);
   await reply(snapshot(["other run"], { runId: second, status: "completed" }));
@@ -432,10 +445,26 @@ test("the Pi run pane follows snapshots, freezes while reading, and stops watchi
   assert.deepEqual(await pane(), other);
   assert.equal((await requests()).length, count);
 
-  await click(".assistant .pi-call");
+  await click(liveRun);
   await next();
   await reply(snapshot(["reopened"]));
   await atLatest("reopened 39");
+  // When the result is saved, its card takes the place of the live one, and the open pane stays on the run.
+  await root.commit(async tx => {
+    await tx.appendEntry(root.id, { kind: "test", model: [{
+      role: "toolResult", toolName: "pi", toolCallId: "current", content: [{ type: "text", text: "Current result" }],
+      timestamp: 0, isError: false, details: { runId: first },
+    }] });
+    (await tx.doc(LiveDoc, root.id)).tools = [{ name: "pi", callId: "current", status: "done" }];
+  }, ctx);
+  await waitFor(browser, "the result's card", state => state.messages.length === 3);
+  assert.equal(await browser.evaluate(`document.querySelectorAll('#live .entry').length`), 0);
+  assert.deepEqual(await browser.evaluate(`[...document.querySelectorAll(${JSON.stringify(oldRun)})].map(button => button.textContent)`),
+    ["Open Pi run", "Open Pi run · Current task"]);
+  assert.equal(await browser.evaluate(`document.querySelector('#pi-run').hidden`), false);
+  await next();
+  await reply(snapshot(["finished"], { status: "completed" }));
+  await atLatest("finished 39");
   await click("#pi-run-close");
   await sleep(1800);
   assert.equal((await requests()).length, count);
@@ -553,8 +582,8 @@ test("Send by the name localhost admits once, preserves a new draft, and shows a
   await until(() => requestIds.length > 0);
   assert.equal(await browser.evaluate("document.querySelector('#send').disabled"), true);
   gate.resolve();
-  await until(() => browser.evaluate("!document.querySelector('#send').disabled && !document.querySelector('#run-failure').hidden"));
-  assert.match(await browser.evaluate<string>("document.querySelector('#run-failure').textContent"), /model_error: Provider is not configured: openai/);
+  await until(() => browser.evaluate("!document.querySelector('#send').disabled && !!document.querySelector('#live .runFailure')"));
+  assert.match(await browser.evaluate<string>("document.querySelector('#live .runFailure').textContent"), /model_error: Provider is not configured: openai/);
   assert.equal(requestIds.length, 1);
   assert.ok(requestIds[0]);
   assert.equal(await browser.evaluate("document.querySelector('#input').value"), "new draft");

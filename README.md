@@ -107,8 +107,13 @@ at a completed exchange with "Fork here"), rename, search, model and thinking pi
 Enter sends on desktop and inserts a newline when the primary pointer is coarse and cannot hover (touch-first).
 Shift+Enter inserts a newline in either case. Use the Send button or ⌘/Ctrl+Enter (without Shift or Alt) to send.
 
-Use **Open Pi run** on a `pi` call (or its result) to inspect that run beside the conversation. On a narrow screen
-it uses the full screen; Close or Esc goes back to the same place in chat. Inherited calls open the original run.
+The transcript shows a card for each message, and for an assistant message one for each run of text and each
+tool call, in the order they were written. Below the saved transcript, dashed cards show what is in progress: the
+answer being written and each tool call that has not finished. How the cards are made, and how to add to them, is
+in [the card pipeline](docs/WEB-CARDS.md).
+
+Use **Open Pi run** on a `pi` call's result, or on its dashed card while it runs, to inspect that run beside the
+conversation. On a narrow screen it uses the full screen; Close or Esc goes back to the same place in chat. Inherited calls open the original run.
 The pane shows its status and elapsed time when known, recent tool starts and finishes, assistant text, bash output,
 Pi stderr, and the final result. It links only to PRs and issues the host confirmed, and shows the confirmed PR head
 and reviewed SHA **at the time of the run**, not current GitHub state.
@@ -269,7 +274,7 @@ loopback; access to the HTTPS URL is controlled by your tailnet policy. Do not u
 
 ## API
 
-- `GET /` the page (and `/app.js`, `/app.css`)
+- `GET /` the page (and `/app.js`, `/app.css`, and the modules of `src/web/` as `/web/<name>.ts`)
 - `GET /health` (includes the process ID, the root's saved model, its catalog availability, the thinking level,
   and `problems`: what the startup health check found, empty when healthy)
 - `GET /api/models`
