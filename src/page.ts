@@ -45,6 +45,7 @@ export const pageHtml = `<!doctype html>
       <button id="rename" type="button">Rename</button>
       <button id="search" type="button">Search</button>
     </div>
+    <div id="model-pending" role="status" hidden></div>
     <div id="notice" role="status" hidden></div>
     <div id="card-header" hidden></div>
     <section id="transcript" aria-live="polite">
@@ -94,7 +95,7 @@ nav li .busy { color: #0a7d32; }
 main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 #controls { display: flex; flex-wrap: wrap; gap: .5rem; padding: .5rem .8rem; border-bottom: 1px solid #eee; align-items: center; }
 #controls select { max-width: 14rem; }
-#notice { padding: .4rem .8rem; background: #fff4e5; color: #8a4b00; }
+#notice, #model-pending { padding: .4rem .8rem; background: #fff4e5; color: #8a4b00; }
 #transcript { flex: 1; overflow-y: auto; padding: .8rem; }
 .entry { margin: 0 0 .8rem; padding: .5rem .7rem; border-radius: 8px; background: #fff; border: 1px solid #e4e4e4; white-space: pre-wrap; overflow-wrap: anywhere; }
 .entry.user { background: #eef5ff; border-color: #cfe0fb; }
@@ -162,8 +163,11 @@ const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max
 // view (the pane they opened and the button that opened it).
 const app = {
   branch: null, branches: [], totalCost: 0, entries: [], before: null, live: {}, socket: null, models: [],
-  pane: undefined, opener: undefined,
+  pane: undefined, opener: undefined, effectiveModel: undefined,
 };
+const modelSaves = new Set();
+const modelRef = model => model ? model.provider + "/" + model.modelId : "";
+const toolRound = () => app.live.tools?.length ? app.live.run?.taskId : undefined;
 // The steps of the card pipeline, in order. A branch's own steps will follow the built-in ones here.
 const steps = builtInSteps;
 
@@ -470,8 +474,8 @@ function renderBranches() {
     const node = branchNode(branch.id);
     node.li.classList.toggle("current", branch.id === app.branch);
     setText(node.title, branch.title);
-    const model = branch.model ? branch.model.modelId : "no model";
-    setText(node.info, "#" + branch.id + " · " + model + " · " + money(branch.cost));
+    const model = branch.id === app.branch && app.effectiveModel !== undefined ? app.effectiveModel : branch.model;
+    setText(node.info, "#" + branch.id + " · " + (model?.modelId ?? "no model") + " · " + money(branch.cost));
     node.busy.hidden = !branch.busy;
     if (list.children[index] !== node.li) list.insertBefore(node.li, list.children[index] || null);
   });
@@ -480,16 +484,26 @@ function renderBranches() {
   setText($("title"), branch.title);
   document.title = branch.title + " · aipatty";
   setText($("cost"), money(branch.cost) + " / " + money(app.totalCost));
-  const ref = branch.model ? branch.model.provider + "/" + branch.model.modelId : "";
+  renderModel(branch);
+  if ($("thinking").value !== branch.thinking) $("thinking").value = branch.thinking;
+}
+
+function renderModel(branch) {
+  const model = app.effectiveModel === undefined ? branch.model : app.effectiveModel;
+  const ref = modelRef(model);
   const picker = $("model");
   if (![...picker.options].some(option => option.value === ref)) {
     const option = document.createElement("option");
     option.value = ref;
-    option.textContent = (branch.model ? branch.model.modelId : "(none)") + " (unavailable)";
+    option.textContent = (model?.modelId ?? "(none)") + " (unavailable)";
     picker.prepend(option);
   }
   if (picker.value !== ref) picker.value = ref;
-  if ($("thinking").value !== branch.thinking) $("thinking").value = branch.thinking;
+  picker.disabled = modelSaves.has(branch.id);
+  const queued = toolRound() !== undefined && modelRef(branch.model) === ref ? branch.pendingModel : undefined;
+  const banner = $("model-pending");
+  setText(banner, queued ? "Model " + modelRef(queued) + " queued until this tool round completes." : "");
+  banner.hidden = !queued;
 }
 
 /*
@@ -722,13 +736,18 @@ function connect(id) {
     } else {
       return;
     }
+    const previousRound = toolRound();
     app.live = frame.live || {};
+    const roundEnded = previousRound !== undefined && previousRound !== toolRound();
+    const modelChanged = modelRef(app.effectiveModel) !== modelRef(frame.model);
+    app.effectiveModel = frame.model;
     const branch = current();
     if (branch) {
       const wasBusy = branch.busy;
       branch.busy = frame.busy;
       branch.cost = frame.usage.cost;
-      if (wasBusy && !frame.busy) refreshBranches();
+      if (roundEnded) delete branch.pendingModel;
+      if (modelChanged || roundEnded || (wasBusy && !frame.busy)) refreshBranches().catch(() => {});
     }
     render();
     renderBranches();
@@ -738,8 +757,11 @@ function connect(id) {
   });
 }
 
+let branchRefresh = 0;
 async function refreshBranches() {
+  const revision = ++branchRefresh;
   const { branches, totalCost } = await api("/api/branches");
+  if (revision !== branchRefresh) return; // Don't restore metadata from before a newer stream-triggered refresh.
   app.branches = branches;
   app.totalCost = totalCost;
   renderBranches();
@@ -750,6 +772,7 @@ async function selectBranch(id) {
   app.entries = [];
   app.before = null;
   app.live = {};
+  app.effectiveModel = undefined;
   app.pane = app.opener = undefined;
   history.replaceState(null, "", "#" + id);
   newTranscript();
@@ -822,14 +845,23 @@ $("search").addEventListener("click", guard(async () => {
   const { matches } = await api("/api/conversations/" + app.branch + "/search?q=" + encodeURIComponent(q));
   notice(matches.length ? matches.map(m => "[" + m.entryId + "] " + m.role + ": " + m.excerpt).join("\\n") : "No matches");
 }));
-$("model").addEventListener("change", guard(async event => {
+$("model").addEventListener("change", async event => {
+  const branch = current();
+  if (!branch || modelSaves.has(branch.id)) return;
   const [provider, ...rest] = event.target.value.split("/");
+  modelSaves.add(branch.id);
+  notice("");
+  renderModel(branch); // The picker shows the effective model, not the requested one.
   try {
-    await api("/api/conversations/" + app.branch + "/model", { method: "PUT", body: { provider, modelId: rest.join("/") } });
+    await api("/api/conversations/" + branch.id + "/model", { method: "PUT", body: { provider, modelId: rest.join("/") } });
+    await refreshBranches(); // Read current pending metadata; the acceptance snapshot may already be obsolete.
+  } catch (error) {
+    if (app.branch === branch.id) notice(error.message);
   } finally {
-    await refreshBranches();
+    modelSaves.delete(branch.id);
+    renderBranches();
   }
-}));
+});
 $("thinking").addEventListener("change", guard(async event => {
   try {
     await api("/api/conversations/" + app.branch + "/thinking", { method: "PUT", body: { level: event.target.value } });

@@ -1,9 +1,9 @@
 import { BACKGROUND_CONTEXT as ctx, type Context } from "@earendil-works/chord/context";
-import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
+import type { ModelThinkingLevel, Models } from "@earendil-works/pi-ai";
 import {
-  createRegistry, Harness, LiveDoc, ROOT_CONVERSATION_ID, UsageDoc,
-  type Conversation, type ConversationId, type EntryId, type InputSubmissionDraft, type ModelRef, type Submission,
-  type ConversationRecord, type Cursor, type EntryRecord, type Page, type Tx, type UsageState,
+  AgentDoc, createRegistry, Harness, LiveDoc, ROOT_CONVERSATION_ID, UsageDoc,
+  type AgentState, type Conversation, type ConversationId, type EntryId, type InputSubmissionDraft, type ModelRef,
+  type ConversationRecord, type Cursor, type EntryRecord, type Extension, type Page, type Submission, type Tx, type UsageState,
 } from "@earendil-works/pi-durable";
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
 import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
@@ -15,6 +15,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { BranchDoc, ROOT_TITLE, thinkingLevels, validTitle, type BranchInfo, type SearchMatch } from "./branches.ts";
 import type { Config } from "./config.ts";
+import { modelSwitchExtension, PendingModelDoc, queueModel } from "./model-switch.ts";
 import { ownDataDir } from "./ownership.ts";
 import { openModels } from "./models.ts";
 import { openPiRuns, type PiRuns } from "./pi-run.ts";
@@ -39,7 +40,11 @@ export interface ModelStatus {
   modelStatus: "available" | "unavailable";
   model: ModelRef | null;
   thinking: ModelThinkingLevel;
+  pendingModel?: ModelRef;
 }
+
+/** The settings at admission when queued; undefined means the new model was saved immediately. */
+export type ModelSwitchResult = (ModelStatus & { pendingModel: ModelRef }) | undefined;
 
 export interface AgentHost {
   harness: Harness;
@@ -56,7 +61,7 @@ export interface AgentHost {
    * `setModel`, `setThinking` and `submit` wait behind aborts on their own branch. Given the caller's `context`,
    * a call whose context was cancelled while it waited rejects when its turn comes and changes nothing.
    */
-  setModel(model: ModelRef & { thinkingLevel?: ModelThinkingLevel }, conversation?: Conversation, context?: Context): Promise<void>;
+  setModel(model: ModelRef & { thinkingLevel?: ModelThinkingLevel }, conversation?: Conversation, context?: Context): Promise<ModelSwitchResult>;
   setThinking(level: string, conversation?: Conversation, context?: Context): Promise<void>;
   /** Every branch, oldest first, and the spend of the whole session. */
   branches(): Promise<{ branches: BranchInfo[]; totalCost: number }>;
@@ -87,11 +92,11 @@ export interface AgentHost {
 }
 
 /** Open paused, so an unavailable saved model never executes interrupted work. */
-export async function openHost(config: Config): Promise<AgentHost> {
+export async function openHost(config: Config, options: { models?: Models; extensions?: readonly Extension[] } = {}): Promise<AgentHost> {
   await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
   const release = ownDataDir(config.dataDir);
   try {
-    const agent = await openOwnedHost(config);
+    const agent = await openOwnedHost(config, options.models ?? await openModels(config), options.extensions ?? []);
     void agent.harness.closed.then(release);
     return agent;
   } catch (error) {
@@ -143,8 +148,7 @@ async function forkPoint(from: Conversation, at: number | undefined, before: num
   return point;
 }
 
-async function openOwnedHost(config: Config): Promise<AgentHost> {
-  const models = await openModels(config);
+async function openOwnedHost(config: Config, models: Models, extensions: readonly Extension[]): Promise<AgentHost> {
   // Before any conversation resumes: stop and clean up runs the previous process left behind.
   const runs = await openPiRuns(config);
   await mkdir(config.workDir, { recursive: true, mode: 0o700 });
@@ -162,7 +166,9 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
     if (!host) throw new Error("aipatty is still starting");
     return host;
   }));
-  const harness = await Harness.open(storage, {
+  registry.install(modelSwitchExtension(() => harness));
+  for (const extension of extensions) registry.install(extension);
+  const harness: Harness = await Harness.open(storage, {
     models,
     registry,
     env: () => new NodeExecutionEnv({ cwd: config.workDir }),
@@ -171,11 +177,25 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
   }, ctx);
   try {
     const root = await harness.root(ctx, { agent: config.faux ? { ...newRoot, model: fauxModel } : newRoot });
-    const available = (model: ModelRef | null | undefined) => !!model && !!models.getModel(model.provider, model.modelId);
+    const statusOf = ({ model, thinkingLevel }: Pick<AgentState, "model" | "thinkingLevel">): ModelStatus => ({
+      modelStatus: model && models.getModel(model.provider, model.modelId) ? "available" : "unavailable",
+      model: model ? { ...model } : null,
+      thinking: thinkingLevel ?? "off",
+    });
     const status = async (conversation: Conversation = root, context = ctx): Promise<ModelStatus> => {
-      const agent = await conversation.agent(context);
-      const saved = agent.model ?? null;
-      return { modelStatus: available(saved) ? "available" : "unavailable", model: saved, thinking: agent.thinkingLevel };
+      const taskId = (await harness.snapshot(LiveDoc, conversation.id, context))?.run?.taskId;
+      if (taskId !== undefined && (await harness.snapshot(PendingModelDoc, taskId, context))?.selection) {
+        // Read pending and effective settings together across application/abort. The snapshot above avoids
+        // creating a task document just to check status when no selection has been queued.
+        return conversation.commit(async tx => {
+          const task = await tx.task(taskId);
+          const saved = statusOf(await tx.doc(AgentDoc, conversation.id));
+          if (!task || task.abortRequested || task.state.status === "terminal") return saved;
+          const model = (await tx.doc(PendingModelDoc, taskId)).selection?.model;
+          return model ? { ...saved, pendingModel: { ...model } } : saved;
+        }, context);
+      }
+      return statusOf(await conversation.agent(context));
     };
     const modelName = (model: ModelRef | null) => model ? `${model.provider}/${model.modelId}` : "(none)";
 
@@ -268,9 +288,7 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
         id: target.id,
         title: title?.title || (target.id === ROOT_CONVERSATION_ID ? ROOT_TITLE : `Branch ${target.id}`),
         parent: record?.parent ? { id: record.parent.conversationId, at: record.parent.at } : null,
-        model: model.model,
-        modelStatus: model.modelStatus,
-        thinking: model.thinking,
+        ...model,
         busy: live?.run !== undefined,
         cost: usage ? usageCost(usage as UsageState) : 0,
       };
@@ -303,8 +321,8 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
           return () => { upgrading = false; };
         });
       },
-      async setModel({ thinkingLevel, ...next }, target = root, context) {
-        await onBranch(target, () => exclusive(async () => {
+      setModel({ thinkingLevel, ...next }, target = root, context) {
+        return onBranch(target, () => exclusive(async () => {
           if (!models.getModel(next.provider, next.modelId)) {
             throw new HttpError(400, `Unknown model ${next.provider}/${next.modelId}; list available models with 'aipatty models'`);
           }
@@ -313,7 +331,13 @@ async function openOwnedHost(config: Config): Promise<AgentHost> {
           const pending = inspection.submissions.filter(s => s.conversationId === target.id);
           const recovering = blocked.has(target.id);
           if (!recovering && (tasks.length || pending.length)) {
-            throw new HttpError(409, `Cannot switch model while the conversation has active work. Wait for the turn to finish, or run 'aipatty abort${branchRef(target.id)}', before switching.`);
+            return target.commit(async tx => {
+              const change = { model: next, ...(thinkingLevel === undefined ? {} : { thinkingLevel }) };
+              if (!(await queueModel(tx, target.id, change))) {
+                throw new HttpError(409, `Cannot switch model while the conversation has active work. Wait for the turn to finish, or run 'aipatty abort${branchRef(target.id)}', before switching.`);
+              }
+              return { ...statusOf(await tx.doc(AgentDoc, target.id)), pendingModel: next };
+            }, context ?? ctx);
           }
           if (recovering) {
             // The scheduler is paused. Withdraw queued submissions and mark all the branch's tasks before

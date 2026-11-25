@@ -4,7 +4,7 @@ import { createServer, STATUS_CODES, type IncomingMessage, type ServerResponse }
 import type { Duplex } from "node:stream";
 import WebSocket, { WebSocketServer } from "ws";
 import { LOOPBACK } from "./config.ts";
-import { HttpError, type AgentHost } from "./host.ts";
+import { HttpError, type AgentHost, type ModelSwitchResult } from "./host.ts";
 import { pageCss, pageHtml, pageJs, pageModules } from "./page.ts";
 import { messageText, piRunApiPath, piRunId, shutdownHeader, streamState, streamUpdate, upgradeCommand, type StreamFrame } from "./protocol.ts";
 import { transcriptPage } from "./transcript.ts";
@@ -182,8 +182,8 @@ async function handleHttp(
   if (pathname === "/api/model" || pathname === "/api/thinking") {
     requireMethod(req, res, "PUT");
     const root = (await agent.conversation("root"))!;
-    await (pathname === "/api/model" ? setModel(agent, root, req) : setThinking(agent, root, req));
-    sendJson(res, 200, await agent.modelStatus(root));
+    const queued = await (pathname === "/api/model" ? setModel(agent, root, req) : setThinking(agent, root, req));
+    sendJson(res, queued ? 202 : 200, queued ?? await agent.modelStatus(root));
     return;
   }
   const route = /^\/api\/conversations\/([^/]+)(?:\/(messages|abort|fork|title|model|thinking|search))?$/.exec(pathname);
@@ -222,8 +222,9 @@ async function handleHttp(
     await agent.rename(conversation, title);
     sendJson(res, 200, await agent.branch(conversation));
   } else if (action === "model") {
-    await setModel(agent, conversation, req);
-    sendJson(res, 200, await agent.branch(conversation));
+    const queued = await setModel(agent, conversation, req);
+    const branch = await agent.branch(conversation);
+    sendJson(res, queued ? 202 : 200, queued ? { ...branch, ...queued, busy: true } : branch);
   } else if (action === "thinking") {
     await setThinking(agent, conversation, req);
     sendJson(res, 200, await agent.branch(conversation));
@@ -241,7 +242,7 @@ async function handleHttp(
   }
 }
 
-async function setModel(agent: AgentHost, conversation: Conversation, req: IncomingMessage): Promise<void> {
+async function setModel(agent: AgentHost, conversation: Conversation, req: IncomingMessage): Promise<ModelSwitchResult> {
   const body = await jsonBody(req);
   const { modelId } = body;
   if (typeof modelId !== "string" || !modelId.trim()) throw new HttpError(400, "Expected modelId");
@@ -253,7 +254,7 @@ async function setModel(agent: AgentHost, conversation: Conversation, req: Incom
     provider = matches[0].provider;
   }
   if (typeof provider !== "string" || !provider.trim()) throw new HttpError(400, "Expected provider");
-  await agent.setModel({ provider, modelId }, conversation);
+  return agent.setModel({ provider, modelId }, conversation);
 }
 
 async function setThinking(agent: AgentHost, conversation: Conversation, req: IncomingMessage): Promise<void> {

@@ -15,10 +15,10 @@ own. Nothing reports back between branches, and every branch stays listed. Each 
 thinking level, and its own cost; the page and the CLI show it as `$<branch> / $<total>`.
 
 The model gets four tools for the tree: `list_branches`, `read_branch` (paging and case-insensitive text search over
-any branch), `fork_branch` (optionally with a first message the new branch starts on), and `set_model`. A branch it
-forks gets the model it has; its `set_model` on another branch is refused while that branch is busy. Forks at an
-incomplete tool exchange are rejected: fork before the call or after its last result. A tool's default self-fork
-ends before its own call. If the optional first message cannot be admitted, the tool reports the created branch ID and
+any branch), `fork_branch` (optionally with a first message the new branch starts on), and `set_model`. A fork
+gets the parent's effective model, never its queued selection. `set_model` follows the same [switch rules](#configure)
+on its own or another branch and reports when a switch is queued. Forks at an incomplete tool exchange are rejected:
+fork before the call or after its last result. A tool's default self-fork ends before its own call. If the optional first message cannot be admitted, the tool reports the created branch ID and
 the admission error; the branch remains available.
 
 ## Tools
@@ -203,6 +203,17 @@ The server listens on `127.0.0.1` only; there is no listen address to configure.
 A new root conversation starts with the model `gpt-6.2-sol` and the thinking level `high`. Both are saved with the
 conversation; change them with `model set` and `thinking set` (add `--branch <id>` for a branch).
 
+A valid chat model selection is saved immediately when the branch is idle. While it is waiting on tools, the
+latest valid selection for that branch is queued: the model picker still shows the effective model and separately
+names the queued one. Once **all** tools of that round return, the switch is saved before the next model request
+of the same turn, which sees the tool results. This neither interrupts a tool nor changes the model of a running
+Pi subprocess. Other busy phases still refuse a switch with 409; invalid or unavailable selections fail immediately.
+
+`abort` cancels a switch that hasn't been applied; it doesn't undo a switch already saved at the boundary. A queued
+selection survives server restart with its tool round. If the round ends without reaching the boundary, or the
+queued model is no longer in the catalog when the boundary runs, the switch is dropped. The latter is logged by
+the server and leaves the saved model in place.
+
 `gpt-6.2-sol` is in the catalog bundled with pi-ai 1.6.0. A model newer than that catalog resolves only if the pi
 CLI has cached a newer catalog in the pi directory. If a branch's saved model is missing from both, the server
 still serves transcripts, branches and model commands. `/health` returns HTTP 200, `modelStatus: "unavailable"`, and the
@@ -213,8 +224,7 @@ that work is neither run on the wrong model nor silently failed.
 
 To keep interrupted work pending, restore the original model (e.g. `pi update --models`) and restart.
 Alternatively, select an available model. Switching withdraws outstanding work from the blocked turn, including
-queued messages; it does **not** rerun them. Send any message you want to retry explicitly. A switch during an
-actively running turn returns 409: wait for the turn to finish, or run `abort` first.
+queued messages and any queued switch; it does **not** rerun them. Send any message you want to retry explicitly.
 
 Only one process can open a data directory, regardless of listen port. The server holds an OS-backed lock in
 a separate `owner.sqlite` file before opening the conversation database. A crash releases the lock; do not delete the file.
@@ -239,7 +249,8 @@ node src/cli.ts rename "<title>"                   # retitle the root (or --bran
 ```
 
 `--branch <id>` before or after the command points `model set`, `thinking set`, `send`, `abort`, `log`, `fork`,
-`rename` and `upgrade` at a branch instead of the root.
+`rename` and `upgrade` at a branch instead of the root. `model set` prints JSON with the effective `model` and,
+if the selection was queued, a separate `pendingModel`.
 
 The CLI connects to `127.0.0.1:8790`. `--port <n>` names another port, for a server started with `--port`
 (or a matching SSH forward). For example: `aipatty --port 9000 shutdown` (or `node src/cli.ts --port 9000 shutdown`).
@@ -281,7 +292,7 @@ loopback; access to the HTTPS URL is controlled by your tailnet policy. Do not u
 
 - `GET /` the page (and `/app.js`, `/app.css`, `/markdown-it.js`, and the modules of `src/web/` as `/web/<name>.ts`)
 - `GET /health` (includes the process ID, the root's saved model, its catalog availability, the thinking level,
-  and `problems`: what the startup health check found, empty when healthy)
+  optional `pendingModel`, and `problems`: what the startup health check found, empty when healthy)
 - `GET /api/models`
 - `GET /api/pi-runs/:runId`: a no-store, read-only snapshot of one active or archived Pi run. Uses the ID from
   the `pi` tool's structured progress/result. Returns `runId`, `status`, `durationMs` when known, bounded `activity`
@@ -291,14 +302,17 @@ loopback; access to the HTTPS URL is controlled by your tailnet policy. Do not u
 - `POST /api/shutdown` (no body needed): requires the `X-Aipatty-Shutdown: 1` header so ordinary browser forms
   cannot trigger it. No CORS is enabled. Returns `202 { "status": "shutdown-requested" }` before stopping the
   server; it does not wait for cleanup. The same Host and Origin rules below apply.
-- `GET /api/branches`: `{ branches: [{ id, title, parent, model, modelStatus, thinking, busy, cost }], totalCost }`
+- `GET /api/branches`: `{ branches: [{ id, title, parent, model, pendingModel?, modelStatus, thinking, busy, cost }], totalCost }`
 - `PUT /api/model` and `PUT /api/thinking`: the root's, as below
 - `GET /api/conversations/:id` (`root` is the root conversation; `?limit=` and `?before=` page backwards); also
   carries `branch` and `totalCost`
 - `POST /api/conversations/:id/fork` with `{ title, at? }`: a new branch from `:id`'s history through entry `at`
   (default its newest); returns the branch
 - `PUT /api/conversations/:id/title` with `{ title }` (1 to 100 characters)
-- `PUT /api/conversations/:id/model` with `{ modelId, provider? }`; 409 while the branch has active work
+- `PUT /api/conversations/:id/model` with `{ modelId, provider? }`: 200 when applied immediately, 202 when queued
+  behind a tool round (the response shows the effective `model` and the accepted `pendingModel` as of admission).
+  Both model references are `{ provider, modelId }`. 400 for an invalid or unavailable selection, 409 for other
+  active work. While queued, `pendingModel` also appears in branch metadata; it disappears when applied or canceled.
 - `PUT /api/conversations/:id/thinking` with `{ level }`
 - `GET /api/conversations/:id/search?q=&limit=&before=`: `{ matches: [{ entryId, role, excerpt }], before }`,
   newest first; pass `before` back for the next page
@@ -307,7 +321,7 @@ loopback; access to the HTTPS URL is controlled by your tailnet policy. Do not u
   is busy or not a managed install
 - `POST /api/conversations/:id/abort` (returns once the conversation is idle)
 - `WS /api/conversations/:id/stream` sends one `state` frame (the newest 50 entries and the live state), then an
-  `update` frame per change: the live state plus any `appended` entries, without the window. It falls back to a full
+  `update` frame per change: the effective model, live state and any `appended` entries, without the window. It falls back to a full
   `state` frame if an entry it already sent changes or a slow client misses part of the window. With `?submissionId=`, it also sends one `settled` frame: the
   answer, or the `reason` and `detail` of a failed run. The server pings every 30 s and drops a stream that does
   not answer.
