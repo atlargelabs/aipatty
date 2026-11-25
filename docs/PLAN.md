@@ -270,6 +270,8 @@ from a release that predates `/upgrade`, which is one more manual deploy. See
    is the self-upgrade milestone.
 5. **After self-upgrade:** phone access, MCP configuration and OAuth, the per-branch switch, and Gmail. Add research
    mode, hooks, or more repos only when needed.
+6. **Planned: connected apps.** A [seam](CONNECTED-APPS.md) for apps that add tools, card steps, pages and data
+   to the branches connected to them, and [Gym](GYM-APP.md) as the first.
 
 ## Setup responsibilities
 

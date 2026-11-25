@@ -173,8 +173,8 @@ Every branch runs these, in this order:
 ## Not built
 
 - **Steps chosen per branch.** Every branch runs the same list. The plan is that a branch adds an app's steps
-  with a command, they run after the built-in ones in the order added, a fork inherits them, and they cannot be
-  removed. The place for them is the `steps` list in `src/page.ts`.
+  with a command, they run after the built-in ones in the order added, and a fork inherits them. The place for
+  them is the `steps` list in `src/page.ts`. [CONNECTED-APPS.md](CONNECTED-APPS.md#card-steps) is the plan.
 - **State in a card.** A card is its precard and nothing more, so it has no form fields or other state of its
   own. A form belongs on an app's own page, reached by a link.
 - **A step that reads several earlier cards.** Only the join of a result to its call exists, in `initial`. If
