@@ -48,7 +48,7 @@ The ID is the only thing two apps must not share, and the host checks each use o
 
 | What | Namespace | Enforced by |
 | --- | --- | --- |
-| Tools | names start `<id>_` | the host rejects other names and collisions |
+| Tools | names start `<id>_` | the host rejects other names and prefixes that already belong to a built-in tool |
 | Routes | `/apps/<id>/…` | the host's router |
 | Data | `data/apps/<id>/` | the host creates it and passes it to `open` |
 | Card steps | only cards of the app's own tools | the step wrapper, below |
@@ -153,7 +153,9 @@ Not handled, as decisions:
 - **In-process code.** Apps run inside the server. One that hangs the event loop or crashes the process takes
   aipatty down. Apps are reviewed code in this repo, not installed at runtime.
 - **Upgrade rollback.** `/upgrade` backs up and restores only `aipatty.sqlite`. App data is not rolled back, so
-  an app's schema changes must be additive.
+  an app's schema changes must be additive. Before a manual downgrade that keeps the current conversation
+  database, disconnect apps on affected branches. An older release without app support cannot remove saved
+  app instructions itself.
 - **Not access control.** A connection selects tools and instructions for the model. Anyone who can reach
   aipatty can open any app's page, and the built-in tools can read `data/apps/` with the service account's
   permissions.

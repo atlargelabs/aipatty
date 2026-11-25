@@ -155,13 +155,15 @@ test("only valid namespaced apps open; app requests keep the host trust and erro
   const dir = await fixture(t);
   let rejectedClosed = false;
   const host = await openHost(fauxConfig(dir), { apps: [
-    fixtureApp("good"), fixtureApp("../invalid"), fixtureApp("duplicate"), fixtureApp("duplicate"),
+    fixtureApp("good"), fixtureApp("../invalid"), fixtureApp("duplicate"), fixtureApp("duplicate"), fixtureApp("read"),
     fixtureApp("bad", { toolName: "good_other", close: () => { rejectedClosed = true; } }),
   ] });
   const api = await startApi(host, health, 0);
   t.after(async () => { await api.close(); await host.close(); });
   assert.equal(rejectedClosed, true);
-  assert.deepEqual((await host.appProblems()).map(problem => problem.split(" unavailable")[0]), ['"../invalid"', '"duplicate"', '"bad"']);
+  const problems = await host.appProblems();
+  assert.deepEqual(problems.map(problem => problem.split(" unavailable")[0]), ['"../invalid"', '"duplicate"', '"read"', '"bad"']);
+  assert.match(problems[2], /namespace read_ overlaps read_branch/);
   const base = `http://127.0.0.1:${api.port}`;
   const route = `${base}/apps/good/`;
   const response = await fetch(route, { headers: { Origin: base } });

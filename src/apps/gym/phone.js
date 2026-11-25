@@ -16,7 +16,7 @@ if (/^[1-9]\d*$/.test(branch ?? "") && Number.isSafeInteger(Number(branch))) {
   $("chat-link").hidden = false;
 }
 
-let id, sets, editing, position, setDirty, valuesDirty;
+let id, sets, editing, position, setDirty, valuesDirty, dateDirty, unreadableDraft;
 let suggestion = null, knownExercises = new Map(), busy = false, lookup = 0, lookedUp;
 
 function today() {
@@ -53,23 +53,43 @@ async function api(path, method = "GET", body) {
 }
 
 function hasDraft() {
-  return editing || sets.length > 0 || date.value !== today() || setDirty || position !== null;
+  return editing || sets.length > 0 || dateDirty || setDirty || position !== null;
+}
+function updateDefaultDate() {
+  if (!hasDraft()) date.value = today();
 }
 function remember() {
-  $("reset-workout").hidden = !hasDraft();
+  $("draft-warning").hidden = !unreadableDraft;
+  $("reset-workout").textContent = unreadableDraft ? "Discard unreadable draft" : "Discard draft";
+  $("reset-workout").hidden = !unreadableDraft && !hasDraft();
+  if (unreadableDraft) return; // Don't overwrite or delete it without an explicit discard.
   try {
     if (!hasDraft()) localStorage.removeItem(draftKey);
     else localStorage.setItem(draftKey, JSON.stringify({
-      id, date: date.value, sets, editing,
+      id, date: date.value, dateDirty, sets, editing,
       fields: { exercise: exercise.value, reps: reps.value, amount: amount.value, unit: unit.value, position, setDirty, valuesDirty },
     }));
   } catch { say("This browser could not store the draft. Save the workout before leaving Gym."); }
 }
-function restore() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(draftKey));
-    if (saved?.id && Array.isArray(saved.sets)) return saved;
-  } catch { /* Storage is optional; the page still saves to the log. */ }
+function restoreEditor() {
+  let raw;
+  try { raw = localStorage.getItem(draftKey); } catch {
+    if (!id) begin(); // Storage is optional; leave an existing in-memory editor alone.
+    return;
+  }
+  let saved;
+  unreadableDraft = false;
+  if (raw !== null) {
+    try {
+      const draft = JSON.parse(raw);
+      if (typeof draft?.id !== "string" || !draft.id || typeof draft.date !== "string" || !Array.isArray(draft.sets)
+        || !draft.sets.every(set => typeof set?.exercise === "string" && typeof set.amount === "number" && typeof set.unit === "string")) {
+        throw new Error("Unrecognized draft");
+      }
+      saved = draft;
+    } catch { unreadableDraft = true; }
+  }
+  begin(saved);
 }
 function timed() { return unit.value === "sec" || unit.value === "min"; }
 function syncFields() {
@@ -100,6 +120,7 @@ function loadFields(fields) {
 function begin(draft) {
   id = draft?.id ?? newId();
   date.value = draft?.date ?? today();
+  dateDirty = draft?.dateDirty ?? false;
   sets = draft ? [...draft.sets] : [];
   editing = !!draft?.editing;
   $("workout-heading").textContent = editing ? "Edit workout" : "Log workout";
@@ -167,6 +188,7 @@ async function previewLast() {
 }
 
 form.addEventListener("input", event => {
+  updateDefaultDate();
   setDirty = true;
   if (event.target === exercise) {
     hideLast();
@@ -179,7 +201,7 @@ form.addEventListener("input", event => {
   remember();
 });
 exercise.addEventListener("change", () => void previewLast());
-date.addEventListener("input", remember);
+date.addEventListener("input", () => { dateDirty = true; remember(); });
 $("clear-set").addEventListener("click", () => { loadFields(); remember(); say(""); });
 form.addEventListener("submit", event => {
   event.preventDefault();
@@ -265,10 +287,21 @@ $("save-workout").addEventListener("click", () => {
   });
 });
 $("reset-workout").addEventListener("click", () => {
-  if (mayDiscardDraft()) { begin(); say(""); }
+  if (unreadableDraft ? !confirm("Discard the unreadable draft and any unsaved changes?") : !mayDiscardDraft()) return;
+  unreadableDraft = false;
+  say("");
+  begin();
 });
 
-begin(restore());
+restoreEditor();
 void run(refresh);
-window.addEventListener("pageshow", event => { if (event.persisted) void run(refresh); });
-document.addEventListener("visibilitychange", () => { if (!document.hidden) void run(refresh); });
+window.addEventListener("pageshow", event => {
+  if (!event.persisted) return;
+  restoreEditor(); // A newer visit may have saved, changed or discarded the draft.
+  void run(refresh);
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  updateDefaultDate();
+  void run(refresh);
+});

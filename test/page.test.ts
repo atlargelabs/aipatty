@@ -875,6 +875,31 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await browser.evaluate("window.confirm = () => true");
   await tap("#reset-workout");
   assert.equal(await browser.evaluate("localStorage.getItem('gym-draft')"), null);
+
+  // A previous visit restored by history must not offer a stale copy if a newer visit saved or discarded it.
+  await set({ exercise: "Deadlift", reps: "3", amount: "90" });
+  const fromHistory = "window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }))";
+  await browser.evaluate(`localStorage.removeItem('gym-draft'); ${fromHistory}`);
+  await wait("!document.querySelector('#workout-editor').disabled");
+  assert.equal(await browser.evaluate("document.querySelector('#exercise').value"), "");
+  await browser.evaluate(`localStorage.setItem('gym-draft', '{corrupt'); ${fromHistory}`);
+  await wait("!document.querySelector('#workout-editor').disabled && !document.querySelector('#draft-warning').hidden");
+  assert.equal(await browser.evaluate("localStorage.getItem('gym-draft')"), "{corrupt");
+  await tap("#reset-workout");
+  assert.equal(await browser.evaluate("localStorage.getItem('gym-draft')"), null);
+
+  // Opening the phone the next day updates the default, not a date the operator picked.
+  const foreground = "document.dispatchEvent(new Event('visibilitychange'))";
+  await browser.evaluate(`window.RealDate = Date; window.Date = class extends RealDate {
+    constructor(...args) { super(...(args.length ? args : ['2027-01-02T12:00:00'])); }
+  }; ${foreground}`);
+  await wait("!document.querySelector('#workout-editor').disabled");
+  assert.equal(await browser.evaluate("document.querySelector('#workout-date').value"), "2027-01-02");
+  await set({ "workout-date": "2026-12-31" });
+  await browser.evaluate(`window.Date = RealDate; ${foreground}`);
+  await wait("!document.querySelector('#workout-editor').disabled");
+  assert.equal(await browser.evaluate("document.querySelector('#workout-date').value"), "2026-12-31");
+  await tap("#reset-workout");
   await tap("#chat-link");
   await waitFor(browser, "back in Training", value => value.title === "Training");
 

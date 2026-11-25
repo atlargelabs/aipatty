@@ -189,15 +189,17 @@ async function openOwnedHost(config: Config, { apps: modules = connectedApps, mo
     try {
       if (!appId.test(id)) throw new Error("ID must contain only lower-case letters and digits");
       if (modules.filter(module => module.id === id).length > 1) throw new Error("Duplicate app ID");
+      const prefix = `${id}_`;
+      const registered = registry.snapshot();
+      const collision = registered.tools().find(({ tool }) => tool.name.startsWith(prefix));
+      if (collision) throw new Error(`Tool namespace ${prefix} overlaps ${collision.tool.name}`);
       const dataDir = appPath(id);
       await mkdir(dataDir, { recursive: true, mode: 0o700 });
       opened = app.open({ dataDir });
-      const registered = registry.snapshot();
       const extension = defineExtension({ name: `aipatty.app.${id}`, tools: opened.tools });
       if (registered.extension(extension.name)) throw new Error(`Extension ${extension.name} is already installed`);
       for (const { name } of opened.tools) {
-        if (!name.startsWith(`${id}_`) || name.length === id.length + 1) throw new Error(`Tool ${name} must be named ${id}_…`);
-        if (registered.tools().some(({ tool }) => tool.name === name)) throw new Error(`Tool ${name} is already installed`);
+        if (!name.startsWith(prefix) || name.length === prefix.length) throw new Error(`Tool ${name} must be named ${prefix}…`);
       }
       registry.install(extension);
       apps.set(id, { title: app.title, instructions: app.instructions, opened, extension });

@@ -241,6 +241,12 @@ The upgrade backup below does **not** cover this file. To back up Gym, stop the 
 exit, and copy `gym.sqlite` to a private backup location. App pages use the chat listener's Host/Origin checks,
 not separate authentication: only let people you trust with the workout log reach aipatty.
 
+Before a manual downgrade to a release without connected apps **keeping the current conversation database**,
+use `/disconnect gym` on each connected branch while still running this release. Otherwise the old release
+can retain the workout instructions without the tools. This does not delete the Gym log. Reconnect the
+branches when running a release with Gym again. Automatic `/upgrade` rollback restores its prior conversation
+database and needs no such step.
+
 ## Upgrade
 
 With the server started as in [Start](#start), from a release that has the command, ask for an upgrade in any
