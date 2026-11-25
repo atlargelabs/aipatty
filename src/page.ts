@@ -787,6 +787,14 @@ function refreshBranchSettings(id) {
   });
 }
 
+function pollBranches() {
+  // A slow background refresh must not be superseded by the next tick before it can finish.
+  setTimeout(async () => {
+    await refreshBranches().catch(() => {});
+    pollBranches();
+  }, 10000);
+}
+
 async function selectBranch(id) {
   app.branch = id;
   app.entries = [];
@@ -924,6 +932,6 @@ guard(async () => {
   await refreshBranches();
   const wanted = Number(location.hash.slice(1));
   await selectBranch(app.branches.some(branch => branch.id === wanted) ? wanted : app.branches[0].id);
-  setInterval(() => { refreshBranches().catch(() => {}); }, 10000);
+  pollBranches();
 })();
 `;
