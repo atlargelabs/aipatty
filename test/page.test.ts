@@ -868,6 +868,7 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   const [first] = (await overview()).workouts;
   assert.deepEqual(first.sets.map(set => [set.exercise, set.reps, set.amount, set.unit]), [["Squat", 5, 60, "kg"], ["Squat", 4, 62.5, "kg"], ["Plank", null, 45, "sec"]]);
   assert.equal(await browser.evaluate("localStorage.getItem('gym-draft')"), null);
+  await wait("document.querySelectorAll('#exercises option').length === 2");
   assert.deepEqual(await browser.evaluate("[...document.querySelectorAll('#exercises option')].map(option => option.value)"), ["Plank", "Squat"]);
   await set({ exercise: "sQuAt" });
   await wait("document.querySelectorAll('#last-session li').length === 2");
@@ -888,8 +889,27 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await tap("#reset-workout");
   assert.equal(await browser.evaluate("localStorage.getItem('gym-draft')"), null);
 
-  // Opening the phone the next day updates the default, not a date the operator picked.
+  // Foreground refresh is bounded and doesn't lock local logging. A failed autosave isn't masked by Set added.
   const foreground = "document.dispatchEvent(new Event('visibilitychange'))";
+  await browser.evaluate(`
+    window.realGymFetch = fetch;
+    window.fetch = (url, init) => url === '/apps/gym/api/overview' ? new Promise((resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+      window.releaseOverview = () => resolve(window.realGymFetch(url, init));
+    }) : window.realGymFetch(url, init);
+    window.saveDraftItem = Storage.prototype.setItem;
+    Storage.prototype.setItem = () => { throw new DOMException('storage quota', 'QuotaExceededError'); };
+    ${foreground}
+  `);
+  await wait("typeof window.releaseOverview === 'function'");
+  await set({ exercise: "Deadlift", reps: "3", amount: "90" });
+  await tap("#add-set");
+  await status("Set added");
+  assert.match(await browser.evaluate<string>("document.querySelector('#draft-warning').innerText"), /could not autosave/);
+  await browser.evaluate("Storage.prototype.setItem = window.saveDraftItem; window.fetch = window.realGymFetch; window.releaseOverview()");
+  await tap("#reset-workout");
+
+  // Opening the phone the next day updates the default, not a date the operator picked.
   await browser.evaluate(`window.RealDate = Date; window.Date = class extends RealDate {
     constructor(...args) { super(...(args.length ? args : ['2027-01-02T12:00:00'])); }
   }; ${foreground}`);

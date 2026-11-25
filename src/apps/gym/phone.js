@@ -17,7 +17,9 @@ if (/^[1-9]\d*$/.test(branch ?? "") && Number.isSafeInteger(Number(branch))) {
 }
 
 let id, sets, editing, position, setDirty, valuesDirty, dateDirty, unreadableDraft;
-let suggestion = null, knownExercises = new Map(), busy = false, lookup = 0, lookedUp;
+let suggestion = null, knownExercises = new Set(), busy = false, lookup = 0, lookedUp, overviewRevision = 0;
+// Match the store's SQLite NOCASE, not Unicode case folding.
+const foldName = name => name.replace(/[A-Z]/g, letter => letter.toLowerCase());
 
 function today() {
   const now = new Date();
@@ -42,9 +44,13 @@ function setLine(set) {
   return set.exercise + " · " + (set.reps == null ? "" : set.reps + " reps · ") + set.amount + " " + set.unit;
 }
 function say(text) { $("status").textContent = text; }
+function warning(id, text = "") {
+  $(id).textContent = text;
+  $(id).hidden = !text;
+}
 async function api(path, method = "GET", body) {
   const response = await fetch("/apps/gym/api/" + path, {
-    method,
+    method, signal: AbortSignal.timeout(8_000),
     ...(body === undefined ? {} : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   });
   const value = await response.json();
@@ -59,17 +65,24 @@ function updateDefaultDate() {
   if (!hasDraft()) date.value = today();
 }
 function remember() {
-  $("draft-warning").hidden = !unreadableDraft;
   $("reset-workout").textContent = unreadableDraft ? "Discard unreadable draft" : "Discard draft";
-  $("reset-workout").hidden = !unreadableDraft && !hasDraft();
-  if (unreadableDraft) return; // Don't overwrite or delete it without an explicit discard.
+  const dirty = hasDraft();
+  $("reset-workout").hidden = !unreadableDraft && !dirty;
+  if (unreadableDraft) {
+    warning("draft-warning", "This browser's saved draft could not be read. It has been kept. Discard it to resume draft autosave.");
+    return;
+  }
   try {
-    if (!hasDraft()) localStorage.removeItem(draftKey);
+    if (!dirty) localStorage.removeItem(draftKey);
     else localStorage.setItem(draftKey, JSON.stringify({
       id, date: date.value, dateDirty, sets, editing,
       fields: { exercise: exercise.value, reps: reps.value, amount: amount.value, unit: unit.value, position, setDirty, valuesDirty },
     }));
-  } catch { say("This browser could not store the draft. Save the workout before leaving Gym."); }
+    warning("draft-warning");
+  } catch {
+    warning("draft-warning", dirty ? "This browser could not autosave the draft. Save the workout before leaving Gym."
+      : "This browser could not clear the draft. A previously saved draft may reappear on reload.");
+  }
 }
 function restoreEditor() {
   let raw;
@@ -193,7 +206,7 @@ form.addEventListener("input", event => {
   if (event.target === exercise) {
     hideLast();
     if (position === null && !valuesDirty) reps.value = amount.value = "";
-    if (knownExercises.has(exercise.value.trim().toLowerCase())) void previewLast();
+    if (knownExercises.has(foldName(exercise.value.trim()))) void previewLast();
   } else {
     valuesDirty = true;
   }
@@ -226,22 +239,26 @@ async function run(action) {
   busy = $("workout-editor").disabled = true;
   say("");
   try { await action(); }
-  catch (error) { say(error instanceof Error ? error.message : String(error)); }
+  catch (error) { say(error.name === "TimeoutError" ? "Gym did not respond. Try again." : error.message); }
   finally { busy = $("workout-editor").disabled = false; }
 }
 async function refresh() {
-  const overview = await api("overview");
-  knownExercises = new Map(overview.exercises.map(name => [name.toLowerCase(), name]));
-  $("exercises").replaceChildren(...Array.from(knownExercises.values(), name => new Option(name, name)));
-  suggestion = overview.suggestion;
-  $("suggestion-note").textContent = suggestion ? (suggestion.note || "Saved on " + suggestion.created + ".") : "No suggestion saved yet.";
-  $("suggestion-sets").replaceChildren(...(suggestion?.sets ?? []).map(set => node("li", setLine(set))));
-  $("suggestion-sets").hidden = startSuggestion.hidden = !suggestion;
-  recent.replaceChildren(...(overview.workouts.length ? overview.workouts.map(workoutCard) : [node("p", "No workouts logged yet.")]));
-}
-async function refreshAfter(message) {
-  try { await refresh(); say(message); }
-  catch { say(message + " Reload Gym to refresh the list."); }
+  // The overview is context for the editor, not a prerequisite for entering sets.
+  const revision = ++overviewRevision;
+  try {
+    const overview = await api("overview");
+    if (revision !== overviewRevision) return;
+    knownExercises = new Set(overview.exercises.map(foldName));
+    $("exercises").replaceChildren(...overview.exercises.map(name => new Option(name, name)));
+    suggestion = overview.suggestion;
+    $("suggestion-note").textContent = suggestion ? (suggestion.note || "Saved on " + suggestion.created + ".") : "No suggestion saved yet.";
+    $("suggestion-sets").replaceChildren(...(suggestion?.sets ?? []).map(set => node("li", setLine(set))));
+    $("suggestion-sets").hidden = startSuggestion.hidden = !suggestion;
+    recent.replaceChildren(...(overview.workouts.length ? overview.workouts.map(workoutCard) : [node("p", "No workouts logged yet.")]));
+    warning("overview-warning");
+  } catch {
+    if (revision === overviewRevision) warning("overview-warning", "Could not refresh workouts and suggestions. You can still enter sets. Reload Gym to retry.");
+  }
 }
 function workoutCard(workout) {
   const card = node("article");
@@ -262,7 +279,8 @@ function workoutCard(workout) {
         await api("workouts/" + workout.id, "DELETE");
         if (editing && id === workout.id) begin();
         card.remove();
-        await refreshAfter("Workout deleted.");
+        say("Workout deleted.");
+        void refresh();
       });
     }),
   );
@@ -283,7 +301,8 @@ $("save-workout").addEventListener("click", () => {
   void run(async () => {
     await api("workouts/" + id, "PUT", { date: date.value, sets });
     begin();
-    await refreshAfter("Workout saved.");
+    say("Workout saved.");
+    void refresh();
   });
 });
 $("reset-workout").addEventListener("click", () => {
@@ -294,14 +313,15 @@ $("reset-workout").addEventListener("click", () => {
 });
 
 restoreEditor();
-void run(refresh);
+$("workout-editor").disabled = false;
+void refresh();
 window.addEventListener("pageshow", event => {
   if (!event.persisted) return;
   restoreEditor(); // A newer visit may have saved, changed or discarded the draft.
-  void run(refresh);
+  void refresh();
 });
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;
   updateDefaultDate();
-  void run(refresh);
+  void refresh();
 });

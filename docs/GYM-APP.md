@@ -44,8 +44,9 @@ of exercises: names from the log are compared using SQLite `NOCASE` (ASCII case 
   first set from them. Most sets repeat the last session, and this is what makes logging quick.
 - **Suggestion:** when there is one, the page shows its note and sets, and **Start from this** loads the sets
   as the draft to correct and save.
-- **Draft:** an unsaved workout is kept in the browser's `localStorage`, so a reload or a locked phone does not
-  lose it. Saving or discarding clears it.
+- **Draft:** an unsaved workout is kept in this browser's `localStorage` and normally survives reload or a
+  locked phone. Saving or discarding clears it. If autosave fails, the page warns that recent edits may only
+  be in memory. Slow workout-history requests do not stop you entering sets.
 - **Recent workouts:** the newest 20, each of which can be edited or deleted.
 - **Back to chat:** shown when the page was opened from a branch.
 

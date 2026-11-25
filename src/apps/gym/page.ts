@@ -12,6 +12,7 @@ export const phonePage = `<!doctype html>
 <body>
   <header><h1>Gym</h1><a id="chat-link" href="/" hidden>Back to chat</a></header>
   <main>
+    <p id="overview-warning" role="status" hidden></p>
     <section aria-labelledby="suggestion-heading">
       <h2 id="suggestion-heading">Suggested workout</h2>
       <p id="suggestion-note">Loading…</p>
@@ -37,7 +38,7 @@ export const phonePage = `<!doctype html>
         <div class="gym-actions"><button id="save-workout" type="button">Save workout</button><button id="reset-workout" type="button" hidden>Discard draft</button></div>
       </fieldset>
       <p id="status" role="status"></p>
-      <p id="draft-warning" role="status" hidden>This browser's saved draft could not be read. It has been kept. Discard it to resume draft autosave.</p>
+      <p id="draft-warning" role="status" hidden></p>
     </section>
     <section aria-labelledby="recent-heading">
       <h2 id="recent-heading">Recent workouts</h2>
