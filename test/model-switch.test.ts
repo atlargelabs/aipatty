@@ -34,7 +34,7 @@ test("/model leaves the whole turn alone and applies the latest valid choice at 
 
   const applied = await post(" /model next\n");
   assert.equal(applied.status, 200);
-  assert.deepEqual(await applied.json(), { modelSwitch: "applied", model: ref("next") });
+  assert.deepEqual(await applied.json(), { modelSwitch: "applied", model: ref("next"), notice: "Model set to faux/next." });
   assert.equal((await post("/model\nfaux/last")).status, 400);
   assert.deepEqual((await root.entries({}, 10, undefined, ctx)).items, []);
   const stream = connect(t, base);
@@ -53,7 +53,9 @@ test("/model leaves the whole turn alone and applies the latest valid choice at 
   await started.promise;
   const queued = await post("/model faux/faux-1");
   assert.equal(queued.status, 202);
-  assert.deepEqual(await queued.json(), { modelSwitch: "queued", model: ref("faux-1") });
+  assert.deepEqual(await queued.json(), {
+    modelSwitch: "queued", model: ref("faux-1"), notice: "Queued faux/faux-1; it will apply when this branch goes idle.",
+  });
   assert.equal(await host.setModel(ref("last"), root), "queued");
   await assert.rejects(host.setModel({ ...ref("faux-1"), thinkingLevel: "low" }, root), /omit thinking/);
   assert.equal((await post("/model faux/invalid")).status, 400);

@@ -104,7 +104,8 @@ test("the stream delivers the answer, and a late joiner gets the current state",
   assert.ok(updates.length > 2, "expected live updates between the first and last state");
   assert.ok(updates.every(update => update.type === "update" && !("entries" in update)));
   assert.equal(updates.flatMap(update => update.type === "update" ? update.appended : []).length, last.entries.length);
-  const { live: _live, type: _type, ...folded } = last;
+  const { live: _live, type: _type, apps, ...folded } = last;
+  assert.deepEqual(apps, []);
   assert.deepEqual(folded, await page(base));
 
   const late = connect(t, base);
