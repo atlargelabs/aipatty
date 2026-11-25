@@ -36,6 +36,16 @@ export async function queueModel(tx: Tx, conversationId: ConversationId, selecti
   return true;
 }
 
+/** A later explicit thinking setting takes precedence over any thinking level bundled with an older selection. */
+export async function configureThinking(tx: Tx, conversationId: ConversationId, thinkingLevel: ModelThinkingLevel) {
+  const round = await toolRound(tx, conversationId);
+  if (round) {
+    const { selection } = await tx.doc(PendingModelDoc, round.taskId);
+    if (selection) delete selection.thinkingLevel;
+  }
+  await configure(tx, conversationId, { thinkingLevel });
+}
+
 export function modelSwitchExtension(harness: () => Harness) {
   return defineExtension({
     name: "aipatty-model-switch",

@@ -9,7 +9,7 @@ import type { BranchInfo } from "../src/branches.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
 import { pageModules } from "../src/page.ts";
 import { messageText, type ConversationPage } from "../src/protocol.ts";
-import { checkout, fauxConfig, fixture, realConfig, until } from "./helpers.ts";
+import { checkout, fauxConfig, fixture, realConfig, requestJson, until } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
 const exec = promisify(execFile);
@@ -19,12 +19,7 @@ async function server(t: TestContext, dir?: string) {
   const api = await startApi(host, health, 0);
   t.after(async () => { await api.close(); await host.harness.close(ctx); });
   const base = `http://127.0.0.1:${api.port}`;
-  const call = async <T = unknown>(path: string, method = "GET", body?: unknown): Promise<{ status: number; body: T }> => {
-    const response = await fetch(base + path, {
-      method, ...(body === undefined ? {} : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
-    });
-    return { status: response.status, body: await response.json() as T };
-  };
+  const call = <T = unknown>(path: string, method = "GET", body?: unknown) => requestJson<T>(base, path, method, body);
   return { host, base, call };
 }
 

@@ -10,6 +10,13 @@ import { applyUpdate, type StreamFrame } from "../src/protocol.ts";
 
 export const checkout = join(import.meta.dirname, "..");
 
+export async function requestJson<T = unknown>(base: string, path: string, method = "GET", body?: unknown) {
+  const response = await fetch(base + path, {
+    method, ...(body === undefined ? {} : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+  });
+  return { status: response.status, body: await response.json() as T };
+}
+
 export async function until<T>(
   read: () => Promise<T> | T, done: (value: T) => boolean = Boolean, timeoutMs = 10_000,
 ): Promise<T> {

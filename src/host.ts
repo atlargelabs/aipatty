@@ -15,7 +15,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { BranchDoc, ROOT_TITLE, thinkingLevels, validTitle, type BranchInfo, type SearchMatch } from "./branches.ts";
 import type { Config } from "./config.ts";
-import { modelSwitchExtension, PendingModelDoc, queueModel } from "./model-switch.ts";
+import { configureThinking, modelSwitchExtension, PendingModelDoc, queueModel } from "./model-switch.ts";
 import { ownDataDir } from "./ownership.ts";
 import { openModels } from "./models.ts";
 import { openPiRuns, type PiRuns } from "./pi-run.ts";
@@ -361,7 +361,7 @@ async function openOwnedHost(config: Config, models: Models, extensions: readonl
         return onBranch(target, () => exclusive(async () => {
           const thinkingLevel = thinkingLevels.find(value => value === level);
           if (!thinkingLevel) throw new HttpError(400, `Expected a thinking level: ${thinkingLevels.join(", ")}`);
-          await target.configure({ thinkingLevel }, ctx);
+          await target.commit(tx => configureThinking(tx, target.id, thinkingLevel), context ?? ctx);
         }, context));
       },
       async branches() {

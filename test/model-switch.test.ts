@@ -9,18 +9,11 @@ import type { ModelStatus } from "../src/host.ts";
 import { PendingModelDoc } from "../src/model-switch.ts";
 import { messageText } from "../src/protocol.ts";
 import { modelSwitchFixture, nextModel, oldModel, otherModel } from "./fixtures/model-switch.ts";
-import { connect, fixture, until } from "./helpers.ts";
+import { connect, fixture, requestJson as json, until } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
 const rootModel = "/api/model";
 const rootPath = "/api/conversations/root";
-
-async function json<T>(base: string, path: string, method = "GET", body?: unknown) {
-  const response = await fetch(base + path, {
-    method, ...(body === undefined ? {} : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
-  });
-  return { status: response.status, body: await response.json() as T };
-}
 
 test("the latest queued model applies to the same submission after an entire parallel tool round", { timeout: 15_000 }, async t => {
   const { faux, tools, open, start } = modelSwitchFixture(await fixture(t), 2);
@@ -86,6 +79,10 @@ test("the latest queued model applies to the same submission after an entire par
   assert.deepEqual(list.body.branches[0].pendingModel, otherModel);
   assert.deepEqual(list.body.branches[0].model, oldModel);
   assert.equal(list.body.branches[0].thinking, "high");
+  const standalone = await json<ModelStatus>(base, "/api/thinking", "PUT", { level: "medium" });
+  assert.equal(standalone.status, 200);
+  assert.equal(standalone.body.thinking, "medium");
+  assert.deepEqual(standalone.body.pendingModel, otherModel);
 
   faux.appendResponses([(context, _options, _state, model) => {
     assert.equal(model.id, otherModel.modelId, "the first actual request after the tools uses the latest model");
@@ -95,7 +92,7 @@ test("the latest queued model applies to the same submission after an entire par
   }]);
   tools[1].done.resolve();
   await boundary.promise;
-  assert.deepEqual(await host.modelStatus(), { modelStatus: "available", model: otherModel, thinking: "low" });
+  assert.deepEqual(await host.modelStatus(), { modelStatus: "available", model: otherModel, thinking: "medium" });
   // The slots still exist, but the hook has already run. Do not accept a switch that would miss the boundary.
   assert.equal((await json(base, rootModel, "PUT", nextModel)).status, 409);
   await until(() => stream.state()?.model?.modelId === otherModel.modelId);

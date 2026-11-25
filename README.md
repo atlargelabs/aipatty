@@ -205,9 +205,12 @@ conversation; change them with `model set` and `thinking set` (add `--branch <id
 
 A valid chat model selection is saved immediately when the branch is idle. While it is waiting on tools, the
 latest valid selection for that branch is queued: the model picker still shows the effective model and separately
-names the queued one. Once **all** tools of that round return, the switch is saved before the next model request
+names the queued one. Use **Keep current model** to replace the queued choice with the effective model. Once **all**
+tools of that round return, the switch is saved before the next model request
 of the same turn, which sees the tool results. This neither interrupts a tool nor changes the model of a running
 Pi subprocess. Other busy phases still refuse a switch with 409; invalid or unavailable selections fail immediately.
+A standalone thinking setting still applies immediately and supersedes any thinking level bundled with an older
+queued switch.
 
 `abort` cancels a switch that hasn't been applied; it doesn't undo a switch already saved at the boundary. A queued
 selection survives server restart with its tool round. If the round ends without reaching the boundary, or the

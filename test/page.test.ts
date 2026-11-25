@@ -134,7 +134,7 @@ test("the model picker shows the queued choice separately and follows the stream
   }`);
   const read = () => browser.evaluate<{ model: string; pending: string; enabled: boolean; busy: boolean }>(`({
     model: document.querySelector("#model").value,
-    pending: document.querySelector("#model-pending").textContent,
+    pending: document.querySelector("#model-pending-message").textContent,
     enabled: !document.querySelector("#model").disabled,
     busy: !document.querySelector("#abort").disabled,
   })`);
@@ -143,6 +143,10 @@ test("the model picker shows the queued choice separately and follows the stream
   const queued = await until(read, state => state.enabled && state.pending.includes(key(nextModel)));
   assert.equal(queued.model, key(oldModel));
   assert.match(queued.pending, /queued until this tool round completes/);
+  await browser.evaluate('document.querySelector("#keep-model").click()');
+  const kept = await until(read, state => state.enabled && state.pending.startsWith("Keeping "));
+  assert.equal(kept.model, key(oldModel));
+  assert.deepEqual((await host.modelStatus()).pendingModel, oldModel);
 
   // Hold a pre-boundary branch list from the replacement PUT until after the socket has shown the new model.
   await browser.evaluate(`{
