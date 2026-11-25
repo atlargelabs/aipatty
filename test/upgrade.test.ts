@@ -11,7 +11,7 @@ import { DatabaseSync } from "node:sqlite";
 import test, { type TestContext } from "node:test";
 import { startApi } from "../src/api.ts";
 import { openHost } from "../src/host.ts";
-import { upgradeText, type ConversationPage } from "../src/protocol.ts";
+import { operatorNotice, type ConversationPage } from "../src/protocol.ts";
 import { upgradeRequest } from "../src/upgrade.ts";
 import { backupDb, restoreDb, upgradeFiles, type Pending } from "../src/upgrade-supervisor.ts";
 import { checkout, fauxConfig, fixture, until } from "./helpers.ts";
@@ -116,7 +116,7 @@ async function install(t: TestContext, originOption?: string) {
   const lines = async (): Promise<string[]> => {
     const page = await fetch(`${base}/api/conversations/root`).then(response => response.json(), () => ({ entries: [] })) as ConversationPage;
     return page.entries.flatMap(entry => {
-      const upgrade = upgradeText(entry);
+      const upgrade = operatorNotice(entry)?.text;
       const messages = (entry.model ?? []).flatMap(message => {
         const text = typeof message.content === "string" ? message.content
           : message.content.flatMap(part => part.type === "text" ? [part.text] : []).join("");

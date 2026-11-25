@@ -226,6 +226,27 @@ acknowledges the request. Wait for the server process to exit before repointing 
 server. For older releases without the command, or if the API is unreachable, use Ctrl-C in the server terminal
 or send the server `SIGTERM`. These all use the same cleanup; see [CLI shutdown semantics](../README.md#cli).
 
+## Gym pilot
+
+No new service, credentials or settings are needed. Once the running release includes Gym, open the usual chat
+page on the phone, create a training branch, and send `/connect gym`. Follow the [Gym quickstart](GYM-APP.md)
+for logging and coaching, then use it for two real workouts before deciding what to change.
+
+Check `/connect` or `aipatty health` (`appProblems`) if Gym is missing. The diagnostic names the app data path;
+see the server's output (`$ROOT/upgrade/server.log` for a supervisor-started server). Fix the problem and restart;
+the branch's saved connection is retained. Do not delete the database as a fix.
+
+The workout log and current suggestion live in `$ROOT/data/apps/gym/gym.sqlite` (`$ROOT/faux` in Faux mode).
+The upgrade backup below does **not** cover this file. To back up Gym, stop the server, wait for its process to
+exit, and copy `gym.sqlite` to a private backup location. App pages use the chat listener's Host/Origin checks,
+not separate authentication: only let people you trust with the workout log reach aipatty.
+
+Before a manual downgrade to a release without connected apps **keeping the current conversation database**,
+use `/disconnect gym` on each connected branch while still running this release. Otherwise the old release
+can retain the workout instructions without the tools. This does not delete the Gym log. Reconnect the
+branches when running a release with Gym again. Automatic `/upgrade` rollback restores its prior conversation
+database and needs no such step.
+
 ## Upgrade
 
 With the server started as in [Start](#start), from a release that has the command, ask for an upgrade in any
@@ -254,7 +275,7 @@ Everything the upgrade keeps is in `$ROOT/upgrade/`:
 | --- | --- |
 | `upgrade.log` | What the supervisor did, with times. |
 | `server.log` | The output of the servers the supervisor started. |
-| `backup.sqlite` | The database as the old release left it at the last switch. Replaced by the next upgrade. |
+| `backup.sqlite` | The conversation database as the old release left it at the last switch (not app data). Replaced by the next upgrade. |
 | `pending.json` | Present only between the switch and the new release passing its health check. |
 | `result.json` | An outcome waiting for a running server to post it. |
 

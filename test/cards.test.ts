@@ -3,7 +3,7 @@ import type { EntryRecord, LiveState } from "@earendil-works/pi-durable";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { upgradeEntryKind } from "../src/protocol.ts";
-import { derive, type AgentData, type Precard, type Step } from "../src/web/cards.ts";
+import { derive, scopeAppStep, type AgentData, type Precard, type Step } from "../src/web/cards.ts";
 import { builtInSteps } from "../src/web/steps.ts";
 
 const branch = 2;
@@ -58,7 +58,7 @@ test("the data alone gives a card per message part, a result its call, and live 
     ["live:tool:1", "liveTool", "tool · running", "→ pi"],
     ["live:failure", "runFailure", "", "Run failed: model_error: boom"],
   ]);
-  assert.deepEqual(surround, { header: [], style: "", pane: undefined });
+  assert.deepEqual(surround, { branch, header: [], style: "", pane: undefined });
   assert.deepEqual(derive(data(entries, live), builtInSteps).precards.map(card => card.format), [
     "markdown", "markdown", "text", "markdown", "text", "text", "text", "text", "text", "text", "text",
   ]);
@@ -103,7 +103,7 @@ test("steps change only the display fields, in order, and a failing step is skip
     [true, "blue", "markdown", ["Fork here", "One", "Two"], 1],
     [false, "red", "text", ["Fork here", "One"], 1],
   ]);
-  assert.deepEqual(surround, { header: [{ label: "Gym", href: "/apps/gym/" }, { label: "3 cards" }], style: "busy", pane });
+  assert.deepEqual(surround, { branch, header: [{ label: "Gym", href: "/apps/gym/" }, { label: "3 cards" }], style: "busy", pane });
   assert.deepEqual(failures, ["second", "third"]);
   // The same data gives the same cards, which is what lets the page keep the ones on screen.
   assert.deepEqual(run(), { precards, surround });
@@ -136,4 +136,36 @@ test("the Pi run step adds a button to a result that names a run and to a runnin
   assert.deepEqual(runButtons(loaded).map(button => button.label), ["Open Pi run · First line", "Open Pi run", "Open Pi run · Now"]);
   // A button is on a result or a live card, never on the call's own card.
   assert.deepEqual(loaded.filter(card => runButtons([card]).length).map(card => card.kind), ["toolResult", "toolResult", "liveTool"]);
+});
+
+test("app steps see only their prefix, append header items in order, and cannot style the page", () => {
+  const entries = [entry([user("a"), fauxAssistantMessage([
+    fauxToolCall("alpha_read", {}, { id: "a" }), fauxToolCall("beta_read", {}, { id: "b" }),
+  ])]), entry([result("alpha_read", "a", "one"), result("beta_read", "b", "two"), result("pi", "p", "done", { runId: first })])];
+  const live: LiveState = { tools: [
+    { callId: "a", name: "alpha_read", status: "running" },
+    { callId: "b", name: "beta_read", status: "running" },
+    { callId: "p", name: "pi", status: "running" },
+  ] };
+  const sample = (id: string) => scopeAppStep(id, {
+    name: "style",
+    card(card) {
+      if (card.text === "two") throw new Error("whoops");
+      return { style: `${id}-sample` };
+    },
+    surround(surround, cards, state) {
+      assert.equal(surround.branch, branch);
+      assert.equal(cards.length, 3);
+      assert.deepEqual(state, {});
+      return { style: "should-not-apply", header: [{ label: id, href: `/apps/${id}/?branch=${surround.branch}` }] };
+    },
+  });
+  const failures: string[] = [];
+  const derived = derive(data(entries, live), [...builtInSteps, sample("beta"), sample("alpha")], { report: step => failures.push(step) });
+  assert.deepEqual(derived.precards.map(card => card.style), ["", "alpha-sample", "beta-sample", "alpha-sample", "", "", "alpha-sample", "beta-sample", ""]);
+  assert.equal(derived.precards[0].format, "markdown");
+  assert.equal(runButtons(derived.precards).length, 2);
+  assert.equal(derived.surround.style, "");
+  assert.deepEqual(derived.surround.header.map(item => item.label), ["beta", "alpha"]);
+  assert.deepEqual(failures, ["beta/style"]);
 });

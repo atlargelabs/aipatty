@@ -4,7 +4,7 @@ import { on } from "node:events";
 import WebSocket, { type RawData } from "ws";
 import { LOOPBACK, readFaux, readPort } from "./config.ts";
 import type { BranchInfo, SearchMatch } from "./branches.ts";
-import { failureText, messageText, shutdownHeader, upgradeCommand, upgradeText, type ConversationPage, type StreamFrame } from "./protocol.ts";
+import { failureText, messageText, operatorNotice, shutdownHeader, upgradeCommand, type ConversationPage, type StreamFrame } from "./protocol.ts";
 import { branchLine } from "./tools.ts";
 
 /** The conversation path of a branch ID, or the root's. */
@@ -36,14 +36,14 @@ async function request<T>(base: URL, path: string, options?: RequestInit): Promi
 }
 
 async function send(base: URL, content: string, root: string): Promise<void> {
-  const { submissionId } = await request<{ submissionId?: number }>(base, `${root}/messages`, {
+  const { submissionId, notice } = await request<{ submissionId?: number; notice?: string }>(base, `${root}/messages`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content, requestId: randomUUID() }),
   });
   if (submissionId === undefined) {
-    // The server took the content as its `/upgrade` command: there is no answer to stream.
-    console.log("Upgrade started. The server restarts if it succeeds; the result appears in this branch's log.");
+    // Operator commands have a notice, not a model turn to stream.
+    console.log(notice ?? "Upgrade started. The server restarts if it succeeds; the result appears in this branch's log.");
     return;
   }
   const url = new URL(`${root}/stream?submissionId=${submissionId}`, base);
@@ -92,8 +92,8 @@ async function log(base: URL, root: string, limit?: number): Promise<void> {
   let entries = pages.reverse().flatMap(page => page.entries);
   if (limit !== undefined) entries = entries.slice(-limit);
   for (const entry of entries) {
-    const upgrade = upgradeText(entry);
-    if (upgrade) console.log(limit === undefined ? `upgrade: ${upgrade}` : `[${entry.id}] upgrade: ${upgrade}`);
+    const notice = operatorNotice(entry);
+    if (notice) console.log(`${limit === undefined ? "" : `[${entry.id}] `}${notice.label}: ${notice.text}`);
     for (const message of entry.model ?? []) {
       const text = messageText(message);
       if (text) console.log(limit === undefined ? `${message.role}: ${text}` : `[${entry.id}] ${message.role}: ${text}`);

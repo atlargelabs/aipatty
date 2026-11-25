@@ -6,12 +6,14 @@ import type { EntryRecord } from "@earendil-works/pi-durable";
 
 /** The kind of a transcript entry about an upgrade: `data.text` is shown to people and is not model context. */
 export const upgradeEntryKind = "aipatty.upgrade";
+export const appEntryKind = "aipatty.app";
 
-/** The text of an upgrade entry. */
-export function upgradeText(entry: Pick<EntryRecord, "kind" | "data">): string | undefined {
-  const { data } = entry;
-  if (entry.kind !== upgradeEntryKind || !data || typeof data !== "object" || Array.isArray(data)) return undefined;
-  return typeof data.text === "string" ? data.text : undefined;
+/** Operator notices are visible in the transcript, not in model context. */
+export function operatorNotice(entry: Pick<EntryRecord, "kind" | "data">): { label: string; text: string } | undefined {
+  const { kind, data } = entry;
+  const label = kind === upgradeEntryKind ? "upgrade" : kind === appEntryKind ? "apps" : undefined;
+  if (!label || !data || typeof data !== "object" || Array.isArray(data) || typeof data.text !== "string") return undefined;
+  return { label, text: data.text };
 }
 
 export const piRunApiPath = "/api/pi-runs/";

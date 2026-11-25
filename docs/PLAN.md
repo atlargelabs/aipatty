@@ -37,7 +37,8 @@ no daemon and no service registration.
   last-known-good release for rollback.
   - `$ROOT/work/`: working directory of aipatty's own tools, for inspection and scratch, not PR work.
   - `$ROOT/runs/`: disposable workspaces for [`pi` runs](#pi-runs).
-  - `$ROOT/data/`: SQLite, logs, and later MCP configuration and sign-ins.
+  - `$ROOT/data/`: the conversation SQLite database, logs, `apps/<id>/` data (not in the upgrade backup),
+    and later MCP configuration and sign-ins.
   - `$ROOT/upgrade/`: the database backup of the last upgrade, its pending record, and the logs of the supervisor
     and of the servers it starts.
   - `$ROOT/pi/`: shared Pi sign-in, model cache, delegates settings and jobs.
@@ -47,7 +48,7 @@ no daemon and no service registration.
   remain unchanged. It adds no environment variable or API. Launch from any cwd with
   `node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT"`. State stays outside releases on redeploy and
   rollback; see [INSTALL.md](INSTALL.md) for the first install, upgrades and fresh cutover.
-- **Conversations:** one root plus forks. Each has a title and its own model.
+- **Conversations:** one root plus forks. Each has a title, its own model, and an ordered list of connected apps.
 
 ### Pi installation
 
@@ -183,7 +184,8 @@ Deferred until something needs them: a read-only research mode and repos other t
   Pi run behind a tool call. It shows archived results or automatically follows new output while the run is active
   and you're at the bottom. It is not an interactive terminal. Add a Gmail switch when Gmail ships. The
   transcript is drawn by [the card pipeline](WEB-CARDS.md), an ordered list of pure steps that later features add to.
-  A built-in step renders saved user and assistant prose as Markdown; live previews and tool output stay plain text.
+  A built-in step renders saved user and assistant prose as Markdown; live previews and tool output stay plain text,
+  except the results of a connected app's tools when its step asks for Markdown.
 - **CLI:** the same API from a terminal.
 - **Auth:** SSH or the tailnet's access policy. The server has no login of its own. HTTP and WebSocket requests
   must name the loopback listener or the single configured HTTPS origin, and any browser `Origin` must match.
@@ -270,6 +272,8 @@ from a release that predates `/upgrade`, which is one more manual deploy. See
    is the self-upgrade milestone.
 5. **After self-upgrade:** phone access, MCP configuration and OAuth, the per-branch switch, and Gmail. Add research
    mode, hooks, or more repos only when needed.
+6. **Gym pilot:** the [connected-app seam](CONNECTED-APPS.md) and [Gym](GYM-APP.md) are implemented and tested
+   with temporary data and Faux. Steve's trial is two real workouts on a phone before expanding the experiment.
 
 ## Setup responsibilities
 

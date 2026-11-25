@@ -10,7 +10,7 @@
  */
 import type { Message, ToolCall } from "@earendil-works/pi-ai";
 import type { EntryRecord, LiveState, RunFailure, ToolSlot } from "@earendil-works/pi-durable";
-import { upgradeText } from "./shared.ts";
+import { operatorNotice } from "./shared.ts";
 
 /** What the pipeline reads: the selected branch's loaded entries, oldest first, and its live state. */
 export interface AgentData {
@@ -72,6 +72,8 @@ export interface Display {
 
 /** What every precard has, set by `initial` and never changed by a step. */
 interface Content extends Display {
+  /** The branch showing this card (not necessarily the one that wrote its entry). */
+  readonly branch: number;
   /** Identifies the card across runs of the pipeline: a card on screen is kept while its key is still produced. */
   readonly key: string;
   /** The small heading of the card, such as `user · 12`; `""` for none. */
@@ -122,6 +124,7 @@ export interface HeaderItem {
 
 /** What is drawn around the cards. */
 export interface Surround {
+  readonly branch: number;
   /** Items shown in a strip above the transcript, in order. The strip is hidden while there are none. */
   readonly header: readonly HeaderItem[];
   /** A CSS class set on the page's `<body>`; `""` for none. */
@@ -142,7 +145,7 @@ export type CardChange = Partial<Display>;
  * replaces. A step cannot set the pane: a pane opens when the reader presses a button with an `openPane` action,
  * and closes when they close it.
  */
-export type SurroundChange = Partial<Omit<Surround, "pane">>;
+export type SurroundChange = Partial<Omit<Surround, "pane" | "branch">>;
 
 /**
  * One transformation of the pipeline. Both functions must be pure: they return a change computed from their
@@ -192,7 +195,7 @@ function callText(call: Pick<ToolCall, "name" | "arguments">): string {
  */
 export function initial(data: AgentData, pane?: PaneRef): Derived {
   const precards: Precard[] = [];
-  const display: Display = { hidden: false, style: "", format: "text", buttons: [], links: [] };
+  const display = { branch: data.branch, hidden: false, style: "", format: "text", buttons: [], links: [] } as const;
   // The newest call of each ID so far. Null when one message used the ID twice: a result cannot tell which it answers.
   const calls = new Map<string, ToolCall | null>();
 
@@ -201,9 +204,9 @@ export function initial(data: AgentData, pane?: PaneRef): Derived {
       ...display, entry, inherited: entry.conversationId !== data.branch,
       buttons: [{ label: "Fork here", action: { type: "fork", at: entry.id } }],
     } as const;
-    const notice = upgradeText(entry);
-    if (notice !== undefined) {
-      precards.push({ ...settled, kind: "notice", key: `${entry.id}:notice`, label: `upgrade · ${entry.id}`, text: notice });
+    const notice = operatorNotice(entry);
+    if (notice) {
+      precards.push({ ...settled, kind: "notice", key: `${entry.id}:notice`, label: `${notice.label} · ${entry.id}`, text: notice.text });
     }
     (entry.model ?? []).forEach((message, index) => {
       const key = `${entry.id}:${index}`;
@@ -259,7 +262,7 @@ export function initial(data: AgentData, pane?: PaneRef): Derived {
     const text = "Run failed: " + runFailure.reason + (runFailure.detail ? ": " + runFailure.detail : "");
     precards.push({ ...display, kind: "runFailure", key: "live:failure", label: "", text, failure: runFailure });
   }
-  return { precards, surround: { header: [], style: "", pane } };
+  return { precards, surround: { branch: data.branch, header: [], style: "", pane } };
 }
 
 function changeCard(precard: Precard, change: CardChange | undefined): Precard {
@@ -280,6 +283,26 @@ function changeSurround(surround: Surround, change: SurroundChange | undefined):
     header: change.header?.length ? [...surround.header, ...change.header] : surround.header,
     style: change.style ?? surround.style,
     pane: surround.pane,
+    branch: surround.branch,
+  };
+}
+
+/** Scope a reviewed app's steps to its own tool cards and additive header items. Not a sandbox. */
+export function scopeAppStep(id: string, step: Step): Step {
+  const prefix = id + "_";
+  const own = (card: Precard) => {
+    const name = card.kind === "toolCall" ? card.call.name : card.kind === "toolResult" ? card.message.toolName
+      : card.kind === "liveTool" ? card.slot.name : undefined;
+    return name?.startsWith(prefix);
+  };
+  return {
+    name: `${id}/${step.name}`,
+    card: step.card && (card => own(card) ? step.card!(card) : undefined),
+    surround: step.surround && ((surround, precards) => {
+      // The header can use this branch and the app's cards, not the raw live state or another app's cards.
+      const change = step.surround!(surround, precards.filter(own), {});
+      return change && { header: change.header };
+    }),
   };
 }
 

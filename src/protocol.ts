@@ -4,13 +4,22 @@ import type { ConversationView, EntryRecord, LiveState, ModelRef, UsageState } f
 import type { RunOutcome } from "./pi-run.ts";
 
 // Shared with the page's own modules, which cannot import this file.
-export { piRunApiPath, piRunId, upgradeEntryKind, upgradeText } from "./web/shared.ts";
+export { appEntryKind, operatorNotice, piRunApiPath, piRunId, upgradeEntryKind } from "./web/shared.ts";
 
 /** Non-safelisted marker: an ordinary browser form cannot send it. */
 export const shutdownHeader = "x-aipatty-shutdown";
 
 /** The message that asks the server to upgrade itself instead of going to the model. */
 export const upgradeCommand = "/upgrade";
+export const connectCommand = "/connect";
+export const disconnectCommand = "/disconnect";
+
+export function appCommand(content: unknown) {
+  if (typeof content !== "string") return;
+  const [command, ...args] = content.trim().split(/\s+/);
+  if (command === connectCommand || command === disconnectCommand) return { connect: command === connectCommand, args };
+}
+export type AppCommand = NonNullable<ReturnType<typeof appCommand>>;
 
 /** `completed` means the run finished and any required PR and review passed the host's checks. */
 export const runStatuses = ["completed", "failed", "aborted", "timed_out", "interrupted"] as const;
@@ -58,8 +67,8 @@ export interface ConversationPage {
  * entries; the client's own oldest entry still says where older pages start, so an update has no `before`.
  */
 export type StreamFrame =
-  | ({ type: "state"; live: LiveState } & ConversationPage)
-  | ({ type: "update"; live: LiveState; appended: readonly EntryRecord[] } & Omit<ConversationPage, "entries" | "before">)
+  | ({ type: "state"; live: LiveState; apps?: string[] } & ConversationPage)
+  | ({ type: "update"; live: LiveState; appended: readonly EntryRecord[]; apps?: string[] } & Omit<ConversationPage, "entries" | "before">)
   | { type: "settled"; submissionId: number; status: "done"; answer: string }
   | { type: "settled"; submissionId: number; status: "unanswered"; reason: string; detail?: JsonValue };
 

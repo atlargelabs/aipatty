@@ -1,15 +1,17 @@
 import { BACKGROUND_CONTEXT as ctx, withAbortSignal } from "@earendil-works/chord/context";
 import type { Conversation, EntryId, InputSubmissionDraft, Submission, SubmissionId } from "@earendil-works/pi-durable";
+import { readFile } from "node:fs/promises";
 import { createServer, STATUS_CODES, type IncomingMessage, type ServerResponse } from "node:http";
+import { stripTypeScriptTypes } from "node:module";
 import type { Duplex } from "node:stream";
 import WebSocket, { WebSocketServer } from "ws";
 import { LOOPBACK } from "./config.ts";
-import { HttpError, type AgentHost } from "./host.ts";
+import type { AgentHost } from "./host.ts";
+import { HttpError, jsonBody, pageHeaders, requireMethod, sendJson } from "./http.ts";
 import { pageCss, pageHtml, pageJs, pageModules } from "./page.ts";
-import { messageText, piRunApiPath, piRunId, shutdownHeader, streamState, streamUpdate, upgradeCommand, type StreamFrame } from "./protocol.ts";
+import { appCommand, appEntryKind, messageText, piRunApiPath, piRunId, shutdownHeader, streamState, streamUpdate, upgradeCommand, type StreamFrame } from "./protocol.ts";
 import { transcriptPage } from "./transcript.ts";
 
-const maxBody = 64 * 1024;
 const defaultPage = 50;
 const maxPage = 100;
 const defaultHeartbeatMs = 30_000;
@@ -20,11 +22,6 @@ interface Streams {
   readonly controllers: Set<AbortController>;
   /** Sockets that answered the last ping, or opened after it. */
   readonly alive: WeakSet<WebSocket>;
-}
-
-function sendJson(res: ServerResponse, status: number, value: unknown): void {
-  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
-  res.end(JSON.stringify(value));
 }
 
 function errorResponse(error: unknown): { status: number; message: string } {
@@ -65,30 +62,6 @@ function positiveInt(value: string | null, field: string, max = Number.MAX_SAFE_
   return number;
 }
 
-async function jsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
-  if (Number(req.headers["content-length"]) > maxBody) throw new HttpError(413, "Request body too large");
-  if (req.headers["content-type"]?.split(";")[0].trim().toLowerCase() !== "application/json") {
-    throw new HttpError(415, "Expected application/json");
-  }
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req.iterator({ destroyOnReturn: false })) {
-    size += chunk.length;
-    if (size > maxBody) throw new HttpError(413, "Request body too large");
-    chunks.push(chunk);
-  }
-  let value: unknown;
-  try {
-    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)));
-  } catch {
-    throw new HttpError(400, "Invalid JSON body");
-  }
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new HttpError(400, "Expected an object");
-  }
-  return value as Record<string, unknown>;
-}
-
 function messageDraft({ content, requestId, whenBusy }: Record<string, unknown>): InputSubmissionDraft {
   if (typeof content !== "string" || !content.trim()) throw new HttpError(400, "Expected non-empty content");
   if (requestId !== undefined && (typeof requestId !== "string" || !requestId.trim() || requestId.length > 256)) {
@@ -111,12 +84,6 @@ async function conversationPage(conversation: Conversation, params: URLSearchPar
   return { ...state, ...await transcriptPage(conversation, ctx, limit, before) };
 }
 
-function requireMethod(req: IncomingMessage, res: ServerResponse, method: string): void {
-  if (req.method === method) return;
-  res.setHeader("Allow", method);
-  throw new HttpError(405, "Method not allowed");
-}
-
 async function handleHttp(
   agent: AgentHost, health: Health, req: IncomingMessage, res: ServerResponse,
   tailscale?: URL, shutdown?: (res: ServerResponse) => void, upgrade?: (conversation: Conversation) => Promise<void>,
@@ -131,7 +98,8 @@ async function handleHttp(
   }
   if (pathname === "/health") {
     requireMethod(req, res, "GET");
-    sendJson(res, 200, { ...health, ...await agent.modelStatus() });
+    const appProblems = await agent.appProblems();
+    sendJson(res, 200, { ...health, ...await agent.modelStatus(), ...(appProblems.length ? { appProblems } : {}) });
     return;
   }
   if (pathname === "/api/models") {
@@ -144,11 +112,27 @@ async function handleHttp(
     res.writeHead(200, {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
-      "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
-      "X-Content-Type-Options": "nosniff",
-      "Referrer-Policy": "no-referrer",
+      ...pageHeaders,
     });
     res.end(pageHtml);
+    return;
+  }
+  const appRoute = /^\/apps\/([^/]+)(\/.*)?$/.exec(pathname);
+  if (appRoute) {
+    for (const [name, value] of Object.entries(pageHeaders)) res.setHeader(name, value);
+    res.setHeader("Cache-Control", "no-store");
+    const [, id, path = "/"] = appRoute;
+    const app = agent.app(id);
+    if (!app) throw new HttpError(404, "App is not available; see /health or send /connect for details");
+    if (path === "/web.ts") {
+      requireMethod(req, res, "GET");
+      // The URL is supplied by the reviewed module, not derived from the request.
+      const script = app.web ? stripTypeScriptTypes(await readFile(app.web, "utf8")) : "export const steps = [];";
+      res.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8" });
+      res.end(script);
+    } else {
+      await app.handle(req, res, path);
+    }
     return;
   }
   // Only the modules listed in `pageModules` are served, looked up by name: no path from the request reaches a file.
@@ -204,7 +188,13 @@ async function handleHttp(
       sendJson(res, 202, { upgrade: "started" });
       return;
     }
-    const submission = await agent.submit(conversation, messageDraft(body));
+    const draft = messageDraft(body);
+    const command = appCommand(body.content);
+    if (command) {
+      sendJson(res, 202, { notice: await agent.appCommand(conversation, command) });
+      return;
+    }
+    const submission = await agent.submit(conversation, draft);
     sendJson(res, 202, { submissionId: submission.id });
   } else if (action === "abort") {
     await agent.abort(conversation);
@@ -262,7 +252,7 @@ async function setThinking(agent: AgentHost, conversation: Conversation, req: In
   await agent.setThinking(level, conversation);
 }
 
-async function stream(socket: WebSocket, streams: Streams, conversation: Conversation, submission?: Submission): Promise<void> {
+async function stream(agent: AgentHost, socket: WebSocket, streams: Streams, conversation: Conversation, submission?: Submission): Promise<void> {
   const controller = new AbortController();
   const context = withAbortSignal(controller.signal, ctx);
   streams.controllers.add(controller);
@@ -293,12 +283,18 @@ async function stream(socket: WebSocket, streams: Streams, conversation: Convers
     const watch = await conversation.watch(context, { min: defaultPage, max: defaultPage });
     // Send the attachment value first; the watch folds changes while a client is slow.
     let sent = watch.value;
-    const initial = send(streamState(sent));
+    const state = streamState(sent);
+    const initial = agent.branchApps(conversation).then(apps => send({ ...state, apps }));
     watch.start(async call => {
       if (call.kind !== "value") return;
       // A partial answer changes only the live document; do not serialise the whole window again for it.
       const frame = streamUpdate(sent, call.value);
       sent = call.value;
+      await initial;
+      // Durable watches its own documents, not BranchDoc. App changes always append an operator notice.
+      if (frame.type === "state" || frame.appended.some(entry => entry.kind === appEntryKind)) {
+        frame.apps = await agent.branchApps(conversation);
+      }
       await send(frame);
     });
     void watch.closed.then(end => {
@@ -350,7 +346,7 @@ async function handleUpgrade(
     }
   }
   if (!socket.destroyed) {
-    wss.handleUpgrade(req, socket, head, ws => { void stream(ws, streams, conversation, submission); });
+    wss.handleUpgrade(req, socket, head, ws => { void stream(agent, ws, streams, conversation, submission); });
   }
 }
 
@@ -402,6 +398,8 @@ export async function startApi(agent: AgentHost, health: Health, port: number, {
     void handleHttp(agent, health, req, res, tailscale, shutdown, onUpgrade).catch(error => {
       if (res.destroyed) return;
       const { status, message } = errorResponse(error);
+      // A handler can fail after writing. End that response rather than trying to send its headers again.
+      if (res.headersSent) { res.destroy(); return; }
       if (!req.complete) res.shouldKeepAlive = false;
       sendJson(res, status, { error: message });
     });
