@@ -121,7 +121,7 @@ const shown = `({
   title: document.getElementById("title").textContent,
   current: document.querySelector("#branch-list li.current div")?.textContent ?? null,
   hash: location.hash,
-  messages: [...document.querySelectorAll("#entries .entry")].map(entry => entry.lastChild.textContent),
+  messages: [...document.querySelectorAll("#entries .card-body")].map(body => body.innerText),
 })`;
 
 /** Wait until the page shows `done`; on timeout, fail with what it showed and any script errors. */
@@ -172,6 +172,104 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
   await browser.navigate("about:blank");
   await browser.navigate(`${base}/#${side.id}`);
   await waitFor(browser, "the branch named in the fragment", value => value.title === "Side" && value.messages.length === 4);
+  assert.deepEqual(browser.errors, []);
+});
+
+test("saved prose renders Markdown on narrow screens and survives live updates", { skip: !chrome, timeout: 60_000 }, async t => {
+  const host = await openHost(fauxConfig(await fixture(t)));
+  const serve = "https://operator.example.invalid";
+  const api = await startApi(host, health, 0, { tailscaleOrigin: serve });
+  t.after(async () => { await api.close(); await host.close(); });
+  const base = `http://127.0.0.1:${api.port}`;
+  const code = "const value = " + "x".repeat(200);
+  const longCell = "x".repeat(80);
+  const raw = '<img src="/markdown-image-probe" onerror="window.bad = true">';
+  const source = [
+    "## Heading", "", "A **strong** and *emphasized* `word`.", "Next line.", "",
+    "> quoted", "", "- one", "- two", "", "1. first", "2. second", "", "```js", code, "```", "",
+    '[site](https://example.org/path "&quot; onclick=&quot;literal") <http://example.com/>', "",
+    raw, "", "![remote](https://example.org/image.png) ![local](/markdown-image-probe)", "",
+    "[script](java&#x73;cript&colon;alert%281%29) [data](data:text/html,hello)",
+    "[empty]() [relative](/api/shutdown) [fragment](#1) [protocol relative](//example.org)",
+    `[internal](${base}/api/shutdown) [alias](http://localhost:${api.port}/api/shutdown) [serve](${serve}/api/shutdown)`,
+    "[credentials](https://someone@example.org/)", "",
+    "| Default | Left | Middle | Right |",
+    "| --- | :--- | :---: | ---: |",
+    `| ${longCell} | **Name** | ready | 42 |`,
+  ].join("\n");
+  const root = (await host.conversation("root"))!;
+  const assistant = fauxAssistantMessage([
+    { type: "text", text: source + "\n\n~~~txt\nAn open fence" },
+    fauxToolCall("bash", { command: "echo **literal**" }, { id: "shell" }),
+    { type: "text", text: "**After the call**" },
+  ], { stopReason: "toolUse" });
+  await root.commit(tx => tx.appendEntry(root.id, { kind: "test", model: [
+    { role: "user", content: source, timestamp: 0 },
+    assistant,
+    { role: "toolResult", toolName: "bash", toolCallId: "shell", content: [{ type: "text", text: "**literal result**" }],
+      timestamp: 0, isError: false },
+  ] }), ctx);
+
+  const browser = await openBrowser(t);
+  await browser.viewport(390, 600);
+  await browser.navigate(base);
+  await waitFor(browser, "the saved cards", state => state.messages.length === 5);
+  for (const role of ["user", "assistant"]) {
+    const rendered = await browser.evaluate(`(() => {
+      const body = document.querySelector('#entries .${role}.prose .card-body');
+      const pre = body.querySelector('pre');
+      const table = body.querySelector('table');
+      const transcript = document.querySelector('#transcript');
+      pre.scrollLeft = 80;
+      table.parentElement.scrollLeft = 80;
+      return {
+        heading: body.querySelector('h2').textContent,
+        paragraph: body.querySelector('p').innerText,
+        inline: ['strong', 'em', 'p code', 'blockquote'].map(tag => body.querySelector(tag).textContent.trim()),
+        items: [...body.querySelectorAll('li')].map(li => li.textContent),
+        code: pre.querySelector('code').textContent,
+        scrolls: pre.scrollLeft > 0 && table.parentElement.scrollLeft > 0 && transcript.scrollWidth === transcript.clientWidth,
+        table: [...table.rows].map(row => [...row.cells].map(cell =>
+          [cell.tagName, cell.textContent, getComputedStyle(cell).textAlign])),
+        links: [...body.querySelectorAll('a[href]')].map(a => [a.textContent, a.getAttribute('href'), a.target, a.rel]),
+        unsafe: !!body.querySelector('img, script, [onerror], [onclick], [style]'),
+        raw: body.textContent.includes(${JSON.stringify(raw)}),
+        imagePlaceholder: body.textContent.includes('[image]'),
+      };
+    })()`);
+    assert.deepEqual(rendered, {
+      heading: "Heading", paragraph: "A strong and emphasized word.\nNext line.",
+      inline: ["strong", "emphasized", "word", "quoted"], items: ["one", "two", "first", "second"],
+      code: code + "\n", scrolls: true,
+      table: [
+        [["TH", "Default", "left"], ["TH", "Left", "left"], ["TH", "Middle", "center"], ["TH", "Right", "right"]],
+        [["TD", longCell, "left"], ["TD", "Name", "left"], ["TD", "ready", "center"], ["TD", "42", "right"]],
+      ],
+      links: [["site", "https://example.org/path", "_blank", "noopener noreferrer"],
+        ["http://example.com/", "http://example.com/", "_blank", "noopener noreferrer"]],
+      unsafe: false, raw: true, imagePlaceholder: true,
+    });
+  }
+  assert.deepEqual(await browser.evaluate(`(() => {
+    const tool = document.querySelector('#entries .toolCall .card-body');
+    const result = document.querySelector('#entries .toolResult .card-body');
+    const after = tool.parentElement.nextElementSibling;
+    window.savedLink = document.querySelector('#entries .user .card-body a[href]');
+    return [tool.textContent, tool.childElementCount, after.querySelector('strong').textContent,
+      result.textContent, result.childElementCount];
+  })()`), ['→ bash {"command":"echo **literal**"}', 0, "After the call", "**literal result**", 0]);
+
+  // Stream unfinished Markdown and a partial call: both stay literal, and the saved link keeps its identity.
+  await root.commit(async tx => {
+    (await tx.doc(LiveDoc, root.id)).generation = { attempt: 1, message: JSON.parse(JSON.stringify(fauxAssistantMessage([
+      { type: "text", text: "**Writing" }, fauxToolCall("bash", { command: "partial" }),
+    ]))) };
+  }, ctx);
+  await until(() => browser.evaluate(`!!document.querySelector('#live .liveText')`));
+  assert.deepEqual(await browser.evaluate(`(() => {
+    const live = document.querySelector('#live .liveText .card-body');
+    return [live.textContent, live.childElementCount, window.savedLink.isConnected];
+  })()`), ['**Writing\n→ bash {"command":"partial"}', 0, true]);
   assert.deepEqual(browser.errors, []);
 });
 
@@ -250,7 +348,7 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   ]);
   assert.equal(await browser.evaluate(`document.querySelectorAll('.entry:not(.toolResult) button[data-action="openPane"]').length`), 0);
   // An assistant message is a card for its text and one for each call, in the order it wrote them.
-  assert.deepEqual(await browser.evaluate(`[...document.querySelectorAll('#entries .entry')].slice(0, 5).map(card => [card.className, card.lastChild.textContent])`), [
+  assert.deepEqual(await browser.evaluate(`[...document.querySelectorAll('#entries .entry')].slice(0, 5).map(card => [card.className, card.lastChild.innerText])`), [
     ["entry prose user", `→ pi {"runId":"${second}"}`],
     ["entry prose assistant", "Pasted → pi {} stays plain"],
     ["entry toolCall assistant", '→ pi {"task":"First task\\nDo not show the rest of the task"}'],

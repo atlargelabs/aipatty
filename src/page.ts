@@ -1,6 +1,6 @@
 /**
  * The crude web page: branch list, transcript, input box, fork, rename, model picker and cost. Served by the API
- * with a strict CSP, so the scripts are separate same-origin files and every value is rendered as text.
+ * with a strict CSP and same-origin scripts. Only saved conversation prose is rendered as Markdown.
  *
  * The transcript is drawn from the card pipeline in ./web/cards.ts (see docs/WEB-CARDS.md). This file is the
  * shell around it and the code that puts its cards on screen.
@@ -8,15 +8,15 @@
 import { readFileSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 
-/**
- * The modules of ./web/ that the page imports, by the path they are served at. They are the files the server and
- * the tests import, with their types removed, and keep the `.ts` name that their imports of each other use.
- */
-export const pageModules: Readonly<Record<string, string>> = Object.fromEntries(
-  ["cards", "shared", "steps"].map(name => [
+const markdownScriptPath = "/markdown-it.js";
+
+/** Browser modules by URL: our own with types removed, and the pinned parser's standalone ESM bundle. */
+export const pageModules: Readonly<Record<string, string>> = {
+  ...Object.fromEntries(["cards", "shared", "steps"].map(name => [
     `/web/${name}.ts`, stripTypeScriptTypes(readFileSync(new URL(`./web/${name}.ts`, import.meta.url), "utf8")),
-  ]),
-);
+  ])),
+  [markdownScriptPath]: readFileSync(new URL(import.meta.resolve("markdown-it/browser")), "utf8"),
+};
 
 export const pageHtml = `<!doctype html>
 <html lang="en">
@@ -107,6 +107,24 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .card-head .role { flex: 1; color: #777; }
 .card-head button { max-width: 100%; padding: .1rem .5rem; text-align: left; overflow-wrap: anywhere; }
 .card-head button[data-action="openPane"] { color: #17458a; }
+.card-body[data-format="markdown"] { display: flow-root; white-space: normal; }
+.card-body[data-format="markdown"] :where(p, ul, ol, blockquote, pre, h1, h2, h3, h4, h5, h6, .markdown-table) { margin: .55rem 0; }
+.card-body[data-format="markdown"] > :first-child { margin-top: 0; }
+.card-body[data-format="markdown"] > :last-child { margin-bottom: 0; }
+.card-body[data-format="markdown"] h1 { font-size: 1.35rem; }
+.card-body[data-format="markdown"] h2 { font-size: 1.2rem; }
+.card-body[data-format="markdown"] :is(h3, h4, h5, h6) { font-size: 1rem; }
+.card-body[data-format="markdown"] :is(ul, ol) { padding-inline-start: 1.5rem; }
+.card-body[data-format="markdown"] blockquote { border-inline-start: 3px solid #b9c2ce; padding-inline-start: .65rem; }
+.card-body[data-format="markdown"] code { font: .9em ui-monospace, monospace; background: #f0f0f0; border-radius: 4px; padding: .1em .25em; }
+.card-body[data-format="markdown"] pre { overflow-x: auto; white-space: pre; overflow-wrap: normal; background: #f0f0f0; border-radius: 4px; padding: .55rem; }
+.card-body[data-format="markdown"] pre code { padding: 0; background: none; }
+.markdown-table { overflow-x: auto; }
+.markdown-table table { width: 100%; border-collapse: collapse; }
+.markdown-table :is(th, td) { border: 1px solid #ddd; padding: .25rem .5rem; overflow-wrap: normal; text-align: left; }
+.markdown-table th { background: #f4f4f4; }
+.markdown-table .align-center { text-align: center; }
+.markdown-table .align-right { text-align: right; }
 #card-header:not([hidden]) { display: flex; flex-wrap: wrap; gap: .3rem 1rem; padding: .4rem .8rem; border-bottom: 1px solid #eee; background: #fff; }
 #composer { display: flex; gap: .5rem; padding: .6rem .8rem; border-top: 1px solid #ddd; background: #fff; }
 #composer textarea { flex: 1; min-width: 0; font: inherit; padding: .4rem; resize: vertical; }
@@ -133,7 +151,8 @@ button { font: inherit; padding: .3rem .7rem; }
 }
 `;
 
-export const pageJs = `import { derive } from "/web/cards.ts";
+export const pageJs = (appHostnames: readonly string[]) => `import markdownit from ${JSON.stringify(markdownScriptPath)};
+import { derive } from "/web/cards.ts";
 import { piRunApiPath } from "/web/shared.ts";
 import { builtInSteps, runIdOf } from "/web/steps.ts";
 
@@ -479,10 +498,49 @@ function renderBranches() {
  * touched, for the same reason as the branch list above.
  */
 
-// The renderers of a card's body, by the name a precard's format gives. Each must leave the body alone when
-// called again with the same text.
+// No raw HTML or plugins.
+const markdown = markdownit({ html: false, breaks: true });
+const appHostnames = ${JSON.stringify(appHostnames.map(host => host.replace(/\.$/, "")))};
+markdown.validateLink = href => {
+  if (!/^https?:\\/\\//i.test(href)) return false;
+  try {
+    const url = new URL(href);
+    return !url.username && !url.password && !appHostnames.includes(url.hostname.replace(/\\.$/, ""));
+  } catch { return false; }
+};
+markdown.renderer.rules.link_open = (tokens, index, options, _env, renderer) => {
+  const token = tokens[index];
+  // The parser can emit an empty href for [label](); don't navigate back to the app.
+  if (!markdown.validateLink(token.attrGet("href") || "")) return "<a>";
+  token.attrSet("target", "_blank");
+  token.attrSet("rel", "noopener noreferrer");
+  return renderer.renderToken(tokens, index, options);
+};
+markdown.renderer.rules.image = () => "[image]";
+markdown.renderer.rules.table_open = () => '<div class="markdown-table"><table>\\n';
+markdown.renderer.rules.table_close = () => "</table></div>\\n";
+
+function renderTableCell(tokens, index, options, _env, renderer) {
+  const token = tokens[index];
+  const style = token.attrIndex("style");
+  if (style !== -1) {
+    // markdown-it sets a style attribute for alignment. Use stylesheet classes under the page's CSP.
+    const [, value] = token.attrs[style];
+    token.attrs.splice(style, 1);
+    if (value === "text-align:center") token.attrJoin("class", "align-center");
+    if (value === "text-align:right") token.attrJoin("class", "align-right");
+    // Left is already the stylesheet default.
+  }
+  return renderer.renderToken(tokens, index, options);
+}
+markdown.renderer.rules.th_open = renderTableCell;
+markdown.renderer.rules.td_open = renderTableCell;
+
+// Only draw a body when its text or format changes, so nested nodes survive stream updates.
+const bodyText = new WeakMap();
 const formats = {
-  text(body, text) { setText(body, text); },
+  text(body, text) { body.textContent = text; },
+  markdown(body, text) { body.innerHTML = markdown.render(text); },
 };
 
 function sendMessage(branch, content) {
@@ -542,12 +600,12 @@ function drawCard(node, precard) {
     head.replaceChildren(head.firstChild, ...precard.links.map(linkNode), ...precard.buttons.map(buttonNode));
   }
   head.hidden = !precard.label && !precard.links.length && !precard.buttons.length;
-  const format = formats[precard.format] ? precard.format : "text";
-  if (body.dataset.format !== format) {
+  const format = Object.hasOwn(formats, precard.format) ? precard.format : "text";
+  if (body.dataset.format !== format || bodyText.get(body) !== precard.text) {
+    formats[format](body, precard.text);
     body.dataset.format = format;
-    body.replaceChildren();
+    bodyText.set(body, precard.text);
   }
-  formats[format](body, precard.text);
 }
 
 /** Make a container show the given precards, in order, keeping the card of every key it already shows. */

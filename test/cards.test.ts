@@ -37,6 +37,7 @@ test("the data alone gives a card per message part, a result its call, and live 
     ], { stopReason: "toolUse" })]),
     entry([result("bash", "b", "files"), user("")]),
     entry([], { kind: upgradeEntryKind, data: { text: "Upgrade complete." } }),
+    entry([{ role: "system", content: "instructions", timestamp: 0 }]),
   ];
   const live: LiveState = {
     generation: { attempt: 1, message: fauxAssistantMessage([{ type: "text", text: "partial" }, fauxToolCall("bash", { command: "p" })]) as never },
@@ -52,12 +53,16 @@ test("the data alone gives a card per message part, a result its call, and live 
     ["2:0:5", "toolCall", "assistant · 2", '→ pi {"task":"Fix it\\nand more"}'],
     ["3:0", "toolResult", "toolResult · 3", "files"],
     ["4:notice", "notice", "upgrade · 4", "Upgrade complete."],
+    ["5:0", "prose", "system · 5", "instructions"],
     ["live:text", "liveText", "", 'partial\n→ bash {"command":"p"}'],
     ["live:tool:1", "liveTool", "tool · running", "→ pi"],
     ["live:failure", "runFailure", "", "Run failed: model_error: boom"],
   ]);
   assert.deepEqual(surround, { header: [], style: "", pane: undefined });
-  const [inherited, , , , , bashResult, , , liveTool] = precards;
+  assert.deepEqual(derive(data(entries, live), builtInSteps).precards.map(card => card.format), [
+    "markdown", "markdown", "text", "markdown", "text", "text", "text", "text", "text", "text", "text",
+  ]);
+  const [inherited, , , , , bashResult, , , , liveTool] = precards;
   assert.equal("inherited" in inherited && inherited.inherited, true);
   assert.deepEqual(inherited.buttons, [{ label: "Fork here", action: { type: "fork", at: 1 } }]);
   assert.equal(bashResult.kind === "toolResult" && bashResult.call, bash);

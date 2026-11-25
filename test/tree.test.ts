@@ -381,7 +381,9 @@ test("the web page is served with a strict policy and its script and style", asy
   const scripts = ["/app.js", ...Object.keys(pageModules)];
   for (const path of scripts) {
     const script = await fetch(base + path);
+    assert.equal(script.status, 200, path);
     assert.match(script.headers.get("content-type")!, /text\/javascript/, path);
+    assert.equal(script.headers.get("x-content-type-options"), "nosniff", path);
     const source = await script.text();
     assert.doesNotThrow(() => stripTypeScriptTypes(source), path);
     for (const [, from] of source.matchAll(/^import .* from "(.+)";$/gm)) {
@@ -389,6 +391,7 @@ test("the web page is served with a strict policy and its script and style", asy
     }
   }
   assert.equal((await fetch(base + "/web/nothing.ts")).status, 404);
+  assert.equal((await fetch(base + "/markdown-it.js.map")).status, 404);
   assert.equal((await fetch(base + "/app.css")).status, 200);
   assert.equal((await fetch(base + "/", { method: "POST" })).status, 405);
 });

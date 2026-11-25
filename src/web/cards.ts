@@ -64,7 +64,7 @@ export interface Display {
   readonly hidden: boolean;
   /** A CSS class added to the card; `""` for none. */
   readonly style: string;
-  /** Which renderer shows `text` in the card's body. `"text"`, plain text, is the only one today. */
+  /** Which renderer shows `text` in the card's body. Built-in formats are `"text"` and `"markdown"`. */
   readonly format: string;
   readonly buttons: readonly Button[];
   readonly links: readonly Link[];

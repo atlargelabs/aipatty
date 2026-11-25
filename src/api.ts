@@ -152,7 +152,8 @@ async function handleHttp(
     return;
   }
   // Only the modules listed in `pageModules` are served, looked up by name: no path from the request reaches a file.
-  const script = pathname === "/app.js" ? pageJs : Object.hasOwn(pageModules, pathname) ? pageModules[pathname] : undefined;
+  const script = pathname === "/app.js" ? pageJs(tailscale ? [...loopbackNames, tailscale.hostname] : loopbackNames)
+    : Object.hasOwn(pageModules, pathname) ? pageModules[pathname] : undefined;
   if (script !== undefined || pathname === "/app.css") {
     requireMethod(req, res, "GET");
     res.writeHead(200, {

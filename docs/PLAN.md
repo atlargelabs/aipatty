@@ -183,6 +183,7 @@ Deferred until something needs them: a read-only research mode and repos other t
   Pi run behind a tool call. It shows archived results or automatically follows new output while the run is active
   and you're at the bottom. It is not an interactive terminal. Add a Gmail switch when Gmail ships. The
   transcript is drawn by [the card pipeline](WEB-CARDS.md), an ordered list of pure steps that later features add to.
+  A built-in step renders saved user and assistant prose as Markdown; live previews and tool output stay plain text.
 - **CLI:** the same API from a terminal.
 - **Auth:** SSH or the tailnet's access policy. The server has no login of its own. HTTP and WebSocket requests
   must name the loopback listener or the single configured HTTPS origin, and any browser `Origin` must match.
