@@ -108,7 +108,7 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .card-head button { max-width: 100%; padding: .1rem .5rem; text-align: left; overflow-wrap: anywhere; }
 .card-head button[data-action="openPane"] { color: #17458a; }
 .card-body[data-format="markdown"] { display: flow-root; white-space: normal; }
-.card-body[data-format="markdown"] :where(p, ul, ol, blockquote, pre, h1, h2, h3, h4, h5, h6) { margin: .55rem 0; }
+.card-body[data-format="markdown"] :where(p, ul, ol, blockquote, pre, h1, h2, h3, h4, h5, h6, .markdown-table) { margin: .55rem 0; }
 .card-body[data-format="markdown"] > :first-child { margin-top: 0; }
 .card-body[data-format="markdown"] > :last-child { margin-bottom: 0; }
 .card-body[data-format="markdown"] h1 { font-size: 1.35rem; }
@@ -119,6 +119,12 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .card-body[data-format="markdown"] code { font: .9em ui-monospace, monospace; background: #f0f0f0; border-radius: 4px; padding: .1em .25em; }
 .card-body[data-format="markdown"] pre { overflow-x: auto; white-space: pre; overflow-wrap: normal; background: #f0f0f0; border-radius: 4px; padding: .55rem; }
 .card-body[data-format="markdown"] pre code { padding: 0; background: none; }
+.markdown-table { overflow-x: auto; }
+.markdown-table table { width: 100%; border-collapse: collapse; }
+.markdown-table :is(th, td) { border: 1px solid #ddd; padding: .25rem .5rem; overflow-wrap: normal; text-align: left; }
+.markdown-table th { background: #f4f4f4; }
+.markdown-table .align-center { text-align: center; }
+.markdown-table .align-right { text-align: right; }
 #card-header:not([hidden]) { display: flex; flex-wrap: wrap; gap: .3rem 1rem; padding: .4rem .8rem; border-bottom: 1px solid #eee; background: #fff; }
 #composer { display: flex; gap: .5rem; padding: .6rem .8rem; border-top: 1px solid #ddd; background: #fff; }
 #composer textarea { flex: 1; min-width: 0; font: inherit; padding: .4rem; resize: vertical; }
@@ -492,8 +498,8 @@ function renderBranches() {
  * touched, for the same reason as the branch list above.
  */
 
-// No raw HTML or plugins. Tables would generate inline alignment styles, which the CSP disallows.
-const markdown = markdownit({ html: false, breaks: true }).disable("table");
+// No raw HTML or plugins.
+const markdown = markdownit({ html: false, breaks: true });
 const appHostnames = ${JSON.stringify(appHostnames.map(host => host.replace(/\.$/, "")))};
 markdown.validateLink = href => {
   if (!/^https?:\\/\\//i.test(href)) return false;
@@ -511,6 +517,24 @@ markdown.renderer.rules.link_open = (tokens, index, options, _env, renderer) => 
   return renderer.renderToken(tokens, index, options);
 };
 markdown.renderer.rules.image = () => "[image]";
+markdown.renderer.rules.table_open = () => '<div class="markdown-table"><table>\\n';
+markdown.renderer.rules.table_close = () => "</table></div>\\n";
+
+function renderTableCell(tokens, index, options, _env, renderer) {
+  const token = tokens[index];
+  const style = token.attrIndex("style");
+  if (style !== -1) {
+    // markdown-it sets a style attribute for alignment. Use stylesheet classes under the page's CSP.
+    const [, value] = token.attrs[style];
+    token.attrs.splice(style, 1);
+    if (value === "text-align:center") token.attrJoin("class", "align-center");
+    if (value === "text-align:right") token.attrJoin("class", "align-right");
+    // Left is already the stylesheet default.
+  }
+  return renderer.renderToken(tokens, index, options);
+}
+markdown.renderer.rules.th_open = renderTableCell;
+markdown.renderer.rules.td_open = renderTableCell;
 
 // Only draw a body when its text or format changes, so nested nodes survive stream updates.
 const bodyText = new WeakMap();

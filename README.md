@@ -112,10 +112,10 @@ tool call, in the order they were written. Below the saved transcript, dashed ca
 answer being written and each tool call that has not finished. How the cards are made, and how to add to them, is
 in [the card pipeline](docs/WEB-CARDS.md).
 
-Saved user and assistant prose renders as Markdown. Single newlines are preserved, and long code blocks scroll
-horizontally. Links must be absolute HTTP(S) URLs outside aipatty's hosts and open in a new tab. Raw HTML is shown
-as text, images are not loaded, and tables are not supported. Live previews (including partial tool arguments),
-tool cards, system messages, notices, and the Pi run pane stay plain text.
+Saved user and assistant prose renders as Markdown. Single newlines are preserved, and wide tables and code
+blocks scroll horizontally. Links must be absolute HTTP(S) URLs outside aipatty's hosts and open in a new tab.
+Raw HTML is shown as text, and images are not loaded. Live previews (including partial tool arguments), tool
+cards, system messages, notices, and the Pi run pane stay plain text.
 
 Use **Open Pi run** on a `pi` call's result, or on its dashed card while it runs, to inspect that run beside the
 conversation. On a narrow screen it uses the full screen; Close or Esc goes back to the same place in chat. Inherited calls open the original run.

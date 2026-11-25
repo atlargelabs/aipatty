@@ -182,6 +182,7 @@ test("saved prose renders Markdown on narrow screens and survives live updates",
   t.after(async () => { await api.close(); await host.close(); });
   const base = `http://127.0.0.1:${api.port}`;
   const code = "const value = " + "x".repeat(200);
+  const longCell = "x".repeat(80);
   const raw = '<img src="/markdown-image-probe" onerror="window.bad = true">';
   const source = [
     "## Heading", "", "A **strong** and *emphasized* `word`.", "Next line.", "",
@@ -191,7 +192,10 @@ test("saved prose renders Markdown on narrow screens and survives live updates",
     "[script](java&#x73;cript&colon;alert%281%29) [data](data:text/html,hello)",
     "[empty]() [relative](/api/shutdown) [fragment](#1) [protocol relative](//example.org)",
     `[internal](${base}/api/shutdown) [alias](http://localhost:${api.port}/api/shutdown) [serve](${serve}/api/shutdown)`,
-    "[credentials](https://someone@example.org/)",
+    "[credentials](https://someone@example.org/)", "",
+    "| Default | Left | Middle | Right |",
+    "| --- | :--- | :---: | ---: |",
+    `| ${longCell} | **Name** | ready | 42 |`,
   ].join("\n");
   const root = (await host.conversation("root"))!;
   const assistant = fauxAssistantMessage([
@@ -214,15 +218,19 @@ test("saved prose renders Markdown on narrow screens and survives live updates",
     const rendered = await browser.evaluate(`(() => {
       const body = document.querySelector('#entries .${role}.prose .card-body');
       const pre = body.querySelector('pre');
+      const table = body.querySelector('table');
       const transcript = document.querySelector('#transcript');
       pre.scrollLeft = 80;
+      table.parentElement.scrollLeft = 80;
       return {
         heading: body.querySelector('h2').textContent,
         paragraph: body.querySelector('p').innerText,
         inline: ['strong', 'em', 'p code', 'blockquote'].map(tag => body.querySelector(tag).textContent.trim()),
         items: [...body.querySelectorAll('li')].map(li => li.textContent),
         code: pre.querySelector('code').textContent,
-        scrolls: pre.scrollLeft > 0 && transcript.scrollWidth === transcript.clientWidth,
+        scrolls: pre.scrollLeft > 0 && table.parentElement.scrollLeft > 0 && transcript.scrollWidth === transcript.clientWidth,
+        table: [...table.rows].map(row => [...row.cells].map(cell =>
+          [cell.tagName, cell.textContent, getComputedStyle(cell).textAlign])),
         links: [...body.querySelectorAll('a[href]')].map(a => [a.textContent, a.getAttribute('href'), a.target, a.rel]),
         unsafe: !!body.querySelector('img, script, [onerror], [onclick], [style]'),
         raw: body.textContent.includes(${JSON.stringify(raw)}),
@@ -233,6 +241,10 @@ test("saved prose renders Markdown on narrow screens and survives live updates",
       heading: "Heading", paragraph: "A strong and emphasized word.\nNext line.",
       inline: ["strong", "emphasized", "word", "quoted"], items: ["one", "two", "first", "second"],
       code: code + "\n", scrolls: true,
+      table: [
+        [["TH", "Default", "left"], ["TH", "Left", "left"], ["TH", "Middle", "center"], ["TH", "Right", "right"]],
+        [["TD", longCell, "left"], ["TD", "Name", "left"], ["TD", "ready", "center"], ["TD", "42", "right"]],
+      ],
       links: [["site", "https://example.org/path", "_blank", "noopener noreferrer"],
         ["http://example.com/", "http://example.com/", "_blank", "noopener noreferrer"]],
       unsafe: false, raw: true, imagePlaceholder: true,

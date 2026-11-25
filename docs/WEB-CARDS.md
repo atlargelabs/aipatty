@@ -166,8 +166,9 @@ Every branch runs these, in this order:
 - **`pi-run`** adds **Open Pi run** to a `pi` tool result that names a run, and to the live card of a `pi` call
   while it runs. The button from a live card names the call, not the run, so an open pane keeps following when
   the run starts and when the result's card replaces the live one.
-- **`markdown`** sets the format on saved user and assistant prose. The renderer turns off raw HTML, images,
-  and tables, and allows only absolute HTTP(S) links outside aipatty's hosts. All other cards stay plain text.
+- **`markdown`** sets the format on saved user and assistant prose. Tables scroll horizontally when too wide,
+  and column alignment uses CSS classes rather than inline styles. The renderer turns off raw HTML and images
+  and allows only absolute HTTP(S) links outside aipatty's hosts. All other cards stay plain text.
 
 ## Not built
 
