@@ -65,7 +65,7 @@ A step returns a change to these fields and nothing else:
 | --- | --- | --- |
 | `hidden` | Do not show the card. It stays in the list. | The later step wins |
 | `style` | A CSS class added to the card | The later step wins |
-| `format` | The renderer for the card's body. `"text"` is the only one today. | The later step wins |
+| `format` | The renderer for the card's body: `"text"` or `"markdown"`. | The later step wins |
 | `buttons` | Buttons in the card's heading, each with an action | Added after the earlier ones |
 | `links` | Links in the card's heading | Added after the earlier ones |
 
@@ -151,8 +151,8 @@ To add it:
 1. Put the step in [`src/web/steps.ts`](../src/web/steps.ts) and add it to `builtInSteps`, in the position it
    should run.
 2. Add the CSS for any class it uses to `pageCss` in [`src/page.ts`](../src/page.ts).
-3. If it uses a new `format`, add the renderer to `formats` in `src/page.ts`. A renderer is given the card's body
-   element and its text, and must leave the body alone when called again with the same text.
+3. If it uses a new `format`, add the renderer to `formats` in `src/page.ts`. The page calls it with the card's
+   body element and text whenever the format or text changes.
 4. Test it in [`test/cards.test.ts`](../test/cards.test.ts) with `derive(data, steps)`, which needs no browser.
 
 The files in `src/web/` are served to the browser as they are, with their types removed. They may import each
@@ -166,13 +166,14 @@ Every branch runs these, in this order:
 - **`pi-run`** adds **Open Pi run** to a `pi` tool result that names a run, and to the live card of a `pi` call
   while it runs. The button from a live card names the call, not the run, so an open pane keeps following when
   the run starts and when the result's card replaces the live one.
+- **`markdown`** sets the format on saved user and assistant prose. The renderer turns off raw HTML, images,
+  and tables, and allows only absolute HTTP(S) links outside aipatty's hosts. All other cards stay plain text.
 
 ## Not built
 
 - **Steps chosen per branch.** Every branch runs the same list. The plan is that a branch adds an app's steps
   with a command, they run after the built-in ones in the order added, a fork inherits them, and they cannot be
   removed. The place for them is the `steps` list in `src/page.ts`.
-- **Markdown.** It will be a `format` and a step that sets it on settled prose.
 - **State in a card.** A card is its precard and nothing more, so it has no form fields or other state of its
   own. A form belongs on an app's own page, reached by a link.
 - **A step that reads several earlier cards.** Only the join of a result to its call exists, in `initial`. If

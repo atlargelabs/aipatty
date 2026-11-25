@@ -43,4 +43,14 @@ export const piRunStep: Step = {
   },
 };
 
-export const builtInSteps: Step[] = [piRunStep];
+/** Render only saved conversation prose as Markdown. Live previews and tool cards stay literal. */
+const markdownStep: Step = {
+  name: "markdown",
+  card(precard) {
+    if (precard.kind === "prose" && (precard.message.role === "user" || precard.message.role === "assistant")) {
+      return { format: "markdown" };
+    }
+  },
+};
+
+export const builtInSteps: Step[] = [piRunStep, markdownStep];
