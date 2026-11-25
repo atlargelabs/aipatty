@@ -201,7 +201,7 @@ test("forking a branch with no messages yet starts an empty branch", async t => 
   assert.deepEqual(page.body.entries, []);
 });
 
-test("each branch keeps its own model and thinking level, and a busy branch refuses a switch", async t => {
+test("each branch keeps its own model and thinking level, and a queued switch does not block another branch", async t => {
   const { host, call } = await server(t);
   const fork = (await call<BranchInfo>("/api/conversations/root/fork", "POST", { title: "Fork" })).body;
   const set = await call<BranchInfo>(`/api/conversations/${fork.id}/thinking`, "PUT", { level: "low" });
@@ -212,10 +212,9 @@ test("each branch keeps its own model and thinking level, and a busy branch refu
   const branch = (await host.conversation(String(fork.id)))!;
   await host.submit(branch, { type: "input", content: "x".repeat(900) });
   await until(async () => (await host.branch(branch)).busy);
-  const busy = await call<{ error: string }>(`/api/conversations/${fork.id}/model`, "PUT", { modelId: "faux-1" });
-  assert.equal(busy.status, 409);
-  assert.match(busy.body.error, /active work/);
-  assert.ok(busy.body.error.includes(`'aipatty abort --branch ${fork.id}'`), busy.body.error);
+  const busy = await call(`/api/conversations/${fork.id}/model`, "PUT", { modelId: "faux-1" });
+  assert.equal(busy.status, 202);
+  assert.deepEqual(busy.body, { modelSwitch: "queued", model: { provider: "faux", modelId: "faux-1" } });
   // The root is not busy, so its model can still change.
   assert.equal((await call("/api/model", "PUT", { modelId: "faux-1" })).status, 200);
   await call(`/api/conversations/${fork.id}/abort`, "POST");

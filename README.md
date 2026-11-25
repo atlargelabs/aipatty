@@ -16,7 +16,9 @@ thinking level, and its own cost; the page and the CLI show it as `$<branch> / $
 
 The model gets four tools for the tree: `list_branches`, `read_branch` (paging and case-insensitive text search over
 any branch), `fork_branch` (optionally with a first message the new branch starts on), and `set_model`. A branch it
-forks gets the model it has; its `set_model` on another branch is refused while that branch is busy. Forks at an
+forks gets the parent's effective model. `set_model` on another branch queues the model if that branch is busy;
+a combined model and thinking change still requires it to be idle. On its own branch the tool still changes the
+model for the next model request. Forks at an
 incomplete tool exchange are rejected: fork before the call or after its last result. A tool's default self-fork
 ends before its own call. If the optional first message cannot be admitted, the tool reports the created branch ID and
 the admission error; the branch remains available.
@@ -204,6 +206,20 @@ The server listens on `127.0.0.1` only; there is no listen address to configure.
 A new root conversation starts with the model `gpt-6.2-sol` and the thinking level `high`. Both are saved with the
 conversation; change them with `model set` and `thinking set` (add `--branch <id>` for a branch).
 
+To change the selected branch's chat model, type `/model <provider/model-id>` or use the model picker, which
+sends the same command. `aipatty send '/model openai/gpt-6.2-sol'` works too. A bare ID without a slash is also
+accepted if it identifies exactly one model in `aipatty models`. After trimming surrounding whitespace, a message
+starting with the exact `/model` token must contain just the command and one model reference on one line;
+malformed commands return an error rather than going to chat. The command is not added to the transcript.
+
+A valid switch (including `model set`) applies immediately on an idle branch. On a busy branch, the latest valid
+choice wins and applies when the branch goes idle, which may be **after already queued chat work**. It does not
+interrupt the current turn or tools or change a running Pi subprocess. The picker shows the effective model until
+it changes; to replace a queued choice with the already displayed model, type `/model` with that model instead.
+A queued choice is kept only in memory: aborting the branch or restarting the server discards it. Invalid choices
+are rejected without replacing a queued one. If a queued choice fails to apply, the server logs the error to stderr;
+check the effective model and retry the command when the server is healthy.
+
 `gpt-6.2-sol` is in the catalog bundled with pi-ai 1.6.0. A model newer than that catalog resolves only if the pi
 CLI has cached a newer catalog in the pi directory. If a branch's saved model is missing from both, the server
 still serves transcripts, branches and model commands. `/health` returns HTTP 200, `modelStatus: "unavailable"`, and the
@@ -214,8 +230,8 @@ that work is neither run on the wrong model nor silently failed.
 
 To keep interrupted work pending, restore the original model (e.g. `pi update --models`) and restart.
 Alternatively, select an available model. Switching withdraws outstanding work from the blocked turn, including
-queued messages; it does **not** rerun them. Send any message you want to retry explicitly. A switch during an
-actively running turn returns 409: wait for the turn to finish, or run `abort` first.
+queued messages; it does **not** rerun them. Send any message you want to retry explicitly. A busy branch that does
+not need recovery refuses a queued switch while another branch is blocking scheduling.
 
 Only one process can open a data directory, regardless of listen port. The server holds an OS-backed lock in
 a separate `owner.sqlite` file before opening the conversation database. A crash releases the lock; do not delete the file.
@@ -313,14 +329,17 @@ loopback; access to the HTTPS URL is controlled by your tailnet policy. Do not u
 - `POST /api/conversations/:id/fork` with `{ title, at? }`: a new branch from `:id`'s history through entry `at`
   (default its newest); inherits its current apps and returns the branch
 - `PUT /api/conversations/:id/title` with `{ title }` (1 to 100 characters)
-- `PUT /api/conversations/:id/model` with `{ modelId, provider? }`; 409 while the branch has active work
+- `PUT /api/conversations/:id/model` with `{ modelId, provider? }`: 200 with the usual settings when applied,
+  or `202 { "modelSwitch": "queued", "model": { "provider": "…", "modelId": "…" } }` for an accepted selection
 - `PUT /api/conversations/:id/thinking` with `{ level }`
 - `GET /api/conversations/:id/search?q=&limit=&before=`: `{ matches: [{ entryId, role, excerpt }], before }`,
   newest first; pass `before` back for the next page
 - `POST /api/conversations/:id/messages` with `{ content, requestId?, whenBusy?: "followUp" | "steer" }`. The
   content `/upgrade` starts an [upgrade](#upgrade) instead: `202 { "upgrade": "started" }`, or 409 when the server
-  is busy or not a managed install. `/connect`, `/connect <id>` and `/disconnect <id>` return `202 { notice }`
-  without a model turn. App mutations are refused with 409 while the branch is busy.
+  is busy or not a managed install. `/model <provider/model-id>` switches the branch's model: 200 when applied or
+  202 when queued, with `{ modelSwitch: "applied" | "queued", model: { provider, modelId }, notice }` and no
+  `submissionId`. `/connect`, `/connect <id>` and `/disconnect <id>` return `202 { notice }` without a model turn.
+  App mutations are refused with 409 while the branch is busy.
 - `POST /api/conversations/:id/abort` (returns once the conversation is idle)
 - `WS /api/conversations/:id/stream` sends one `state` frame (the newest 50 entries and the live state), then an
   `update` frame per change: the live state plus any `appended` entries, without the window. An `apps` list is

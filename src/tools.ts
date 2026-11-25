@@ -149,7 +149,7 @@ export function treeExtension(getHost: () => AgentHost) {
   const setModel = defineTool({
     name: "set_model",
     description: "Set the model of a branch, from the IDs `aipatty models` lists. On this branch it applies from the next model request; "
-      + "another branch must be idle.",
+      + "on another branch it applies when that branch is idle. Only include thinking if the target is idle or this branch.",
     parameters: obj({
       modelId: str({ minLength: 1 }),
       provider: opt(str({ minLength: 1, description: "Needed only when two providers have the model ID" })),
@@ -166,15 +166,15 @@ export function treeExtension(getHost: () => AgentHost) {
       const thinkingLevel = args.thinking === undefined ? undefined : thinkingLevels.find(level => level === args.thinking);
       if (args.thinking !== undefined && !thinkingLevel) throw new Error(`Expected a thinking level: ${thinkingLevels.join(", ")}`);
       const model = { provider: matches[0].provider, modelId: matches[0].modelId };
-      if (conversation.id === api.conversationId) {
-        // This branch is running this call; the change applies from its next model request.
-        await conversation.configure({ model, ...(thinkingLevel ? { thinkingLevel } : {}) }, context);
-      } else {
-        // Another branch goes through the host, which refuses while that branch has active work.
-        await queued(host.setModel({ ...model, thinkingLevel }, conversation, context), context);
-      }
       const name = conversation.id === ROOT_CONVERSATION_ID ? "the main branch" : `branch ${conversation.id}`;
-      return text(`Set ${name} to ${model.provider}/${model.modelId}${thinkingLevel ? ` with thinking ${thinkingLevel}` : ""}.`);
+      const selection = `${model.provider}/${model.modelId}${thinkingLevel ? ` with thinking ${thinkingLevel}` : ""}`;
+      if (conversation.id === api.conversationId) {
+        // Avoid this branch's admission line: an abort can hold it while waiting for this call.
+        await conversation.configure({ model, ...(thinkingLevel ? { thinkingLevel } : {}) }, context);
+      } else if (await queued(host.setModel({ ...model, thinkingLevel }, conversation, context), context) === "queued") {
+        return text(`Queued ${selection} for ${name}; it will apply when that branch goes idle.`);
+      }
+      return text(`Set ${name} to ${selection}.`);
     },
   });
 

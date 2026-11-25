@@ -32,6 +32,7 @@ interface HostOptions {
   // Test fixtures and scripted Faux model. The server always uses the defaults.
   apps?: readonly ConnectedApp[];
   models?: Models;
+  extensions?: readonly Extension[];
 }
 
 /** What a new root conversation starts with. Afterwards `model set` and `thinking set` change the saved values. */
@@ -44,6 +45,8 @@ export interface ModelStatus {
   model: ModelRef | null;
   thinking: ModelThinkingLevel;
 }
+
+type ModelChange = ModelRef & { thinkingLevel?: ModelThinkingLevel };
 
 export interface AgentHost {
   harness: Harness;
@@ -64,8 +67,9 @@ export interface AgentHost {
   /**
    * `setModel`, `setThinking` and `submit` wait behind aborts on their own branch. Given the caller's `context`,
    * a call whose context was cancelled while it waited rejects when its turn comes and changes nothing.
+   * Save a model immediately if idle, otherwise keep the latest valid choice in memory until the branch is idle.
    */
-  setModel(model: ModelRef & { thinkingLevel?: ModelThinkingLevel }, conversation?: Conversation, context?: Context): Promise<void>;
+  setModel(model: ModelChange, conversation?: Conversation, context?: Context): Promise<"applied" | "queued">;
   setThinking(level: string, conversation?: Conversation, context?: Context): Promise<void>;
   /** Every branch, oldest first, and the spend of the whole session. */
   branches(): Promise<{ branches: BranchInfo[]; totalCost: number }>;
@@ -152,7 +156,9 @@ async function forkPoint(from: Conversation, at: number | undefined, before: num
   return point;
 }
 
-async function openOwnedHost(config: Config, { apps: modules = connectedApps, models: scriptedModels }: HostOptions): Promise<AgentHost> {
+async function openOwnedHost(config: Config, {
+  apps: modules = connectedApps, models: scriptedModels, extensions: testExtensions = [],
+}: HostOptions): Promise<AgentHost> {
   const models = scriptedModels ?? await openModels(config);
   // Before any conversation resumes: stop and clean up runs the previous process left behind.
   const runs = await openPiRuns(config);
@@ -171,6 +177,7 @@ async function openOwnedHost(config: Config, { apps: modules = connectedApps, mo
     if (!host) throw new Error("aipatty is still starting");
     return host;
   }));
+  for (const extension of testExtensions) registry.install(extension);
   // An implicit default selects *every* installed extension, even on old conversations.
   const extensions = registry.snapshot().installed();
   const apps = new Map<string, { title: string; instructions: string; opened: OpenApp; extension: Extension }>();
@@ -381,6 +388,38 @@ async function openOwnedHost(config: Config, { apps: modules = connectedApps, mo
     };
     const totalCost = async () => usageCost(await harness.usage(ctx));
 
+    const branchWork = async (target: Conversation) => {
+      const inspection = await harness.inspect(ctx);
+      const tasks = inspection.tasks.filter(t => t.record.conversationId === target.id);
+      const submissions = inspection.submissions.filter(s => s.conversationId === target.id);
+      // Like waitForIdle, don't count independent background tasks as a turn.
+      return { tasks, submissions, busy: tasks.some(t => !t.record.background) || submissions.length > 0 };
+    };
+    type Selection = { model: ModelRef };
+    const pendingModels = new Map<ConversationId, Selection>();
+    async function applyWhenIdle(target: Conversation, selection: Selection) {
+      const current = () => pendingModels.get(target.id) === selection;
+      try {
+        do {
+          // No admission line is held here. Only branches admitted with scheduling enabled can reach this wait.
+          await target.waitForIdle(ctx);
+        } while (await exclusive(async () => {
+          if (!current()) return false;
+          // A new turn may have won admission since the idle notification.
+          const { busy } = await branchWork(target);
+          if (!current()) return false; // shutdown can clear the selection during the read
+          if (busy) return true;
+          await target.configure({ model: selection.model }, ctx);
+          pendingModels.delete(target.id);
+          return false;
+        }));
+      } catch (error) {
+        if (!current()) return;
+        pendingModels.delete(target.id);
+        console.error(`Could not apply ${modelName(selection.model)} on branch ${target.id}. Retry the model selection when the server is healthy:`, error);
+      }
+    }
+
     host = {
       harness,
       runs,
@@ -428,7 +467,8 @@ async function openOwnedHost(config: Config, { apps: modules = connectedApps, mo
         }));
       },
       async close() {
-        // First, so interrupted runs are left for the next start to report, not settled as aborts.
+        pendingModels.clear();
+        // Before closing the harness, so interrupted runs are left for the next start to report, not settled as aborts.
         await runs.close();
         await harness.close(ctx);
         await closed;
@@ -450,34 +490,48 @@ async function openOwnedHost(config: Config, { apps: modules = connectedApps, mo
           return () => { upgrading = false; };
         });
       },
-      async setModel({ thinkingLevel, ...next }, target = root, context) {
-        await onBranch(target, () => exclusive(async () => {
-          if (!models.getModel(next.provider, next.modelId)) {
-            throw new HttpError(400, `Unknown model ${next.provider}/${next.modelId}; list available models with 'aipatty models'`);
-          }
-          const inspection = await harness.inspect(ctx);
-          const tasks = inspection.tasks.filter(t => t.record.conversationId === target.id);
-          const pending = inspection.submissions.filter(s => s.conversationId === target.id);
+      async setModel({ thinkingLevel, ...model }, target = root, context) {
+        if (!models.getModel(model.provider, model.modelId)) {
+          throw new HttpError(400, `Unknown model ${model.provider}/${model.modelId}; list available models with 'aipatty models'`);
+        }
+        return onBranch(target, () => exclusive(async () => {
+          const { busy, tasks, submissions } = await branchWork(target);
           const recovering = blocked.has(target.id);
-          if (!recovering && (tasks.length || pending.length)) {
-            throw new HttpError(409, `Cannot switch model while the conversation has active work. Wait for the turn to finish, or run 'aipatty abort${branchRef(target.id)}', before switching.`);
+          if (!recovering && busy) {
+            // waitForIdle() resumes Durable; never start that waiter while stale-model recovery has it paused.
+            await assertRunning(target.id);
+            if (thinkingLevel !== undefined) {
+              throw new HttpError(409, "Cannot set model and thinking together on a busy branch; omit thinking to queue just the model");
+            }
+            const pending = pendingModels.get(target.id);
+            if (pending) pending.model = model;
+            else {
+              const selection = { model };
+              pendingModels.set(target.id, selection);
+              void applyWhenIdle(target, selection);
+            }
+            return "queued";
           }
+          pendingModels.delete(target.id);
           if (recovering) {
             // The scheduler is paused. Withdraw queued submissions and mark all the branch's tasks before
             // configuring or resuming. Their abort handlers may run; interrupted turns are not replayed.
-            for (const submission of pending) {
+            for (const submission of submissions) {
               if (submission.status === "queued") await harness.abortSubmission(submission.id, ctx);
             }
             for (const task of tasks) await harness.abortTask(task.record.id, ctx);
           }
-          await target.configure({ model: next, thinkingLevel }, ctx);
-          if (!recovering) return;
-          blocked.delete(target.id);
-          recovered.push(target);
-          if (blocked.size) return;
-          harness.resume();
-          // An input admitted while the aborted tasks are still settling would never start.
-          for (const done of recovered.splice(0)) await done.waitForIdle(ctx);
+          await target.configure({ model, thinkingLevel }, ctx);
+          if (recovering) {
+            blocked.delete(target.id);
+            recovered.push(target);
+            if (!blocked.size) {
+              harness.resume();
+              // An input admitted while the aborted tasks are still settling would never start.
+              for (const done of recovered.splice(0)) await done.waitForIdle(ctx);
+            }
+          }
+          return "applied";
         }, context));
       },
       setThinking(level, target = root, context) {
@@ -558,6 +612,7 @@ async function openOwnedHost(config: Config, { apps: modules = connectedApps, mo
         return onBranch(target, async () => {
           await exclusive(async () => {
             await assertRunning(target.id);
+            pendingModels.delete(target.id);
             aborting.add(target.id);
           });
           try {

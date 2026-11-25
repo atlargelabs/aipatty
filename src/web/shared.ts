@@ -4,6 +4,12 @@
  */
 import type { EntryRecord } from "@earendil-works/pi-durable";
 
+export const modelCommand = "/model";
+
+export function isModelCommand(content: string): boolean {
+  return content.trimStart().split(/\s/, 1)[0] === modelCommand;
+}
+
 /** The kind of a transcript entry about an upgrade: `data.text` is shown to people and is not model context. */
 export const upgradeEntryKind = "aipatty.upgrade";
 export const appEntryKind = "aipatty.app";

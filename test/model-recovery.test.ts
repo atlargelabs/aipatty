@@ -63,18 +63,24 @@ test("settled frame is delivered while a later submission is still running", asy
   assert.ok((await host.harness.inspect(ctx)).submissions.length > 0, "later submission must still be pending");
 });
 
-test("a model switch conflicts with active work, which finishes after a restart", async t => {
+test("switching a busy branch does not resume work blocked on a different branch's unavailable model", async t => {
   const dir = await fixture(t);
-  const host = await openHost(fauxConfig(dir));
+  const config = fauxConfig(dir);
+  const host = await openHost(config);
   const root = (await host.conversation("root"))!;
+  const fork = await host.fork(root, { title: "Unavailable" });
+  const side = (await host.conversation(String(fork.id)))!;
   await host.submit(root, { type: "input", content: "x".repeat(900) });
-  await until(async () => (await host.harness.inspect(ctx)).tasks.length > 0);
-  await assert.rejects(host.setModel({ provider: "faux", modelId: "faux-1" }), /active work/);
-  await host.harness.close(ctx);
-  const reopened = await openHost(fauxConfig(dir));
-  assert.equal((await reopened.modelStatus()).modelStatus, "available");
-  await until(async () => (await reopened.harness.inspect(ctx)).submissions.length === 0);
-  await reopened.harness.close(ctx);
+  await host.submit(side, { type: "input", content: "y".repeat(900) });
+  await side.configure({ model: { provider: "missing", modelId: "offline" } }, ctx);
+  await host.close();
+
+  const reopened = await openHost(config);
+  t.after(() => reopened.close());
+  await assert.rejects(reopened.setModel({ provider: "faux", modelId: "faux-1" }), /has interrupted work waiting/);
+  const inspection = await reopened.harness.inspect(ctx);
+  assert.equal(inspection.scheduling, "paused");
+  assert.equal(inspection.submissions.length, 2);
 });
 
 test("a message sent right behind a recovering model switch, or during an abort, is not stranded", { timeout: 20_000 }, async t => {

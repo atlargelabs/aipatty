@@ -154,7 +154,7 @@ button { font: inherit; padding: .3rem .7rem; }
 
 export const pageJs = (appHostnames: readonly string[]) => `import markdownit from ${JSON.stringify(markdownScriptPath)};
 import { derive, scopeAppStep } from "/web/cards.ts";
-import { piRunApiPath } from "/web/shared.ts";
+import { isModelCommand, modelCommand, piRunApiPath } from "/web/shared.ts";
 import { builtInSteps, runIdOf } from "/web/steps.ts";
 
 const $ = id => document.getElementById(id);
@@ -162,7 +162,7 @@ const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max
 // What the page holds: the agent data of the selected branch (entries, live), and what the reader has done to the
 // view (the pane they opened and the button that opened it).
 const app = {
-  branch: null, branches: [], totalCost: 0, entries: [], before: null, live: {}, socket: null, models: [],
+  branch: null, branches: [], totalCost: 0, entries: [], before: null, live: {}, socket: null, model: undefined,
   pane: undefined, opener: undefined,
 };
 // The selected branch's app steps follow the built-ins. Switching invalidates any import still in flight.
@@ -430,6 +430,11 @@ document.addEventListener("keydown", event => {
 
 function current() { return app.branches.find(branch => branch.id === app.branch); }
 
+// The selected branch's stream, not a possibly older branch-list response, owns its effective model.
+function modelOf(branch) {
+  return branch.id === app.branch && app.model !== undefined ? app.model : branch.model;
+}
+
 /*
  * A stream frame arrives about ten times a second while a branch answers. Rendering one must leave the nodes already
  * on the page in place: a node replaced between a press and its release gets no click, and loses its selection and
@@ -473,8 +478,8 @@ function renderBranches() {
     const node = branchNode(branch.id);
     node.li.classList.toggle("current", branch.id === app.branch);
     setText(node.title, branch.title);
-    const model = branch.model ? branch.model.modelId : "no model";
-    setText(node.info, "#" + branch.id + " · " + model + " · " + money(branch.cost));
+    const model = modelOf(branch);
+    setText(node.info, "#" + branch.id + " · " + (model?.modelId ?? "no model") + " · " + money(branch.cost));
     node.busy.hidden = !branch.busy;
     if (list.children[index] !== node.li) list.insertBefore(node.li, list.children[index] || null);
   });
@@ -483,12 +488,13 @@ function renderBranches() {
   setText($("title"), branch.title);
   document.title = branch.title + " · aipatty";
   setText($("cost"), money(branch.cost) + " / " + money(app.totalCost));
-  const ref = branch.model ? branch.model.provider + "/" + branch.model.modelId : "";
+  const model = modelOf(branch);
+  const ref = model ? model.provider + "/" + model.modelId : "";
   const picker = $("model");
   if (![...picker.options].some(option => option.value === ref)) {
     const option = document.createElement("option");
     option.value = ref;
-    option.textContent = (branch.model ? branch.model.modelId : "(none)") + " (unavailable)";
+    option.textContent = (model?.modelId ?? "(none)") + " (unavailable)";
     picker.prepend(option);
   }
   if (picker.value !== ref) picker.value = ref;
@@ -546,17 +552,20 @@ const formats = {
   markdown(body, text) { body.innerHTML = markdown.render(text); },
 };
 
-function sendMessage(branch, content) {
+async function sendMessage(branch, content) {
   // Unlike randomUUID, getRandomValues does not need a secure context.
   const requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
-  return api("/api/conversations/" + branch + "/messages", { method: "POST", body: { content, requestId, whenBusy: "followUp" } });
+  const ack = await api("/api/conversations/" + branch + "/messages", { method: "POST", body: { content, requestId, whenBusy: "followUp" } });
+  if (ack.modelSwitch && branch === app.branch) notice(ack.notice);
 }
 
 // Carry out a button's action against the selected branch. These are all the actions there are (see Action in
 // src/web/cards.ts).
 async function act(action, button) {
-  if (action.type === "send") await sendMessage(app.branch, action.content);
-  else if (action.type === "abort") await api("/api/conversations/" + app.branch + "/abort", { method: "POST" });
+  if (action.type === "send") {
+    if (isModelCommand(action.content)) throw new Error("Type " + modelCommand + " in the message box to switch models.");
+    await sendMessage(app.branch, action.content);
+  } else if (action.type === "abort") await api("/api/conversations/" + app.branch + "/abort", { method: "POST" });
   else if (action.type === "fork") await forkAt(action.at);
   else if (action.type === "openPane") {
     app.pane = action.pane;
@@ -758,12 +767,14 @@ function connect(id) {
       return;
     }
     app.live = frame.live || {};
+    app.model = frame.model;
     if (frame.apps) setAppSteps(frame.apps);
     const branch = current();
     if (branch) {
       const wasBusy = branch.busy;
       branch.busy = frame.busy;
       branch.cost = frame.usage.cost;
+      branch.model = frame.model;
       if (wasBusy && !frame.busy) refreshBranches();
     }
     render();
@@ -782,6 +793,7 @@ async function refreshBranches() {
 }
 
 async function selectBranch(id) {
+  notice("");
   // Reset even if the next branch has the same app list: its stream supplies the authoritative selection.
   appKey = null;
   setAppSteps([]);
@@ -789,6 +801,7 @@ async function selectBranch(id) {
   app.entries = [];
   app.before = null;
   app.live = {};
+  app.model = undefined;
   app.pane = app.opener = undefined;
   history.replaceState(null, "", "#" + id);
   newTranscript();
@@ -807,7 +820,6 @@ async function forkAt(at) {
 
 async function loadModels() {
   const { models } = await api("/api/models");
-  app.models = models;
   $("model").replaceChildren(...models.map(model => {
     const option = document.createElement("option");
     option.value = model.provider + "/" + model.modelId;
@@ -862,12 +874,9 @@ $("search").addEventListener("click", guard(async () => {
   notice(matches.length ? matches.map(m => "[" + m.entryId + "] " + m.role + ": " + m.excerpt).join("\\n") : "No matches");
 }));
 $("model").addEventListener("change", guard(async event => {
-  const [provider, ...rest] = event.target.value.split("/");
-  try {
-    await api("/api/conversations/" + app.branch + "/model", { method: "PUT", body: { provider, modelId: rest.join("/") } });
-  } finally {
-    await refreshBranches();
-  }
+  const ref = event.target.value;
+  renderBranches(); // Keep showing the effective model until the stream reports its replacement.
+  if (app.branch !== null) await sendMessage(app.branch, modelCommand + " " + ref);
 }));
 $("thinking").addEventListener("change", guard(async event => {
   try {

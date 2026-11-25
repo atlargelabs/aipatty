@@ -690,6 +690,31 @@ test("Send by the name localhost admits once, preserves a new draft, and shows a
   assert.deepEqual(browser.errors, []);
 });
 
+test("the model picker and composer use the same operator command", { skip: !chrome, timeout: 60_000 }, async t => {
+  const host = await openHost(realConfig(await fixture(t)));
+  const api = await startApi(host, health, 0);
+  t.after(async () => { await api.close(); await host.close(); });
+  const browser = await openBrowser(t);
+  await browser.navigate(`http://127.0.0.1:${api.port}/`);
+  await waitFor(browser, "the main branch", state => state.current === "Main");
+  await browser.evaluate(`
+    const picker = document.getElementById('model');
+    picker.value = 'openai/gpt-6.1-sol';
+    picker.dispatchEvent(new Event('change'));
+  `);
+  const shows = (ref: string) => until(() => browser.evaluate(`
+    document.getElementById('model').value === ${JSON.stringify(ref)} &&
+    document.getElementById('notice').textContent === ${JSON.stringify(`Model set to ${ref}.`)}
+  `));
+  await shows("openai/gpt-6.1-sol");
+  await browser.evaluate(`
+    document.getElementById('input').value = '/model openai/gpt-6.2-sol';
+    document.getElementById('composer').requestSubmit();
+  `);
+  await shows("openai/gpt-6.2-sol");
+  assert.deepEqual((await browser.evaluate<Shown>(shown)).messages, []);
+});
+
 test("an older page is requested once and cannot overwrite a different branch", { skip: !chrome, timeout: 60_000 }, async t => {
   const host = await openHost(fauxConfig(await fixture(t)));
   const api = await startApi(host, health, 0);
