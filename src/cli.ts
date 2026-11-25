@@ -4,7 +4,10 @@ import { on } from "node:events";
 import WebSocket, { type RawData } from "ws";
 import { LOOPBACK, readFaux, readPort } from "./config.ts";
 import type { BranchInfo, SearchMatch } from "./branches.ts";
-import { failureText, messageText, shutdownHeader, upgradeCommand, upgradeText, type ConversationPage, type StreamFrame } from "./protocol.ts";
+import {
+  failureText, messageText, modelSwitchText, shutdownHeader, upgradeCommand, upgradeText,
+  type ConversationPage, type ModelSwitchAck, type StreamFrame,
+} from "./protocol.ts";
 import { branchLine } from "./tools.ts";
 
 /** The conversation path of a branch ID, or the root's. */
@@ -36,16 +39,21 @@ async function request<T>(base: URL, path: string, options?: RequestInit): Promi
 }
 
 async function send(base: URL, content: string, root: string): Promise<void> {
-  const { submissionId } = await request<{ submissionId?: number }>(base, `${root}/messages`, {
+  const ack = await request<{ submissionId: number } | { upgrade: "started" } | ModelSwitchAck>(base, `${root}/messages`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content, requestId: randomUUID() }),
   });
-  if (submissionId === undefined) {
-    // The server took the content as its `/upgrade` command: there is no answer to stream.
+  // Operator commands have no answer to stream.
+  if ("upgrade" in ack) {
     console.log("Upgrade started. The server restarts if it succeeds; the result appears in this branch's log.");
     return;
   }
+  if ("modelSwitch" in ack) {
+    console.log(modelSwitchText(ack));
+    return;
+  }
+  const { submissionId } = ack;
   const url = new URL(`${root}/stream?submissionId=${submissionId}`, base);
   url.protocol = "ws:";
   const socket = new WebSocket(url);

@@ -6,7 +6,6 @@ import {
 import { int, obj, opt, str } from "@earendil-works/pi-schema";
 import { thinkingLevels, type BranchInfo } from "./branches.ts";
 import type { AgentHost } from "./host.ts";
-import { queueModel } from "./model-switch.ts";
 import { messageText } from "./protocol.ts";
 import { transcriptPage } from "./transcript.ts";
 
@@ -27,9 +26,7 @@ function money(value: number): string {
 export function branchLine(branch: BranchInfo): string {
   const model = branch.model ? `${branch.model.provider}/${branch.model.modelId}` : "(no model)";
   const from = branch.parent ? `, forked from ${branch.parent.id} at entry ${branch.parent.at}` : "";
-  const pending = branch.pendingModel;
-  const flags = [branch.busy ? "busy" : "", branch.modelStatus === "unavailable" ? "model unavailable" : "",
-    pending ? `queued model ${pending.provider}/${pending.modelId}` : ""].filter(Boolean);
+  const flags = [branch.busy ? "busy" : "", branch.modelStatus === "unavailable" ? "model unavailable" : ""].filter(Boolean);
   return `${branch.id}: ${branch.title} (${model}, ${money(branch.cost)}${from}${flags.length ? `, ${flags.join(", ")}` : ""})`;
 }
 
@@ -151,8 +148,8 @@ export function treeExtension(getHost: () => AgentHost) {
 
   const setModel = defineTool({
     name: "set_model",
-    description: "Set the chat model of a branch, from the IDs `aipatty models` lists. The selection is saved immediately "
-      + "on an idle branch or queued until the current tool round returns; other active work refuses it.",
+    description: "Set the model of a branch, from the IDs `aipatty models` lists. On this branch it applies from the next model request; "
+      + "on another branch it applies when that branch is idle.",
     parameters: obj({
       modelId: str({ minLength: 1 }),
       provider: opt(str({ minLength: 1, description: "Needed only when two providers have the model ID" })),
@@ -169,19 +166,15 @@ export function treeExtension(getHost: () => AgentHost) {
       const thinkingLevel = args.thinking === undefined ? undefined : thinkingLevels.find(level => level === args.thinking);
       if (args.thinking !== undefined && !thinkingLevel) throw new Error(`Expected a thinking level: ${thinkingLevels.join(", ")}`);
       const model = { provider: matches[0].provider, modelId: matches[0].modelId };
-      let isQueued;
-      if (conversation.id === api.conversationId) {
-        // Never wait for this branch's admission line: an abort may hold it waiting for this call.
-        isQueued = await conversation.commit(tx => queueModel(tx, conversation.id, {
-          model, ...(thinkingLevel === undefined ? {} : { thinkingLevel }),
-        }), context);
-        if (!isQueued) throw new Error("The current tool round is no longer accepting a model selection");
-      } else {
-        isQueued = !!await queued(host.setModel({ ...model, thinkingLevel }, conversation, context), context);
-      }
       const name = conversation.id === ROOT_CONVERSATION_ID ? "the main branch" : `branch ${conversation.id}`;
       const selection = `${model.provider}/${model.modelId}${thinkingLevel ? ` with thinking ${thinkingLevel}` : ""}`;
-      return text(isQueued ? `Queued ${selection} for ${name} after its tool round.` : `Set ${name} to ${selection}.`);
+      if (conversation.id === api.conversationId) {
+        // Avoid this branch's admission line: an abort can hold it while waiting for this call.
+        await conversation.configure({ model, ...(thinkingLevel ? { thinkingLevel } : {}) }, context);
+      } else if (await queued(host.setModel({ ...model, thinkingLevel }, conversation, context), context) === "queued") {
+        return text(`Queued ${selection} for ${name}; it will apply when that branch goes idle.`);
+      }
+      return text(`Set ${name} to ${selection}.`);
     },
   });
 

@@ -11,7 +11,6 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { startApi } from "../src/api.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
 import { piRunApiPath, upgradeEntryKind, type PiRunSnapshot } from "../src/protocol.ts";
-import { modelSwitchFixture, nextModel, oldModel, otherModel } from "./fixtures/model-switch.ts";
 import { archivedPiRun, checkout, fauxConfig, fixture, realConfig, until } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
@@ -115,67 +114,6 @@ async function openBrowser(t: TestContext, flags: string[] = []) {
       send("Input.dispatchMouseEvent", { type, x, y, button: "left", clickCount: 1 }),
   };
 }
-
-test("the model picker shows the queued choice separately and follows the streamed effective model", { skip: chrome ? false : "no Chrome found; set CHROME_PATH", timeout: 60_000 }, async t => {
-  const { faux, tools, open, start } = modelSwitchFixture(await fixture(t));
-  const answer = Promise.withResolvers<void>();
-  t.after(() => answer.resolve());
-  const host = await open();
-  const api = await startApi(host, health, 0);
-  t.after(async () => { await api.close(); await host.close(); });
-  const { submission } = await start(host);
-  const browser = await openBrowser(t);
-  await browser.navigate(`http://127.0.0.1:${api.port}/`);
-  const key = (model: typeof oldModel) => `${model.provider}/${model.modelId}`;
-  const pick = (model: typeof oldModel) => browser.evaluate(`{
-    const picker = document.querySelector("#model");
-    picker.value = ${JSON.stringify(key(model))};
-    picker.dispatchEvent(new Event("change"));
-  }`);
-  const read = () => browser.evaluate<{ model: string; pending: string; enabled: boolean; busy: boolean }>(`({
-    model: document.querySelector("#model").value,
-    pending: document.querySelector("#model-pending-message").textContent,
-    enabled: !document.querySelector("#model").disabled,
-    busy: !document.querySelector("#abort").disabled,
-  })`);
-  await until(read, state => state.busy && state.model === key(oldModel));
-  await pick(nextModel);
-  const queued = await until(read, state => state.enabled && state.pending.includes(key(nextModel)));
-  assert.equal(queued.model, key(oldModel));
-  assert.match(queued.pending, /queued until this tool round completes/);
-  await browser.evaluate('document.querySelector("#keep-model").click()');
-  const kept = await until(read, state => state.enabled && state.pending.startsWith("Keeping "));
-  assert.equal(kept.model, key(oldModel));
-  assert.deepEqual((await host.modelStatus()).pendingModel, oldModel);
-
-  // Hold a pre-boundary branch list from the replacement PUT until after the socket has shown the new model.
-  await browser.evaluate(`{
-    const original = window.fetch;
-    let hold = true;
-    window.fetch = async (path, init) => {
-      const response = await original(path, init);
-      if (hold && path === "/api/branches") {
-        hold = false;
-        await new Promise(resolve => { window.releaseBranchList = resolve; });
-      }
-      return response;
-    };
-  }`);
-  await pick(otherModel);
-  await until(() => browser.evaluate("typeof window.releaseBranchList === 'function'"));
-  faux.appendResponses([async () => { await answer.promise; return fauxAssistantMessage("Continued"); }]);
-  tools[0].done.resolve();
-  const applied = await until(read, state => state.model === key(otherModel));
-  assert.ok(applied.busy, "the picker updates during the same turn, not on idle");
-  assert.equal(applied.pending, "");
-  await browser.evaluate("window.releaseBranchList()");
-  const refreshed = await until(read, state => state.enabled);
-  assert.equal(refreshed.model, key(otherModel));
-  assert.equal(refreshed.pending, "");
-  answer.resolve();
-  assert.equal((await submission.wait(ctx)).status, "done");
-  assert.deepEqual(browser.errors, []);
-});
 
 /** What the page shows: the header title, the highlighted branch, the URL fragment and the visible messages. */
 interface Shown { title: string; current: string | null; hash: string; messages: string[] }
@@ -748,6 +686,31 @@ test("Send by the name localhost admits once, preserves a new draft, and shows a
   assert.ok(requestIds[0]);
   assert.equal(await browser.evaluate("document.querySelector('#input').value"), "new draft");
   assert.deepEqual(browser.errors, []);
+});
+
+test("the model picker and composer use the same operator command", { skip: !chrome, timeout: 60_000 }, async t => {
+  const host = await openHost(realConfig(await fixture(t)));
+  const api = await startApi(host, health, 0);
+  t.after(async () => { await api.close(); await host.close(); });
+  const browser = await openBrowser(t);
+  await browser.navigate(`http://127.0.0.1:${api.port}/`);
+  await waitFor(browser, "the main branch", state => state.current === "Main");
+  await browser.evaluate(`
+    const picker = document.getElementById('model');
+    picker.value = 'openai/gpt-6.1-sol';
+    picker.dispatchEvent(new Event('change'));
+  `);
+  const shows = (ref: string) => until(() => browser.evaluate(`
+    document.getElementById('model').value === ${JSON.stringify(ref)} &&
+    document.getElementById('notice').textContent === ${JSON.stringify(`Model set to ${ref}.`)}
+  `));
+  await shows("openai/gpt-6.1-sol");
+  await browser.evaluate(`
+    document.getElementById('input').value = '/model openai/gpt-6.2-sol';
+    document.getElementById('composer').requestSubmit();
+  `);
+  await shows("openai/gpt-6.2-sol");
+  assert.deepEqual((await browser.evaluate<Shown>(shown)).messages, []);
 });
 
 test("an older page is requested once and cannot overwrite a different branch", { skip: !chrome, timeout: 60_000 }, async t => {

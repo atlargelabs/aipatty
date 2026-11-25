@@ -9,7 +9,7 @@ import type { BranchInfo } from "../src/branches.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
 import { pageModules } from "../src/page.ts";
 import { messageText, type ConversationPage } from "../src/protocol.ts";
-import { checkout, fauxConfig, fixture, realConfig, requestJson, until } from "./helpers.ts";
+import { checkout, fauxConfig, fixture, realConfig, until } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
 const exec = promisify(execFile);
@@ -19,7 +19,12 @@ async function server(t: TestContext, dir?: string) {
   const api = await startApi(host, health, 0);
   t.after(async () => { await api.close(); await host.harness.close(ctx); });
   const base = `http://127.0.0.1:${api.port}`;
-  const call = <T = unknown>(path: string, method = "GET", body?: unknown) => requestJson<T>(base, path, method, body);
+  const call = async <T = unknown>(path: string, method = "GET", body?: unknown): Promise<{ status: number; body: T }> => {
+    const response = await fetch(base + path, {
+      method, ...(body === undefined ? {} : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+    });
+    return { status: response.status, body: await response.json() as T };
+  };
   return { host, base, call };
 }
 
@@ -196,7 +201,7 @@ test("forking a branch with no messages yet starts an empty branch", async t => 
   assert.deepEqual(page.body.entries, []);
 });
 
-test("each branch keeps its own model and thinking level, and a busy branch refuses a switch", async t => {
+test("each branch keeps its own model and thinking level, and a queued switch does not block another branch", async t => {
   const { host, call } = await server(t);
   const fork = (await call<BranchInfo>("/api/conversations/root/fork", "POST", { title: "Fork" })).body;
   const set = await call<BranchInfo>(`/api/conversations/${fork.id}/thinking`, "PUT", { level: "low" });
@@ -207,10 +212,9 @@ test("each branch keeps its own model and thinking level, and a busy branch refu
   const branch = (await host.conversation(String(fork.id)))!;
   await host.submit(branch, { type: "input", content: "x".repeat(900) });
   await until(async () => (await host.branch(branch)).busy);
-  const busy = await call<{ error: string }>(`/api/conversations/${fork.id}/model`, "PUT", { modelId: "faux-1" });
-  assert.equal(busy.status, 409);
-  assert.match(busy.body.error, /active work/);
-  assert.ok(busy.body.error.includes(`'aipatty abort --branch ${fork.id}'`), busy.body.error);
+  const busy = await call(`/api/conversations/${fork.id}/model`, "PUT", { modelId: "faux-1" });
+  assert.equal(busy.status, 202);
+  assert.deepEqual(busy.body, { modelSwitch: "queued", model: { provider: "faux", modelId: "faux-1" } });
   // The root is not busy, so its model can still change.
   assert.equal((await call("/api/model", "PUT", { modelId: "faux-1" })).status, 200);
   await call(`/api/conversations/${fork.id}/abort`, "POST");

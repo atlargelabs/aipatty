@@ -2,7 +2,23 @@
  * Constants and checks that both the server and the page's modules use. The page loads this file as it is (see
  * `pageModules` in ../page.ts), so it may import types only. Server code reads these through ../protocol.ts.
  */
-import type { EntryRecord } from "@earendil-works/pi-durable";
+import type { EntryRecord, ModelRef } from "@earendil-works/pi-durable";
+
+export const modelCommand = "/model";
+
+export function isModelCommand(content: string): boolean {
+  return content.trimStart().split(/\s/, 1)[0] === modelCommand;
+}
+
+export interface ModelSwitchAck {
+  modelSwitch: "applied" | "queued";
+  model: ModelRef;
+}
+
+export function modelSwitchText({ modelSwitch, model }: ModelSwitchAck): string {
+  const name = `${model.provider}/${model.modelId}`;
+  return modelSwitch === "queued" ? `Queued ${name}; it will apply when this branch goes idle.` : `Model set to ${name}.`;
+}
 
 /** The kind of a transcript entry about an upgrade: `data.text` is shown to people and is not model context. */
 export const upgradeEntryKind = "aipatty.upgrade";

@@ -34,7 +34,6 @@ export interface BranchInfo {
   /** The branch it was forked from and the last entry it inherits; null for the root and branches started fresh. */
   parent: { id: number; at: number } | null;
   model: ModelRef | null;
-  pendingModel?: ModelRef;
   modelStatus: "available" | "unavailable";
   thinking: string;
   busy: boolean;

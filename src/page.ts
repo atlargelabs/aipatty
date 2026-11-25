@@ -45,10 +45,6 @@ export const pageHtml = `<!doctype html>
       <button id="rename" type="button">Rename</button>
       <button id="search" type="button">Search</button>
     </div>
-    <div id="model-pending" hidden>
-      <span id="model-pending-message" role="status"></span>
-      <button id="keep-model" type="button" hidden>Keep current model</button>
-    </div>
     <div id="notice" role="status" hidden></div>
     <div id="card-header" hidden></div>
     <section id="transcript" aria-live="polite">
@@ -98,7 +94,7 @@ nav li .busy { color: #0a7d32; }
 main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 #controls { display: flex; flex-wrap: wrap; gap: .5rem; padding: .5rem .8rem; border-bottom: 1px solid #eee; align-items: center; }
 #controls select { max-width: 14rem; }
-#notice, #model-pending { padding: .4rem .8rem; background: #fff4e5; color: #8a4b00; }
+#notice { padding: .4rem .8rem; background: #fff4e5; color: #8a4b00; }
 #transcript { flex: 1; overflow-y: auto; padding: .8rem; }
 .entry { margin: 0 0 .8rem; padding: .5rem .7rem; border-radius: 8px; background: #fff; border: 1px solid #e4e4e4; white-space: pre-wrap; overflow-wrap: anywhere; }
 .entry.user { background: #eef5ff; border-color: #cfe0fb; }
@@ -157,7 +153,7 @@ button { font: inherit; padding: .3rem .7rem; }
 
 export const pageJs = (appHostnames: readonly string[]) => `import markdownit from ${JSON.stringify(markdownScriptPath)};
 import { derive } from "/web/cards.ts";
-import { piRunApiPath } from "/web/shared.ts";
+import { isModelCommand, modelCommand, modelSwitchText, piRunApiPath } from "/web/shared.ts";
 import { builtInSteps, runIdOf } from "/web/steps.ts";
 
 const $ = id => document.getElementById(id);
@@ -165,12 +161,9 @@ const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max
 // What the page holds: the agent data of the selected branch (entries, live), and what the reader has done to the
 // view (the pane they opened and the button that opened it).
 const app = {
-  branch: null, branches: [], totalCost: 0, entries: [], before: null, live: {}, socket: null, models: [],
-  pane: undefined, opener: undefined, effectiveModel: undefined,
+  branch: null, branches: [], totalCost: 0, entries: [], before: null, live: {}, socket: null, model: undefined,
+  pane: undefined, opener: undefined,
 };
-const modelSaves = new Set();
-const modelRef = model => model ? model.provider + "/" + model.modelId : "";
-const toolRound = () => app.live.tools?.length ? app.live.run?.taskId : undefined;
 // The steps of the card pipeline, in order. A branch's own steps will follow the built-in ones here.
 const steps = builtInSteps;
 
@@ -434,6 +427,11 @@ document.addEventListener("keydown", event => {
 
 function current() { return app.branches.find(branch => branch.id === app.branch); }
 
+// The selected branch's stream, not a possibly older branch-list response, owns its effective model.
+function modelOf(branch) {
+  return branch.id === app.branch && app.model !== undefined ? app.model : branch.model;
+}
+
 /*
  * A stream frame arrives about ten times a second while a branch answers. Rendering one must leave the nodes already
  * on the page in place: a node replaced between a press and its release gets no click, and loses its selection and
@@ -477,7 +475,7 @@ function renderBranches() {
     const node = branchNode(branch.id);
     node.li.classList.toggle("current", branch.id === app.branch);
     setText(node.title, branch.title);
-    const model = branch.id === app.branch ? effectiveModel(branch) : branch.model;
+    const model = modelOf(branch);
     setText(node.info, "#" + branch.id + " · " + (model?.modelId ?? "no model") + " · " + money(branch.cost));
     node.busy.hidden = !branch.busy;
     if (list.children[index] !== node.li) list.insertBefore(node.li, list.children[index] || null);
@@ -487,17 +485,8 @@ function renderBranches() {
   setText($("title"), branch.title);
   document.title = branch.title + " · aipatty";
   setText($("cost"), money(branch.cost) + " / " + money(app.totalCost));
-  renderModel(branch);
-  if ($("thinking").value !== branch.thinking) $("thinking").value = branch.thinking;
-}
-
-function effectiveModel(branch) {
-  return app.effectiveModel === undefined ? branch.model : app.effectiveModel;
-}
-
-function renderModel(branch) {
-  const model = effectiveModel(branch);
-  const ref = modelRef(model);
+  const model = modelOf(branch);
+  const ref = model ? model.provider + "/" + model.modelId : "";
   const picker = $("model");
   if (![...picker.options].some(option => option.value === ref)) {
     const option = document.createElement("option");
@@ -506,14 +495,7 @@ function renderModel(branch) {
     picker.prepend(option);
   }
   if (picker.value !== ref) picker.value = ref;
-  picker.disabled = modelSaves.has(branch.id);
-  const waiting = app.effectiveModel === undefined || toolRound() !== undefined;
-  const queued = waiting && modelRef(branch.model) === ref ? modelRef(branch.pendingModel) : "";
-  setText($("model-pending-message"), !queued ? "" : queued === ref
-    ? "Keeping " + ref + " after this tool round." : "Model " + queued + " queued until this tool round completes.");
-  $("model-pending").hidden = !queued;
-  $("keep-model").hidden = !queued || queued === ref || branch.modelStatus !== "available";
-  $("keep-model").disabled = picker.disabled;
+  if ($("thinking").value !== branch.thinking) $("thinking").value = branch.thinking;
 }
 
 /*
@@ -567,17 +549,20 @@ const formats = {
   markdown(body, text) { body.innerHTML = markdown.render(text); },
 };
 
-function sendMessage(branch, content) {
+async function sendMessage(branch, content) {
   // Unlike randomUUID, getRandomValues does not need a secure context.
   const requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
-  return api("/api/conversations/" + branch + "/messages", { method: "POST", body: { content, requestId, whenBusy: "followUp" } });
+  const ack = await api("/api/conversations/" + branch + "/messages", { method: "POST", body: { content, requestId, whenBusy: "followUp" } });
+  if (ack.modelSwitch && branch === app.branch) notice(modelSwitchText(ack));
 }
 
 // Carry out a button's action against the selected branch. These are all the actions there are (see Action in
 // src/web/cards.ts).
 async function act(action, button) {
-  if (action.type === "send") await sendMessage(app.branch, action.content);
-  else if (action.type === "abort") await api("/api/conversations/" + app.branch + "/abort", { method: "POST" });
+  if (action.type === "send") {
+    if (isModelCommand(action.content)) throw new Error("Type " + modelCommand + " in the message box to switch models.");
+    await sendMessage(app.branch, action.content);
+  } else if (action.type === "abort") await api("/api/conversations/" + app.branch + "/abort", { method: "POST" });
   else if (action.type === "fork") await forkAt(action.at);
   else if (action.type === "openPane") {
     app.pane = action.pane;
@@ -746,53 +731,29 @@ function connect(id) {
     } else {
       return;
     }
-    const previousRound = toolRound();
     app.live = frame.live || {};
-    const roundEnded = previousRound !== undefined && previousRound !== toolRound();
-    const modelChanged = modelRef(app.effectiveModel) !== modelRef(frame.model);
-    app.effectiveModel = frame.model;
+    app.model = frame.model;
     const branch = current();
     if (branch) {
       const wasBusy = branch.busy;
       branch.busy = frame.busy;
       branch.cost = frame.usage.cost;
-      if (roundEnded) delete branch.pendingModel;
-      if (modelChanged || roundEnded || (wasBusy && !frame.busy)) refreshBranchSettings(id);
+      branch.model = frame.model;
+      if (wasBusy && !frame.busy) refreshBranches();
     }
     render();
     renderBranches();
   });
   socket.addEventListener("close", () => {
-    if (app.socket !== socket) return;
-    app.effectiveModel = undefined; // Until reconnection, fresh HTTP metadata drives the picker.
-    renderBranches();
-    refreshBranchSettings(id);
-    setTimeout(() => { if (app.socket === socket) connect(id); }, 2000);
+    if (app.socket === socket) setTimeout(() => { if (app.socket === socket) connect(id); }, 2000);
   });
 }
 
-let branchRefresh = 0;
 async function refreshBranches() {
-  const revision = ++branchRefresh;
   const { branches, totalCost } = await api("/api/branches");
-  if (revision !== branchRefresh) return; // Don't restore metadata from before a newer stream-triggered refresh.
   app.branches = branches;
   app.totalCost = totalCost;
   renderBranches();
-}
-
-function refreshBranchSettings(id) {
-  return refreshBranches().catch(error => {
-    if (app.branch === id) notice("Could not refresh branch settings: " + error.message);
-  });
-}
-
-function pollBranches() {
-  // A slow background refresh must not be superseded by the next tick before it can finish.
-  setTimeout(async () => {
-    await refreshBranches().catch(() => {});
-    pollBranches();
-  }, 10000);
 }
 
 async function selectBranch(id) {
@@ -800,7 +761,7 @@ async function selectBranch(id) {
   app.entries = [];
   app.before = null;
   app.live = {};
-  app.effectiveModel = undefined;
+  app.model = undefined;
   app.pane = app.opener = undefined;
   history.replaceState(null, "", "#" + id);
   newTranscript();
@@ -819,7 +780,6 @@ async function forkAt(at) {
 
 async function loadModels() {
   const { models } = await api("/api/models");
-  app.models = models;
   $("model").replaceChildren(...models.map(model => {
     const option = document.createElement("option");
     option.value = model.provider + "/" + model.modelId;
@@ -873,30 +833,11 @@ $("search").addEventListener("click", guard(async () => {
   const { matches } = await api("/api/conversations/" + app.branch + "/search?q=" + encodeURIComponent(q));
   notice(matches.length ? matches.map(m => "[" + m.entryId + "] " + m.role + ": " + m.excerpt).join("\\n") : "No matches");
 }));
-async function saveModel(branch, value) {
-  if (modelSaves.has(branch.id)) return;
-  const [provider, ...rest] = value.split("/");
-  modelSaves.add(branch.id);
-  notice("");
-  renderModel(branch); // The picker shows the effective model, not the requested one.
-  try {
-    await api("/api/conversations/" + branch.id + "/model", { method: "PUT", body: { provider, modelId: rest.join("/") } });
-    await refreshBranchSettings(branch.id); // The acceptance snapshot may already be obsolete.
-  } catch (error) {
-    if (app.branch === branch.id) notice(error.message);
-  } finally {
-    modelSaves.delete(branch.id);
-    renderBranches();
-  }
-}
-$("model").addEventListener("change", event => {
-  const branch = current();
-  if (branch) void saveModel(branch, event.target.value);
-});
-$("keep-model").addEventListener("click", () => {
-  const branch = current();
-  if (branch) void saveModel(branch, modelRef(effectiveModel(branch)));
-});
+$("model").addEventListener("change", guard(async event => {
+  const ref = event.target.value;
+  renderBranches(); // Keep showing the effective model until the stream reports its replacement.
+  if (app.branch !== null) await sendMessage(app.branch, modelCommand + " " + ref);
+}));
 $("thinking").addEventListener("change", guard(async event => {
   try {
     await api("/api/conversations/" + app.branch + "/thinking", { method: "PUT", body: { level: event.target.value } });
@@ -932,6 +873,6 @@ guard(async () => {
   await refreshBranches();
   const wanted = Number(location.hash.slice(1));
   await selectBranch(app.branches.some(branch => branch.id === wanted) ? wanted : app.branches[0].id);
-  pollBranches();
+  setInterval(() => { refreshBranches().catch(() => {}); }, 10000);
 })();
 `;

@@ -349,11 +349,13 @@ test("CLI changes the thinking level and aborts a running turn", { timeout: 15_0
   const busy = async () => (await (await fetch(base + route)).json() as { busy: boolean }).busy;
   const sending = cli("send", "x".repeat(900)).then(() => "answered", (error: Error) => error.message);
   await until(busy);
-  await assert.rejects(cli("model", "set", "faux-1"), /run 'aipatty abort'/);
+  assert.equal(JSON.parse((await cli("model", "set", "faux-1")).stdout).modelSwitch, "queued");
+  assert.equal((await cli("send", "/model faux/faux-1")).stdout, "Queued faux/faux-1; it will apply when this branch goes idle.\n");
   assert.equal((await cli("abort")).stdout, "");
   assert.match(await sending, /aipatty: Run failed: aborted\n/);
   assert.equal(await busy(), false);
   assert.equal(JSON.parse((await cli("model", "set", "faux-1")).stdout).modelStatus, "available");
+  assert.equal((await cli("send", "/model faux/faux-1")).stdout, "Model set to faux/faux-1.\n");
 
   // The level is saved with the conversation, not taken from the settings.
   first.child.kill("SIGTERM");
