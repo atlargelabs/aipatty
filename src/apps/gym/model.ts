@@ -31,16 +31,21 @@ function reader<T>(label: string, schema: Schema<T>) {
 const id = str({ pattern: "^[A-Za-z0-9_-]{1,64}$" });
 const exercise = str({ minLength: 1, maxLength: maxExercise, pattern: "\\S" });
 const set = obj({
-  exercise, reps: opt(nullable(int({ minimum: 1, maximum: maxReps }))),
-  amount: num({ minimum: 0, maximum: maxAmount }), unit: oneOf(units),
+  exercise,
+  reps: opt(nullable(int({ minimum: 1, maximum: maxReps }), { description: "Required for a weight; optional for a time." })),
+  amount: num({ minimum: 0, maximum: maxAmount, description: "Weight (0 for bodyweight), or a time greater than zero." }),
+  unit: oneOf(units),
 });
 const workout = reader("Workout", obj({
   id, date: str({ pattern: "^\\d{4}-\\d{2}-\\d{2}$" }),
   sets: arr(set, { minItems: 1, maxItems: maxSets }),
 }));
-const suggestion = reader("Suggestion", obj({
-  note: str({ maxLength: maxNote }), sets: arr(set, { maxItems: maxSets }),
-}));
+/** The parameters of the suggestion tool, and what the store checks again before saving. */
+export const suggestionSchema = obj({
+  note: str({ maxLength: maxNote, description: "A short coaching note; may be empty." }),
+  sets: arr(set, { maxItems: maxSets, description: "The sets in order. An empty list clears the suggestion." }),
+});
+const suggestion = reader("Suggestion", suggestionSchema);
 
 function checkedSets(sets: ReturnType<typeof workout>["sets"]): GymSet[] {
   return sets.map(({ exercise, reps, amount, unit }, i) => {

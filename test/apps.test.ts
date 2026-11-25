@@ -88,9 +88,7 @@ test("apps opt branches into tools, discovery and instructions, including forks 
     await command("root", "/connect beta");
     await command("root", "/connect alpha");
     assert.match(await command("root", "/connect beta"), /already connected/);
-    const attached = await host.branch(original);
-    assert.deepEqual(attached.apps, ["beta", "alpha"]);
-    assert.deepEqual(attached.availableApps, ["alpha", "beta"]);
+    assert.deepEqual(await host.branchApps(original), ["beta", "alpha"]);
     await until(() => stream.state()?.apps?.join(",") === "beta,alpha");
     await discover(original, ["beta", "alpha"], true);
     script(fauxAssistantMessage(fauxToolCall("beta_probe", { fail: true }), { stopReason: "toolUse" }), reply);
@@ -98,7 +96,7 @@ test("apps opt branches into tools, discovery and instructions, including forks 
     assert.match(messageText(requests.at(-1)!.messages.at(-1)!), /beta tool failed/);
     const child = await host.fork(original, { title: "Both apps" });
     const fork = (await host.conversation(String(child.id)))!;
-    assert.deepEqual(child.apps, ["beta", "alpha"]);
+    assert.deepEqual(await host.branchApps(fork), ["beta", "alpha"]);
     await discover(fork, ["beta", "alpha"], true);
     await command("root", "/disconnect alpha");
     await command("root", "/disconnect beta");
@@ -132,8 +130,7 @@ test("apps opt branches into tools, discovery and instructions, including forks 
     assert.equal(requests.length, before, "a suspended request with stale declarations must not be sent");
     const unavailable = (await host.conversation(String(child.id)))!;
     await discover(unavailable, [], false);
-    const summary = await host.branch(unavailable);
-    assert.deepEqual([summary.connectedApps, summary.apps], [["beta", "alpha"], []]);
+    assert.deepEqual(await host.branchApps(unavailable), []);
     const status = await (await fetch(`${endpoint()}/health`)).json() as { ok: boolean; appProblems: string[]; problems?: string[] };
     assert.equal(status.ok, true);
     assert.equal(status.problems, undefined, "optional apps must not count as a failed upgrade health check");
@@ -145,7 +142,7 @@ test("apps opt branches into tools, discovery and instructions, including forks 
     host = await openHost(config, { apps: [alpha, beta], models });
     api = await startApi(host, health, 0);
     const restored = (await host.conversation(String(child.id)))!;
-    assert.deepEqual((await host.branch(restored)).apps, ["beta", "alpha"]);
+    assert.deepEqual(await host.branchApps(restored), ["beta", "alpha"]);
     await discover(restored, ["beta", "alpha"], true);
     await discover(await root(), [], false);
   } finally { await api.close(); await host.close(); }

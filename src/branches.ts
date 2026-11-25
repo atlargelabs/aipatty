@@ -37,12 +37,6 @@ export interface BranchInfo {
   modelStatus: "available" | "unavailable";
   thinking: string;
   busy: boolean;
-  /** Connected and available, in connection order: the browser's effective list. */
-  apps: string[];
-  /** The saved list, including apps that are currently unavailable. */
-  connectedApps: string[];
-  /** All available apps, whether attached here or not. */
-  availableApps: string[];
   /** The branch's own spend in dollars, without what it inherited from its parent. */
   cost: number;
 }

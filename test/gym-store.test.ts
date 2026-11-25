@@ -100,7 +100,6 @@ test("Gym SQL runs ordinary analytics without a table/function list and bounds M
   assert.equal(run(` /* comment */ WITH kg AS (SELECT amount, reps FROM sets WHERE unit = 'kg')
     SELECT ROUND(SUM(amount * reps)) AS volume, COUNT(*) AS sets FROM kg; -- done`),
   "| volume | sets |\n| --- | --- |\n| 3300.0 | 11 |".replace("3300.0", "3300"));
-  assert.match(run("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<3) SELECT sum(x) FROM n"), /\| 6 \|/);
   assert.match(run("SELECT json_group_array(name) FROM sqlite_schema WHERE type = 'table'"), /workouts.*sets.*suggestion/);
   assert.match(run("SELECT value FROM json_each('[123]')"), /\| 123 \|/);
   assert.match(run("SELECT 9007199254740993 AS exact, X'41' AS blob, NULL, 'a|b'"), /\| 9007199254740993 \| 0x41 \| NULL \| a\\\|b \|/);
@@ -127,16 +126,19 @@ test("Gym SQL rejects writes, statements after a SELECT, and attachment effects"
     `ATTACH DATABASE '${absent}' AS scratch`, `SELECT 1; ATTACH DATABASE '${absent}' AS scratch`, `VACUUM INTO '${absent}'`,
     "SELECT load_extension('not-a-library')",
   ]) assert.throws(() => query.run(sql), Error, sql);
+  // A recursive query can run forever on the server's only thread.
+  assert.throws(() => query.run("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n) SELECT count(*) FROM n"), /WITH RECURSIVE is not allowed/);
   assert.equal(existsSync(absent), false);
   assert.match(query.run("SELECT COUNT(*) FROM sets"), /\| 2 \|/);
 });
 
-test("Gym durable tools record the request on success and failure; only suggestions write", { timeout: 10_000 }, async t => {
+test("Gym durable tools declare typed arguments, report failures, and only suggestions write", { timeout: 10_000 }, async t => {
   const store = await open(t);
   store.saveWorkout(lift);
   const { tools, close } = openGymTools(store);
   t.after(close);
   assert.deepEqual(tools.map(tool => tool.name), ["gym_query", "gym_suggest_workout"]);
+  assert.ok(tools.every(tool => tool.replay !== "safe"), "an interrupted call is reported, not rerun at startup");
   const registry = createRegistry();
   registry.install({ name: "gym", tools });
   const faux = fauxProvider();
@@ -167,14 +169,14 @@ test("Gym durable tools record the request on success and failure; only suggesti
     assert.equal(message.isError, error, contentText(message.content));
     return contentText(message.content);
   };
-  assert.ok(result("read", false).includes(query));
-  assert.match(result("read", false), /\| load \|\n\| --- \|\n\| 60 \|/);
-  assert.ok(result("bad-sql", true).includes(badQuery));
-  assert.match(result("malformed-sql", true), /SQL:\n42/);
-  assert.match(result("missing-sql", true), /not provided/);
-  assert.match(result("suggest", false), /\| Plank \| — \| 60 \| sec \|/);
-  assert.match(result("bad-sets", true), /"exercise":"Plank".*"amount":0/);
-  assert.match(result("malformed-sets", true), /Requested sets:\nnot an array/);
+  assert.equal(result("read", false), "| load |\n| --- |\n| 60 |");
+  assert.match(result("bad-sql", true), /no such column: missing/);
+  // The declared schema rejects these before the tool runs.
+  result("malformed-sql", true);
+  result("missing-sql", true);
+  assert.match(result("suggest", false), /Keep it easy\.\n\n.*\| Plank \| — \| 60 \| sec \|/s);
+  assert.match(result("bad-sets", true), /Set 1: enter a time greater than zero/);
+  result("malformed-sets", true);
   assert.equal(store.overview().suggestion?.note, "Keep it easy.");
   assert.equal(store.overview().workouts.length, 1);
 
@@ -182,7 +184,7 @@ test("Gym durable tools record the request on success and failure; only suggesti
   const fork = root.id + 1;
   const { precards, surround } = derive({ branch: fork, entries, live: {} }, steps);
   assert.deepEqual(surround.header, [{ label: "Log workout", href: `/apps/gym/?branch=${fork}` }]);
-  assert.ok(precards.filter(card => card.kind === "toolCall").every(card => card.hidden));
+  assert.ok(precards.every(card => !card.hidden), "the call card shows what was asked");
   for (const card of precards) {
     if (card.kind !== "toolResult") continue;
     assert.equal(card.format, card.message.isError ? "text" : "markdown");
@@ -197,6 +199,6 @@ test("Gym durable tools record the request on success and failure; only suggesti
   const clearing = (await root.entries({}, 10, undefined, ctx)).items.flatMap(entry => entry.model ?? [])
     .find(message => message.role === "toolResult" && message.toolCallId === "clear");
   assert.ok(clearing?.role === "toolResult" && !clearing.isError);
-  assert.match(contentText(clearing.content), /Requested sets: `\[\]`/);
+  assert.match(contentText(clearing.content), /Cleared the current suggestion/);
   assert.equal(store.overview().suggestion, null);
 });

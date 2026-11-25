@@ -4,7 +4,7 @@ import type { ConversationView, EntryRecord, LiveState, ModelRef, UsageState } f
 import type { RunOutcome } from "./pi-run.ts";
 
 // Shared with the page's own modules, which cannot import this file.
-export { appEntryKind, operatorNotice, piRunApiPath, piRunId, upgradeEntryKind, upgradeText } from "./web/shared.ts";
+export { appEntryKind, operatorNotice, piRunApiPath, piRunId, upgradeEntryKind } from "./web/shared.ts";
 
 /** Non-safelisted marker: an ordinary browser form cannot send it. */
 export const shutdownHeader = "x-aipatty-shutdown";

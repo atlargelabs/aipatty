@@ -935,10 +935,10 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await compose(browser, "Show my squats and suggest the next workout.");
   await wait("document.querySelector('#entries .prose strong')?.textContent === 'Next workout'");
   await wait("document.querySelectorAll('.toolResult table').length === 2");
-  assert.equal(await browser.evaluate("document.querySelectorAll('.toolCall[hidden]').length"), 3);
+  assert.equal(await browser.evaluate("document.querySelectorAll('.toolCall[hidden]').length"), 0);
   assert.equal(await browser.evaluate("document.querySelectorAll('.toolResult a[href^=\"/apps/gym/\"]').length"), 2);
-  assert.ok(await browser.evaluate<boolean>(`[...document.querySelectorAll('.toolResult pre')].some(el => el.textContent.includes(${JSON.stringify(sql)}))`));
-  assert.ok(await browser.evaluate<boolean>(`[...document.querySelectorAll('.toolResult .card-body[data-format=text]')].some(el => el.textContent.includes('"amount":0') && el.textContent.includes('Gym suggestion failed'))`));
+  assert.ok(await browser.evaluate<boolean>(`[...document.querySelectorAll('.toolCall .card-body')].some(el => el.textContent.includes(${JSON.stringify(JSON.stringify(sql))}))`));
+  assert.ok(await browser.evaluate<boolean>(`[...document.querySelectorAll('.toolResult .card-body[data-format=text]')].some(el => el.textContent.includes('enter a time greater than zero'))`));
   const queryRows = await browser.evaluate<string[]>("[...document.querySelectorAll('.toolResult table:first-of-type td')].map(el => el.textContent)");
   assert.ok(queryRows.includes("62.5"));
   assert.equal((await overview()).workouts.length, 1, "even the successful suggestion did not log a workout");

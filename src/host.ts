@@ -371,9 +371,6 @@ async function openOwnedHost(config: Config, { apps: modules = connectedApps, mo
       return {
         id: target.id,
         title: doc?.title || (target.id === ROOT_CONVERSATION_ID ? ROOT_TITLE : `Branch ${target.id}`),
-        apps: effective(doc?.apps ?? []),
-        connectedApps: doc?.apps.slice() ?? [],
-        availableApps: [...apps.keys()],
         parent: record?.parent ? { id: record.parent.conversationId, at: record.parent.at } : null,
         model: model.model,
         modelStatus: model.modelStatus,

@@ -16,10 +16,6 @@ export function operatorNotice(entry: Pick<EntryRecord, "kind" | "data">): { lab
   return { label, text: data.text };
 }
 
-export function upgradeText(entry: Pick<EntryRecord, "kind" | "data">): string | undefined {
-  if (entry.kind === upgradeEntryKind) return operatorNotice(entry)?.text;
-}
-
 export const piRunApiPath = "/api/pi-runs/";
 /** A timestamp to the second, then eight hex digits (see the generator in pi-run.ts). */
 export const piRunId = /^\d{8}T\d{6}-[0-9a-f]{8}$/;

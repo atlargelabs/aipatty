@@ -21,9 +21,10 @@ export function openQuery(path: string) {
     limits: { attach: 0, length: 64 * 1024, sqlLength: 4 * maxSql, column: 32 },
   });
   try {
-    // Allow reads and built-in functions without a table or function list. Reject all write, attachment and PRAGMA actions.
+    // Allow reads and built-in functions without a table or function list. Reject every other action: writes,
+    // attachments, PRAGMAs, and recursive queries, which can run forever on this synchronous connection.
     db.setAuthorizer(action => action === sqlite.SQLITE_SELECT || action === sqlite.SQLITE_READ
-      || action === sqlite.SQLITE_FUNCTION || action === sqlite.SQLITE_RECURSIVE ? sqlite.SQLITE_OK : sqlite.SQLITE_DENY);
+      || action === sqlite.SQLITE_FUNCTION ? sqlite.SQLITE_OK : sqlite.SQLITE_DENY);
   } catch (error) {
     db.close();
     throw error;
@@ -35,12 +36,20 @@ export function openQuery(path: string) {
       }
       const sql = input.trim();
       if (!/^(?:SELECT|WITH)\b/i.test(sql.replace(commentOrSpace, ""))) {
-        throw new GymInputError("Run one SELECT or a read-only WITH query.");
+        throw new GymInputError("Run one SELECT. WITH is allowed.");
       }
-      const statement = db.prepare(sql);
+      let statement;
+      try {
+        statement = db.prepare(sql);
+      } catch (error) {
+        if (/\bRECURSIVE\b/i.test(sql) && /not authorized/.test(String(error))) {
+          throw new GymInputError("WITH RECURSIVE is not allowed. Use joins and aggregation.");
+        }
+        throw error;
+      }
       // Node prepares only the first statement; sourceSQL ends exactly where SQLite stopped.
       if (sql.slice(statement.sourceSQL.length).replace(commentOrSpace, "")) {
-        throw new GymInputError("Run one SELECT or a read-only WITH query, not multiple statements.");
+        throw new GymInputError("Run one SELECT, not multiple statements.");
       }
       const columns = statement.columns().map(column => column.name);
       if (!columns.length) throw new GymInputError("The query must return columns.");

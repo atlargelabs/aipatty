@@ -115,7 +115,8 @@ in [the card pipeline](docs/WEB-CARDS.md).
 Saved user and assistant prose renders as Markdown. Single newlines are preserved, and wide tables and code
 blocks scroll horizontally. Links must be absolute HTTP(S) URLs outside aipatty's hosts and open in a new tab.
 Raw HTML is shown as text, and images are not loaded. Live previews (including partial tool arguments), tool
-cards, system messages, notices, and the Pi run pane stay plain text.
+cards, system messages, notices, and the Pi run pane stay plain text. A [connected app](docs/CONNECTED-APPS.md)
+can have its own tools' results rendered as Markdown, as Gym does.
 
 Use **Open Pi run** on a `pi` call's result, or on its dashed card while it runs, to inspect that run beside the
 conversation. On a narrow screen it uses the full screen; Close or Esc goes back to the same place in chat. Inherited calls open the original run.
@@ -305,7 +306,7 @@ loopback; access to the HTTPS URL is controlled by your tailnet policy. Do not u
 - `POST /api/shutdown` (no body needed): requires the `X-Aipatty-Shutdown: 1` header so ordinary browser forms
   cannot trigger it. No CORS is enabled. Returns `202 { "status": "shutdown-requested" }` before stopping the
   server; it does not wait for cleanup. The same Host and Origin rules below apply.
-- `GET /api/branches`: `{ branches: [{ id, title, parent, model, modelStatus, thinking, busy, cost, apps, connectedApps, availableApps }], totalCost }`
+- `GET /api/branches`: `{ branches: [{ id, title, parent, model, modelStatus, thinking, busy, cost }], totalCost }`
 - `PUT /api/model` and `PUT /api/thinking`: the root's, as below
 - `GET /api/conversations/:id` (`root` is the root conversation; `?limit=` and `?before=` page backwards); also
   carries `branch` and `totalCost`

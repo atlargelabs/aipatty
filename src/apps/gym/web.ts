@@ -14,11 +14,8 @@ function logLink(branch: number) {
 export const steps: Step[] = [{
   name: "gym",
   card(card) {
-    if (card.kind === "toolCall" && gymTool(card.call.name)) return { hidden: true };
-    if (card.kind === "toolResult" && gymTool(card.message.toolName)) {
-      return card.message.isError
-        ? { format: "text" }
-        : { format: "markdown", links: [logLink(card.branch)] };
+    if (card.kind === "toolResult" && gymTool(card.message.toolName) && !card.message.isError) {
+      return { format: "markdown", links: [logLink(card.branch)] };
     }
   },
   surround(surround) {

@@ -85,9 +85,10 @@ A page is not tied to a branch. A link from a branch carries `?branch=<id>` so t
 
 ### Card steps
 
-The page draws the transcript through [the card pipeline](WEB-CARDS.md). `BranchInfo` reports `connectedApps`
-(saved IDs), `availableApps` (all opened modules), and `apps` (the effective intersection in connection order).
-The selected branch's stream sends `apps` on attachment and when an app notice arrives.
+The page draws the transcript through [the card pipeline](WEB-CARDS.md). The selected branch's stream sends
+`apps`, the branch's connected apps that opened, in connection order. It is sent with each snapshot and when an
+app notice arrives, and is the page's only source for the list. `/connect` shows the saved list and every app's
+status.
 
 - The host serves each app's `web` module at `/apps/<id>/web.ts` with its types removed, like the modules in
   `src/web/`. It may import types only, plus `/web/cards.ts` and `/web/shared.ts`. An app with no `web` exports an

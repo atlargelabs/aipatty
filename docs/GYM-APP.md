@@ -71,21 +71,23 @@ ID the page made up, as a transactional upsert, so a retried save does not make 
 - **The instructions** give the schema, say to compare exercise names without case and not to mix units, and
   say to save a suggestion when Steve asks what to do next.
 
-`gym_query` uses a read-only connection, checks for exactly one `SELECT` (including `WITH`), denies writes and
-attachments in SQLite, and caps the statement and result sizes. It has no allow-list of functions or tables.
-Queries run synchronously without a query-time budget; use ordinary joins and aggregations over the small log.
-This is an app tool boundary, not a sandbox: the model already has `bash` with the service account's permissions.
+`gym_query` uses a read-only connection, checks for exactly one `SELECT` (including `WITH`), denies writes,
+attachments and `WITH RECURSIVE` in SQLite, and caps the statement and result sizes. It has no allow-list of
+functions or tables. Queries run synchronously without a query-time budget. Recursion is denied because it is
+the one way a query over this small log could run without end and stop the server; a large cross join is still
+slow. Neither tool is replayed after a restart: a call the server died during is reported to the model as
+interrupted. This is an app tool boundary, not a sandbox: the model already has `bash` with the service
+account's permissions.
 
 ## The cards
 
 Gym's web module exports one step:
 
 - a `gym_query` or `gym_suggest_workout` **result** is rendered as Markdown and gets a **Log workout** link;
-- the matching **call** card, which is raw JSON arguments, is hidden;
 - the **header** gets a **Log workout** link to `/apps/gym/?branch=<id>`.
 
-Because the call is hidden, each tool's result and error message repeat what was asked for: the SQL, or the
-suggested sets. A failed result is left as plain text.
+The **call** card is left as it is, so the SQL or the suggested sets can be read there. A failed result is left
+as plain text.
 
 ## Trial
 
