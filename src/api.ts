@@ -5,7 +5,7 @@ import type { Duplex } from "node:stream";
 import WebSocket, { WebSocketServer } from "ws";
 import { LOOPBACK } from "./config.ts";
 import { HttpError, type AgentHost } from "./host.ts";
-import { pageCss, pageHtml, pageJs } from "./page.ts";
+import { pageCss, pageHtml, pageJs, pageModules } from "./page.ts";
 import { messageText, piRunApiPath, piRunId, shutdownHeader, streamState, streamUpdate, upgradeCommand, type StreamFrame } from "./protocol.ts";
 import { transcriptPage } from "./transcript.ts";
 
@@ -151,15 +151,16 @@ async function handleHttp(
     res.end(pageHtml);
     return;
   }
-  if (pathname === "/app.js" || pathname === "/app.css") {
+  // Only the modules listed in `pageModules` are served, looked up by name: no path from the request reaches a file.
+  const script = pathname === "/app.js" ? pageJs : Object.hasOwn(pageModules, pathname) ? pageModules[pathname] : undefined;
+  if (script !== undefined || pathname === "/app.css") {
     requireMethod(req, res, "GET");
-    const js = pathname === "/app.js";
     res.writeHead(200, {
-      "Content-Type": js ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8",
+      "Content-Type": script !== undefined ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8",
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
     });
-    res.end(js ? pageJs : pageCss);
+    res.end(script ?? pageCss);
     return;
   }
   if (pathname === "/api/branches") {

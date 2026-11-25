@@ -1,8 +1,22 @@
 /**
  * The crude web page: branch list, transcript, input box, fork, rename, model picker and cost. Served by the API
- * with a strict CSP, so the script is a separate same-origin file and every value is rendered as text.
+ * with a strict CSP, so the scripts are separate same-origin files and every value is rendered as text.
+ *
+ * The transcript is drawn from the card pipeline in ./web/cards.ts (see docs/WEB-CARDS.md). This file is the
+ * shell around it and the code that puts its cards on screen.
  */
-import { piRunApiPath, piRunId, upgradeEntryKind } from "./protocol.ts";
+import { readFileSync } from "node:fs";
+import { stripTypeScriptTypes } from "node:module";
+
+/**
+ * The modules of ./web/ that the page imports, by the path they are served at. They are the files the server and
+ * the tests import, with their types removed, and keep the `.ts` name that their imports of each other use.
+ */
+export const pageModules: Readonly<Record<string, string>> = Object.fromEntries(
+  ["cards", "shared", "steps"].map(name => [
+    `/web/${name}.ts`, stripTypeScriptTypes(readFileSync(new URL(`./web/${name}.ts`, import.meta.url), "utf8")),
+  ]),
+);
 
 export const pageHtml = `<!doctype html>
 <html lang="en">
@@ -11,7 +25,7 @@ export const pageHtml = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>aipatty</title>
 <link rel="stylesheet" href="/app.css">
-<script src="/app.js" defer></script>
+<script type="module" src="/app.js"></script>
 </head>
 <body>
 <header>
@@ -32,11 +46,11 @@ export const pageHtml = `<!doctype html>
       <button id="search" type="button">Search</button>
     </div>
     <div id="notice" role="status" hidden></div>
+    <div id="card-header" hidden></div>
     <section id="transcript" aria-live="polite">
       <button id="older" type="button" hidden>Load older</button>
       <div id="entries"></div>
       <div id="live"></div>
-      <div id="run-failure" class="entry" role="status" hidden></div>
     </section>
     <form id="composer">
       <textarea id="input" rows="3" placeholder="Message" required></textarea>
@@ -84,17 +98,20 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 #transcript { flex: 1; overflow-y: auto; padding: .8rem; }
 .entry { margin: 0 0 .8rem; padding: .5rem .7rem; border-radius: 8px; background: #fff; border: 1px solid #e4e4e4; white-space: pre-wrap; overflow-wrap: anywhere; }
 .entry.user { background: #eef5ff; border-color: #cfe0fb; }
-.entry.toolResult, .entry.tool { font: 12px/1.4 ui-monospace, monospace; color: #444; background: #f4f4f4; max-height: 12rem; overflow: auto; }
-.entry .role { display: block; font-size: .75rem; color: #777; margin-bottom: .2rem; }
-.entry .fork-here { float: right; font-size: .75rem; }
+.entry:is(.toolCall, .toolResult, .liveTool) { font: 12px/1.4 ui-monospace, monospace; color: #444; background: #f4f4f4; max-height: 12rem; overflow: auto; }
 .entry.inherited { opacity: .7; }
-#live .entry { border-style: dashed; }
-#run-failure { background: #fff4e5; color: #8a4b00; }
+.entry:is(.liveText, .liveTool) { border-style: dashed; }
+.entry.runFailure { background: #fff4e5; color: #8a4b00; }
+.card-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: .2rem .5rem; margin-bottom: .2rem; white-space: normal; font: .75rem/1.45 system-ui, sans-serif; }
+.card-head[hidden] { display: none; }
+.card-head .role { flex: 1; color: #777; }
+.card-head button { max-width: 100%; padding: .1rem .5rem; text-align: left; overflow-wrap: anywhere; }
+.card-head button[data-action="openPane"] { color: #17458a; }
+#card-header:not([hidden]) { display: flex; flex-wrap: wrap; gap: .3rem 1rem; padding: .4rem .8rem; border-bottom: 1px solid #eee; background: #fff; }
 #composer { display: flex; gap: .5rem; padding: .6rem .8rem; border-top: 1px solid #ddd; background: #fff; }
 #composer textarea { flex: 1; min-width: 0; font: inherit; padding: .4rem; resize: vertical; }
 #actions { display: flex; flex-direction: column; gap: .4rem; }
 button { font: inherit; padding: .3rem .7rem; }
-.pi-call { max-width: 100%; text-align: left; white-space: normal; overflow-wrap: anywhere; color: #17458a; }
 #pi-run:not([hidden]) { display: flex; }
 #pi-run { flex: 0 0 clamp(18rem, 36vw, 35rem); min-width: 0; flex-direction: column; border-left: 1px solid #ddd; background: #fff; }
 .run-controls { display: flex; align-items: center; gap: .5rem; padding: .5rem .8rem; border-bottom: 1px solid #ddd; }
@@ -116,12 +133,20 @@ button { font: inherit; padding: .3rem .7rem; }
 }
 `;
 
-export const pageJs = `"use strict";
+export const pageJs = `import { derive } from "/web/cards.ts";
+import { piRunApiPath } from "/web/shared.ts";
+import { builtInSteps, runIdOf } from "/web/steps.ts";
+
 const $ = id => document.getElementById(id);
 const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-const piRunId = ${piRunId};
-const piRunApiPath = ${JSON.stringify(piRunApiPath)};
-const app = { branch: null, branches: [], totalCost: 0, entries: [], before: null, live: {}, socket: null, models: [] };
+// What the page holds: the agent data of the selected branch (entries, live), and what the reader has done to the
+// view (the pane they opened and the button that opened it).
+const app = {
+  branch: null, branches: [], totalCost: 0, entries: [], before: null, live: {}, socket: null, models: [],
+  pane: undefined, opener: undefined,
+};
+// The steps of the card pipeline, in order. A branch's own steps will follow the built-in ones here.
+const steps = builtInSteps;
 
 function money(value) { return "$" + value.toFixed(value > 0 && value < 0.01 ? 4 : 2); }
 
@@ -148,88 +173,22 @@ function guard(fn) {
   };
 }
 
-function blockText(block) {
-  if (block.type === "text") return block.text;
-  if (block.type === "toolCall") return "→ " + block.name + " " + JSON.stringify(block.arguments);
-  if (block.type === "image") return "[image]";
-  return "";
-}
-
-/** The in-flight generation is still text: partial tool arguments are not a durable call yet. */
-function messageText(message) {
-  if (typeof message.content === "string") return message.content;
-  return (message.content || []).map(blockText).filter(Boolean).join("\\n");
-}
-
-function isPiCall(block) { return block.type === "toolCall" && block.name === "pi"; }
-function isToolRound(message) { return message.role === "assistant" && message.stopReason === "toolUse"; }
-function isPiResult(message) { return message.role === "toolResult" && message.toolName === "pi"; }
-function runIdOf(details) {
-  return typeof details?.runId === "string" && piRunId.test(details.runId) ? details.runId : undefined;
-}
-
-function taskTitle(value) {
-  const line = typeof value === "string" ? value.trim().split("\\n", 1)[0].trim() : "";
-  return line.length > 120 ? line.slice(0, 119) + "…" : line;
-}
-
-function runButton(label, source) {
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "pi-call";
-  button.setAttribute("aria-controls", "pi-run");
-  button.textContent = label;
-  button.addEventListener("click", () => openRun(button, source));
-  return button;
-}
-
-function messageNodes(entry, message) {
-  if (!isToolRound(message) || !message.content.some(isPiCall)) {
-    const text = document.createTextNode(messageText(message));
-    const id = isPiResult(message) ? runIdOf(message.details) : undefined;
-    return id ? [runButton("Open Pi run", { id, durationMs: message.durationMs }), document.createTextNode("\\n"), text] : [text];
-  }
-  const nodes = [];
-  const ids = new Map();
-  for (const block of message.content) {
-    if (block.type === "toolCall") ids.set(block.id, (ids.get(block.id) || 0) + 1);
-  }
-  for (const block of message.content) {
-    let node;
-    if (isPiCall(block)) {
-      const title = taskTitle(block.arguments?.task);
-      // Duplicate IDs in one round are ambiguous; only the result's own run ID can address it.
-      if (ids.get(block.id) > 1) node = "→ pi (duplicate call ID; open the run from its result)";
-      else node = runButton("Open Pi run" + (title ? " · " + title : ""), { entry, callId: block.id, title });
-    } else node = blockText(block);
-    if (!node) continue;
-    if (nodes.length) nodes.push(document.createTextNode("\\n"));
-    nodes.push(typeof node === "string" ? document.createTextNode(node) : node);
-  }
-  return nodes;
-}
-
-// Follow the durable exchange, not a run ID printed by a model or a tool error. A result may be on
-// a newer transcript page; all newer loaded entries are still present when paging back to the call.
-function resolveRun(source) {
-  if (source.id) return source;
-  const { entry, callId } = source;
-  const start = app.entries.findIndex(item => item.id === entry.id);
-  if (start === -1) return {};
-  for (let i = start + 1; i < app.entries.length; i++) {
-    const next = app.entries[i];
-    if (next.conversationId !== entry.conversationId) continue;
-    for (const message of next.model || []) {
-      if (isPiResult(message) && message.toolCallId === callId) {
+// The run a "pi-run" pane is about (see piRunStep). One opened from a result names its run. One opened from a live
+// card names the call: read the run from the call's live slot, and once that is gone, from the result it left.
+function resolveRun(ref) {
+  if (ref.runId) return { id: ref.runId, durationMs: ref.durationMs };
+  const slot = app.live.tools?.find(slot => slot.name === "pi" && slot.callId === ref.callId);
+  if (slot && slot.status !== "done") return { id: runIdOf(slot.details), pending: true };
+  for (let i = app.entries.length - 1; i >= 0; i--) {
+    for (const message of (app.entries[i].model || []).toReversed()) {
+      if (message.role === "toolResult" && message.toolName === "pi" && message.toolCallId === ref.callId) {
         return { id: runIdOf(message.details), durationMs: message.durationMs, settled: true };
       }
-      // If a later round reused a provider's ID, it can't be the result of this call.
-      if (isToolRound(message) && message.content.some(block => block.type === "toolCall" && block.id === callId)) return {};
+      // An earlier round that reused the ID is not this call: stop at the call itself.
+      if (message.role === "assistant" && message.content.some(block => block.type === "toolCall" && block.id === ref.callId)) return {};
     }
   }
-  if (entry.conversationId !== app.branch) return {};
-  const slot = app.live.tools?.find(slot => slot.name === "pi" && slot.callId === callId);
-  return { id: runIdOf(slot?.details), pending: slot && slot.status !== "done" };
+  return {};
 }
 
 let openedRun;
@@ -269,13 +228,13 @@ function stopRunWatch() {
   openedRun = undefined;
 }
 
-function openRun(button, source) {
+function openRun(ref) {
   const alreadyOpen = !!openedRun;
   stopRunWatch();
-  openedRun = { button, source };
+  openedRun = { ref };
   if (!alreadyOpen) keepChatPlace(() => { runPane.hidden = false; });
-  $("pi-run-task").textContent = source.title || "";
-  $("pi-run-task").hidden = !source.title;
+  $("pi-run-task").textContent = ref.title || "";
+  $("pi-run-task").hidden = !ref.title;
   $("pi-run-data").replaceChildren();
   runJump.hidden = true;
   runView.scrollTop = 0;
@@ -284,14 +243,13 @@ function openRun(button, source) {
   resolveOpenedRun();
 }
 
-function closeRun(restoreFocus = true) {
+function closeRun() {
   if (!openedRun) return;
-  const { button } = openedRun;
   stopRunWatch();
   keepChatPlace(() => { runPane.hidden = true; });
   $("pi-run-data").replaceChildren();
   syncPane();
-  if (restoreFocus && button.isConnected) button.focus({ preventScroll: true });
+  if (app.opener?.isConnected) app.opener.focus({ preventScroll: true });
 }
 
 // Reserve space outside the log for polling status so it stays visible without shifting the reading position.
@@ -305,7 +263,7 @@ function setRunStatus(text, elapsed = "", detail = "") {
 function resolveOpenedRun() {
   const open = openedRun;
   if (!open || open.run) return;
-  const run = resolveRun(open.source);
+  const run = resolveRun(open.ref);
   if (!run.id) {
     if (run.settled) open.run = run;
     setRunStatus(run.settled ? "This request did not start a Pi run. See the tool result in chat."
@@ -439,9 +397,13 @@ narrowPane.addEventListener("change", syncPane);
 runView.addEventListener("scroll", () => syncRunScroll());
 new ResizeObserver(() => syncRunScroll()).observe(runPane);
 runJump.addEventListener("click", () => syncRunScroll(true));
-$("pi-run-close").addEventListener("click", () => closeRun());
+function closePane() {
+  app.pane = undefined;
+  render();
+}
+$("pi-run-close").addEventListener("click", closePane);
 document.addEventListener("keydown", event => {
-  if (event.key === "Escape" && openedRun) closeRun();
+  if (event.key === "Escape" && openedRun) closePane();
 });
 
 function current() { return app.branches.find(branch => branch.id === app.branch); }
@@ -511,33 +473,138 @@ function renderBranches() {
   if ($("thinking").value !== branch.thinking) $("thinking").value = branch.thinking;
 }
 
-function entryNode(entry, message) {
-  const div = document.createElement("div");
-  div.className = "entry " + message.role + (entry.conversationId !== app.branch ? " inherited" : "");
-  const role = document.createElement("span");
-  role.className = "role";
-  role.textContent = message.role + " · " + entry.id;
-  const fork = document.createElement("button");
-  fork.type = "button";
-  fork.className = "fork-here";
-  fork.textContent = "Fork here";
-  fork.addEventListener("click", guard(() => forkAt(entry.id)));
-  div.append(fork, role, ...messageNodes(entry, message));
-  return div;
+/*
+ * Drawing the card pipeline's output. A stream frame arrives about ten times a second while a branch answers, and
+ * the whole pipeline runs again for each. A card on screen is kept and only the parts of it that changed are
+ * touched, for the same reason as the branch list above.
+ */
+
+// The renderers of a card's body, by the name a precard's format gives. Each must leave the body alone when
+// called again with the same text.
+const formats = {
+  text(body, text) { setText(body, text); },
+};
+
+function sendMessage(branch, content) {
+  // Unlike randomUUID, getRandomValues does not need a secure context.
+  const requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
+  return api("/api/conversations/" + branch + "/messages", { method: "POST", body: { content, requestId, whenBusy: "followUp" } });
 }
 
-function entryNodes(entries) {
-  const nodes = [];
-  for (const entry of entries) {
-    if (entry.kind === ${JSON.stringify(upgradeEntryKind)} && entry.data && typeof entry.data.text === "string") {
-      nodes.push(entryNode(entry, { role: "upgrade", content: entry.data.text }));
-    }
-    for (const message of entry.model || []) {
-      if (isToolRound(message) && message.content.some(isPiCall)
-          || isPiResult(message) && runIdOf(message.details) || messageText(message)) nodes.push(entryNode(entry, message));
-    }
+// Carry out a button's action against the selected branch. These are all the actions there are (see Action in
+// src/web/cards.ts).
+async function act(action, button) {
+  if (action.type === "send") await sendMessage(app.branch, action.content);
+  else if (action.type === "abort") await api("/api/conversations/" + app.branch + "/abort", { method: "POST" });
+  else if (action.type === "fork") await forkAt(action.at);
+  else if (action.type === "openPane") {
+    app.pane = action.pane;
+    app.opener = button;
+    // Pressing the button of the pane that is open starts it again.
+    shownPane = undefined;
+    render();
+  } else throw new Error("Unknown action " + action.type);
+}
+
+function buttonNode({ label, action }) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.dataset.action = action.type;
+  button.textContent = label;
+  button.addEventListener("click", guard(() => act(action, button)));
+  return button;
+}
+
+// An absolute http(s) URL opens in a new tab and a path stays on this server. Anything else is not a link.
+function linkNode({ label, href = "" }) {
+  const external = /^https?:\\/\\//i.test(href) && URL.canParse(href);
+  const local = href[0] === "/" && href[1] !== "/" && href[1] !== "\\\\";
+  const node = document.createElement(external || local ? "a" : "span");
+  node.textContent = label;
+  if (external || local) node.href = href;
+  if (external) {
+    node.target = "_blank";
+    node.rel = "noopener noreferrer";
   }
-  return nodes;
+  return node;
+}
+
+function drawCard(node, precard) {
+  const classes = new Set(["entry", precard.kind, precard.message?.role, precard.inherited && "inherited", precard.style]);
+  const className = [...classes].filter(Boolean).join(" ");
+  if (node.className !== className) node.className = className;
+  if (node.hidden !== precard.hidden) node.hidden = precard.hidden;
+  const [head, body] = node.children;
+  setText(head.firstChild, precard.label);
+  const controls = JSON.stringify([precard.links, precard.buttons]);
+  if (node.dataset.controls !== controls) {
+    node.dataset.controls = controls;
+    head.replaceChildren(head.firstChild, ...precard.links.map(linkNode), ...precard.buttons.map(buttonNode));
+  }
+  head.hidden = !precard.label && !precard.links.length && !precard.buttons.length;
+  const format = formats[precard.format] ? precard.format : "text";
+  if (body.dataset.format !== format) {
+    body.dataset.format = format;
+    body.replaceChildren();
+  }
+  formats[format](body, precard.text);
+}
+
+/** Make a container show the given precards, in order, keeping the card of every key it already shows. */
+function drawCards(container, precards) {
+  const old = new Map([...container.children].map(node => [node.dataset.key, node]));
+  precards.forEach((precard, index) => {
+    let node = old.get(precard.key);
+    old.delete(precard.key);
+    if (!node) {
+      node = document.createElement("div");
+      node.dataset.key = precard.key;
+      const head = document.createElement("div");
+      head.className = "card-head";
+      const label = document.createElement("span");
+      label.className = "role";
+      head.append(label);
+      const body = document.createElement("div");
+      body.className = "card-body";
+      node.append(head, body);
+    }
+    drawCard(node, precard);
+    if (container.children[index] !== node) container.insertBefore(node, container.children[index] || null);
+  });
+  for (const node of old.values()) node.remove();
+}
+
+function drawSurround(surround) {
+  const header = $("card-header");
+  const items = JSON.stringify(surround.header);
+  if (header.dataset.items !== items) {
+    header.dataset.items = items;
+    header.replaceChildren(...surround.header.map(linkNode));
+  }
+  header.hidden = !surround.header.length;
+  if (document.body.className !== surround.style) document.body.className = surround.style;
+}
+
+// The pane on screen, as the JSON of its reference.
+let shownPane;
+function showPane(ref) {
+  const key = ref && JSON.stringify(ref);
+  if (key === shownPane) return;
+  shownPane = key;
+  if (ref?.type === "pi-run") openRun(ref);
+  else {
+    closeRun();
+    if (ref) notice("This page has no pane of type " + ref.type + ".");
+  }
+}
+
+// A step that fails is reported once, not once a frame.
+const failedSteps = new Set();
+function reportStep(step, error) {
+  if (failedSteps.has(step)) return;
+  failedSteps.add(step);
+  console.error("Card step " + step + " failed:", error);
+  notice("Card step " + step + " failed (" + error + "). The cards it could not change are shown without it.");
 }
 
 /** Change the transcript, and keep it scrolled to the bottom if it was there. */
@@ -548,42 +615,35 @@ function keepAtBottom(change) {
   if (atBottom) box.scrollTop = box.scrollHeight;
 }
 
+/** Change the transcript above what is shown, and keep what is shown where it is. */
+function keepBelow(change) {
+  const box = $("transcript");
+  const { scrollHeight, scrollTop } = box;
+  change();
+  box.scrollTop = scrollTop + box.scrollHeight - scrollHeight;
+}
+
+/** Run the card pipeline on what the page holds, and make the screen show the result. */
+function render(keep = keepAtBottom) {
+  const { precards, surround } = derive(
+    { branch: app.branch, entries: app.entries, live: app.live }, steps, { pane: app.pane, report: reportStep },
+  );
+  keep(() => {
+    drawCards($("entries"), precards.filter(precard => precard.entry));
+    drawCards($("live"), precards.filter(precard => !precard.entry));
+    $("older").hidden = app.before === null;
+    drawSurround(surround);
+  });
+  $("abort").disabled = !app.live.run;
+  showPane(surround.pane);
+  resolveOpenedRun();
+}
+
 // A branch switch or replacement snapshot supersedes any pending load for the old transcript.
 let transcriptRevision = 0;
-function renderEntries() {
+function newTranscript() {
   transcriptRevision++;
   $("older").disabled = false;
-  keepAtBottom(() => {
-    $("entries").replaceChildren(...entryNodes(app.entries));
-    $("older").hidden = app.before === null;
-    renderLive();
-  });
-}
-
-/** Add the entries of a stream update below the ones shown. */
-function appendEntries(entries) {
-  keepAtBottom(() => {
-    $("entries").append(...entryNodes(entries));
-    renderLive();
-  });
-}
-
-function renderLive() {
-  $("abort").disabled = !app.live.run;
-  const failure = app.live.runFailure;
-  setText($("run-failure"), failure ? "Run failed: " + failure.reason + (failure.detail ? ": " + failure.detail : "") : "");
-  $("run-failure").hidden = !failure;
-  const live = $("live");
-  const message = app.live.generation && app.live.generation.message;
-  const text = message ? messageText(message) : "";
-  if (!text) { live.replaceChildren(); return; }
-  let div = live.firstElementChild;
-  if (!div) {
-    div = document.createElement("div");
-    div.className = "entry assistant";
-    live.append(div);
-  }
-  setText(div, text);
 }
 
 function connect(id) {
@@ -598,6 +658,7 @@ function connect(id) {
     if (frame.type === "state") {
       app.entries = frame.entries;
       app.before = frame.before;
+      newTranscript();
     } else if (frame.type === "update") {
       app.entries = app.entries.concat(frame.appended);
     } else {
@@ -611,9 +672,8 @@ function connect(id) {
       branch.cost = frame.usage.cost;
       if (wasBusy && !frame.busy) refreshBranches();
     }
-    if (frame.type === "state") renderEntries(); else appendEntries(frame.appended);
+    render();
     renderBranches();
-    resolveOpenedRun();
   });
   socket.addEventListener("close", () => {
     if (app.socket === socket) setTimeout(() => { if (app.socket === socket) connect(id); }, 2000);
@@ -628,13 +688,14 @@ async function refreshBranches() {
 }
 
 async function selectBranch(id) {
-  closeRun(false);
   app.branch = id;
   app.entries = [];
   app.before = null;
   app.live = {};
+  app.pane = app.opener = undefined;
   history.replaceState(null, "", "#" + id);
-  renderEntries();
+  newTranscript();
+  render();
   renderBranches();
   connect(id);
 }
@@ -674,11 +735,7 @@ $("composer").addEventListener("submit", guard(async event => {
   if (send.disabled || branch === null || !content.trim()) return;
   send.disabled = true;
   try {
-    // Unlike randomUUID, getRandomValues does not need a secure context.
-    const requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
-    await api("/api/conversations/" + branch + "/messages", {
-      method: "POST", body: { content, requestId, whenBusy: "followUp" },
-    });
+    await sendMessage(branch, content);
     if (branch === app.branch && revision === draftRevision) $("input").value = "";
   } finally {
     send.disabled = false;
@@ -692,7 +749,7 @@ $("input").addEventListener("keydown", event => {
   event.preventDefault();
   if (!event.repeat) $("composer").requestSubmit();
 });
-$("abort").addEventListener("click", guard(() => api("/api/conversations/" + app.branch + "/abort", { method: "POST" })));
+$("abort").addEventListener("click", guard(() => act({ type: "abort" })));
 $("fork").addEventListener("click", guard(() => forkAt()));
 $("rename").addEventListener("click", guard(async () => {
   const branch = current();
@@ -732,11 +789,7 @@ $("older").addEventListener("click", guard(async () => {
     if (revision !== transcriptRevision) return;
     app.entries = page.entries.concat(app.entries);
     app.before = page.before;
-    const box = $("transcript");
-    const { scrollHeight, scrollTop } = box;
-    $("entries").prepend(...entryNodes(page.entries));
-    $("older").hidden = app.before === null;
-    box.scrollTop = scrollTop + box.scrollHeight - scrollHeight;
+    render(keepBelow);
   } finally {
     if (revision === transcriptRevision) button.disabled = false;
   }
