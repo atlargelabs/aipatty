@@ -1,7 +1,6 @@
 # Connected apps
 
-**Plan, not built.** This describes the seam that every connected app uses. [Gym](GYM-APP.md) is the first app
-and the only reason any of it is built now. When the seam exists, this file becomes its API reference.
+[Gym](GYM-APP.md) is the first connected app. This is the API reference for reviewed apps in this repo.
 
 A connected app is a reviewed module in this repo that gives the branches connected to it:
 
@@ -40,7 +39,7 @@ interface OpenApp {
 ```
 
 The app imports from the host only `src/apps/app.ts`, the card types in `src/web/cards.ts` and the small HTTP
-helpers (`HttpError`, `jsonBody`, `sendJson`, moved out of `host.ts` and `api.ts` into `src/http.ts`). The host
+helpers in [`src/http.ts`](../src/http.ts) (`HttpError`, `jsonBody`, `sendJson`, `requireMethod`). The host
 imports only each app's `ConnectedApp` export.
 
 ### One namespace per app
@@ -49,7 +48,7 @@ The ID is the only thing two apps must not share, and the host checks each use o
 
 | What | Namespace | Enforced by |
 | --- | --- | --- |
-| Tools | names start `<id>_` | the host refuses to open an app with any other tool name |
+| Tools | names start `<id>_` | the host rejects other names and collisions |
 | Routes | `/apps/<id>/…` | the host's router |
 | Data | `data/apps/<id>/` | the host creates it and passes it to `open` |
 | Card steps | only cards of the app's own tools | the step wrapper, below |
@@ -79,32 +78,34 @@ A page is not tied to a branch. A link from a branch carries `?branch=<id>` so t
 ### Tools and instructions
 
 - **Off unless connected.** pi-durable selects every installed extension for a conversation that names none, so
-  the host sets the default selection explicitly to the built-in extensions. PR #41 proved, against the pinned
-  pi-durable, that a branch's extensions and instructions can change mid-conversation, and that an unselected
-  app's tools are not reachable through `tool_search` or nested `codemode` calls. That test moves over.
+  the host sets the default selection explicitly to the built-in extensions. Unselected app tools are not
+  reachable through `tool_search` or through nested `codemode` calls.
 - **On a connected branch,** the branch's selection adds each connected app's extension, and its instructions are
   the connected apps' instructions joined in connection order.
 
 ### Card steps
 
-The page already draws the transcript from [the card pipeline](WEB-CARDS.md), and this is the part that pipeline
-left unbuilt: steps chosen per branch.
+The page draws the transcript through [the card pipeline](WEB-CARDS.md). `BranchInfo` reports `connectedApps`
+(saved IDs), `availableApps` (all opened modules), and `apps` (the effective intersection in connection order).
+The selected branch's stream sends `apps` on attachment and when an app notice arrives.
 
-- `BranchInfo` gains `apps`, the IDs of the branch's connected and available apps, in connection order.
 - The host serves each app's `web` module at `/apps/<id>/web.ts` with its types removed, like the modules in
-  `src/web/`. It may import types only, plus `/web/cards.ts` and `/web/shared.ts`.
+  `src/web/`. It may import types only, plus `/web/cards.ts` and `/web/shared.ts`. An app with no `web` exports an
+  empty steps list from that route.
 - For the selected branch the page imports those modules and runs `builtInSteps` followed by each app's steps.
   A module that fails to load is left out, with a notice naming the app.
 - **Each app step is wrapped** so that it cannot reach past its own app:
   - `card` is called only for a `toolCall`, `toolResult` or `liveTool` whose tool name starts `<id>_`;
-  - `surround` may add `header` items; a `style` it returns is dropped.
+  - `surround` sees only those cards, not the raw live state. It may add `header` items; a `style` it returns
+    is dropped.
 
   So an app can hide, style, re-format, and add buttons and links to its own tool cards, and add links and text
   to the header, and nothing else. The existing rule that a throwing step is skipped still applies.
 - **Formatting is a step's `format`.** An app's tools return Markdown, tables included, and its step sets
   `format: "markdown"` on their results. That needs no new renderer. An app supplying its own renderer is left
   until Markdown is not enough.
-- `Surround` gains a read-only `branch`, the selected branch's ID, so a header link can carry `?branch=`.
+- `Surround.branch` and `Precard.branch` are the selected branch's read-only ID, including when a card's entry
+  was inherited from another branch. Use it for links with `?branch=`.
 
 The header strip shows only what a step can compute from the loaded cards, which in practice is the app's
 links. Showing live app data there (such as the last workout) would need a second data source in the pipeline
@@ -112,8 +113,8 @@ and a way to know when it is stale; the app's page shows that instead.
 
 ## Connecting a branch
 
-Handled like `/upgrade`: defined in [`src/protocol.ts`](../src/protocol.ts), intercepted before the model, and
-answered with a transcript notice. The notice card that today shows only upgrade reports becomes a general one.
+Send these in chat, or with `aipatty --branch <id> send '<command>'`. Like `/upgrade`, they are operator
+commands intercepted before the model. The response is an operator notice in the transcript, not a model turn.
 
 | Command | Effect |
 | --- | --- |
@@ -134,11 +135,13 @@ answered with a transcript notice. The notice card that today shows only upgrade
 One rule: **a branch gets an app only if the app is in its list and the app opened; otherwise that app is
 absent from the branch.** One function applies the rule to a branch by setting its extensions and
 instructions. It runs for every branch at startup, before interrupted work resumes, and on connect, disconnect
-and fork. A failed app is skipped, not disconnected, so its branches get it back once it opens.
+and fork. A failed app is skipped, not disconnected, so its branches get it back once it opens. If a restart
+changes a branch's effective app configuration, already interrupted work on that branch is stopped with a
+notice to resend: Durable can otherwise reuse the model request it prepared before the restart.
 
 | Failure | What happens |
 | --- | --- |
-| An app fails to open, or fails a namespace check | The error is logged and `/health` and `/connect` report it with the data path. Its branches run without it. |
+| An app fails to open, or fails a namespace check | See server stderr, `/health` (`appProblems`) or `/connect` for the error and data path. Its branches run without it. Optional app problems do not fail an upgrade's core health check. |
 | The app is fixed and aipatty restarts | Its branches have it again, with nothing to redo. |
 | A tool throws | The model sees an ordinary tool error and the turn continues. |
 | A page handler throws | That request fails. |
@@ -159,7 +162,6 @@ Not handled, as decisions:
 
 ## Tests
 
-The seam is tested with a small fixture app in `test/`, not with Gym, so that its tests say what any app can
-rely on: tools and instructions appear on connect, disappear on disconnect and are absent elsewhere; a fork
-inherits; two apps on one branch keep to their own cards; an app that throws in `open` leaves chat working and
-comes back after a restart; and its route sits behind the Host and Origin checks.
+The seam tests use fixture apps: real pinned Durable turns (including tool search and codemode), idle-only
+commands, restart/fork behavior, route headers and errors, and scoped steps with browser fallback. Gym has
+separate temporary SQLite and headless Chrome tests with scripted Faux coaching, not live history or credentials.

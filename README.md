@@ -252,6 +252,18 @@ scheduling is [blocked by an unavailable model](#configure). Partial answers may
 Active [`pi` runs](#pi-runs) are stopped and reported as interrupted on restart, not replayed. Wait for the server
 process to exit before starting another one on the same data directory.
 
+## Connected apps: Gym
+
+Fork a training branch and send `/connect gym` while idle. Tap **Log workout** above the transcript to log
+sets on your phone. Ask the coach about your history or for a suggestion, then use **Start from this** on the
+Gym page to make a draft. Only saving on the page logs a workout. `/connect` lists app status and
+`/disconnect gym` removes coaching from the branch without deleting the log.
+
+See the [Gym quickstart and trial](docs/GYM-APP.md) and [app API](docs/CONNECTED-APPS.md). Apps are trusted code,
+not an access-control boundary. The Gym database is separate from the conversation database and is not in the
+upgrade backup. A restart that changes a branch's app configuration can stop its interrupted turn with a
+notice to resend.
+
 ## Upgrade
 
 In a [service install](#configure), typing `/upgrade` in a branch on the page, or running the CLI's `upgrade`,
@@ -281,7 +293,9 @@ loopback; access to the HTTPS URL is controlled by your tailnet policy. Do not u
 
 - `GET /` the page (and `/app.js`, `/app.css`, `/markdown-it.js`, and the modules of `src/web/` as `/web/<name>.ts`)
 - `GET /health` (includes the process ID, the root's saved model, its catalog availability, the thinking level,
-  and `problems`: what the startup health check found, empty when healthy)
+  and `problems`: what the startup health check found, empty when healthy). Optional apps report separately
+  in `appProblems` when unavailable; they do not fail the core health check.
+- `/apps/<id>/`: the app's pages and API, e.g. [Gym](docs/GYM-APP.md#the-page).
 - `GET /api/models`
 - `GET /api/pi-runs/:runId`: a no-store, read-only snapshot of one active or archived Pi run. Uses the ID from
   the `pi` tool's structured progress/result. Returns `runId`, `status`, `durationMs` when known, bounded `activity`
@@ -291,12 +305,12 @@ loopback; access to the HTTPS URL is controlled by your tailnet policy. Do not u
 - `POST /api/shutdown` (no body needed): requires the `X-Aipatty-Shutdown: 1` header so ordinary browser forms
   cannot trigger it. No CORS is enabled. Returns `202 { "status": "shutdown-requested" }` before stopping the
   server; it does not wait for cleanup. The same Host and Origin rules below apply.
-- `GET /api/branches`: `{ branches: [{ id, title, parent, model, modelStatus, thinking, busy, cost }], totalCost }`
+- `GET /api/branches`: `{ branches: [{ id, title, parent, model, modelStatus, thinking, busy, cost, apps, connectedApps, availableApps }], totalCost }`
 - `PUT /api/model` and `PUT /api/thinking`: the root's, as below
 - `GET /api/conversations/:id` (`root` is the root conversation; `?limit=` and `?before=` page backwards); also
   carries `branch` and `totalCost`
 - `POST /api/conversations/:id/fork` with `{ title, at? }`: a new branch from `:id`'s history through entry `at`
-  (default its newest); returns the branch
+  (default its newest); inherits its current apps and returns the branch
 - `PUT /api/conversations/:id/title` with `{ title }` (1 to 100 characters)
 - `PUT /api/conversations/:id/model` with `{ modelId, provider? }`; 409 while the branch has active work
 - `PUT /api/conversations/:id/thinking` with `{ level }`
@@ -304,10 +318,12 @@ loopback; access to the HTTPS URL is controlled by your tailnet policy. Do not u
   newest first; pass `before` back for the next page
 - `POST /api/conversations/:id/messages` with `{ content, requestId?, whenBusy?: "followUp" | "steer" }`. The
   content `/upgrade` starts an [upgrade](#upgrade) instead: `202 { "upgrade": "started" }`, or 409 when the server
-  is busy or not a managed install
+  is busy or not a managed install. `/connect`, `/connect <id>` and `/disconnect <id>` return `202 { notice }`
+  without a model turn. App mutations are refused with 409 while the branch is busy.
 - `POST /api/conversations/:id/abort` (returns once the conversation is idle)
 - `WS /api/conversations/:id/stream` sends one `state` frame (the newest 50 entries and the live state), then an
-  `update` frame per change: the live state plus any `appended` entries, without the window. It falls back to a full
+  `update` frame per change: the live state plus any `appended` entries, without the window. An `apps` list is
+  included with snapshots and when an app notice arrives. It falls back to a full
   `state` frame if an entry it already sent changes or a slow client misses part of the window. With `?submissionId=`, it also sends one `settled` frame: the
   answer, or the `reason` and `detail` of a failed run. The server pings every 30 s and drops a stream that does
   not answer.

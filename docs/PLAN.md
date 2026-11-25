@@ -37,7 +37,8 @@ no daemon and no service registration.
   last-known-good release for rollback.
   - `$ROOT/work/`: working directory of aipatty's own tools, for inspection and scratch, not PR work.
   - `$ROOT/runs/`: disposable workspaces for [`pi` runs](#pi-runs).
-  - `$ROOT/data/`: SQLite, logs, and later MCP configuration and sign-ins.
+  - `$ROOT/data/`: the conversation SQLite database, logs, `apps/<id>/` data (not in the upgrade backup),
+    and later MCP configuration and sign-ins.
   - `$ROOT/upgrade/`: the database backup of the last upgrade, its pending record, and the logs of the supervisor
     and of the servers it starts.
   - `$ROOT/pi/`: shared Pi sign-in, model cache, delegates settings and jobs.
@@ -47,7 +48,7 @@ no daemon and no service registration.
   remain unchanged. It adds no environment variable or API. Launch from any cwd with
   `node "$ROOT/deploy/current/src/main.ts" --install-dir "$ROOT"`. State stays outside releases on redeploy and
   rollback; see [INSTALL.md](INSTALL.md) for the first install, upgrades and fresh cutover.
-- **Conversations:** one root plus forks. Each has a title and its own model.
+- **Conversations:** one root plus forks. Each has a title, its own model, and an ordered list of connected apps.
 
 ### Pi installation
 
@@ -270,8 +271,8 @@ from a release that predates `/upgrade`, which is one more manual deploy. See
    is the self-upgrade milestone.
 5. **After self-upgrade:** phone access, MCP configuration and OAuth, the per-branch switch, and Gmail. Add research
    mode, hooks, or more repos only when needed.
-6. **Planned: connected apps.** A [seam](CONNECTED-APPS.md) for apps that add tools, card steps, pages and data
-   to the branches connected to them, and [Gym](GYM-APP.md) as the first.
+6. **Gym pilot:** the [connected-app seam](CONNECTED-APPS.md) and [Gym](GYM-APP.md) are implemented and tested
+   with temporary data and Faux. Steve's trial is two real workouts on a phone before expanding the experiment.
 
 ## Setup responsibilities
 

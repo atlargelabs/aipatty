@@ -1,19 +1,24 @@
 # Gym
 
-**Plan, not built.** Gym is the first [connected app](CONNECTED-APPS.md): Steve logs workouts on a phone page,
-and on a connected branch the model can search that log and suggest the next workout.
+Gym is the first [connected app](CONNECTED-APPS.md). Log workouts on a phone; in a connected branch the coach
+can read the log and suggest the next workout.
 
-This replaces the pilot in PR #41, which was built before [the card pipeline](WEB-CARDS.md) and drew its own
-header and tool cards with DOM code. Its store, input checks and phone page are the starting point here; its
-`branch.js` and its changes to `page.ts` are not.
+## Quickstart
 
-## Using it
+On a running release that includes Gym, there is no setup beyond reaching the normal chat page. For a phone,
+use [Tailscale Serve](INSTALL.md#optional-tailnet-browser-access) or the same tunnel you use for chat.
 
-1. Fork a branch for training and send `/connect gym` in it.
-2. Tap **Log workout** in the strip above the transcript, or bookmark `/apps/gym/`. Pick an exercise, enter each
-   set, and save.
-3. In the branch, ask about progress or ask what to do next. A suggestion the coach saves appears on the page,
-   ready to log against.
+1. Fork a branch named **Training** and send `/connect gym` while it is idle. `/connect` lists the available
+   apps and the branch's connections. A fork of **Training** inherits Gym; the root stays ordinary chat.
+2. Tap **Log workout** above the transcript, or bookmark `/apps/gym/` on that origin. Pick an exercise, use
+   **Add set** for each set, then **Save workout**. The page remembers unfinished drafts in that browser.
+3. Go **Back to chat**. Ask “How have my squats changed?” or “What should I do next?” The latter should put a
+   suggestion on the phone page. **Start from this** copies it into a draft; correct it and save what you
+   actually did. It is not part of your history until you save it.
+4. Send `/disconnect gym` to remove Gym's coach and card steps from that branch. The page and its data stay.
+
+If Gym is unavailable, check `/connect` or `/health` for the reason and data path. Fix that and restart; the
+branch still remembers the connection.
 
 ## Data
 
@@ -26,7 +31,7 @@ header and tool cards with DOM code. Its store, input checks and phone page are 
 | `suggestion` | one row: `created` date, `note` text, `sets` as JSON in the shape of a workout's sets |
 
 `reps` is optional, so a timed set such as a 60-second plank needs only an amount and a unit. There is no list
-of exercises: a name is whatever was typed, compared without regard to case.
+of exercises: names from the log are compared using SQLite `NOCASE` (ASCII case folding).
 
 ## The page
 
@@ -44,9 +49,10 @@ of exercises: a name is whatever was typed, compared without regard to case.
 - **Recent workouts:** the newest 20, each of which can be edited or deleted.
 - **Back to chat:** shown when the page was opened from a branch.
 
-The page's API is `GET /apps/gym/api/overview` (recent workouts, exercise names, the suggestion), and `GET`,
-`PUT` and `DELETE` on `/apps/gym/api/workouts/<id>`. `PUT` sends the whole workout with an ID the page made
-up, as an upsert, so a retried save does not make a second workout.
+The page's API is `GET /apps/gym/api/overview` (recent workouts, exercise names, the suggestion),
+`GET /apps/gym/api/last?exercise=<name>` (`{ date, sets }` from the newest matching workout across the whole log,
+or `null`), and `GET`, `PUT` and `DELETE` on `/apps/gym/api/workouts/<id>`. `PUT` sends `{ date, sets }` with an
+ID the page made up, as a transactional upsert, so a retried save does not make a second workout.
 
 ## The tools
 
@@ -64,8 +70,10 @@ up, as an upsert, so a retried save does not make a second workout.
 - **The instructions** give the schema, say to compare exercise names without case and not to mix units, and
   say to save a suggestion when Steve asks what to do next.
 
-`gym_query` uses a read-only connection, one statement and a size cap. PR #41 also had an allow-list of SQL
-functions and tables; that is dropped, because the model already has `bash` with the same file permissions.
+`gym_query` uses a read-only connection, checks for exactly one `SELECT` (including `WITH`), denies writes and
+attachments in SQLite, and caps the statement and result sizes. It has no allow-list of functions or tables.
+Queries run synchronously without a query-time budget; use ordinary joins and aggregations over the small log.
+This is an app tool boundary, not a sandbox: the model already has `bash` with the service account's permissions.
 
 ## The cards
 
@@ -78,26 +86,18 @@ Gym's web module exports one step:
 Because the call is hidden, each tool's result and error message repeat what was asked for: the SQL, or the
 suggested sets. A failed result is left as plain text.
 
-## Build order
+## Trial
 
-1. **The seam,** as [CONNECTED-APPS.md](CONNECTED-APPS.md) describes, tested with its fixture app. Done when a
-   fixture app's tools, instructions, header link and card format appear on a connected branch and nowhere else.
-2. **Log page.** The store, the page and its API. Done when Steve can log, correct and delete a workout on the
-   phone, a second session of an exercise starts from the first, and the data survives a restart.
-3. **Coach.** The two tools, the instructions and the step. Done when the coach answers a progress question
-   from SQL shown as a table, and a suggestion it saves can be started from on the phone.
-
-Unconnected branches behave as they do on `main` throughout.
-
-**Then use it for two real workouts.** Carry on with apps only if logging takes about a minute, the coach uses
-what was logged, and a second app looks easy to write against the seam. Otherwise fix the largest friction or
-stop.
+The tests use a temporary Gym database and a scripted Faux coach. On a real phone, **try two real workouts**
+before expanding the experiment. Carry on with apps only if logging takes about a minute, the coach uses what
+was logged, and a second app looks easy to write against the seam. Otherwise fix the largest friction or stop.
 
 ## Not handled, as decisions
 
 - **Workouts from chat.** Describing a workout in chat does not log it. Add a `gym_save_workout` tool if typing
   into the page turns out to be the slow part.
 - **Two devices editing at once.** A save replaces the whole workout, so the last one wins.
-- **Backup.** The log is not in the upgrade backup; see [the seam's limits](CONNECTED-APPS.md#robustness).
+- **Backup.** The log and current suggestion are not in the upgrade backup. To keep a separate copy, stop the
+  server and copy `data/apps/gym/gym.sqlite`; see [the operator runbook](INSTALL.md#gym-pilot).
 - **Not now:** a multi-week programme, exercise metadata such as muscle groups, charts, rest timers, body weight
   and import or export.

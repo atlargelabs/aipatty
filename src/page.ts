@@ -1,6 +1,6 @@
 /**
  * The crude web page: branch list, transcript, input box, fork, rename, model picker and cost. Served by the API
- * with a strict CSP and same-origin scripts. Only saved conversation prose is rendered as Markdown.
+ * with a strict CSP and same-origin scripts. The pipeline selects which cards use the built-in Markdown renderer.
  *
  * The transcript is drawn from the card pipeline in ./web/cards.ts (see docs/WEB-CARDS.md). This file is the
  * shell around it and the code that puts its cards on screen.
@@ -46,6 +46,7 @@ export const pageHtml = `<!doctype html>
       <button id="search" type="button">Search</button>
     </div>
     <div id="notice" role="status" hidden></div>
+    <div id="card-notice" role="status" hidden></div>
     <div id="card-header" hidden></div>
     <section id="transcript" aria-live="polite">
       <button id="older" type="button" hidden>Load older</button>
@@ -94,7 +95,7 @@ nav li .busy { color: #0a7d32; }
 main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 #controls { display: flex; flex-wrap: wrap; gap: .5rem; padding: .5rem .8rem; border-bottom: 1px solid #eee; align-items: center; }
 #controls select { max-width: 14rem; }
-#notice { padding: .4rem .8rem; background: #fff4e5; color: #8a4b00; }
+#notice, #card-notice { padding: .4rem .8rem; background: #fff4e5; color: #8a4b00; white-space: pre-line; }
 #transcript { flex: 1; overflow-y: auto; padding: .8rem; }
 .entry { margin: 0 0 .8rem; padding: .5rem .7rem; border-radius: 8px; background: #fff; border: 1px solid #e4e4e4; white-space: pre-wrap; overflow-wrap: anywhere; }
 .entry.user { background: #eef5ff; border-color: #cfe0fb; }
@@ -152,7 +153,7 @@ button { font: inherit; padding: .3rem .7rem; }
 `;
 
 export const pageJs = (appHostnames: readonly string[]) => `import markdownit from ${JSON.stringify(markdownScriptPath)};
-import { derive } from "/web/cards.ts";
+import { derive, scopeAppStep } from "/web/cards.ts";
 import { piRunApiPath } from "/web/shared.ts";
 import { builtInSteps, runIdOf } from "/web/steps.ts";
 
@@ -164,8 +165,10 @@ const app = {
   branch: null, branches: [], totalCost: 0, entries: [], before: null, live: {}, socket: null, models: [],
   pane: undefined, opener: undefined,
 };
-// The steps of the card pipeline, in order. A branch's own steps will follow the built-in ones here.
-const steps = builtInSteps;
+// The selected branch's app steps follow the built-ins. Switching invalidates any import still in flight.
+let steps = builtInSteps;
+let appKey = "";
+let appRevision = 0;
 
 function money(value) { return "$" + value.toFixed(value > 0 && value < 0.01 ? 4 : 2); }
 
@@ -656,13 +659,45 @@ function showPane(ref) {
   }
 }
 
-// A step that fails is reported once, not once a frame.
-const failedSteps = new Set();
+// A failure is reported once per selection, not once a frame. Keep it separate from composer/action notices.
+const cardProblems = new Map();
+function showCardProblems() {
+  $("card-notice").textContent = [...cardProblems.values()].join("\\n");
+  $("card-notice").hidden = !cardProblems.size;
+}
 function reportStep(step, error) {
-  if (failedSteps.has(step)) return;
-  failedSteps.add(step);
-  console.error("Card step " + step + " failed:", error);
-  notice("Card step " + step + " failed (" + error + "). The cards it could not change are shown without it.");
+  if (cardProblems.has(step)) return;
+  cardProblems.set(step, "Card step " + step + " failed (" + error + "). The cards it could not change are shown without it.");
+  showCardProblems();
+}
+function setAppSteps(ids) {
+  const key = ids.join(",");
+  if (appKey === key) return;
+  appKey = key;
+  const revision = ++appRevision;
+  steps = builtInSteps;
+  cardProblems.clear();
+  showCardProblems();
+  if (!ids.length) return;
+  void Promise.all(ids.map(async id => {
+    try {
+      const { steps } = await import("/apps/" + id + "/web.ts");
+      if (!Array.isArray(steps) || steps.some(step => typeof step?.name !== "string"
+        || (step.card !== undefined && typeof step.card !== "function")
+        || (step.surround !== undefined && typeof step.surround !== "function"))) {
+        throw new Error("Expected an array of named card steps");
+      }
+      return { id, steps: steps.map(step => scopeAppStep(id, step)) };
+    } catch (error) { return { id, error }; }
+  })).then(results => {
+    if (revision !== appRevision) return;
+    for (const { id, error } of results) {
+      if (error) cardProblems.set(id, "Could not load cards for app " + id + " (" + error + "). Showing the built-in cards instead.");
+    }
+    showCardProblems();
+    steps = [...builtInSteps, ...results.flatMap(result => result.steps || [])];
+    render();
+  });
 }
 
 /** Change the transcript, and keep it scrolled to the bottom if it was there. */
@@ -723,6 +758,7 @@ function connect(id) {
       return;
     }
     app.live = frame.live || {};
+    if (frame.apps) setAppSteps(frame.apps);
     const branch = current();
     if (branch) {
       const wasBusy = branch.busy;
@@ -746,6 +782,9 @@ async function refreshBranches() {
 }
 
 async function selectBranch(id) {
+  // Reset even if the next branch has the same app list: its stream supplies the authoritative selection.
+  appKey = null;
+  setAppSteps([]);
   app.branch = id;
   app.entries = [];
   app.before = null;

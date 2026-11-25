@@ -1,16 +1,18 @@
 import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
-import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, getCurrentTools } from "@earendil-works/pi-ai";
 import { LiveDoc, type Tx } from "@earendil-works/pi-durable";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { test, type TestContext } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { startApi } from "../src/api.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
 import { piRunApiPath, upgradeEntryKind, type PiRunSnapshot } from "../src/protocol.ts";
+import { fixtureApp } from "./fixtures/app.ts";
 import { archivedPiRun, checkout, fauxConfig, fixture, realConfig, until } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
@@ -761,4 +763,179 @@ test("a click on another branch lands while the current branch is streaming", { 
   assert.equal(onSide.current, "Side");
   assert.deepEqual(browser.errors, []);
   await host.abort(root);
+});
+
+const click = (selector: string) => `document.querySelector(${JSON.stringify(selector)}).click()`;
+
+async function compose(browser: Awaited<ReturnType<typeof openBrowser>>, content: string) {
+  await until(() => browser.evaluate<boolean>("!document.querySelector('#send').disabled"));
+  await browser.evaluate(`document.querySelector('#input').value = ${JSON.stringify(content)}; document.querySelector('#composer').requestSubmit()`);
+}
+
+test("app load and step failures fall back without leaking async results to another branch", { skip: !chrome, timeout: 60_000 }, async t => {
+  const dir = await fixture(t);
+  const web = join(dir, "late.ts");
+  await writeFile(web, `
+    // A gate for this test only. Switch branches while import is still pending.
+    await new Promise<void>(resolve => { globalThis.releaseFixture = resolve; });
+    export const steps = [
+      { name: "header", surround({ branch }: { branch: number }) { return { style: "must-not-apply", header: [{ label: "Fixture " + branch }] }; } },
+      { name: "broken", surround() { throw new Error("test step crashed"); } },
+    ];
+  `);
+  const host = await openHost(fauxConfig(dir), { apps: [fixtureApp("late", { web: pathToFileURL(web) }),
+    fixtureApp("missing", { web: pathToFileURL(join(dir, "missing.ts")) })] });
+  const api = await startApi(host, health, 0);
+  t.after(async () => { await api.close(); await host.close(); });
+  const root = (await host.conversation("root"))!;
+  const side = await host.fork(root, { title: "App side" });
+  const base = `http://127.0.0.1:${api.port}`;
+  const browser = await openBrowser(t);
+  await browser.navigate(`${base}/#${side.id}`);
+  await waitFor(browser, "the side branch", value => value.title === "App side");
+  await compose(browser, "/connect missing");
+  await compose(browser, "/connect late");
+  await until(() => browser.evaluate<boolean>("typeof globalThis.releaseFixture === 'function'"));
+  await browser.evaluate(click(`[data-branch='${root.id}']`));
+  await waitFor(browser, "the root", value => value.title === "Main");
+  await browser.evaluate("globalThis.releaseFixture()");
+  await say(host, "root", "**Normal chat after the import**");
+  await waitFor(browser, "the ordinary response", value => value.messages.some(text => text.includes("Faux reply")));
+  assert.deepEqual(await browser.evaluate("[document.querySelector('#card-header').hidden, document.querySelector('#card-notice').hidden, document.body.className]"), [true, true, ""]);
+  await browser.evaluate(click(`[data-branch='${side.id}']`));
+  const diagnostic = () => browser.evaluate<string>("document.querySelector('#card-notice').textContent");
+  const problems = await until(diagnostic, text => text.includes("late/broken") && text.includes("missing"));
+  assert.match(problems, /Could not load cards for app missing/);
+  assert.match(problems, /test step crashed/);
+  assert.deepEqual(await browser.evaluate("[document.querySelector('#card-header').textContent, document.body.className]"), [`Fixture ${side.id}`, ""]);
+  await compose(browser, "/disconnect missing");
+  await compose(browser, "/disconnect late");
+  await until(() => browser.evaluate<boolean>("document.querySelector('#card-header').hidden && document.querySelector('#card-notice').hidden"));
+  assert.deepEqual(browser.errors, []);
+});
+
+test("Gym phone logging and a Faux coaching turn share the same actual workouts", { skip: !chrome, timeout: 60_000 }, async t => {
+  const dir = await fixture(t);
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const host = await openHost(fauxConfig(dir), { models });
+  const api = await startApi(host, health, 0);
+  t.after(async () => { await api.close(); await host.close(); });
+  const root = (await host.conversation("root"))!;
+  const side = await host.fork(root, { title: "Training" });
+  const base = `http://127.0.0.1:${api.port}`;
+  const gym = `/apps/gym/?branch=${side.id}`;
+  const browser = await openBrowser(t, ["--window-size=390,800"]);
+  await browser.viewport(390, 780);
+  await browser.emulateTouch();
+  const wait = (expression: string) => until(() => browser.evaluate<boolean>(expression));
+  const tap = (selector: string) => browser.evaluate(click(selector));
+  const set = (values: Record<string, string>) => browser.evaluate(`for (const [id, value] of Object.entries(${JSON.stringify(values)})) {
+    const field = document.getElementById(id);
+    field.value = value;
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+  }`);
+  const status = (text: string) => wait(`document.querySelector('#status').textContent.includes(${JSON.stringify(text)})`);
+  const overview = async () => (await fetch(`${base}/apps/gym/api/overview`)).json() as Promise<{
+    workouts: { id: string; sets: { exercise: string; reps: number | null; amount: number; unit: string }[] }[];
+    suggestion: { note: string } | null;
+  }>;
+
+  await browser.navigate(`${base}/#${side.id}`);
+  await waitFor(browser, "Training", value => value.title === "Training");
+  await compose(browser, "/connect gym");
+  await wait(`document.querySelector('#card-header a')?.getAttribute('href') === '${gym}'`);
+  assert.match((await waitFor(browser, "connect notice", value => value.messages.some(text => text.includes("Connected this branch")))).messages.join(), /Connected this branch to Gym/);
+  await tap("#card-header a");
+  await wait("document.querySelector('#workout-editor')?.disabled === false");
+  assert.equal(await browser.evaluate("document.querySelector('#chat-link').getAttribute('href')"), `/#${side.id}`);
+  assert.equal(await browser.evaluate(`document.querySelector('#workout-date').value === new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10)`), true);
+  assert.equal(await browser.evaluate("document.documentElement.scrollWidth === innerWidth"), true, "phone does not scroll horizontally");
+  await set({ exercise: "Squat", reps: "5", amount: "60" });
+  await tap("#add-set");
+  await set({ reps: "4", amount: "62.5" });
+  await tap("#add-set");
+  await set({ exercise: "Plank", unit: "sec", reps: "", amount: "45" });
+  assert.equal((await overview()).workouts.length, 0, "draft changes don't write the log");
+  await browser.navigate(`${base}/#${side.id}`);
+  await browser.navigate(base + gym);
+  await wait("document.querySelector('#workout-editor')?.disabled === false");
+  assert.deepEqual(await browser.evaluate("[document.querySelectorAll('#draft-sets li').length, document.querySelector('#exercise').value, document.querySelector('#amount').value]"), [2, "Plank", "45"]);
+  await tap("#add-set");
+  await tap("#save-workout");
+  await status("Workout saved");
+  const [first] = (await overview()).workouts;
+  assert.deepEqual(first.sets.map(set => [set.exercise, set.reps, set.amount, set.unit]), [["Squat", 5, 60, "kg"], ["Squat", 4, 62.5, "kg"], ["Plank", null, 45, "sec"]]);
+  assert.equal(await browser.evaluate("localStorage.getItem('gym-draft')"), null);
+  assert.deepEqual(await browser.evaluate("[...document.querySelectorAll('#exercises option')].map(option => option.value)"), ["Plank", "Squat"]);
+  await set({ exercise: "sQuAt" });
+  await wait("document.querySelectorAll('#last-session li').length === 2");
+  assert.deepEqual(await browser.evaluate("['reps', 'amount', 'unit'].map(id => document.getElementById(id).value)"), ["5", "60", "kg"]);
+  await browser.evaluate("window.confirm = () => true");
+  await tap("#reset-workout");
+  assert.equal(await browser.evaluate("localStorage.getItem('gym-draft')"), null);
+  await tap("#chat-link");
+  await waitFor(browser, "back in Training", value => value.title === "Training");
+
+  const sql = "SELECT exercise, reps, amount, unit FROM sets WHERE exercise = 'squat' ORDER BY position";
+  const suggested = [{ exercise: "Squat", reps: 5, amount: 65, unit: "kg" }, { exercise: "Plank", reps: null, amount: 1, unit: "min" }];
+  faux.setResponses([request => {
+    assert.deepEqual(getCurrentTools(request.messages).map(tool => tool.name).filter(name => name.startsWith("gym_")), ["gym_query", "gym_suggest_workout"]);
+    return fauxAssistantMessage(fauxToolCall("gym_query", { sql }, { id: "gym-read" }), { stopReason: "toolUse" });
+  }, fauxAssistantMessage([
+    fauxToolCall("gym_suggest_workout", { note: "Start light, then hold a plank.", sets: suggested }, { id: "gym-suggestion" }),
+    fauxToolCall("gym_suggest_workout", { note: "invalid", sets: [{ ...suggested[1], amount: 0 }] }, { id: "gym-error" }),
+  ], { stopReason: "toolUse" }), fauxAssistantMessage("**Next workout** is on your phone.")]);
+  await compose(browser, "Show my squats and suggest the next workout.");
+  await wait("document.querySelector('#entries .prose strong')?.textContent === 'Next workout'");
+  await wait("document.querySelectorAll('.toolResult table').length === 2");
+  assert.equal(await browser.evaluate("document.querySelectorAll('.toolCall[hidden]').length"), 3);
+  assert.equal(await browser.evaluate("document.querySelectorAll('.toolResult a[href^=\"/apps/gym/\"]').length"), 2);
+  assert.ok(await browser.evaluate<boolean>(`[...document.querySelectorAll('.toolResult pre')].some(el => el.textContent.includes(${JSON.stringify(sql)}))`));
+  assert.ok(await browser.evaluate<boolean>(`[...document.querySelectorAll('.toolResult .card-body[data-format=text]')].some(el => el.textContent.includes('"amount":0') && el.textContent.includes('Gym suggestion failed'))`));
+  const queryRows = await browser.evaluate<string[]>("[...document.querySelectorAll('.toolResult table:first-of-type td')].map(el => el.textContent)");
+  assert.ok(queryRows.includes("62.5"));
+  assert.equal((await overview()).workouts.length, 1, "even the successful suggestion did not log a workout");
+
+  await tap("#card-header a");
+  await wait("document.querySelector('#start-suggestion')?.hidden === false && !document.querySelector('#workout-editor').disabled");
+  assert.equal(await browser.evaluate("document.querySelector('#suggestion-note').textContent"), "Start light, then hold a plank.");
+  await tap("#start-suggestion");
+  assert.equal(await browser.evaluate("document.querySelectorAll('#draft-sets li').length"), 2);
+  assert.equal((await overview()).workouts.length, 1);
+  await tap('#draft-sets [data-action="edit-set"]');
+  await set({ amount: "145", unit: "lb" });
+  await tap("#add-set");
+  await tap('#draft-sets li:nth-child(2) [data-action="edit-set"]');
+  await set({ amount: "1.5" });
+  await tap("#add-set");
+  await tap("#save-workout");
+  await status("Workout saved");
+  const next = (await overview()).workouts.find(workout => workout.id !== first.id)!;
+  assert.deepEqual(next.sets.map(set => [set.amount, set.unit]), [[145, "lb"], [1.5, "min"]]);
+
+  await tap(`[data-workout-id='${first.id}'] [data-action='edit-workout']`);
+  await wait("document.querySelector('#workout-heading').textContent === 'Edit workout'");
+  await tap('#draft-sets li:nth-child(3) [data-action="remove-set"]');
+  await tap("#save-workout");
+  await status("Workout saved");
+  assert.equal((await overview()).workouts.find(workout => workout.id === first.id)?.sets.length, 2);
+  await browser.evaluate("window.confirm = () => true");
+  await tap(`[data-workout-id='${first.id}'] [data-action='delete-workout']`);
+  await status("Workout deleted");
+  assert.deepEqual((await overview()).workouts.map(workout => workout.id), [next.id]);
+  assert.equal((await fetch(`${base}/apps/gym/api/workouts/${first.id}`)).status, 404);
+
+  await tap("#chat-link");
+  await waitFor(browser, "Training again", value => value.title === "Training");
+  await wait("!document.querySelector('#card-header').hidden");
+  const check = "SELECT amount, unit FROM sets ORDER BY position";
+  faux.setResponses([fauxAssistantMessage(fauxToolCall("gym_query", { sql: check }), { stopReason: "toolUse" }), fauxAssistantMessage("Actual workout checked.")]);
+  await compose(browser, "Read the saved workout.");
+  await wait("[...document.querySelectorAll('.toolResult td')].some(el => el.textContent === '145')");
+  await tap(`[data-branch='${root.id}']`);
+  await waitFor(browser, "Main", value => value.title === "Main");
+  assert.deepEqual(await browser.evaluate("[document.querySelector('#card-header').hidden, document.querySelectorAll('.toolResult table').length, document.body.className]"), [true, 0, ""]);
+  assert.deepEqual(browser.errors, []);
 });

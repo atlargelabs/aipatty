@@ -114,8 +114,9 @@ A pane fetches its own data and has its own lifecycle. The one pane today is `pi
 2. **One precard at a time.** `card(precard)` sees that precard only. It cannot see its neighbours or the
    surround, and it sees the live state only when the precard is a live one. So a settled card cannot depend on
    anything that changes.
-3. **The surround can see everything.** `surround(surround, precards, live)` gets the surround so far, the
-   precards the previous step produced, and the live state.
+3. **The surround can see the pipeline so far.** A built-in `surround(surround, precards, live)` gets the surround
+   so far, the precards the previous step produced, and the live state. An app gets only its own tool cards and
+   no raw live state, and can append header items, not set page style.
 4. **Order is the order of the list.** A step sees what the steps before it did and nothing of the steps after it.
 
 Rule 2 is what makes stacking predictable. A step that needed to look ahead in the conversation, such as hiding a
@@ -170,11 +171,15 @@ Every branch runs these, in this order:
   and column alignment uses CSS classes rather than inline styles. The renderer turns off raw HTML and images
   and allows only absolute HTTP(S) links outside aipatty's hosts. All other cards stay plain text.
 
+## Connected app steps
+
+For the selected branch, the page imports modules for its connected and available apps and adds their wrapped
+steps after the built-ins, in connection order. A fork inherits the app list; `/disconnect` removes the app's
+steps without changing the transcript. Loading or running a step can fail without breaking built-in cards.
+See the [app step contract](CONNECTED-APPS.md#card-steps).
+
 ## Not built
 
-- **Steps chosen per branch.** Every branch runs the same list. The plan is that a branch adds an app's steps
-  with a command, they run after the built-in ones in the order added, and a fork inherits them. The place for
-  them is the `steps` list in `src/page.ts`. [CONNECTED-APPS.md](CONNECTED-APPS.md#card-steps) is the plan.
 - **State in a card.** A card is its precard and nothing more, so it has no form fields or other state of its
   own. A form belongs on an app's own page, reached by a link.
 - **A step that reads several earlier cards.** Only the join of a result to its call exists, in `initial`. If
