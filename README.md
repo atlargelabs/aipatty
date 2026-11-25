@@ -16,8 +16,9 @@ thinking level, and its own cost; the page and the CLI show it as `$<branch> / $
 
 The model gets four tools for the tree: `list_branches`, `read_branch` (paging and case-insensitive text search over
 any branch), `fork_branch` (optionally with a first message the new branch starts on), and `set_model`. A branch it
-forks gets the parent's effective model. `set_model` on another branch queues the change if that branch is busy;
-on its own branch the tool still changes the model for the next model request. Forks at an
+forks gets the parent's effective model. `set_model` on another branch queues the model if that branch is busy;
+a combined model and thinking change still requires it to be idle. On its own branch the tool still changes the
+model for the next model request. Forks at an
 incomplete tool exchange are rejected: fork before the call or after its last result. A tool's default self-fork
 ends before its own call. If the optional first message cannot be admitted, the tool reports the created branch ID and
 the admission error; the branch remains available.
@@ -213,8 +214,10 @@ malformed commands return an error rather than going to chat. The command is not
 A valid switch (including `model set`) applies immediately on an idle branch. On a busy branch, the latest valid
 choice wins and applies when the branch goes idle, which may be **after already queued chat work**. It does not
 interrupt the current turn or tools or change a running Pi subprocess. The picker shows the effective model until
-it changes. A queued choice is kept only in memory: aborting the branch or restarting the server discards it.
-Invalid choices are rejected without replacing a queued one.
+it changes; to replace a queued choice with the already displayed model, type `/model` with that model instead.
+A queued choice is kept only in memory: aborting the branch or restarting the server discards it. Invalid choices
+are rejected without replacing a queued one. If a queued choice fails to apply, the server logs the error to stderr;
+check the effective model and retry the command when the server is healthy.
 
 `gpt-6.2-sol` is in the catalog bundled with pi-ai 1.6.0. A model newer than that catalog resolves only if the pi
 CLI has cached a newer catalog in the pi directory. If a branch's saved model is missing from both, the server

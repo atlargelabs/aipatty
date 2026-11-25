@@ -757,6 +757,7 @@ async function refreshBranches() {
 }
 
 async function selectBranch(id) {
+  notice("");
   app.branch = id;
   app.entries = [];
   app.before = null;

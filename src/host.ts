@@ -289,7 +289,7 @@ async function openOwnedHost(config: Config, options: HostOptions): Promise<Agen
       // Like waitForIdle, don't count independent background tasks as a turn.
       return { tasks, submissions, busy: tasks.some(t => !t.record.background) || submissions.length > 0 };
     };
-    type Selection = { change: { model: ModelRef; thinkingLevel?: ModelThinkingLevel } };
+    type Selection = { model: ModelRef };
     const pendingModels = new Map<ConversationId, Selection>();
     async function applyWhenIdle(target: Conversation, selection: Selection) {
       const current = () => pendingModels.get(target.id) === selection;
@@ -303,14 +303,14 @@ async function openOwnedHost(config: Config, options: HostOptions): Promise<Agen
           const { busy } = await branchWork(target);
           if (!current()) return false; // shutdown can clear the selection during the read
           if (busy) return true;
-          await target.configure(selection.change, ctx);
+          await target.configure({ model: selection.model }, ctx);
           pendingModels.delete(target.id);
           return false;
         }));
       } catch (error) {
         if (!current()) return;
         pendingModels.delete(target.id);
-        console.error(`Queued model switch failed for branch ${target.id}:`, error);
+        console.error(`Could not apply ${modelName(selection.model)} on branch ${target.id}. Retry the model selection when the server is healthy:`, error);
       }
     }
 
@@ -348,14 +348,16 @@ async function openOwnedHost(config: Config, options: HostOptions): Promise<Agen
         return onBranch(target, () => exclusive(async () => {
           const { busy, tasks, submissions } = await branchWork(target);
           const recovering = blocked.has(target.id);
-          const change = { model, thinkingLevel };
           if (!recovering && busy) {
             // waitForIdle() resumes Durable; never start that waiter while stale-model recovery has it paused.
             await assertRunning(target.id);
+            if (thinkingLevel !== undefined) {
+              throw new HttpError(409, "Cannot set model and thinking together on a busy branch; omit thinking to queue just the model");
+            }
             const pending = pendingModels.get(target.id);
-            if (pending) pending.change = change;
+            if (pending) pending.model = model;
             else {
-              const selection = { change };
+              const selection = { model };
               pendingModels.set(target.id, selection);
               void applyWhenIdle(target, selection);
             }
@@ -370,7 +372,7 @@ async function openOwnedHost(config: Config, options: HostOptions): Promise<Agen
             }
             for (const task of tasks) await harness.abortTask(task.record.id, ctx);
           }
-          await target.configure(change, ctx);
+          await target.configure({ model, thinkingLevel }, ctx);
           if (recovering) {
             blocked.delete(target.id);
             recovered.push(target);

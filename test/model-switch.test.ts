@@ -55,6 +55,7 @@ test("/model leaves the whole turn alone and applies the latest valid choice at 
   assert.equal(queued.status, 202);
   assert.deepEqual(await queued.json(), { modelSwitch: "queued", model: ref("faux-1") });
   assert.equal(await host.setModel(ref("last"), root), "queued");
+  await assert.rejects(host.setModel({ ...ref("faux-1"), thinkingLevel: "low" }, root), /omit thinking/);
   assert.equal((await post("/model faux/invalid")).status, 400);
   assert.deepEqual((await host.modelStatus()).model, ref("next"));
   assert.deepEqual((await host.harness.inspect(ctx)).submissions.map(s => s.id), [submissionId]);

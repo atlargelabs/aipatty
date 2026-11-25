@@ -149,7 +149,7 @@ export function treeExtension(getHost: () => AgentHost) {
   const setModel = defineTool({
     name: "set_model",
     description: "Set the model of a branch, from the IDs `aipatty models` lists. On this branch it applies from the next model request; "
-      + "on another branch it applies when that branch is idle.",
+      + "on another branch it applies when that branch is idle. Only include thinking if the target is idle or this branch.",
     parameters: obj({
       modelId: str({ minLength: 1 }),
       provider: opt(str({ minLength: 1, description: "Needed only when two providers have the model ID" })),
