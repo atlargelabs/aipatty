@@ -39,7 +39,7 @@ export const phonePage = `<!doctype html>
           </div>
           <div class="gym-actions"><button id="add-set" type="submit">Add set</button><button id="clear-set" type="button">Clear fields</button></div>
         </form>
-        <ol id="draft-sets" aria-label="Workout sets"></ol>
+        <ol id="draft-sets" aria-label="Workout sets" reversed></ol>
         <div class="gym-actions"><button id="save-workout" type="button">Save workout</button><button id="reset-workout" type="button" hidden>Discard draft</button></div>
       </fieldset>
       <p id="status" role="status"></p>
