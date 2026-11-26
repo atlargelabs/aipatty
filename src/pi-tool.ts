@@ -22,17 +22,23 @@ function result(outcome: RunOutcome): ToolExecutionResult {
 export function piExtension(getRuns: () => PiRuns) {
   const pi = defineTool({
     name: "pi",
-    description: "Run one Pi coding session on a bounded task in a fresh clone of atlargelabs/aipatty, aipatty's own repository, and wait "
-      + "for its result. Use it for every change that should become a PR: Pi opens an issue, a task branch and a PR, runs the "
-      + "checks, and has a crmanager delegate review the final commit. Only Steve merges. At most one run per conversation "
-      + "branch (including cleanup); other branches run independently. Every run starts fresh and sees nothing of this conversation or of earlier "
-      + "runs, so put all the context it needs in `task`: the goal, the relevant decisions, and what done means. "
-      + "The result reports the PR and its head commit as confirmed with GitHub, and whether the last review covered "
-      + "that commit; a result that says NOT REVIEWED or lists problems is not finished work. The run's cost is charged to this branch.",
+    description: "Run one Pi session on a bounded coding or research task and wait for its result.\n\n"
+      + "For research or coding without a PR, set `pr: false`. Pi can investigate, prototype, debug, or run tests without publishing anything. "
+      + "It uses a disposable checkout of `atlargelabs/aipatty` by default; set `clone: false` if the task doesn’t need the repository. "
+      + "For research, Pi can use `web_search` and `web_fetch` where configured, run independent delegates in parallel, or convene a "
+      + "`thinktank` delegate to compare perspectives. The workspace is deleted after the run, so ask for any code or small patch you want to keep in the report.\n\n"
+      + "For changes that should become a PR, use `pr: true` (the default). Pi works in a fresh clone of `atlargelabs/aipatty`, "
+      + "opens an issue, a task branch, and a PR, runs the checks, and has a `crmanager` delegate review the final commit. Only Steve merges. "
+      + "The result reports the PR and head commit as confirmed by GitHub and whether the last review covered that commit. "
+      + "A result that says `NOT REVIEWED` or lists problems is not finished work.\n\n"
+      + "Only one Pi run can be active per conversation branch at a time, including cleanup. Once cleanup completes, you can run Pi again "
+      + "on the same branch. Other branches can run independently. Each run starts fresh and sees neither this conversation nor previous runs, "
+      + "so include the goal, relevant context, and what done means in `task`. The run’s cost is charged to the calling branch.",
     parameters: obj({
       task: str({ minLength: 1, maxLength: 60_000, description: "The complete task and its context" }),
-      pr: opt(bool({ description: "Whether the run must end with a reviewed PR; default true. False investigates and reports, publishing nothing" })),
-      base: opt(str({ minLength: 1, maxLength: 200, description: "Branch, tag or commit to start from; default main" })),
+      pr: opt(bool({ description: "True (default) requires a reviewed PR. False allows research or scratch coding and returns a report; publish nothing." })),
+      clone: opt(bool({ description: "True (default) checks out atlargelabs/aipatty. False starts in a disposable scratch workspace; requires pr: false and no base." })),
+      base: opt(str({ minLength: 1, maxLength: 200, description: "Branch, tag or commit to check out when cloning; default main. Omit with clone: false." })),
       model: opt(str({ minLength: 1, maxLength: 200, description: `Pi's model as provider/id; default ${defaultModel}. Use claude-code/<model-id> only when explicitly requested.` })),
       thinking: opt(str({ description: "Thinking level: off, minimal, low, medium, high, xhigh or max; default high" })),
       timeoutMinutes: opt(int({ minimum: 1, maximum: maxMinutes, description: `Stop the run after this long; default ${defaultMinutes}` })),
@@ -42,14 +48,12 @@ export function piExtension(getRuns: () => PiRuns) {
     // The harness's own bound comes after the tool has clipped the summary and the lists.
     outputLimits: { maxBytes: 24_000, maxLines: 400, retain: "head" },
     async execute(args, api, context) {
-      const base = args.base ?? "main";
-      if (!/^[\w][\w./-]*$/.test(base) || base.includes("..")) throw new Error(`Not a branch, tag or commit: ${base}`);
       const model = args.model ?? defaultModel;
       if (!/^[\w][\w./:-]*$/.test(model)) throw new Error(`Not a model reference: ${model}`);
       const thinking = args.thinking ?? "high";
       if (!thinkingLevels.some(level => level === thinking)) throw new Error(`Expected a thinking level: ${thinkingLevels.join(", ")}`);
       return result(await getRuns().run({
-        conversationId: api.conversationId, taskId: api.taskId, task: args.task, pr: args.pr ?? true, base, model, thinking,
+        conversationId: api.conversationId, taskId: api.taskId, task: args.task, pr: args.pr ?? true, clone: args.clone, base: args.base, model, thinking,
         timeoutMs: (args.timeoutMinutes ?? defaultMinutes) * 60_000,
       }, context.abortSignal, runId => {
         // Publish only after the slot admits this exact call. Progress is best effort; the final details are durable.

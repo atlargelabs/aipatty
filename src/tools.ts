@@ -76,8 +76,9 @@ export function treeExtension(getHost: () => AgentHost) {
 
   const readBranch = defineTool({
     name: "read_branch",
-    description: "Read a branch's transcript, newest entries last, or search it for text (case-insensitive). "
-      + "Page backwards with `before`, the entry ID a previous result says to continue from.",
+    description: "Read the transcript of this or another branch, newest entries last, or search it for text (case-insensitive). "
+      + "Page backwards with `before`, the entry ID a previous result says to continue from. "
+      + "Use it, for example, to check a fork's progress or retrieve its result.",
     parameters: obj({
       branch: opt(int({ minimum: 1, description: "Branch ID; default this branch" })),
       query: opt(str({ minLength: 1, maxLength: 200, description: "Text to search for instead of reading in order" })),
@@ -113,9 +114,11 @@ export function treeExtension(getHost: () => AgentHost) {
 
   const forkBranch = defineTool({
     name: "fork_branch",
-    description: "Start a new branch, an independent workstream that shares this branch's history up to this call. "
-      + "It gets this branch's model. Optionally send it a first message, which it starts working on at once. "
-      + "Nothing reports back here: read it later with read_branch.",
+    description: "Start an independent branch that shares the source branch's history up to the fork point and inherits its model. "
+      + "By default, fork this branch just before this call. "
+      + "Use a fork to delegate independent work that can run in parallel; stay on this branch for sequential work. "
+      + "Optionally send a first message for the fork to work on at once. For delegated work, make it a self-contained task "
+      + "with a clear expected result. Forks don't report back automatically; use `read_branch` to check progress or retrieve the result.",
     parameters: obj({
       title: str({ minLength: 1, maxLength: 100, description: "A short title for the branch list" }),
       message: opt(str({ minLength: 1, description: "First message for the new branch" })),

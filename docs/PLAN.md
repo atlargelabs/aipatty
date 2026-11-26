@@ -124,7 +124,7 @@ changing the setting. See [INSTALL.md](INSTALL.md) for the first pinned deploy a
 | Tool | What it does |
 | --- | --- |
 | `read`, `write`, `edit`, `bash`, `codemode`, `tool_search` | pi-durable built-ins, working in `work/`. |
-| `pi` | Runs one Pi session on a bounded coding task in a fresh clone and returns the result to the calling branch. At most one run per conversation branch; branches run independently. Inside the run Pi may delegate the work, and always delegates the review of a PR. |
+| `pi` | Runs one Pi session on a bounded coding or research task and returns the result to the calling branch. A project checkout and a reviewed PR are the defaults; no-PR runs can also opt out of the checkout. One active run at a time per conversation branch, including cleanup; branches run independently. |
 | `fork_branch`, `list_branches`, `read_branch`, `set_model` | Tree management, plus paging and text search over any branch. |
 | `publish_page` | Publish immutable sandboxed HTML from any branch without configuration. Organize or delete links in the instance-wide [Pages library](INSTALL.md#pages), not in Git or the transcript. |
 | `mcp_status`, `mcp_reload`, `mcp_sign_in` | Later: server state, re-reading `mcp.json`, and OAuth by link. |
@@ -134,23 +134,27 @@ Pi does not receive aipatty's MCP tools.
 
 ## `pi` runs
 
-Every `pi` call starts a fresh session. A later run does not inherit the session or checkout. Published issues and PRs,
-the tool result, and operator logs remain available.
+Every `pi` call starts a fresh session. A later run does not inherit the session or workspace. The tool result
+and operator logs remain available, as do issues and PRs from publication runs.
 
 1. **Request and workspace:** reserve the calling conversation ID before any asynchronous work. Refuse a
    second call on that branch through startup, execution and cleanup. Other branches need no run coordination.
    Create `runs/<run-id>/` and write the run's checkpoint in `data/pi-runs/<run-id>.json` before spawning.
-   For a PR run, check the configured reviewer matches the running release. `atlargelabs/aipatty` is the only allowed repo for now. Clone it with the service account's GitHub access
-   and record the resolved base SHA.
+   For a PR run, check the configured reviewer matches the running release. By default, clone `atlargelabs/aipatty`
+   with the service account's GitHub access and resolve `base` to a commit (`main` by default). Only `pr: false`
+   may set `clone: false`, which forbids `base` and starts in a private scratch directory with an empty local Git
+   repository, no remotes, and no project clone or base resolution. This keeps shared delegates working on the
+   scratch directory, even if the operator put the runs directory inside a checkout.
 2. **Launch:** use the pinned CLI in one-shot JSON mode (`--mode json --no-session`). Collect structured events and
    stderr separately. Use `openai/gpt-6.2-sol` unless the call names another model. Disable automatic loading of
    checkout settings and executable resources, extensions, and MCP, then load the pinned
    [top-level extensions](#pi-extensions) explicitly. Aipatty can ask Pi to delegate particular work or leave
    that to Pi; the tool does not map a task to a profile.
-   Give Pi the git-hygiene skill and issue workflow: every change has an issue, a task branch, and a PR linking the
-   issue, and Pi runs `npm run check` and `npm test` before it pushes. Pi passes the same rules to any writable
-   delegate. Only Steve merges.
-3. **Review:** when the change is committed, Pi delegates a review to a `crmanager`: `/review branch main` before
+   For `pr: true`, give Pi the git and issue workflow: every change has an issue, a task branch, and a PR linking
+   the issue, and Pi runs `npm run check` and `npm test` before it pushes. Only Steve merges. For `pr: false`, in
+   either workspace, allow local edits and tests but require a report and no publication. Pi passes the same rules
+   to any writable delegate. Workspace choice is not a change to authentication or a sandbox.
+3. **PR review:** when the change is committed, Pi delegates a review to a `crmanager`: `/review branch main` before
    a PR exists, `/review pr <number>` after. A `crmanager` is read-only, runs no tests and returns findings only.
    Important findings are those tagged P0 or P1, and any that give the verdict "needs attention". Pi fixes them,
    or continues the `prmanager` job that opened the PR, reruns the checks, and starts a fresh `crmanager` on the
@@ -175,7 +179,7 @@ the tool result, and operator logs remain available.
    settled result. Never replay a call or repeat publication automatically. Known cleanup failures hold only
    their branch; ambiguous ownership blocks new runs and preserves the records for inspection.
 
-Deferred until something needs them: a read-only research mode and repos other than aipatty.
+Deferred until needed: managed checkouts of repos other than aipatty.
 
 ## Remote access
 

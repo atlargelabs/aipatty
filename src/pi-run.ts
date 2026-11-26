@@ -9,7 +9,7 @@ import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import type { Config } from "./config.ts";
 import { stageDelegates } from "./pi-delegates.ts";
-import { instructions, taskPrompt } from "./pi-prompt.ts";
+import { instructions, maxSummary, taskPrompt, type PromptInput } from "./pi-prompt.ts";
 import { addUsage, githubLink, readReport, RunTrace, usageKey, type JobUsage, type Review } from "./pi-trace.ts";
 import { readPiRunSnapshot, runLogParts } from "./pi-run-view.ts";
 import { runStatuses, type PiRunSnapshot, type RunStatus } from "./protocol.ts";
@@ -54,10 +54,13 @@ export interface RunRequest {
   task: string;
   /** Whether the run must end with a PR. */
   pr: boolean;
-  base: string;
+  /** Defaults to a checkout; false uses a scratch workspace and requires pr: false. */
+  clone?: boolean;
+  /** Only for a checkout; defaults to main. */
+  base?: string;
   model: string;
   thinking: string;
-  /** From the start of the run, cloning included. */
+  /** From the start of the run, workspace setup included. */
   timeoutMs: number;
 }
 
@@ -110,7 +113,6 @@ interface JobManifest {
   workspace?: { source?: string };
 }
 
-const maxSummary = 6_000;
 const maxItems = 20;
 const maxItem = 600;
 const defaultPollMs = 2_000;
@@ -945,7 +947,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         }
       });
     };
-    // The deadline covers the whole run, cloning included.
+    // The deadline covers the whole run, workspace setup included.
     const timer = setTimeout(() => {
       run.stop ??= "timed_out";
       run.kill();
@@ -960,6 +962,10 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
     // pi-web-search must resolve its config from the trusted Pi agent dir, never a checkout-relative override.
     delete env.PI_WEB_SEARCH_CONFIG;
     delete env.PATTY_CLAUDE_CODE_MODEL;
+    if (request.clone === false) {
+      // Scratch Git operations must not inherit another checkout's worktree or storage locations.
+      for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"]) delete env[name];
+    }
 
     /** Run a setup command as part of the run: in its own process group, recorded, and stopped with the run. */
     const command = async (file: string, args: string[], cwd?: string): Promise<string> => {
@@ -991,27 +997,35 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
         const problem = await reviewerProblem(pi);
         if (problem) problems.push(problem);
       }
-      const repo = join(saved.workspace, "repo");
-      let baseSha = "";
-      if (!problems.length) try {
-        await command(pi.git, ["clone", "--quiet", pi.repoUrl, repo]);
-        // Resolve the base to a commit: a name that is only a file in the tree is not one.
-        const names = [`refs/remotes/origin/${request.base}`, `refs/tags/${request.base}`, ...(/^[0-9a-f]{7,40}$/.test(request.base) ? [request.base] : [])];
-        for (const name of names) {
-          baseSha = (await command(pi.git, ["rev-parse", "--verify", "--quiet", `${name}^{commit}`], repo).catch(() => "")).trim();
-          if (baseSha) break;
+      const cwd = join(saved.workspace, request.clone === false ? "scratch" : "repo");
+      let checkout: PromptInput["checkout"];
+      if (!problems.length && !run.stop) {
+        if (request.clone === false) {
+          await mkdir(cwd, { mode: 0o700 });
+          // Shared delegates can run without Git but prefer a discovered worktree to cwd. Stop discovery here,
+          // even if the operator put runsDir inside another checkout. No templates, history, or remote.
+          await command(pi.git, ["init", "--quiet", "--template=", "."], cwd);
+        } else {
+          const base = request.base ?? "main";
+          try {
+            await command(pi.git, ["clone", "--quiet", pi.repoUrl, cwd]);
+            // Resolve the base to a commit: a name that is only a file in the tree is not one.
+            const names = [`refs/remotes/origin/${base}`, `refs/tags/${base}`, ...(/^[0-9a-f]{7,40}$/.test(base) ? [base] : [])];
+            let sha = "";
+            for (const name of names) {
+              sha = (await command(pi.git, ["rev-parse", "--verify", "--quiet", `${name}^{commit}`], cwd).catch(() => "")).trim();
+              if (sha) break;
+            }
+            if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("no such branch, tag or commit");
+            const cloned = (await command(pi.git, ["rev-parse", "--verify", "HEAD"], cwd)).trim();
+            if (cloned !== sha) await command(pi.git, ["checkout", "--quiet", "--detach", sha], cwd);
+            checkout = { base, sha };
+          } catch (error) {
+            if (!run.stop) problems.push(`Could not clone ${pi.repo} at ${base}: ${clip(message(error), 600)}`);
+          }
         }
-        if (!/^[0-9a-f]{40}$/.test(baseSha)) {
-          baseSha = "";
-          throw new Error("no such branch, tag or commit");
-        }
-        const cloned = (await command(pi.git, ["rev-parse", "--verify", "HEAD"], repo)).trim();
-        if (cloned !== baseSha) await command(pi.git, ["checkout", "--quiet", "--detach", baseSha], repo);
-      } catch (error) {
-        baseSha = "";
-        if (!run.stop) problems.push(`Could not clone ${pi.repo} at ${request.base}: ${clip(message(error), 600)}`);
       }
-      if (baseSha && !run.stop) {
+      if (!problems.length && !run.stop) {
         await mkdir(pi.agentDir, { recursive: true, mode: 0o700 });
         await directories(pi.agentDir, jobStoreParts, true);
         const delegateLogs = await directories(await archiveDirectory(saved.runId), ["delegates"], true);
@@ -1019,7 +1033,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
           (args, cwd) => command(pi.git, args, cwd));
         if (run.stop) throw new Error("the run was stopped");
         const input = {
-          runId: saved.runId, repo: pi.repo, branch: request.conversationId, task: request.task, base: request.base, baseSha,
+          runId: saved.runId, repo: pi.repo, branch: request.conversationId, task: request.task, checkout,
           pr: request.pr, timeoutMinutes: Math.max(1, Math.round(request.timeoutMs / 60_000)),
         };
         const rules = join(saved.logDir, "instructions.md");
@@ -1035,7 +1049,7 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
           "--no-approve", "--no-extensions", "-e", extension, "-e", pi.webFetchExtension, "-e", pi.webSearchExtension,
           "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-mcp", "--append-system-prompt", rules,
           ...(claude === undefined ? [] : ["--provider", "claude-code", "-e", pi.claudeCodeExtension]),
-        ], { cwd: repo, env: claude === undefined ? env : {
+        ], { cwd, env: claude === undefined ? env : {
           ...env, PATTY_CLAUDE_CODE_MODEL: claude, PATH: env.PATH?.split(delimiter).filter(isAbsolute).join(delimiter) || "/usr/bin:/bin",
         }, stdio: ["pipe", "pipe", "pipe"], detached: true });
         launched = true;
@@ -1190,6 +1204,12 @@ export async function openPiRuns(config: Config): Promise<PiRuns> {
       return run ? Date.parse(run.saved.startedAt) : undefined;
     }),
     async run(request, signal, onStart) {
+      if (request.clone === false) {
+        if (request.pr) throw new Error("clone: false requires pr: false.");
+        if (request.base !== undefined) throw new Error("Omit base when clone is false; there is no checkout.");
+      } else if (request.base !== undefined && (!/^[\w][\w./-]*$/.test(request.base) || request.base.includes(".."))) {
+        throw new Error(`Not a branch, tag or commit: ${request.base}`);
+      }
       if (closed) throw new Error("aipatty is shutting down");
       const branch = request.conversationId;
       const current = active.get(branch);

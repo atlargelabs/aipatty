@@ -537,7 +537,7 @@ test("a branch reserves its Pi slot synchronously during startup, rejects same-b
   const runs = await openPiRuns(config);
   t.after(() => runs.close());
   let id = "";
-  const first = runs.run(request({ conversationId: 3, pr: false }), undefined, runId => { id = runId; });
+  const first = runs.run(request({ conversationId: 3, pr: false, clone: false, base: undefined }), undefined, runId => { id = runId; });
   // No await between the calls, as when the tool calls arrive in one model batch.
   await assert.rejects(runs.run(request({ conversationId: 3, taskId: 102 })),
     new RegExp(`Pi run ${id} is still active on branch 3`));
@@ -547,7 +547,10 @@ test("a branch reserves its Pi slot synchronously during startup, rejects same-b
   assert.equal(await runs.settled(101, 4), undefined, "a different branch cannot settle the admitted call");
   assert.equal(runs.hasActive(), true);
   assert.equal((await runs.settled(101, 3))?.status, "aborted");
-  assert.equal((await first).status, "aborted");
+  const aborted = await first;
+  assert.equal(aborted.status, "aborted");
+  assert.deepEqual(await readdir(config.runsDir), []);
+  assert.ok(existsSync(join(aborted.logDir, "events.jsonl")));
   assert.equal(runs.hasActive(), false);
   assert.deepEqual(await pendingRecords(config), []);
   await scenario(config, [assistant(report({ pr: null, issue: null })), settled]);
@@ -825,13 +828,110 @@ test("the pi tool returns the outcome to the calling branch and charges the run 
   assert.match(await lastText(host), /Not a branch, tag or commit/);
   await send('call pi {"task":"x","thinking":"loud"}');
   assert.match(await lastText(host), /Expected a thinking level/);
+  for (const args of [',"clone":false', ',"clone":false,"pr":true']) {
+    await send(`call pi {"task":"x"${args}}`);
+    assert.match(await lastText(host), /clone: false requires pr: false/);
+  }
+  await send('call pi {"task":"x","pr":false,"clone":false,"base":"main"}');
+  assert.match(await lastText(host), /Omit base when clone is false/);
   assert.equal((await launches(config)).length, 1);
+  assert.equal((await readdir(join(config.dataDir, "logs/runs"))).length, 1, "validation does not admit a run");
 
   // A failed run is an error result that still charges what it spent.
   await scenario(config, [assistant("", 0.25, "error", "boom"), settled]);
   await send('call pi {"task":"Again."}');
   assert.match(await lastText(host), /Pi run \S+: failed[^]*No PR was found/);
   assert.equal((await host.branch(root)).cost, 3);
+
+  // No-PR investigation still clones by default, and supports a selected base without any GitHub confirmation.
+  const ghCalls = join(config.dataDir, "fake-gh-calls.txt");
+  await rm(ghCalls);
+  const git = (...args: string[]) => exec("git", ["-c", "user.name=test", "-c", "user.email=test@example.invalid", ...args], { cwd: config.pi.repoUrl });
+  const baseSha = (await git("rev-parse", "HEAD")).stdout.trim();
+  await git("tag", "fixture-base");
+  await git("commit", "--quiet", "--allow-empty", "-m", "advance default branch past fixture-base");
+  await scenario(config, [assistant(report({ pr: null, issue: null })), settled], { expectedHead: baseSha });
+  await send('call pi {"task":"Investigate the repo.","pr":false,"base":"fixture-base"}');
+  assert.match(await lastText(host), /Pi run \S+: completed/);
+  const investigation = (await launches(config)).at(-1)!;
+  assert.equal(investigation.cwd.endsWith("/repo"), true);
+  assert.ok(investigation.prompt.includes(`checked out here at \`fixture-base\` (${baseSha}).`));
+  const rules = await readFile(investigation.argv[investigation.argv.indexOf("--append-system-prompt") + 1], "utf8");
+  assert.match(rules, /Publish nothing\.[^]*edit and run code in the disposable checkout/);
+  assert.doesNotMatch(rules, /checks the links against GitHub|survive.*through the PR/);
+  assert.ok(!existsSync(ghCalls));
+});
+
+test("clone-free Pi bootstraps from scratch and runs shared delegates without a project remote or base", { timeout: 40_000 }, async t => {
+  const config = await setup(t);
+  config.runsDir = join(config.pi.repoUrl, "runs"); // An enclosing checkout must not become the delegates' workspace.
+  config.pi.repoUrl = join(config.dataDir, "inaccessible-origin");
+
+  const gitCalls = join(config.dataDir, "git-calls.txt");
+  const git = join(config.dataDir, "git");
+  await writeFile(git, `#!/bin/sh
+printf '%s\\n' "$1" >> ${JSON.stringify(gitCalls)}
+case "$1" in init|--git-dir=./.no-git) exec git "$@" ;; esac
+exit 1
+`, { mode: 0o700 });
+  // Keep the coordinator's Unix socket path short and exercise the real CLI and staged delegates offline.
+  const home = await mkdtemp("/tmp/aipatty-pi-");
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const launcher = join(home, "pi.mjs");
+  const faux = join(checkout, "test/fixtures/pi-scratch-smoke.ts");
+  await writeFile(launcher, `
+    Object.assign(process.env, { HOME: ${JSON.stringify(home)}, TMPDIR: ${JSON.stringify(home)}, PI_OFFLINE: "1" });
+    if (!process.env.PI_DELEGATE_BOOTSTRAP) process.argv.splice(2, 0, "-e", ${JSON.stringify(faux)});
+    await import(${JSON.stringify(readConfig([], {}).pi.cli)});`);
+  Object.assign(config.pi, { cli: launcher, git });
+  const settings = JSON.stringify({ delegates: {
+    profiles: Object.fromEntries(["worker", "thinktank", "thinker"].map(profile => [profile, { model: "fixture/coding" }])),
+    extensions: [{ path: faux, readOnly: true, tools: [] }],
+  } });
+  await writeFile(join(config.pi.agentDir, "settings.json"), settings);
+
+  const host = await openHost(config);
+  t.after(() => host.close());
+  const root = (await host.conversation("root"))!;
+  await (await host.submit(root, { type: "input", content: 'call pi {"task":"Compare two perspectives on a scratch prototype.","pr":false,"clone":false,"model":"fixture/coding","thinking":"off"}' })).wait(ctx);
+  const text = await lastText(host);
+  const runId = /Pi run (\S+): completed/.exec(text)?.[1];
+  assert.ok(runId, text);
+  const logDir = join(config.dataDir, "logs/runs", runId);
+  const { outcome } = JSON.parse(await readFile(join(logDir, "result.json"), "utf8")) as { outcome: RunOutcome };
+  assert.equal(outcome.summary, "Offline scratch run finished.");
+  assert.equal(outcome.review.status, "none");
+  assert.equal(outcome.usageComplete, true);
+  assert.equal(outcome.pr, undefined);
+  assert.equal(outcome.issue, undefined);
+  assert.equal(await readFile(gitCalls, "utf8"), "init\n--git-dir=./.no-git\n");
+  assert.ok(!existsSync(join(config.dataDir, "fake-gh-calls.txt")));
+
+  const scratch = join(await realpath(config.runsDir), runId, "scratch");
+  const events = await readFile(join(logDir, "events.jsonl"), "utf8");
+  assert.equal(JSON.parse(events.split("\n")[0]).cwd, scratch);
+  const prompt = await readFile(join(logDir, "prompt.md"), "utf8");
+  assert.match(prompt, /Fresh scratch workspace; no project checkout or base revision\./);
+  assert.match(prompt, /a report only; publish nothing/);
+  assert.doesNotMatch(prompt, /checked out here|atlargelabs\/aipatty/);
+  const rules = await readFile(join(logDir, "instructions.md"), "utf8");
+  assert.match(rules, /scratch directory, not a project checkout[^]*no commits or remotes/);
+  assert.match(rules, /Publish nothing\.[^]*"issue": null, "pr": null/);
+  assert.doesNotMatch(rules, /checks the links against GitHub|Git and issue workflow/);
+
+  const logs = join(logDir, "delegates");
+  const jobs = await Promise.all((await readdir(logs)).map(async id => {
+    assert.ok((await readdir(join(logs, id))).some(file => file.startsWith("child-")));
+    assert.deepEqual((await readdir(join(config.pi.agentDir, "delegates/jobs", id))).sort(), ["discarded", "job.json"]);
+    const job = JSON.parse(await readFile(join(logs, id, "job.json"), "utf8"));
+    assert.equal(job.execution, "stopped", JSON.stringify(job));
+    assert.equal(job.workspace.source, scratch);
+    assert.equal(job.workspace.kind, "shared");
+    return job;
+  }));
+  assert.deepEqual(jobs.map(job => job.summary).sort(), ["Read the prototype.", "Read the prototype.", "Synthesized perspectives.", "Wrote the prototype."]);
+  assert.deepEqual(await readdir(config.runsDir), []);
+  assert.deepEqual(await pendingRecords(config), []);
 });
 
 test("the model's own tools work in the work directory", { timeout: 30_000 }, async t => {

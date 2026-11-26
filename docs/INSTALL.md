@@ -82,7 +82,11 @@ ROOT="$HOME/aipatty"
    ```
 
    The host checks this path resolves to the running release's pinned file before cloning for a PR run.
-   Only `crmanager` loads the reviewer. Non-PR investigation does not require this setting.
+   Only `crmanager` loads the reviewer. The host does not require this setting for `pr: false` runs, which
+   must not push or create/update issues, PRs or remote branches. These runs still clone the project unless
+   `clone: false` is set and `base` is omitted. The scratch workspace has no project history, remotes or
+   base lookup; its empty local Git repository keeps Git operations and shared delegates from discovering
+   an enclosing checkout. No-PR is a workflow rule, not a security boundary.
 
 ### Enable ten delegates per Pi
 
@@ -117,7 +121,7 @@ The option derives `$ROOT/data` (or `$ROOT/faux` in faux mode), `$ROOT/pi`, `$RO
 The database, ownership lock, and run logs live in the data directory; Pi auth, model cache, settings and jobs
 live in the Pi directory. The pinned CLI and extensions live in the release. Model scratch lives in `work`;
 disposable Pi workspaces live in `runs`. The browser's run pane reads a bounded excerpt from `data/logs/runs/`
-(or `logs/runs/` under the configured data directory), not the disposable clone. Removing an archive leaves the
+(or `logs/runs/` under the configured data directory), not the disposable workspace. Removing an archive leaves the
 chat intact but removes its replay. An individual directory option overrides its derived path. Omitting the
 root leaves the legacy defaults unchanged. The option is server-only; it adds no environment variable or API.
 The server forwards its configured Pi directory to Pi subprocesses; bootstrap commands must set it explicitly.
@@ -180,8 +184,10 @@ To remove the default HTTPS route, run `tailscale serve --https=443 off` on the 
 Each release brings its own pinned `just-web-fetch`, `pi-web-search` and `pi-claude-code` via
 `npm ci --ignore-scripts`. Rollback uses the previous release's versions. Do not register them with `pi install`,
 Pi's `packages` settings, or delegate profiles. The top-level `pi` tool supplies absolute `-e` paths to its
-release's entries. Ambient extension and checkout resource discovery stay off. These tools are not available
-in aipatty's durable conversations, delegate jobs, or `crmanager` reviews.
+release's entries, including for `pr: false, clone: false`. The managed copy of the pinned `delegates` extension
+is staged from local release files; it does not clone the project. Ambient extension and checkout resource
+discovery stay off. The top-level web tools are not automatically inherited by delegates, and are not available
+in aipatty's durable conversations or `crmanager` reviews.
 
 - **`web_fetch`:** provision Chrome/Chromium for the service account. The tool looks in standard install
   locations or uses `PUPPETEER_EXECUTABLE_PATH` (a trusted absolute executable path). Install `trafilatura`

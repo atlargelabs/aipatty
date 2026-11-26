@@ -30,21 +30,31 @@ have the permissions of the user the server runs as.
 
 ## `pi` runs
 
-Work meant for a PR goes through the `pi` tool. Each call runs one session of the Pi CLI pinned in `package.json`,
-in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits for it.
+The `pi` tool runs one session of the Pi CLI pinned in `package.json` and waits for its report. The default
+`pr: true` uses a fresh checkout of `atlargelabs/aipatty` and requires a reviewed PR. Set `pr: false` to
+investigate, prototype, debug or run tests without publishing. This still checks out the repo by default.
+For research or scratch coding that does not need the repo, set both `pr: false` and `clone: false`, and
+omit `base`. Otherwise, `base` selects the checkout's branch, tag or commit (default `main`).
 
-- **One per conversation branch.** A second call in the same branch is refused during startup, execution and
-  cleanup. Different branches start and finish independently in separate clones; there is no global run cap
-  or coordination of work in GitHub.
+Scratch mode starts in a private disposable directory with an empty local Git repository (no commits or
+remotes), so Git and shared-workspace delegates do not pick up an enclosing checkout. There is no project
+clone or base lookup. `delegate_parallel` and the `thinktank` profile work with shared-workspace delegates;
+clone-based profiles need a committed checkout. Ask Pi to include code or a small patch in its report if it
+should outlast the workspace. Neither no-PR mode requires a review, and Pi is told not to publish in either
+mode. This is a workflow rule, not a sandbox or a change to the service account's permissions.
+
+- **One active run per conversation branch.** A second call in the same branch is refused during startup, execution
+  and cleanup. Once cleanup completes, the same branch can start another run. Different branches start and finish
+  independently in separate workspaces; there is no global run cap or coordination of work in GitHub.
 - **Launch.** The CLI runs in one-shot JSON mode with no session. It explicitly loads the release's pinned
   `delegates`, `just-web-fetch` (managed `web_fetch`) and `pi-web-search` (`web_search`, plus `url_context` on
-  supported models). The default stays `openai/gpt-6.2-sol`. An explicit `model: "claude-code/<model-id>"`
+  supported models). Staging the release's pinned delegate code is local and happens even without a project clone. The default stays `openai/gpt-6.2-sol`. An explicit `model: "claude-code/<model-id>"`
   opts that run into the experimental Claude Code provider; there is no automatic Claude discovery or fallback
   on OpenAI runs. Nothing loads by discovery: no checkout settings, extensions, skills, context files or MCP
   servers. Pi shares the server's Pi directory, sign-in and `delegates` settings. Set `delegates.maxParallel`
   to `10` in that directory's `settings.json` for ten concurrent top-level delegates **per Pi** (not a shared
   pool or a cap on all nested jobs). See [the operator setup](docs/INSTALL.md#enable-ten-delegates-per-pi).
-- **Rules.** Pi is told the git and issue workflow: an issue, a task branch and a PR that links the issue;
+- **Rules for PR runs.** Pi is told the git and issue workflow: an issue, a task branch and a PR that links the issue;
   `npm run check` and `npm test` before every push; a `crmanager` review of the final commit, repeated until it
   has no P0 or P1 finding; and that only Steve merges.
 - **Result.** The tool returns a status, Pi's summary, the PR and issue, the last review, the cost, and anything
@@ -63,7 +73,7 @@ in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits fo
 - **Cost.** Pi's spend and its delegates' is charged to the calling branch, once. When a run is cut off, the
   cost includes what its unfinished delegate jobs had recorded, and is marked incomplete.
 - **Abort and timeout.** Aborting the branch, or the run's time limit (60 minutes unless the call says otherwise,
-  counted from the start of the clone), stops Pi and the processes it started, its delegates included. The result
+  including workspace setup), stops Pi and the processes it started, its delegates included. The result
   reports what the run had done. Once Pi has finished and the host is checking the result, the run ends as it
   ended. Stopping one branch does not stop another's run.
 - **Cleanup.** New runs write events, error output and prompts to `logs/runs/<run-id>/` in the data directory.
@@ -80,17 +90,17 @@ in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits fo
   Preserve the records and workspaces as evidence. A later cleanup may add spend to `result.json`; if the
   call's result was already committed in its branch, that spend is not charged there again.
 
-A run needs `git`, `gh`, a GitHub login for the account running the server, and the Pi sign-in. For a PR run,
-`delegates.reviewExtension` in the selected Pi directory's `settings.json` must be an absolute path to the
-running release's `node_modules/@earendil-works/pi-review/review.ts`. The host checks it before cloning; a
-missing path or an older or shared copy is refused. Only the `crmanager` job loads pi-review. Non-PR runs do
-not require this setting. See [the runbook](docs/INSTALL.md) for the exact path and rollout steps.
+A run needs local `git` and sign-in for its Pi model. Checkout-based runs also need GitHub read access via
+SSH; PR runs need `gh` and a GitHub login with write access. Scratch runs need neither `gh` nor GitHub access
+for setup. For a PR run, `delegates.reviewExtension` in the selected Pi directory's `settings.json` must be an
+absolute path to the running release's `node_modules/@earendil-works/pi-review/review.ts`. The host checks it
+before cloning; a missing path or an older or shared copy is refused. Only the `crmanager` job loads pi-review.
+Non-PR runs do not require this setting. See [the runbook](docs/INSTALL.md) for the exact path and rollout steps.
 
-Web and Claude Code extensions are for the top-level coding run only, not conversations, delegates, or the
-reviewer. Fetch needs operator-installed Chrome/Chromium, trafilatura, and a filtering egress proxy; managed
-runs do not load fetch hooks.
-Search needs a provider/account with native search and can incur separate usage. Claude Code needs its own CLI
-and service-account subscription login. See [optional coding extensions](docs/INSTALL.md#optional-coding-extensions)
+The managed web and Claude Code extensions are loaded for the top-level Pi run, not for conversations or the
+reviewer. Delegates do not inherit the top-level web tools. Fetch needs operator-installed Chrome/Chromium,
+trafilatura, and a filtering egress proxy; managed runs do not load fetch hooks. Search needs a provider/account
+with native search and can incur separate usage. Claude Code needs its own CLI and service-account subscription login. See [optional coding extensions](docs/INSTALL.md#optional-coding-extensions)
 for prerequisites, configuration, and data/usage boundaries.
 
 A run's processes are identified by a remembered PID and start time or by a marker in their environment.
@@ -132,7 +142,7 @@ still change while the excerpt is frozen. Scroll back to the bottom or use **Jum
 snapshot and resume following. The pane stops checking when it receives a final snapshot or you close it or
 switch branches. This is a read-only viewer, not a terminal: you can't send input to Pi from it.
 
-Refused requests have no run. A finished run opens at the bottom too and remains readable after its clone is
+Refused requests have no run. A finished run opens at the bottom too and remains readable after its workspace is
 deleted if its archive is retained. Output depends on the available logs and is a bounded excerpt, not a complete
 transcript. It can contain sensitive information printed by the run. Anyone allowed to reach aipatty, including
 through Tailscale Serve if enabled, can read these archives.
