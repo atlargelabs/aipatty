@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
@@ -14,7 +14,9 @@ import { checkout, fauxConfig, fixture } from "./helpers.ts";
 test("Gym history preview and Save workout through the real phone page", { timeout: 60_000 }, async t => {
   const dir = await fixture(t);
   const writes: unknown[] = [];
+  const phoneScript = await readFile(join(checkout, "src/apps/gym/phone.js"), "utf8");
   let hideOnce: string | undefined;
+  let blockSaveClick = false;
   const host = await openHost(fauxConfig(dir), { apps: [{
     ...gymApp,
     open(context) {
@@ -27,6 +29,13 @@ test("Gym history preview and Save workout through the real phone page", { timeo
         }
         if (path === "/api/workouts/wrong-route") throw new HttpError(404, "Gym page not found");
         if (req.method === "PUT" && path === "/api/workouts/rejected-save") throw new HttpError(503, "Synthetic save unavailable");
+        if (blockSaveClick && path === "/phone.js") {
+          res.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8" });
+          res.end(phoneScript + `\n document.addEventListener("click", event => {
+            if (event.target.closest("#save-workout")) event.stopImmediatePropagation();
+          }, true);`);
+          return;
+        }
         return app.handle(req, res, path);
       } };
     },
@@ -78,9 +87,14 @@ test("Gym history preview and Save workout through the real phone page", { timeo
     assert.deepEqual(writes, browserWrites, "skips and conflicts do not write");
 
     await assert.rejects(run([{ ...first, id: "rejected-save" }, untouched], "--save"), {
-      stderr: /Workout #1: Gym Save workout failed: Synthetic save unavailable/,
+      stderr: /Workout #1: Gym Save workout failed \(HTTP 503\): Synthetic save unavailable/,
     });
     assert.equal((await get(untouched.id)).status, 404, "a failed click stops the run");
-    assert.deepEqual(writes, [...browserWrites, ["PUT", workoutPath("rejected-save"), "same-origin"]]);
+    const attemptedWrites = [...browserWrites, ["PUT", workoutPath("rejected-save"), "same-origin"]];
+    assert.deepEqual(writes, attemptedWrites);
+
+    blockSaveClick = true;
+    await assert.rejects(run([untouched], "--save"), { stderr: /Workout #1: No confirmed response from Save workout/ });
+    assert.deepEqual(writes, attemptedWrites, "blocking the real click handler prevents all mutation requests");
   } finally { await api.close(); await host.close(); }
 });

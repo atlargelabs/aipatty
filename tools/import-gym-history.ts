@@ -33,13 +33,15 @@ function message(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
+const workoutUrl = (phoneUrl: string, id: string) => new URL(`api/workouts/${id}`, phoneUrl).href;
+
 async function readExisting(phoneUrl: string, id: string) {
-  const url = new URL(`api/workouts/${id}`, phoneUrl);
-  const response = await fetch(url, { redirect: "error", signal: AbortSignal.timeout(timeout) });
+  const response = await fetch(workoutUrl(phoneUrl, id), { redirect: "error", signal: AbortSignal.timeout(timeout) });
   const body: unknown = await response.json().catch(() => {
     throw new Error(`Could not read Gym's workout JSON (HTTP ${response.status}).`);
   });
-  // A missing app, proxy route, or login page is not a missing workout.
+  // The current route only distinguishes missing workouts by this message. A changed message,
+  // missing app, or proxy 404 fails closed rather than allowing an unsafe upsert.
   if (response.status === 404 && isDeepStrictEqual(body, { error: "Workout not found. Reload Gym to refresh the list." })) return undefined;
   if (response.status !== 200) throw new Error(`Gym workout GET failed (HTTP ${response.status}).`);
   return body;
@@ -53,12 +55,14 @@ async function matchesExisting(phoneUrl: string, workout: Workout): Promise<bool
   return true;
 }
 
+const editorReady = () => document.querySelector<HTMLFieldSetElement>("#workout-editor")?.disabled === false;
+
 async function restoreDraft(page: Page, phoneUrl: string, workout: Workout) {
   // Only touch localStorage in this new browser context, on the Gym page itself.
   await page.evaluate(draft => localStorage.setItem("gym-draft", draft), JSON.stringify({ ...workout, dateDirty: true }));
   const response = await page.reload();
   if (!response?.ok() || page.url() !== phoneUrl) throw new Error("Could not reload the Gym phone page.");
-  await page.waitForFunction(() => document.querySelector<HTMLFieldSetElement>("#workout-editor")?.disabled === false);
+  await page.waitForFunction(editorReady);
   const restored = await page.evaluate(() => {
     const draft = JSON.parse(localStorage.getItem("gym-draft") ?? "null");
     const date = document.querySelector<HTMLInputElement>("#workout-date");
@@ -66,6 +70,23 @@ async function restoreDraft(page: Page, phoneUrl: string, workout: Workout) {
     return { id: draft.id, date: date.value, sets: draft.sets };
   });
   if (!isDeepStrictEqual(restored, workout)) throw new Error("The phone page did not restore the intended draft; no Save was clicked.");
+}
+
+async function clickSave(page: Page, phoneUrl: string, workout: Workout) {
+  const url = workoutUrl(phoneUrl, workout.id);
+  // Observe (never send) the page's request. The confirmation wording is not part of verification.
+  const [response] = await Promise.all([
+    page.waitForResponse(response => response.url() === url && response.request().method() === "PUT"),
+    page.getByRole("button", { name: "Save workout", exact: true }).click(),
+  ]).catch(error => { throw new Error(`No confirmed response from Save workout: ${message(error)}`); });
+  await page.waitForFunction(editorReady); // Let the page finish clearing this draft before staging another.
+  if (!response.ok()) {
+    const status = await page.locator("#status").textContent();
+    throw new Error(`Gym Save workout failed (HTTP ${response.status()}): ${status?.trim() || "No page status."}`);
+  }
+  if (!isDeepStrictEqual(await readExisting(phoneUrl, workout.id), workout)) {
+    throw new Error("Gym responded to Save, but read-back did not match the source.");
+  }
 }
 
 async function apply(phoneUrl: string, workouts: Workout[], existing: boolean[]) {
@@ -81,12 +102,7 @@ async function apply(phoneUrl: string, workouts: Workout[], existing: boolean[])
       try {
         await restoreDraft(page, phoneUrl, workout);
         if (await matchesExisting(phoneUrl, workout)) continue; // Check again immediately before the upsert.
-        await page.getByRole("button", { name: "Save workout", exact: true }).click();
-        const status = await page.locator("#status").filter({ hasText: /\S/ }).textContent();
-        if (status !== "Workout saved.") throw new Error(`Gym Save workout failed: ${status}`);
-        if (!isDeepStrictEqual(await readExisting(phoneUrl, workout.id), workout)) {
-          throw new Error("Gym reported a save, but read-back did not match the source.");
-        }
+        await clickSave(page, phoneUrl, workout);
         saved++;
         console.log(`Workout #${i + 1}: saved and verified.`);
       } catch (error) {
@@ -109,8 +125,12 @@ async function main() {
     throw new Error("--origin must be the base HTTP(S) origin of the Gym page, without credentials or a path.");
   }
   const phoneUrl = origin.origin + "/apps/gym/";
-  const text = await readFile(positionals[0]).then(bytes => new TextDecoder("utf-8", { fatal: true }).decode(bytes))
-    .catch(() => { throw new Error("Could not read the history file as UTF-8."); });
+  const bytes = await readFile(positionals[0]).catch((error: NodeJS.ErrnoException) => {
+    throw new Error(`Could not read the history file (${error.code ?? "read failed"}). Check the path and permissions.`);
+  });
+  let text: string;
+  try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch { throw new Error("The history file is not valid UTF-8."); }
   const workouts = parseHistory(text);
   const existing: boolean[] = [];
   for (const [i, workout] of workouts.entries()) {
