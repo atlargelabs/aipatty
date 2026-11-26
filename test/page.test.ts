@@ -1094,12 +1094,28 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   const matching = (selector: string, property = "textContent") => browser.evaluate<string[]>(
     `[...document.querySelectorAll(${JSON.stringify(selector)})].map(el => el[${JSON.stringify(property)}])`);
   const draftLines = () => matching("#draft-sets > li span");
-  const numbered = async (selector: string, reversed = false, start = 1) => {
-    assert.deepEqual(await browser.evaluate(`(() => {
+  const checkSetList = async (selector: string, expectedGaps: number[]) => {
+    const { markerless, gaps, trailing } = await browser.evaluate<{ markerless: boolean; gaps: number[]; trailing: number }>(`(() => {
       const list = document.querySelector(${JSON.stringify(selector)});
-      return [list.tagName, list.reversed, list.start, getComputedStyle(list).listStyleType,
-        [...list.children].every(li => getComputedStyle(li).display === 'list-item' && !li.hasAttribute('value'))];
-    })()`), ["OL", reversed, start, "decimal", true], `${selector} uses native list numbering`);
+      const rows = [...list.children];
+      const bounds = list.getBoundingClientRect();
+      const boxes = rows.map(row => row.getBoundingClientRect());
+      return {
+        markerless: list.getAttribute('role') === 'list' && rows.every(row => {
+          const style = getComputedStyle(row);
+          return row.tagName === 'LI' && style.display === 'list-item' && style.listStyleType === 'none';
+        }),
+        gaps: rows.map((row, i) => (boxes[i].top - (i ? boxes[i - 1].bottom : bounds.top)) / parseFloat(getComputedStyle(row).lineHeight)),
+        trailing: bounds.bottom - boxes.at(-1).bottom,
+      };
+    })()`);
+    assert.ok(markerless, `${selector} retains list semantics without markers`);
+    assert.equal(gaps[0], 0, `${selector} starts flush`);
+    assert.equal(trailing, 0, `${selector} ends flush`);
+    assert.equal(gaps.length, expectedGaps.length + 1);
+    for (const [i, gap] of expectedGaps.entries()) {
+      assert.ok(Math.abs(gaps[i + 1] - gap) < 0.02, `${selector} gap after row ${i + 1}: expected ${gap} lines, got ${gaps[i + 1]}`);
+    }
   };
   const checkInlineActions = async (row: string, textSelector: string, minTarget = 32) => {
     assert.equal(await browser.evaluate(`(() => {
@@ -1122,6 +1138,8 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
     suggestion: { note: string } | null;
   }>;
 
+  const heading = async (text: string) => assert.deepEqual(await matching("#workout-heading"), [text]);
+  assert.match(await (await fetch(base + gym)).text(), /<h2 id="workout-heading">Workouts<\/h2>/);
   await browser.navigate(`${base}/#${side.id}`);
   await waitFor(browser, "Training", value => value.title === "Training");
   await compose(browser, "/connect gym");
@@ -1129,6 +1147,7 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   assert.match((await waitFor(browser, "connect notice", value => value.messages.some(text => text.includes("Connected this branch")))).messages.join(), /Connected this branch to Gym/);
   await tap("#card-header a");
   await wait("document.querySelector('#workout-editor')?.disabled === false");
+  await heading("Workouts");
   assert.equal(await browser.evaluate("document.querySelector('#chat-link').getAttribute('href')"), `/#${side.id}`);
   assert.equal(await browser.evaluate(`document.querySelector('#workout-date').value === new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10)`), true);
   await assertNoHorizontalScroll("phone does not scroll horizontally");
@@ -1162,14 +1181,15 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await browser.navigate(`${base}/#${side.id}`);
   await browser.navigate(base + gym);
   await wait("document.querySelector('#workout-editor')?.disabled === false");
+  await heading("Workouts");
   assert.equal(await browser.evaluate("document.querySelectorAll('#draft-sets li').length"), 2);
   assert.deepEqual(await values("exercise", "duration", "duration-unit", "load", "load-unit"), ["name:" + plank, "15.5", "sec", "60", "kg"]);
   await tap("#add-set");
-  await numbered("#draft-sets", true, 3);
-  assert.deepEqual(await draftLines(), [plankLine, "Squat · 4 reps · 62.5 kg", "Squat · 5 reps · 60 kg"]);
+  const newestFirst = [plankLine, "Squat · 4 reps · 62.5 kg", "Squat · 5 reps · 60 kg"];
+  assert.deepEqual(await draftLines(), newestFirst);
   assert.deepEqual(await matching("#draft-sets button", "ariaLabel"),
-    ["Edit set 3", "Remove set 3", "Edit set 2", "Remove set 2", "Edit set 1", "Remove set 1"]);
-  await tap('#draft-sets li:last-child button[aria-label="Edit set 1"]');
+    newestFirst.flatMap((line, i) => ["Edit", "Remove"].map(action => `${action} set ${3 - i}: ${line}`)));
+  await tap('#draft-sets li:last-child [data-action="edit-set"]');
   assert.deepEqual(await values("exercise", "duration", "load"), ["name:Squat", "5", "60"]);
   await set({ duration: "6" });
   await tap("#add-set");
@@ -1177,6 +1197,7 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   assert.deepEqual(await draftLines(), [entryLines[2], entryLines[1], entryLines[0]], "editing does not move a set");
   assert.deepEqual(await browser.evaluate("JSON.parse(localStorage.getItem('gym-draft')).sets.map(set => set.duration)"), [6, 4, 15.5]);
   await browser.viewport(320, 780);
+  await checkSetList("#draft-sets", [0.5, 0]);
   await checkInlineActions("#draft-sets > li:first-child", "span");
   assert.equal(await browser.evaluate(`(() => {
     const range = document.createRange();
@@ -1193,7 +1214,7 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   assert.equal(await browser.evaluate("localStorage.getItem('gym-draft')"), null);
   const firstCard = `[data-workout-id='${first.id}']`;
   await wait(`!!document.querySelector(${JSON.stringify(firstCard)})`);
-  await numbered(`${firstCard} ol`);
+  await checkSetList(`${firstCard} ol`, [0, 0.5]);
   assert.deepEqual(await matching(`${firstCard} ol > li`), entryLines);
   assert.deepEqual(await matching(`${firstCard} h3`), [first.date]);
   const workoutActions = ["Edit", "Copy", "Delete"].map(action => `${action} workout on ${first.date}`);
@@ -1206,7 +1227,7 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   assert.deepEqual(await names(), ["Choose an exercise", plank, "Squat", "Add new"]);
   await newExercise("sQuAt");
   await wait("document.querySelectorAll('#last-session li').length === 2");
-  await numbered("#last-session ol");
+  await checkSetList("#last-session ol", [0]);
   assert.deepEqual(await matching("#last-session ol > li"), entryLines.slice(0, 2));
   assert.deepEqual(await values("exercise", "duration", "duration-unit", "load", "load-unit"), ["name:Squat", "6", "reps", "60", "kg"]);
   assert.deepEqual(await names(), ["Choose an exercise", plank, "Squat", "Add new"]);
@@ -1287,13 +1308,15 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
 
   const sql = "SELECT exercise, duration, duration_unit, load, load_unit FROM sets WHERE exercise = 'squat' ORDER BY position";
   const suggested = [{ exercise: "Squat", duration: 5, durationUnit: "reps", load: 65, loadUnit: "kg" },
-    { exercise: "Farmer carry", duration: 20, durationUnit: "m", load: 60, loadUnit: "kg" }];
+    { exercise: "sQuAt", duration: 4, durationUnit: "reps", load: 60, loadUnit: "kg" },
+    { exercise: "Farmer carry", duration: 20, durationUnit: "m", load: 60, loadUnit: "kg" },
+    { exercise: "Squat", duration: 3, durationUnit: "reps", load: 55, loadUnit: "kg" }];
   faux.setResponses([request => {
     assert.deepEqual(getCurrentTools(request.messages).map(tool => tool.name).filter(name => name.startsWith("gym_")), ["gym_query", "gym_suggest_workout"]);
     return fauxAssistantMessage(fauxToolCall("gym_query", { sql }, { id: "gym-read" }), { stopReason: "toolUse" });
   }, fauxAssistantMessage([
     fauxToolCall("gym_suggest_workout", { note: "Start light, then carry.", sets: suggested }, { id: "gym-suggestion" }),
-    fauxToolCall("gym_suggest_workout", { note: "invalid", sets: [{ ...suggested[1], loadUnit: null }] }, { id: "gym-error" }),
+    fauxToolCall("gym_suggest_workout", { note: "invalid", sets: [{ ...suggested[2], loadUnit: null }] }, { id: "gym-error" }),
   ], { stopReason: "toolUse" }), fauxAssistantMessage("**Next workout** is on your phone.")]);
   await compose(browser, "Show my squats and suggest the next workout.");
   await wait("document.querySelector('#entries .prose strong')?.textContent === 'Next workout'");
@@ -1310,13 +1333,17 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await wait("document.querySelector('#start-suggestion')?.hidden === false && !document.querySelector('#workout-editor').disabled");
   assert.equal(await browser.evaluate("document.querySelector('#suggestion-note').textContent"), "Start light, then carry.");
   assert.ok((await names()).includes("Farmer carry"));
+  const suggestedLines = ["Squat · 5 reps · 65 kg", "sQuAt · 4 reps · 60 kg", "Farmer carry · 20 m · 60 kg", "Squat · 3 reps · 55 kg"];
+  assert.deepEqual(await matching("#suggestion-sets > li"), suggestedLines);
+  await checkSetList("#suggestion-sets", [0, 0.5, 0.5]);
   await tap("#start-suggestion");
-  assert.equal(await browser.evaluate("document.querySelectorAll('#draft-sets li').length"), 2);
+  assert.deepEqual(await draftLines(), suggestedLines.toReversed());
+  await checkSetList("#draft-sets", [0.5, 0.5, 0]);
   assert.equal((await overview()).workouts.length, 1);
-  await tap('#draft-sets [aria-label="Edit set 1"]');
+  await tap('#draft-sets li:last-child [data-action="edit-set"]');
   await set({ load: "145", "load-unit": "lb" });
   await tap("#add-set");
-  await tap('#draft-sets [aria-label="Edit set 2"]');
+  await tap('#draft-sets li:nth-child(2) [data-action="edit-set"]');
   assert.deepEqual(await values("exercise", "duration", "duration-unit", "load", "load-unit"), ["name:Farmer carry", "20", "m", "60", "kg"]);
   await set({ duration: "20.25" });
   await tap("#add-set");
@@ -1326,18 +1353,30 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await status("Workout saved");
   const next = (await overview()).workouts.find(workout => workout.id !== first.id)!;
   assert.deepEqual(next.sets.map(set => [set.duration, set.durationUnit, set.load, set.loadUnit]),
-    [[5, "reps", 145, "lb"], [20.25, "m", 60, "kg"], [20.25, "m", 60, "kg"]]);
+    [[5, "reps", 145, "lb"], [4, "reps", 60, "kg"], [20.25, "m", 60, "kg"], [3, "reps", 55, "kg"], [20.25, "m", 60, "kg"]]);
 
   await wait("document.querySelectorAll('#recent-workouts article').length === 2");
   assert.deepEqual(await browser.evaluate("[...document.querySelectorAll('#recent-workouts article')].map(card => card.dataset.workoutId)"),
     [first.id, next.id]);
   await tap(`${firstCard} [data-action='edit-workout']`);
-  await wait("document.querySelector('#workout-heading').textContent === 'Edit workout'");
-  await tap('#draft-sets li:last-child button[aria-label="Remove set 1"]');
-  await numbered("#draft-sets", true, 2);
+  const editingReady = "document.querySelector('#workout-heading').textContent === 'Edit workout' && !document.querySelector('#workout-editor').disabled";
+  await wait(editingReady);
+  await browser.navigate("about:blank");
+  await browser.navigate(base + gym);
+  await wait("!document.querySelector('#workout-editor').disabled");
+  await heading("Edit workout");
+  await browser.evaluate("window.confirm = () => true");
+  await tap("#reset-workout");
+  await heading("Workouts");
+  await wait(`!!document.querySelector(${JSON.stringify(firstCard)})`);
+  await tap(`${firstCard} [data-action='edit-workout']`);
+  await wait(editingReady);
+  await tap('#draft-sets li:last-child [data-action="remove-set"]');
+  await checkSetList("#draft-sets", [0.5]);
   assert.deepEqual(await draftLines(), [entryLines[2], entryLines[1]]);
   await tap("#save-workout");
   await status("Workout saved");
+  await heading("Workouts");
   assert.deepEqual((await overview()).workouts.find(workout => workout.id === first.id)?.sets.map(set => set.duration), [4, 15.5]);
   await browser.evaluate("window.confirm = () => true");
   await tap(`${firstCard} [data-action='delete-workout']`);

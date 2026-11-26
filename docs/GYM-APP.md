@@ -42,9 +42,9 @@ compared using SQLite `NOCASE` (ASCII case folding).
 
 ## The page
 
-`/apps/gym/`, built for the phone.
+`/apps/gym/`, built for the phone. Set lists have no visible numbers and leave a small gap when the exercise changes.
 
-- **Log:** choose the date (today by default), pick an exercise, and add sets one at a time. Duration starts in
+- **Workouts:** choose the date (today by default), pick an exercise, and add sets one at a time. Duration starts in
   `reps`; change the unit for distance or time. Enter a weight in `kg` or `lb` if useful (e.g. 15 sec at 60 kg).
   **Save workout** writes the whole workout.
 - **Exercise picker:** names come from the log, current workout and suggestion. **Add new** lets you use a
@@ -54,10 +54,10 @@ compared using SQLite `NOCASE` (ASCII case folding).
   first set when the measurement fields are untouched. After adding a set, its fields stay filled for one-tap repeats.
 - **Suggestion:** when there is one, the page shows its note and sets, and **Start from this** loads the sets
   as the draft to correct and save.
-- **Draft:** the latest set appears closest to the form, but set numbers still reflect entry order. Edit or remove
-  a set beside its measurements. An unsaved workout is kept in this browser's `localStorage` and normally survives
-  reload or a locked phone. Saving or discarding clears it. If autosave fails, the page warns that recent edits may
-  only be in memory. Slow workout-history requests do not stop you entering sets.
+- **Draft:** the latest set appears closest to the form. Edit or remove a set beside its measurements. An unsaved
+  workout is kept in this browser's `localStorage` and normally survives reload or a locked phone. Saving or discarding
+  clears it. If autosave fails, the page warns that recent edits may only be in memory. Slow workout-history requests
+  do not stop you entering sets.
 - **Recent workouts:** the newest 20 with their full set lists in entry order. Edit, copy or delete the whole
   workout beside its date. **Copy** puts the date and numbered sets on the clipboard as plain text without
   changing your draft. It needs browser clipboard access (typically HTTPS or localhost).

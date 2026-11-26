@@ -70,9 +70,21 @@ function setLine(set) {
     + (set.extraReps == null ? "" : " · " + set.extraReps + " reps")
     + (set.load == null ? "" : " · " + set.load + " " + set.loadUnit + (set.load === 0 ? " (bodyweight)" : ""));
 }
+function renderSets(list, sets, renderRow = set => node("li", setLine(set))) {
+  let previous;
+  list.replaceChildren(...sets.map((set, i) => {
+    const row = renderRow(set, i);
+    const name = foldName(set.exercise);
+    if (i > 0 && name !== previous) row.classList.add("exercise-break");
+    previous = name;
+    return row;
+  }));
+}
 function setList(sets) {
   const list = node("ol");
-  list.append(...sets.map(set => node("li", setLine(set))));
+  list.className = "gym-set-list";
+  list.setAttribute("role", "list");
+  renderSets(list, sets);
   return list;
 }
 function say(text) { $("status").textContent = text; }
@@ -200,7 +212,7 @@ function begin(draft) {
   sets = draft ? [...draft.sets] : [];
   addedExercises = draft?.addedExercises ?? [];
   editing = !!draft?.editing;
-  $("workout-heading").textContent = editing ? "Edit workout" : "Log workout";
+  $("workout-heading").textContent = editing ? "Edit workout" : "Workouts";
   loadFields(draft?.fields);
   renderDraft();
   if (selectedExercise) void previewLast();
@@ -215,10 +227,9 @@ function pendingSet() {
 }
 function renderDraft() {
   renderExercisePicker();
-  const list = $("draft-sets");
-  list.start = sets.length;
-  // Reverse the rendered rows only; their controls use the original array indexes.
-  list.replaceChildren(...sets.map((set, i) => {
+  // Reverse the display only; row controls still target the original array indexes.
+  renderSets($("draft-sets"), sets.toReversed(), (set, index) => {
+    const i = sets.length - 1 - index;
     const row = node("li");
     const content = node("div");
     content.className = "gym-inline";
@@ -237,13 +248,15 @@ function renderDraft() {
       else if (position !== null && position > i) position--;
       renderDraft();
     });
-    edit.setAttribute("aria-label", "Edit set " + (i + 1));
-    remove.setAttribute("aria-label", "Remove set " + (i + 1));
+    const line = setLine(set);
+    const label = " set " + (i + 1) + ": " + line;
+    edit.setAttribute("aria-label", "Edit" + label);
+    remove.setAttribute("aria-label", "Remove" + label);
     actions.append(edit, remove);
-    content.append(node("span", setLine(set)), actions);
+    content.append(node("span", line), actions);
     row.append(content);
     return row;
-  }).reverse());
+  });
   remember();
 }
 async function previewLast() {
@@ -356,7 +369,7 @@ async function refresh() {
     suggestion = overview.suggestion;
     renderExercisePicker();
     $("suggestion-note").textContent = suggestion ? (suggestion.note || "Saved on " + suggestion.created + ".") : "No suggestion saved yet.";
-    $("suggestion-sets").replaceChildren(...(suggestion?.sets ?? []).map(set => node("li", setLine(set))));
+    renderSets($("suggestion-sets"), suggestion?.sets ?? []);
     $("suggestion-sets").hidden = startSuggestion.hidden = !suggestion;
     recent.replaceChildren(...(overview.workouts.length ? overview.workouts.map(workoutCard) : [node("p", "No workouts logged yet.")]));
     warning("overview-warning");
