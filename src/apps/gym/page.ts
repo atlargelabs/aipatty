@@ -18,11 +18,11 @@ export const phonePage = `<!doctype html>
     <section aria-labelledby="suggestion-heading">
       <h2 id="suggestion-heading">Suggested workout</h2>
       <p id="suggestion-note">Loading…</p>
-      <ol id="suggestion-sets" hidden></ol>
+      <ol id="suggestion-sets" class="gym-set-list" role="list" hidden></ol>
       <button id="start-suggestion" type="button" hidden>Start from this</button>
     </section>
     <section aria-labelledby="workout-heading">
-      <h2 id="workout-heading">Log workout</h2>
+      <h2 id="workout-heading">Workouts</h2>
       <fieldset id="workout-editor" aria-labelledby="workout-heading" disabled>
         <label>Workout date <input id="workout-date" type="date" required></label>
         <label>Exercise <select id="exercise"></select></label>
@@ -39,7 +39,7 @@ export const phonePage = `<!doctype html>
           </div>
           <div class="gym-actions"><button id="add-set" type="submit">Add set</button><button id="clear-set" type="button">Clear fields</button></div>
         </form>
-        <ol id="draft-sets" aria-label="Workout sets" reversed></ol>
+        <ol id="draft-sets" class="gym-set-list" role="list" aria-label="Workout sets"></ol>
         <div class="gym-actions"><button id="save-workout" type="button">Save workout</button><button id="reset-workout" type="button" hidden>Discard draft</button></div>
       </fieldset>
       <p id="status" role="status"></p>
