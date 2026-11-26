@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { HttpError, jsonBody, requireMethod, sendJson } from "../../http.ts";
+import { brandHeaders } from "../../web/brand.ts";
 import type { ConnectedApp, OpenApp } from "../app.ts";
 import { GymInputError } from "./model.ts";
 import { phonePage } from "./page.ts";
@@ -25,7 +26,7 @@ export const gymApp: ConnectedApp = {
             requireMethod(req, res, "GET");
             const body = path === "/" ? phonePage : await readFile(new URL("." + path, import.meta.url));
             const type = path === "/" ? "text/html" : path.endsWith(".css") ? "text/css" : "text/javascript";
-            res.writeHead(200, { "Content-Type": type + "; charset=utf-8" });
+            res.writeHead(200, { "Content-Type": type + "; charset=utf-8", ...(path === "/" && brandHeaders) });
             res.end(body);
             return;
           }

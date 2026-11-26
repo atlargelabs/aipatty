@@ -76,7 +76,7 @@ interface Content extends Display {
   readonly branch: number;
   /** Identifies the card across runs of the pipeline: a card on screen is kept while its key is still produced. */
   readonly key: string;
-  /** The small heading of the card, such as `user · 12`; `""` for none. */
+  /** The small heading of the card, such as `User · 12`; `""` for none. */
   readonly label: string;
   /** The body, shown by the renderer that `format` names. */
   readonly text: string;
@@ -200,22 +200,24 @@ export function initial(data: AgentData, pane?: PaneRef): Derived {
   const calls = new Map<string, ToolCall | null>();
 
   for (const entry of data.entries) {
+    const heading = (name: string) => `${name.charAt(0).toUpperCase()}${name.slice(1)} · ${entry.id}`;
     const settled = {
       ...display, entry, inherited: entry.conversationId !== data.branch,
       buttons: [{ label: "Fork here", action: { type: "fork", at: entry.id } }],
     } as const;
     const notice = operatorNotice(entry);
     if (notice) {
-      precards.push({ ...settled, kind: "notice", key: `${entry.id}:notice`, label: `${notice.label} · ${entry.id}`, text: notice.text });
+      precards.push({ ...settled, kind: "notice", key: `${entry.id}:notice`, label: heading(notice.label), text: notice.text });
     }
     (entry.model ?? []).forEach((message, index) => {
       const key = `${entry.id}:${index}`;
-      const label = `${message.role} · ${entry.id}`;
       if (message.role === "toolResult") {
         const call = calls.get(message.toolCallId) ?? undefined;
+        const label = heading(message.isError ? "Tool error" : "Tool result");
         precards.push({ ...settled, kind: "toolResult", key, label, text: plainText(message.content), message, call });
         return;
       }
+      const label = heading(message.role);
       if (message.role !== "assistant") {
         const text = plainText(message.content);
         if (text) precards.push({ ...settled, kind: "prose", key, label, text, message });
@@ -236,7 +238,7 @@ export function initial(data: AgentData, pane?: PaneRef): Derived {
           prose();
           calls.set(block.id, ids.has(block.id) ? null : block);
           ids.add(block.id);
-          precards.push({ ...settled, kind: "toolCall", key: `${key}:${at}`, label, text: callText(block), message, call: block });
+          precards.push({ ...settled, kind: "toolCall", key: `${key}:${at}`, label: heading("Tool call"), text: callText(block), message, call: block });
         }
       });
       prose();
@@ -249,12 +251,12 @@ export function initial(data: AgentData, pane?: PaneRef): Derived {
     const text = generation.message.content
       .map(block => block.type === "text" ? block.text : block.type === "toolCall" ? callText(block) : "")
       .filter(Boolean).join("\n");
-    if (text) precards.push({ ...display, kind: "liveText", key: "live:text", label: "", text, message: generation.message });
+    if (text) precards.push({ ...display, kind: "liveText", key: "live:text", label: "Assistant · writing", text, message: generation.message });
   }
   (tools ?? []).forEach((slot, index) => {
     if (slot.status === "done") return;
     precards.push({
-      ...display, kind: "liveTool", key: `live:tool:${index}`, label: `tool · ${slot.status}`, text: "→ " + slot.name,
+      ...display, kind: "liveTool", key: `live:tool:${index}`, label: `Tool · ${slot.status}`, text: "→ " + slot.name,
       slot, call: calls.get(slot.callId) ?? undefined,
     });
   });

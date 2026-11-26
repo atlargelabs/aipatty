@@ -5,6 +5,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { stripTypeScriptTypes } from "node:module";
 import { join } from "node:path";
 import { HttpError, jsonBody, pageHeaders, requireMethod, sendJson } from "../http.ts";
+import { brandHeaders } from "../web/brand.ts";
 import { libraryCss, libraryHtml, libraryScriptPath, libraryStylePath } from "./library.ts";
 import { maxPageTitle, pageIdPattern, pagePath, pagesLibraryApi, pagesPath, pagesPreviewScript, publishPageTool } from "./shared.ts";
 import { maxHtmlBytes, openPagesStore } from "./store.ts";
@@ -65,7 +66,7 @@ function openPagesAt(path: string) {
       const asset = assets.get(pathname);
       if (asset) {
         requireMethod(req, res, "GET");
-        res.writeHead(200, { "Content-Type": `${asset.type}; charset=utf-8` });
+        res.writeHead(200, { "Content-Type": `${asset.type}; charset=utf-8`, ...(asset.type === "text/html" && brandHeaders) });
         res.end(asset.body);
       } else if (pathname === pagesLibraryApi) {
         requireMethod(req, res, "GET", "POST", "DELETE");

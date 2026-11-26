@@ -42,7 +42,8 @@ compared using SQLite `NOCASE` (ASCII case folding).
 
 ## The page
 
-`/apps/gym/`, built for the phone. Set lists have no visible numbers and leave a small gap when the exercise changes.
+`/apps/gym/`, built for the phone and usable beside chat on a desktop. Set lists have no visible numbers and leave
+a small gap when the exercise changes.
 
 - **Workouts:** choose the date (today by default), pick an exercise, and add sets one at a time. Duration starts in
   `reps`; change the unit for distance or time. Enter a weight in `kg` or `lb` if useful (e.g. 15 sec at 60 kg).
@@ -54,13 +55,14 @@ compared using SQLite `NOCASE` (ASCII case folding).
   first set when the measurement fields are untouched. After adding a set, its fields stay filled for one-tap repeats.
 - **Suggestion:** when there is one, the page shows its note and sets, and **Start from this** loads the sets
   as the draft to correct and save.
-- **Draft:** the latest set appears closest to the form. Edit or remove a set beside its measurements. An unsaved
-  workout is kept in this browser's `localStorage` and normally survives reload or a locked phone. Saving or discarding
-  clears it. If autosave fails, the page warns that recent edits may only be in memory. Slow workout-history requests
-  do not stop you entering sets.
-- **Recent workouts:** the newest 20 with their full set lists in entry order. Edit, copy or delete the whole
-  workout beside its date. **Copy** puts the date and numbered sets on the clipboard as plain text without
-  changing your draft. It needs browser clipboard access (typically HTTPS or localhost).
+- **Draft:** the latest set appears closest to the form. Use the pencil to edit a set or the trash can to remove
+  it. An unsaved workout is kept in this browser's `localStorage` and normally survives reload or a locked
+  phone. Saving or discarding clears it. If autosave fails, the page warns that recent edits may only be in
+  memory. Slow workout-history requests do not stop you entering sets.
+- **Recent workouts:** the newest 20 with their full set lists in entry order. Use the pencil to edit a workout,
+  the overlapping squares to copy it, or the trash can to delete it. **Copy workout** puts the date and numbered
+  sets on the clipboard as plain text without changing your draft. It needs browser clipboard access (typically
+  HTTPS or localhost).
 - **Back to chat:** shown when the page was opened from a branch.
 
 The page's API is `GET /apps/gym/api/overview` (recent workouts, exercise names, the suggestion),

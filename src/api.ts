@@ -13,6 +13,7 @@ import { isPagesPath } from "./pages/index.ts";
 import { pagesLibraryApi } from "./pages/shared.ts";
 import { appCommand, appEntryKind, messageText, piRunApiPath, piRunId, shutdownHeader, streamState, streamUpdate, upgradeCommand, type StreamFrame } from "./protocol.ts";
 import { transcriptPage } from "./transcript.ts";
+import { brandAssets, brandHeaders } from "./web/brand.ts";
 
 const defaultPage = 50;
 const maxPage = 100;
@@ -125,8 +126,8 @@ async function handleHttp(
     res.writeHead(200, {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
-      ...pageHeaders,
-      ...(agent.pages && { "Content-Security-Policy": `${pageHeaders["Content-Security-Policy"]}; frame-src 'self'` }),
+      ...brandHeaders,
+      ...(agent.pages && { "Content-Security-Policy": `${brandHeaders["Content-Security-Policy"]}; frame-src 'self'` }),
     });
     res.end(pageHtml(!!agent.pages));
     return;
@@ -149,7 +150,14 @@ async function handleHttp(
     }
     return;
   }
-  // Only the modules listed in `pageModules` are served, looked up by name: no path from the request reaches a file.
+  // The UI assets are served from explicit lists: no path from the request reaches a file.
+  const asset = brandAssets.get(pathname);
+  if (asset) {
+    requireMethod(req, res, "GET");
+    res.writeHead(200, { "Content-Type": asset.type, "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
+    res.end(asset.body);
+    return;
+  }
   const script = pathname === "/app.js" ? pageJs(tailscale ? [...loopbackNames, tailscale.hostname] : loopbackNames, !!agent.pages)
     : Object.hasOwn(pageModules, pathname) ? pageModules[pathname] : undefined;
   if (script !== undefined || pathname === "/app.css") {

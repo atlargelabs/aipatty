@@ -1,3 +1,4 @@
+import { brandCredit, brandStylePath } from "../web/brand.ts";
 import { maxSectionName, pagesPath } from "./shared.ts";
 
 export const libraryScriptPath = `${pagesPath}/library.js`;
@@ -9,16 +10,22 @@ export const libraryHtml = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Pages · aipatty</title>
+<link rel="stylesheet" href="${brandStylePath}">
 <link rel="stylesheet" href="${libraryStylePath}">
 <script type="module" src="${libraryScriptPath}"></script>
 </head>
 <body>
-<header><a href="/">Back to chat</a><h1>Pages</h1></header>
+<header class="masthead">
+  <div class="header-inner">
+    <div><h1 class="product-name">Pages</h1>${brandCredit}</div>
+    <a href="/">Back to chat</a>
+  </div>
+</header>
 <main>
   <p>Ask aipatty in any branch to publish a page. New pages appear in Unsorted. Opening a JavaScript page runs its code in a sandbox.</p>
   <form id="new-section">
     <label>Section name <input name="name" maxlength="${maxSectionName}" required></label>
-    <button type="submit">Add section</button>
+    <button type="submit" class="primary">Add section</button>
     <button id="refresh" type="button">Refresh</button>
   </form>
   <p id="status" role="status">Loading library…</p>
@@ -30,15 +37,17 @@ export const libraryHtml = `<!doctype html>
 `;
 
 export const libraryCss = `
-* { box-sizing: border-box; }
-body { max-width: 54rem; margin: 1.25rem auto; padding-inline: 1rem; font: 16px/1.45 system-ui, sans-serif; color: #1d1d1f; }
-h1, h2, p { overflow-wrap: anywhere; }
-button, select, input { font: inherit; }
-button, select { padding: .2rem .45rem; }
-form, .page-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; }
-section { border-top: 1px solid #ddd; }
-li { margin-block: .7rem; overflow-wrap: anywhere; }
-li small { margin-inline-start: .5rem; color: #555; }
-.page-actions { margin-top: .25rem; }
-#status { min-height: 1.45em; }
+:root { --content-width: 54rem; }
+main { max-width: var(--content-width); margin: 16px auto; padding-inline: 16px; }
+h2 { font-size: 1.125rem; }
+h2, p { overflow-wrap: anywhere; }
+label, input, select { min-width: 0; max-width: 100%; }
+input, select { font-size: 1rem; }
+button, select, input { min-height: 44px; }
+form, .page-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+section { margin-block: 12px; padding: 0 16px 8px; background: var(--paper); border: 1px solid var(--line); border-radius: 8px; }
+li { margin-block: 12px; overflow-wrap: anywhere; }
+li small { margin-inline-start: 8px; color: var(--muted); }
+.page-actions { margin-top: 4px; }
+#status { min-height: 1.55em; }
 `;

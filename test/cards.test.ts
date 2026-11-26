@@ -46,16 +46,16 @@ test("the data alone gives a card per message part, a result its call, and live 
   };
   const { precards, surround } = derive(data(entries, live), []);
   assert.deepEqual(shown(precards), [
-    ["1:0", "prose", "user · 1", "hello"],
-    ["2:0:1", "prose", "assistant · 2", "one\ntwo"],
-    ["2:0:3", "toolCall", "assistant · 2", '→ bash {"command":"ls"}'],
-    ["2:0:4", "prose", "assistant · 2", "three"],
-    ["2:0:5", "toolCall", "assistant · 2", '→ pi {"task":"Fix it\\nand more"}'],
-    ["3:0", "toolResult", "toolResult · 3", "files"],
-    ["4:notice", "notice", "upgrade · 4", "Upgrade complete."],
-    ["5:0", "prose", "system · 5", "instructions"],
-    ["live:text", "liveText", "", 'partial\n→ bash {"command":"p"}'],
-    ["live:tool:1", "liveTool", "tool · running", "→ pi"],
+    ["1:0", "prose", "User · 1", "hello"],
+    ["2:0:1", "prose", "Assistant · 2", "one\ntwo"],
+    ["2:0:3", "toolCall", "Tool call · 2", '→ bash {"command":"ls"}'],
+    ["2:0:4", "prose", "Assistant · 2", "three"],
+    ["2:0:5", "toolCall", "Tool call · 2", '→ pi {"task":"Fix it\\nand more"}'],
+    ["3:0", "toolResult", "Tool result · 3", "files"],
+    ["4:notice", "notice", "Upgrade · 4", "Upgrade complete."],
+    ["5:0", "prose", "System · 5", "instructions"],
+    ["live:text", "liveText", "Assistant · writing", 'partial\n→ bash {"command":"p"}'],
+    ["live:tool:1", "liveTool", "Tool · running", "→ pi"],
     ["live:failure", "runFailure", "", "Run failed: model_error: boom"],
   ]);
   assert.deepEqual(surround, { branch, header: [], style: "", pane: undefined });
