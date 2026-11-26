@@ -896,6 +896,12 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await browser.emulateTouch();
   const wait = (expression: string) => until(() => browser.evaluate<boolean>(expression));
   const tap = (selector: string) => browser.evaluate(click(selector));
+  const backToCoach = async () => {
+    await tap("#chat-link");
+    // Clicking Back navigates to a different document; wait for its markup before reading the chat view.
+    await wait("document.getElementById('title') !== null");
+    await waitFor(browser, "back in Training", value => value.title === "Training");
+  };
   const set = (values: Record<string, string>) => browser.evaluate(`for (const [id, value] of Object.entries(${JSON.stringify(values)})) {
     const field = document.getElementById(id);
     field.value = value;
@@ -1041,8 +1047,7 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await wait("!document.querySelector('#workout-editor').disabled");
   assert.equal(await browser.evaluate("document.querySelector('#workout-date').value"), "2026-12-31");
   await tap("#reset-workout");
-  await tap("#chat-link");
-  await waitFor(browser, "back in Training", value => value.title === "Training");
+  await backToCoach();
 
   const sql = "SELECT exercise, duration, duration_unit, load, load_unit FROM sets WHERE exercise = 'squat' ORDER BY position";
   const suggested = [{ exercise: "Squat", duration: 5, durationUnit: "reps", load: 65, loadUnit: "kg" },
@@ -1098,8 +1103,7 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   assert.deepEqual((await overview()).workouts.map(workout => workout.id), [next.id]);
   assert.equal((await fetch(`${base}/apps/gym/api/workouts/${first.id}`)).status, 404);
 
-  await tap("#chat-link");
-  await waitFor(browser, "Training again", value => value.title === "Training");
+  await backToCoach();
   await wait("!document.querySelector('#card-header').hidden");
   const check = "SELECT duration, duration_unit, load, load_unit FROM sets ORDER BY position";
   faux.setResponses([fauxAssistantMessage(fauxToolCall("gym_query", { sql: check }), { stopReason: "toolUse" }), fauxAssistantMessage("Actual workout checked.")]);
