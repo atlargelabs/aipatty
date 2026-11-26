@@ -53,7 +53,7 @@ main {
 #controls { border-bottom: 1px solid var(--line); font-size: .8125rem; }
 .picker-group label { display: flex; align-items: center; gap: 4px; color: var(--muted); }
 #controls :is(select, button) { min-height: 36px; }
-#controls select { max-width: 14rem; color: var(--pine); }
+#controls select { max-width: 14rem; color: var(--pine); font-size: 1rem; }
 #notice, #card-notice { padding: 8px var(--chat-gutter); background: var(--danger-fill); color: var(--danger); white-space: pre-line; overflow-wrap: anywhere; }
 #transcript { flex: 1; overflow: auto; padding: 16px var(--chat-gutter); }
 #older { margin-block-end: 12px; }
@@ -141,7 +141,7 @@ main {
   #branches.open { display: block; }
   main { --chat-gutter: 12px; }
   .picker-group { display: grid; grid-template-columns: minmax(0, 1fr) auto; width: 100%; }
-  #controls select { padding-inline: 5px; font-size: 1rem; }
+  #controls select { padding-inline: 5px; }
   .picker-group label, #controls #model { min-width: 0; }
   #controls #model { flex: 1; }
   .card-head .icon-button { width: 44px; height: 44px; }

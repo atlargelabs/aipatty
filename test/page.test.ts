@@ -325,6 +325,10 @@ test("phone controls fit with long model and cost labels and leave room for chat
     return box('#model').top === box('#archive').top && box('#archive').height >= 44 && box('#transcript').height >= 100;
   })()`), true, "even with Gym linked, there is space to read in landscape");
 
+  await browser.viewport(844, 390);
+  assert.deepEqual(await browser.evaluate(`['#model', '#thinking'].map(selector => getComputedStyle(document.querySelector(selector)).fontSize)`),
+    ["16px", "16px"], "native pickers remain large enough to avoid iOS focus zoom above the drawer breakpoint");
+
   await browser.viewport(1000, 600);
   const modelWidthInRem = await browser.evaluate<number>(`document.querySelector('#model').getBoundingClientRect().width /
     parseFloat(getComputedStyle(document.documentElement).fontSize)`);
