@@ -105,6 +105,10 @@ async function openBrowser(t: TestContext, flags: string[] = []) {
     errors,
     evaluate,
     async watchRequests() { await send("Network.enable"); return requested; },
+    async onNewDocument(source: string) {
+      const { identifier } = await send("Page.addScriptToEvaluateOnNewDocument", { source }) as { identifier: string };
+      return () => send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+    },
     async navigate(url: string) {
       const { loaderId, errorText } = await send("Page.navigate", { url }) as { loaderId?: string; errorText?: string };
       if (errorText) throw new Error(`Could not navigate to ${url}: ${errorText}`);
@@ -887,9 +891,16 @@ test("Pages previews and direct views are sandboxed; the library moves and delet
   await writeFile(web, `export const steps = [{ name: 'format', card: () => ({ format: 'page-preview', style: 'format-probe' }) }];`);
   const faux = fauxPages();
   const host = await openHost(fauxConfig(dir), { models: faux.models, apps: [fixtureApp("formatter", { web: pathToFileURL(web) })] });
-  const api = await startApi(host, health, 0);
+  let api = await startApi(host, health, 0);
   t.after(async () => { await api.close(); await host.close(); });
   const base = `http://127.0.0.1:${api.port}`;
+  const root = (await host.conversation("root"))!;
+  await host.harness.commit(async tx => {
+    // Force an older page that a reconnect's initial transcript window will drop.
+    for (let i = 0; i < 55; i++) {
+      await tx.appendEntry(root.id, { kind: "test", model: [fauxAssistantMessage(`Earlier Pages history ${i}`)] });
+    }
+  }, ctx);
   const safeBranch = await host.newBranch("Empty sandbox probe");
   const fixtureSite = await pagesBrowserFixture(t, safeBranch.id);
   const title = "Static <em>as text</em>";
@@ -897,7 +908,6 @@ test("Pages previews and direct views are sandboxed; the library moves and delet
   const { page: jsPage } = await faux.publish(host, "root", { title: "Interactive", html: fixtureSite.html("interactive"), interactive: true });
   const htmlPath = pagePath(staticPage.id);
   const jsPath = pagePath(jsPage.id);
-  const root = (await host.conversation("root"))!;
   await host.appCommand(root, { connect: true, args: ["formatter"] });
   await host.harness.commit(async tx => {
     const result = (toolName: string, details: JsonObject, text: string, isError = false) => ({
@@ -926,9 +936,19 @@ test("Pages previews and direct views are sandboxed; the library moves and delet
     apiBlocked: true, noCorsReadBlocked: true, wsBlocked: true, external: "Fixture data",
   });
 
+  const stopSeeding = await browser.onNewDocument(`window.originalFetch = fetch;
+    window.fetch = (url, ...args) => url !== '${pagesLibraryApi}' ? originalFetch(url, ...args)
+      : new Promise(resolve => { window.releaseMetadata = () => resolve(originalFetch(url, ...args)); });`);
+  const atBottom = `(() => { const box = document.querySelector('#transcript');
+    return box.scrollHeight - box.scrollTop - box.clientHeight < 40; })()`;
   await browser.navigate(base);
+  await stopSeeding();
+  await wait(`typeof window.releaseMetadata === 'function'`);
+  assert.equal(await browser.evaluate(atBottom), true);
+  await browser.evaluate(`window.fetch = originalFetch; window.releaseMetadata(); undefined`);
   await wait(`document.querySelector('${staticFrame}') !== null && document.querySelector('${preview} button') !== null
     && document.querySelector('.format-probe') !== null`);
+  assert.equal(await browser.evaluate(atBottom), true, "expanding a preview preserves the bottom of the transcript");
   await browser.evaluate(`document.querySelector('${staticFrame}').scrollIntoView()`);
   await until(() => fixtureSite.requests.includes("/static-render.svg"));
   assert.deepEqual(await browser.evaluate(`[
@@ -962,6 +982,18 @@ test("Pages previews and direct views are sandboxed; the library moves and delet
   assert.equal(await browser.evaluate(`window.keptPage === document.querySelector('${jsFrame}')`), true);
   await browser.evaluate(`window.fetch = originalFetch; window.dispatchEvent(new Event('focus'))`);
   await wait(`!document.querySelector('#entries').textContent.includes('Could not check page availability.')`);
+
+  const earlier = `document.querySelector('#entries').textContent.includes('Earlier Pages history 0')`;
+  assert.equal(await browser.evaluate(earlier), false);
+  await tap("#older");
+  await wait(earlier);
+  await browser.evaluate("window.keptBrowsingContext = window.keptPage.contentWindow");
+  const port = api.port;
+  await api.close();
+  api = await startApi(host, health, port);
+  await wait(`!(${earlier})`);
+  assert.equal(await browser.evaluate(`window.keptBrowsingContext === document.querySelector('${jsFrame}').contentWindow`), true,
+    "trimming older history preserves the running browsing context, not just the iframe node");
 
   // These are top-level navigations: there is no iframe attribute supplying the isolation.
   await browser.navigate(base + htmlPath);

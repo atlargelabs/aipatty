@@ -165,7 +165,7 @@ export const pageJs = (appHostnames: readonly string[], pagesEnabled: boolean) =
 import { derive, scopeAppStep } from "/web/cards.ts";
 import { piRunApiPath } from "/web/shared.ts";
 import { builtInSteps, runIdOf } from "/web/steps.ts";
-${pagesEnabled ? `import { drawPagePreview } from "${pagesPreviewScript}";` : ""}
+${pagesEnabled ? `import { pagePreviews } from "${pagesPreviewScript}";` : ""}
 
 const $ = id => document.getElementById(id);
 const rootId = ${ROOT_CONVERSATION_ID};
@@ -626,10 +626,15 @@ function drawCard(node, precard) {
 
 /** Make a container show the given precards, in order, keeping the card of every key it already shows. */
 function drawCards(container, precards) {
-  const old = new Map([...container.children].map(node => [node.dataset.key, node]));
+  // Prune first: moving a surviving card past a stale one would restart any iframe inside it.
+  const keys = new Set(precards.map(card => card.key));
+  const old = new Map();
+  for (const node of [...container.children]) {
+    if (keys.has(node.dataset.key)) old.set(node.dataset.key, node);
+    else node.remove();
+  }
   precards.forEach((precard, index) => {
     let node = old.get(precard.key);
-    old.delete(precard.key);
     if (!node) {
       node = document.createElement("div");
       node.dataset.key = precard.key;
@@ -645,7 +650,6 @@ function drawCards(container, precards) {
     drawCard(node, precard);
     if (container.children[index] !== node) container.insertBefore(node, container.children[index] || null);
   });
-  for (const node of old.values()) node.remove();
 }
 
 function drawSurround(surround) {
@@ -720,6 +724,8 @@ function keepAtBottom(change) {
   change();
   if (atBottom) box.scrollTop = box.scrollHeight;
 }
+
+${pagesEnabled ? "const drawPagePreview = pagePreviews(keepAtBottom);" : ""}
 
 /** Change the transcript above what is shown, and keep what is shown where it is. */
 function keepBelow(change) {
