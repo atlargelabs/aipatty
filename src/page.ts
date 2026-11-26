@@ -9,7 +9,7 @@ import { ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
 import { readFileSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 import { pagesPath, pagesPreviewScript } from "./pages/shared.ts";
-import { brandCredit, brandStylePath } from "./web/brand.ts";
+import { brandStylePath } from "./web/brand.ts";
 
 const markdownScriptPath = "/markdown-it.js";
 
@@ -35,7 +35,7 @@ export const pageHtml = (pagesAvailable: boolean) => `<!doctype html>
 <header class="masthead">
   <a id="skip-to-chat" href="#input">Skip to message</a>
   <button id="menu" type="button" aria-label="Branches" aria-expanded="false" aria-controls="branches">☰</button>
-  <div class="wordmark"><span class="product-name">Aipatty</span>${brandCredit}</div>
+  <span class="wordmark product-name">aipatty</span>
   <h1 id="title">aipatty</h1>
   ${pagesAvailable ? `<a class="pages-link" href="${pagesPath}">Pages</a>` : ""}
   <span id="cost" title="This branch / all branches"></span>
@@ -396,16 +396,9 @@ function branchNode(id) {
     button.className = "branch-item";
     const title = document.createElement("span");
     title.className = "branch-name";
-    const meta = document.createElement("span");
-    meta.className = "meta";
-    const info = document.createElement("span");
-    const busy = document.createElement("span");
-    busy.className = "busy";
-    busy.textContent = " · busy";
-    meta.append(info, busy);
-    button.append(title, meta);
+    button.append(title);
     li.append(button);
-    node = { li, button, title, info, busy };
+    node = { li, button, title };
     branchNodes.set(id, node);
   }
   return node;
@@ -423,15 +416,15 @@ function renderBranches() {
     const selected = branch.id === app.branch;
     node.button.ariaCurrent = selected ? "page" : null;
     setText(node.title, branch.title);
-    const model = branch.model ? branch.model.modelId : "no model";
-    setText(node.info, "#" + branch.id + " · " + model + " · " + money(branch.cost));
-    node.busy.hidden = !branch.busy;
+    node.button.classList.toggle("is-busy", branch.busy);
+    const label = branch.busy ? branch.title + ", busy" : null;
+    if (node.button.ariaLabel !== label) node.button.ariaLabel = label;
     if (list.children[index] !== node.li) list.insertBefore(node.li, list.children[index] || null);
   });
   const branch = current();
   $("archive").hidden = !branch || branch.id === rootId;
   if (!branch) return;
-  setText($("title"), branch.title);
+  setText($("title"), "#" + branch.id + " · " + branch.title);
   document.title = branch.title + " · aipatty";
   setText($("cost"), money(branch.cost) + " / " + money(app.totalCost));
   const ref = branch.model ? branch.model.provider + "/" + branch.model.modelId : "";

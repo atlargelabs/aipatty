@@ -67,9 +67,6 @@ button.danger:enabled:hover { background: var(--danger-fill); }
   border-bottom: 1px solid #465c4d;
 }
 .masthead a { color: var(--phosphor); font-weight: 600; }
-.brand-credit { display: block; color: var(--sage); font: 400 .6875rem/1.35 var(--font); white-space: nowrap; }
-.brand-credit span { color: var(--chalk); font-weight: 600; }
-.brand-credit b { color: var(--phosphor); }
 .product-name { display: block; font-size: 1.25rem; font-weight: 600; line-height: 1.2; }
 .header-inner {
   width: min(100%, var(--content-width));

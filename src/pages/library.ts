@@ -1,4 +1,4 @@
-import { brandCredit, brandStylePath } from "../web/brand.ts";
+import { brandStylePath } from "../web/brand.ts";
 import { maxSectionName, pagesPath } from "./shared.ts";
 
 export const libraryScriptPath = `${pagesPath}/library.js`;
@@ -17,7 +17,7 @@ export const libraryHtml = `<!doctype html>
 <body>
 <header class="masthead">
   <div class="header-inner">
-    <div><h1 class="product-name">Pages</h1>${brandCredit}</div>
+    <h1 class="product-name">Pages</h1>
     <a href="/">Back to chat</a>
   </div>
 </header>

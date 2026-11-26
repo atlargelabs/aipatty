@@ -1,4 +1,4 @@
-import { brandCredit, brandStylePath } from "../../web/brand.ts";
+import { brandStylePath } from "../../web/brand.ts";
 import { durationUnits, loadUnits, maxAmount, maxExercise, maxReps, maxSets } from "./model.ts";
 
 const options = (units: readonly string[]) => units.map(unit => `<option>${unit}</option>`).join("");
@@ -8,7 +8,7 @@ export const phonePage = `<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Gym · Aipatty</title>
+  <title>Gym · aipatty</title>
   <link rel="stylesheet" href="${brandStylePath}">
   <link rel="stylesheet" href="/apps/gym/phone.css">
   <script type="module" src="/apps/gym/phone.js"></script>
@@ -16,7 +16,7 @@ export const phonePage = `<!doctype html>
 <body>
   <header class="masthead">
     <div class="header-inner">
-      <div><h1 class="product-name">Gym</h1>${brandCredit}</div>
+      <h1 class="product-name">Gym</h1>
       <a id="chat-link" href="/" hidden>Back to chat</a>
     </div>
   </header>

@@ -131,10 +131,10 @@ async function openBrowser(t: TestContext, flags: string[] = []) {
   };
 }
 
-/** What the page shows: the header title, the highlighted branch, the URL fragment and the visible messages. */
+/** What the page shows: the branch title without its ID prefix, the highlighted branch, the URL fragment and the visible messages. */
 interface Shown { title: string; current: string | null; hash: string; messages: string[] }
 const shown = `({
-  title: document.getElementById("title").textContent,
+  title: document.getElementById("title").textContent.replace(/^#\\d+ · /, ""),
   current: document.querySelector("#branch-list [aria-current] .branch-name")?.textContent ?? null,
   hash: location.hash,
   messages: [...document.querySelectorAll("#entries .card-body")].map(body => body.innerText),
@@ -170,6 +170,10 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
   await browser.navigate(`${base}/`);
   const main = await waitFor(browser, "the main branch", value => value.messages.length === 2);
   assert.deepEqual(main, { title: "Main", current: "Main", hash: "#1", messages: ["on main", "Faux reply: on main"] });
+  const heading = `document.querySelector('header h1').innerText`;
+  assert.equal(await browser.evaluate(heading), "#1 · Main");
+  assert.deepEqual(await browser.evaluate(`[...document.querySelectorAll('#branch-list button')].map(b => b.innerText).sort()`),
+    ["Main", "Side"]);
   await browser.key("Tab");
   assert.equal(await browser.evaluate("document.activeElement.id"), "skip-to-chat");
   await browser.key("Enter");
@@ -183,6 +187,7 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
     title: "Side", current: "Side", hash: `#${side.id}`,
     messages: ["on main", "Faux reply: on main", "only on side", "Faux reply: only on side"],
   });
+  assert.equal(await browser.evaluate(heading), `#${side.id} · Side`);
 
   await browser.viewport(390, 780);
   await browser.emulateTouch();
@@ -197,13 +202,22 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
   await browser.navigate("about:blank");
   await browser.navigate(`${base}/#${side.id}`);
   await waitFor(browser, "the branch named in the fragment", value => value.title === "Side" && value.messages.length === 4);
+  const renamed = "<em>Side & friends</em>";
+  await browser.evaluate(`window.prompt = () => ${JSON.stringify(renamed)}; document.querySelector('#rename').click()`);
+  await waitFor(browser, "the renamed side branch", value => value.title === renamed && value.current === renamed);
+  assert.deepEqual(await browser.evaluate(`[${heading}, document.title, location.hash]`),
+    [`#${side.id} · ${renamed}`, `${renamed} · aipatty`, `#${side.id}`]);
   assert.deepEqual(browser.errors, []);
 });
 
 test("toolbar New starts blank, Fork here keeps history, and Archive works while busy", { skip: !chrome, timeout: 60_000 }, async t => {
   const faux = fauxProvider();
+  const settle = Promise.withResolvers<void>();
   const gate = Promise.withResolvers<void>();
   faux.setResponses([fauxAssistantMessage("original answer"), async () => {
+    await settle.promise;
+    return fauxAssistantMessage("finished before archiving");
+  }, async () => {
     await gate.promise;
     return fauxAssistantMessage("finished while archived");
   }]);
@@ -211,7 +225,7 @@ test("toolbar New starts blank, Fork here keeps history, and Archive works while
   models.setProvider(faux.provider);
   const host = await openHost(fauxConfig(await fixture(t)), { models });
   const api = await startApi(host, health, 0);
-  t.after(async () => { gate.resolve(); await api.close(); await host.close(); });
+  t.after(async () => { settle.resolve(); gate.resolve(); await api.close(); await host.close(); });
   const base = `http://127.0.0.1:${api.port}`;
   const root = (await host.conversation("root"))!;
   await host.rename(root, "Home");
@@ -240,14 +254,40 @@ test("toolbar New starts blank, Fork here keeps history, and Archive works while
   assert.equal(await browser.evaluate(`document.querySelectorAll('#entries .inherited-marker:not([hidden])').length`), 2);
   const id = side.hash.slice(1);
   const branch = (await host.conversation(id))!;
-  const active = await host.submit(branch, { type: "input", content: "keep working" });
+  const item = `document.querySelector('li[data-branch="${id}"] button')`;
+  const row = () => browser.evaluate(`(() => {
+    const button = ${item};
+    const style = getComputedStyle(button);
+    return { text: button.innerText, tooltip: button.title, label: button.ariaLabel, current: button.ariaCurrent,
+      nameColor: getComputedStyle(button.querySelector('.branch-name')).color, buttonColor: style.color,
+      edge: style.borderInlineStartColor };
+  })()`);
+  const chalk = "rgb(242, 246, 241)";
+  const cyan = "rgb(115, 216, 232)";
+  const phosphor = "rgb(184, 237, 138)";
+  const idle = { text: "Main", tooltip: "", label: null, current: "page", nameColor: chalk, buttonColor: chalk, edge: cyan };
+  assert.deepEqual(await row(), idle);
+  assert.equal(await browser.evaluate(`getComputedStyle(document.querySelector('#send')).backgroundColor`), cyan);
+
+  const first = await host.submit(branch, { type: "input", content: "start working" });
   await until(() => browser.evaluate(`!document.querySelector('#abort').disabled`));
+  const running = { ...idle, label: "Main, busy", nameColor: phosphor, edge: phosphor };
+  assert.deepEqual(await row(), running);
 
   await browser.evaluate(`window.prompt = () => 'Fresh'; document.querySelector('#new').click()`);
   const fresh = await waitFor(browser, "a blank branch", state => state.current === "Fresh" && state.messages.length === 0);
-  const item = `document.querySelector('li[data-branch="${id}"] button')`;
+  assert.deepEqual(await row(), { ...running, current: null, edge: "rgba(0, 0, 0, 0)" });
+  assert.equal(await browser.evaluate(`getComputedStyle(document.querySelector('#branch-list [aria-current]')).borderInlineStartColor`), cyan);
   await browser.evaluate(`${item}.click()`);
   await until(() => browser.evaluate(`!document.querySelector('#abort').disabled && location.hash === '#${id}'`));
+
+  settle.resolve();
+  assert.equal((await first.wait(ctx)).status, "done");
+  await until(() => browser.evaluate(`document.querySelector('#abort').disabled && ${item}.ariaLabel === null`));
+  assert.deepEqual(await row(), idle);
+
+  const active = await host.submit(branch, { type: "input", content: "keep working" });
+  await until(() => browser.evaluate(`!document.querySelector('#abort').disabled`));
   assert.equal(await browser.evaluate(`document.querySelector('#archive').matches(':not([hidden]):enabled')`), true);
   const confirmation = await browser.evaluate<string>(`
     window.confirm = text => { window.confirmation = text; return true; };
@@ -275,11 +315,22 @@ test("toolbar New starts blank, Fork here keeps history, and Archive works while
   assert.deepEqual(browser.errors, []);
 });
 
+async function assertBranding(browser: Awaited<ReturnType<typeof openBrowser>>, name: string, title: string) {
+  const [productName, documentTitle, header] = await browser.evaluate<[string, string, string]>(`[
+    document.querySelector('header .product-name').textContent, document.title,
+    document.querySelector('header').textContent,
+  ]`);
+  assert.equal(productName, name);
+  assert.equal(documentTitle, title);
+  assert.doesNotMatch(header, /@tLarge Labs/i);
+}
+
 test("phone controls fit with long model and cost labels and leave room for chat in landscape", { skip: !chrome, timeout: 60_000 }, async t => {
   const host = await openHost(fauxConfig(await fixture(t)));
   const api = await startApi(host, health, 0);
   t.after(async () => { await api.close(); await host.close(); });
-  const side = await host.newBranch("Training");
+  const title = "Training with a long branch title that should be truncated on narrow phones";
+  const side = await host.newBranch(title);
   await host.appCommand((await host.conversation(String(side.id)))!, { connect: true, args: ["gym"] });
 
   const browser = await openBrowser(t);
@@ -311,12 +362,15 @@ test("phone controls fit with long model and cost labels and leave room for chat
     assert.equal(await browser.evaluate(`(() => {
       const box = selector => document.querySelector(selector).getBoundingClientRect();
       const range = document.createRange();
-      range.selectNodeContents(document.querySelector('.brand-credit'));
+      range.selectNodeContents(document.querySelector('.wordmark'));
+      const heading = document.querySelector('#title');
       return range.getBoundingClientRect().right <= box('.pages-link').left
         && box('#title').right <= box('#cost').left
+        && heading.scrollWidth > heading.clientWidth && getComputedStyle(heading).textOverflow === 'ellipsis'
         && document.documentElement.scrollWidth === innerWidth;
-    })()`), true, `branding, title and costs fit at ${width}px`);
+    })()`), true, `branding and costs fit, and the long title truncates at ${width}px`);
   }
+  await assertBranding(browser, "aipatty", `${title} · aipatty`);
 
   await browser.viewport(568, 320);
   await browser.emulateTouch();
@@ -374,6 +428,16 @@ test("saved prose renders Markdown on narrow screens and survives live updates",
   await browser.viewport(390, 600);
   await browser.navigate(base);
   await waitFor(browser, "the saved cards", state => state.messages.length === 5);
+  assert.deepEqual(await browser.evaluate(`['.prose.assistant', '.toolResult', '.prose.user', '.toolCall'].map(role => {
+    const card = document.querySelector('#entries .entry' + role);
+    const style = getComputedStyle(card);
+    return [style.borderInlineStartColor, getComputedStyle(card.querySelector('.role')).backgroundColor, style.backgroundColor];
+  })`), [
+    ["rgb(184, 237, 138)", "rgb(184, 237, 138)", "rgb(236, 245, 229)"], // Phosphor
+    ["rgb(227, 165, 184)", "rgb(227, 165, 184)", "rgb(250, 237, 241)"], // Dusty Rose
+    ["rgb(115, 216, 232)", "rgb(115, 216, 232)", "rgb(232, 245, 246)"], // Cyan
+    ["rgb(181, 164, 227)", "rgb(181, 164, 227)", "rgb(243, 238, 249)"], // Violet
+  ]);
   for (const role of ["user", "assistant"]) {
     const rendered = await browser.evaluate(`(() => {
       const body = document.querySelector('#entries .${role}.prose .card-body');
@@ -428,8 +492,10 @@ test("saved prose renders Markdown on narrow screens and survives live updates",
   await until(() => browser.evaluate(`!!document.querySelector('#live .liveText')`));
   assert.deepEqual(await browser.evaluate(`(() => {
     const live = document.querySelector('#live .liveText .card-body');
-    return [live.textContent, live.childElementCount, window.savedLink.isConnected];
-  })()`), ['**Writing\n→ bash {"command":"partial"}', 0, true]);
+    const style = getComputedStyle(live.parentElement);
+    return [live.textContent, live.childElementCount, window.savedLink.isConnected,
+      style.borderInlineStartStyle, style.borderInlineStartColor, style.backgroundColor];
+  })()`), ['**Writing\n→ bash {"command":"partial"}', 0, true, "dashed", "rgb(115, 216, 232)", "rgb(252, 253, 250)"]);
   assert.deepEqual(browser.errors, []);
 });
 
@@ -1080,6 +1146,7 @@ test("Pages previews and direct views are sandboxed; the library moves and delet
 
   const beforeLibrary = requested.filter(url => url === base + jsPath || url === base + htmlPath).length;
   await browser.navigate(base + pagesPath);
+  await assertBranding(browser, "Pages", "Pages · aipatty");
   await wait("document.querySelectorAll('#sections li').length === 2");
   assert.deepEqual(await browser.evaluate(`[
     document.querySelector('#sections h2').textContent, document.querySelector('#sections a').textContent,
@@ -1251,6 +1318,7 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   assert.match((await waitFor(browser, "connect notice", value => value.messages.some(text => text.includes("Connected this branch")))).messages.join(), /Connected this branch to Gym/);
   await tap("#card-header a");
   await wait("document.querySelector('#workout-editor')?.disabled === false");
+  await assertBranding(browser, "Gym", "Gym · aipatty");
   await heading("Workouts");
   assert.equal(await browser.evaluate("document.querySelector('#chat-link').getAttribute('href')"), `/#${side.id}`);
   assert.equal(await browser.evaluate(`document.querySelector('#workout-date').value === new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10)`), true);
