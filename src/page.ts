@@ -396,16 +396,12 @@ function branchNode(id) {
     button.className = "branch-item";
     const title = document.createElement("span");
     title.className = "branch-name";
-    const meta = document.createElement("span");
-    meta.className = "meta";
-    const info = document.createElement("span");
     const busy = document.createElement("span");
     busy.className = "busy";
-    busy.textContent = " · busy";
-    meta.append(info, busy);
-    button.append(title, meta);
+    busy.textContent = "busy";
+    button.append(title, busy);
     li.append(button);
-    node = { li, button, title, info, busy };
+    node = { li, button, title, busy };
     branchNodes.set(id, node);
   }
   return node;
@@ -423,15 +419,13 @@ function renderBranches() {
     const selected = branch.id === app.branch;
     node.button.ariaCurrent = selected ? "page" : null;
     setText(node.title, branch.title);
-    const model = branch.model ? branch.model.modelId : "no model";
-    setText(node.info, "#" + branch.id + " · " + model + " · " + money(branch.cost));
     node.busy.hidden = !branch.busy;
     if (list.children[index] !== node.li) list.insertBefore(node.li, list.children[index] || null);
   });
   const branch = current();
   $("archive").hidden = !branch || branch.id === rootId;
   if (!branch) return;
-  setText($("title"), branch.title);
+  setText($("title"), "#" + branch.id + " · " + branch.title);
   document.title = branch.title + " · aipatty";
   setText($("cost"), money(branch.cost) + " / " + money(app.totalCost));
   const ref = branch.model ? branch.model.provider + "/" + branch.model.modelId : "";

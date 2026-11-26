@@ -131,10 +131,10 @@ async function openBrowser(t: TestContext, flags: string[] = []) {
   };
 }
 
-/** What the page shows: the header title, the highlighted branch, the URL fragment and the visible messages. */
+/** What the page shows: the branch title without its ID prefix, the highlighted branch, the URL fragment and the visible messages. */
 interface Shown { title: string; current: string | null; hash: string; messages: string[] }
 const shown = `({
-  title: document.getElementById("title").textContent,
+  title: document.getElementById("title").textContent.replace(/^#\\d+ · /, ""),
   current: document.querySelector("#branch-list [aria-current] .branch-name")?.textContent ?? null,
   hash: location.hash,
   messages: [...document.querySelectorAll("#entries .card-body")].map(body => body.innerText),
@@ -170,6 +170,10 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
   await browser.navigate(`${base}/`);
   const main = await waitFor(browser, "the main branch", value => value.messages.length === 2);
   assert.deepEqual(main, { title: "Main", current: "Main", hash: "#1", messages: ["on main", "Faux reply: on main"] });
+  const heading = `document.querySelector('header h1').innerText`;
+  assert.equal(await browser.evaluate(heading), "#1 · Main");
+  assert.deepEqual(await browser.evaluate(`[...document.querySelectorAll('#branch-list button')].map(b => b.innerText).sort()`),
+    ["Main", "Side"]);
   await browser.key("Tab");
   assert.equal(await browser.evaluate("document.activeElement.id"), "skip-to-chat");
   await browser.key("Enter");
@@ -183,6 +187,7 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
     title: "Side", current: "Side", hash: `#${side.id}`,
     messages: ["on main", "Faux reply: on main", "only on side", "Faux reply: only on side"],
   });
+  assert.equal(await browser.evaluate(heading), `#${side.id} · Side`);
 
   await browser.viewport(390, 780);
   await browser.emulateTouch();
@@ -197,6 +202,11 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
   await browser.navigate("about:blank");
   await browser.navigate(`${base}/#${side.id}`);
   await waitFor(browser, "the branch named in the fragment", value => value.title === "Side" && value.messages.length === 4);
+  const renamed = "<em>Side & friends</em>";
+  await browser.evaluate(`window.prompt = () => ${JSON.stringify(renamed)}; document.querySelector('#rename').click()`);
+  await waitFor(browser, "the renamed side branch", value => value.title === renamed && value.current === renamed);
+  assert.deepEqual(await browser.evaluate(`[${heading}, document.title, location.hash]`),
+    [`#${side.id} · ${renamed}`, `${renamed} · aipatty`, `#${side.id}`]);
   assert.deepEqual(browser.errors, []);
 });
 
@@ -246,6 +256,7 @@ test("toolbar New starts blank, Fork here keeps history, and Archive works while
   await browser.evaluate(`window.prompt = () => 'Fresh'; document.querySelector('#new').click()`);
   const fresh = await waitFor(browser, "a blank branch", state => state.current === "Fresh" && state.messages.length === 0);
   const item = `document.querySelector('li[data-branch="${id}"] button')`;
+  assert.equal(await browser.evaluate(`${item}.innerText`), "Main\nbusy");
   await browser.evaluate(`${item}.click()`);
   await until(() => browser.evaluate(`!document.querySelector('#abort').disabled && location.hash === '#${id}'`));
   assert.equal(await browser.evaluate(`document.querySelector('#archive').matches(':not([hidden]):enabled')`), true);
@@ -289,7 +300,8 @@ test("phone controls fit with long model and cost labels and leave room for chat
   const host = await openHost(fauxConfig(await fixture(t)));
   const api = await startApi(host, health, 0);
   t.after(async () => { await api.close(); await host.close(); });
-  const side = await host.newBranch("Training");
+  const title = "Training with a long branch title that should be truncated on narrow phones";
+  const side = await host.newBranch(title);
   await host.appCommand((await host.conversation(String(side.id)))!, { connect: true, args: ["gym"] });
 
   const browser = await openBrowser(t);
@@ -322,12 +334,14 @@ test("phone controls fit with long model and cost labels and leave room for chat
       const box = selector => document.querySelector(selector).getBoundingClientRect();
       const range = document.createRange();
       range.selectNodeContents(document.querySelector('.wordmark'));
+      const heading = document.querySelector('#title');
       return range.getBoundingClientRect().right <= box('.pages-link').left
         && box('#title').right <= box('#cost').left
+        && heading.scrollWidth > heading.clientWidth && getComputedStyle(heading).textOverflow === 'ellipsis'
         && document.documentElement.scrollWidth === innerWidth;
-    })()`), true, `branding, title and costs fit at ${width}px`);
+    })()`), true, `branding and costs fit, and the long title truncates at ${width}px`);
   }
-  await assertBranding(browser, "aipatty", "Training · aipatty");
+  await assertBranding(browser, "aipatty", `${title} · aipatty`);
 
   await browser.viewport(568, 320);
   await browser.emulateTouch();
