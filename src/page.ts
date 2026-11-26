@@ -20,7 +20,7 @@ export const pageModules: Readonly<Record<string, string>> = {
   [markdownScriptPath]: readFileSync(new URL(import.meta.resolve("markdown-it/browser")), "utf8"),
 };
 
-export const pageHtml = (pagesEnabled: boolean) => `<!doctype html>
+export const pageHtml = (pagesAvailable: boolean) => `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -33,7 +33,7 @@ export const pageHtml = (pagesEnabled: boolean) => `<!doctype html>
 <header>
   <button id="menu" type="button" aria-label="Branches">☰</button>
   <h1 id="title">aipatty</h1>
-  ${pagesEnabled ? `<a href="${pagesPath}">Pages</a>` : ""}
+  ${pagesAvailable ? `<a href="${pagesPath}">Pages</a>` : ""}
   <span id="cost" title="This branch / all branches"></span>
 </header>
 <div id="layout">
@@ -161,11 +161,11 @@ button { font: inherit; padding: .3rem .7rem; }
 }
 `;
 
-export const pageJs = (appHostnames: readonly string[], pagesEnabled: boolean) => `import markdownit from ${JSON.stringify(markdownScriptPath)};
+export const pageJs = (appHostnames: readonly string[], pagesAvailable: boolean) => `import markdownit from ${JSON.stringify(markdownScriptPath)};
 import { derive, scopeAppStep } from "/web/cards.ts";
 import { piRunApiPath } from "/web/shared.ts";
 import { builtInSteps, runIdOf } from "/web/steps.ts";
-${pagesEnabled ? `import { pagePreviews } from "${pagesPreviewScript}";` : ""}
+${pagesAvailable ? `import { pagePreviews } from "${pagesPreviewScript}";` : ""}
 
 const $ = id => document.getElementById(id);
 const rootId = ${ROOT_CONVERSATION_ID};
@@ -615,7 +615,7 @@ function drawCard(node, precard) {
     head.replaceChildren(head.firstChild, ...precard.links.map(linkNode), ...precard.buttons.map(buttonNode));
   }
   head.hidden = !precard.label && !precard.links.length && !precard.buttons.length;
-  ${pagesEnabled ? "if (drawPagePreview(body, precard)) return;" : ""}
+  ${pagesAvailable ? "if (drawPagePreview(body, precard)) return;" : ""}
   const format = Object.hasOwn(formats, precard.format) ? precard.format : "text";
   if (body.dataset.format !== format || bodyText.get(body) !== precard.text) {
     formats[format](body, precard.text);
@@ -725,7 +725,7 @@ function keepAtBottom(change) {
   if (atBottom) box.scrollTop = box.scrollHeight;
 }
 
-${pagesEnabled ? "const drawPagePreview = pagePreviews(keepAtBottom);" : ""}
+${pagesAvailable ? "const drawPagePreview = pagePreviews(keepAtBottom);" : ""}
 
 /** Change the transcript above what is shown, and keep what is shown where it is. */
 function keepBelow(change) {

@@ -248,23 +248,21 @@ can retain the workout instructions without the tools. This does not delete the 
 branches when running a release with Gym again. Automatic `/upgrade` rollback restores its prior conversation
 database and needs no such step.
 
-## Optional Pages
+## Pages
 
-Pages is off by default, and is not a `/connect` app. On a release that includes it, create an empty
-`pages.enabled` file in the server's data directory and restart the server when idle. In a normal managed
-install that is `touch "$ROOT/data/pages.enabled"` (use `$ROOT/faux` in Faux mode, or the directory passed as
-`--data-dir` if overridden). Open **Pages** in chat or visit `/pages` on the same hostname and port as chat.
-If the marker exists but the link is missing after restart, check server output for a Pages startup error.
-Remove the marker and restart to turn off the tool, routes and link without deleting the library.
+Pages is available in every branch without setup or `/connect`. Open **Pages** in chat or visit `/pages` on the
+same hostname and port as chat. At startup the server opens or creates `pages.sqlite` in its data directory
+(`$ROOT/data` in a normal managed install, `$ROOT/faux` in Faux mode, or the directory passed as `--data-dir`).
+If the database cannot be opened, chat still runs; check server output for the Pages startup error.
 
-The marker plus `pages.sqlite` stay outside the release and survive ordinary restarts and upgrades. The
-upgrade backup does **not** include them. To back them up, stop the server and copy both files to a private
-location after the process exits. The library holds up to 128 pages of at most 256 KiB each and 32 sections
-including Unsorted. The instance's existing SSH/tailnet access governs the library and direct page URLs;
-there is no separate login, publish listener, proxy or server-side page runtime.
+`pages.sqlite` stays outside the release and survives ordinary restarts and upgrades. The upgrade backup does
+**not** include it. To back it up, stop the server and copy the file to a private location after the process
+exits. The library holds up to 128 pages of at most 256 KiB each and 32 sections including Unsorted. The
+instance's existing SSH/tailnet access governs the library and direct page URLs; there is no separate login,
+publish listener, proxy or server-side page runtime.
 
-The trial `/pages/ai-patty-usage` Tailscale mount is not a managed page and is not imported by enabling Pages.
-Leave its routing and files as they are; any import is a separate operator follow-up.
+The trial `/pages/ai-patty-usage` Tailscale mount is not a managed page and is not imported. Leave its routing
+and files as they are; any import is a separate operator follow-up.
 
 ## Upgrade
 

@@ -1,6 +1,6 @@
 import { defineExtension, defineTool } from "@earendil-works/pi-durable";
 import { bool, obj, opt, str } from "@earendil-works/pi-schema";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { stripTypeScriptTypes } from "node:module";
 import { join } from "node:path";
@@ -8,8 +8,6 @@ import { HttpError, jsonBody, pageHeaders, requireMethod, sendJson } from "../ht
 import { libraryCss, libraryHtml, libraryScriptPath, libraryStylePath } from "./library.ts";
 import { maxPageTitle, pageIdPattern, pagePath, pagesLibraryApi, pagesPath, pagesPreviewScript, publishPageTool } from "./shared.ts";
 import { maxHtmlBytes, openPagesStore } from "./store.ts";
-
-export const pagesEnableFile = "pages.enabled";
 
 export function isPagesPath(path: string): boolean {
   return path === pagesPath || path.startsWith(`${pagesPath}/`);
@@ -28,7 +26,7 @@ function script(file: string) {
   return stripTypeScriptTypes(readFileSync(new URL(file, import.meta.url), "utf8"));
 }
 
-function openEnabledPages(path: string) {
+function openPagesAt(path: string) {
   const assets = new Map([
     [pagesPath, { body: libraryHtml, type: "text/html" }],
     [`${pagesPath}/`, { body: libraryHtml, type: "text/html" }],
@@ -97,12 +95,11 @@ function openEnabledPages(path: string) {
   };
 }
 
-export type Pages = ReturnType<typeof openEnabledPages>;
+export type Pages = ReturnType<typeof openPagesAt>;
 
-/** A startup-only, data-directory opt-in; a failure must not take down chat. */
+/** Open the instance's library at startup. A failure must not take down chat. */
 export function openPages(dataDir: string): Pages | undefined {
-  if (!existsSync(join(dataDir, pagesEnableFile))) return;
   const path = join(dataDir, "pages.sqlite");
-  try { return openEnabledPages(path); }
+  try { return openPagesAt(path); }
   catch (error) { console.error(`Pages unavailable at ${path}:`, error); }
 }

@@ -71,7 +71,7 @@ export function pagePreviews(preserveScroll: PreserveScroll) {
       let ids: Set<string> | undefined;
       try {
         const response = await fetch(pagesLibraryApi);
-        if (response.status === 404) ids = new Set(); // The new server no longer has Pages enabled.
+        if (response.status === 404) ids = new Set(); // The server no longer serves the library (e.g. after rollback).
         else if (response.ok) {
           const { sections } = await response.json() as { sections: PageSection[] };
           ids = new Set(sections.flatMap(section => section.pages.map(page => page.id)));

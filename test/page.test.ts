@@ -11,7 +11,6 @@ import { test, type TestContext } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { startApi } from "../src/api.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
-import { pagesEnableFile } from "../src/pages/index.ts";
 import { pagePath, pagesLibraryApi, pagesPath, publishPageTool } from "../src/pages/shared.ts";
 import { piRunApiPath, upgradeEntryKind, type PiRunSnapshot } from "../src/protocol.ts";
 import { fixtureApp } from "./fixtures/app.ts";
@@ -436,7 +435,7 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   await browser.viewport(1250, 850);
   const base = `http://127.0.0.1:${api.port}`;
   const html = await fetch(base);
-  assert.equal(html.headers.get("content-security-policy"), "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
+  assert.equal(html.headers.get("content-security-policy"), "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; frame-src 'self'");
   await browser.navigate(base);
   // The newest 50 entries: two of them are assistant messages that each made two calls, a card apiece.
   await waitFor(browser, "the cards of the 50 newest entries", state => state.messages.length === 52);
@@ -886,7 +885,6 @@ async function compose(browser: Awaited<ReturnType<typeof openBrowser>>, content
 
 test("Pages previews and direct views are sandboxed; the library moves and deletes links without running them", { skip: !chrome, timeout: 60_000 }, async t => {
   const dir = await fixture(t);
-  await writeFile(join(dir, pagesEnableFile), "");
   const web = join(dir, "formatter.ts");
   await writeFile(web, `export const steps = [{ name: 'format', card: () => ({ format: 'page-preview', style: 'format-probe' }) }];`);
   const faux = fauxPages();

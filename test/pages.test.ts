@@ -1,12 +1,10 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
-import { unlink, writeFile } from "node:fs/promises";
+import { mkdir, stat } from "node:fs/promises";
 import { get } from "node:http";
 import { join } from "node:path";
 import { test } from "node:test";
 import { startApi } from "../src/api.ts";
 import { openHost } from "../src/host.ts";
-import { pagesEnableFile } from "../src/pages/index.ts";
 import { pagePath, pagesLibraryApi, pagesPath, pagesPreviewScript, publishPageTool, type PageSection } from "../src/pages/shared.ts";
 import { maxHtmlBytes } from "../src/pages/store.ts";
 import { messageText } from "../src/protocol.ts";
@@ -15,13 +13,13 @@ import { fauxConfig, fixture } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
 
-test("Pages opts in for existing independent branches, with durable immutable content and a separate library", { timeout: 30_000 }, async t => {
+test("Pages is available at startup in every branch, with durable immutable content and a separate library", { timeout: 30_000 }, async t => {
   const dir = await fixture(t);
   const config = fauxConfig(dir);
   const faux = fauxPages();
-  const marker = join(dir, pagesEnableFile);
   let host = await openHost(config, { models: faux.models });
-  let api = await startApi(host, health, 0);
+  const start = () => startApi(host, health, 0, { tailscaleOrigin: "https://mini.example.ts.net:8443" });
+  let api = await start();
   const base = () => `http://127.0.0.1:${api.port}`;
   const request = (path: string, init?: RequestInit) => fetch(base() + path, init);
   const close = async () => { await api.close(); await host.close(); };
@@ -29,7 +27,7 @@ test("Pages opts in for existing independent branches, with durable immutable co
   const restart = async () => {
     await close();
     host = await openHost(config, { models: faux.models });
-    api = await startApi(host, health, 0, { tailscaleOrigin: "https://mini.example.ts.net:8443" });
+    api = await start();
   };
   const sections = async () => {
     const response = await request(pagesLibraryApi);
@@ -43,18 +41,14 @@ test("Pages opts in for existing independent branches, with durable immutable co
     get({ host: "127.0.0.1", port: api.port, path, headers }, res => { res.resume(); resolve(res.statusCode); }).on("error", reject);
   });
 
-  const independent = String((await host.newBranch("Independent before Pages")).id);
-  const off = await faux.turn(host, independent);
-  assert.ok(!off.tools.some(tool => tool.name === publishPageTool));
-  assert.ok(!existsSync(join(dir, "pages.sqlite")));
-  for (const path of [pagesPath, pagesLibraryApi, pagesPreviewScript, pagePath("a".repeat(32))]) {
-    assert.equal((await request(path)).status, 404);
-  }
-  assert.doesNotMatch(await (await request("/")).text(), /href="\/pages"/);
-  assert.doesNotMatch(await (await request("/app.js")).text(), /\/pages\/preview\.js/);
-  await writeFile(marker, "");
-  assert.equal((await request(pagesPath)).status, 404, "the marker is read at startup only");
-  await restart();
+  assert.ok((await stat(join(dir, "pages.sqlite"))).isFile());
+  assert.deepEqual(await sections(), [{ id: 1, name: "Unsorted", pages: [] }]);
+  const chat = await request("/");
+  assert.match(await chat.text(), /href="\/pages">Pages</);
+  assert.match(chat.headers.get("content-security-policy")!, /frame-src 'self'/);
+  assert.equal((await request(pagesPath)).status, 200);
+  assert.equal((await request(pagesPreviewScript)).status, 200);
+  const independent = String((await host.newBranch("Independent branch")).id);
   assert.deepEqual(await host.branchApps((await host.conversation(independent))!), []);
 
   const title = "The same title <test>";
@@ -92,8 +86,6 @@ test("Pages opts in for existing independent branches, with durable immutable co
     assert.match(messageText(result), /Expected (a page title|non-empty HTML)/);
   }
 
-  assert.match(await (await request("/")).text(), /href="\/pages">Pages</);
-  assert.match((await request("/")).headers.get("content-security-policy")!, /frame-src 'self'/);
   for (const path of [pagesPath, "/apps/gym/"]) {
     const response = await request(path);
     assert.match(response.headers.get("content-security-policy")!, /frame-ancestors 'none'/);
@@ -119,25 +111,41 @@ test("Pages opts in for existing independent branches, with durable immutable co
     assert.equal((await edit({ action: "move", id: page.id, section: reports.id })).status, 200);
   }
   assert.equal((await edit({ action: "step", id: second.page.id, direction: "up" })).status, 200);
-  const third = await publish(independent, 2);
-  const organized = [
-    { id: 1, name: "Unsorted", pages: [third.page] },
-    { ...reports, pages: [second.page, first.page] },
-  ];
-  assert.deepEqual(await sections(), organized);
   await restart();
-  assert.deepEqual(await sections(), organized);
+  assert.deepEqual(await sections(), [
+    { id: 1, name: "Unsorted", pages: [] },
+    { ...reports, pages: [second.page, first.page] },
+  ]);
   assert.equal(await (await request(pagePath(first.page.id))).text(), contents[0]);
+  const third = await publish(independent, 2);
   assert.equal((await edit({ id: first.page.id }, "DELETE")).status, 200);
   await restart();
-  assert.deepEqual(await sections(), [organized[0], { ...reports, pages: [second.page] }]);
+  assert.deepEqual(await sections(), [
+    { id: 1, name: "Unsorted", pages: [third.page] },
+    { ...reports, pages: [second.page] },
+  ]);
   assert.equal((await request(pagePath(first.page.id))).status, 404);
   assert.ok(JSON.stringify(await (await request("/api/conversations/root")).json()).includes(pagePath(first.page.id)), "deleting does not change the transcript");
+});
 
-  await unlink(marker);
-  await restart();
-  assert.equal((await request(pagePath(second.page.id))).status, 404);
-  assert.doesNotMatch((await request("/")).headers.get("content-security-policy")!, /frame-src/);
-  assert.ok(!(await faux.turn(host, independent)).tools.some(tool => tool.name === publishPageTool));
-  assert.ok(existsSync(join(dir, "pages.sqlite")), "disabling preserves the library");
+test("an unopenable Pages database leaves chat running", async t => {
+  const dir = await fixture(t);
+  const db = join(dir, "pages.sqlite");
+  await mkdir(db);
+  const log = t.mock.method(console, "error", () => {});
+  const faux = fauxPages();
+  const host = await openHost(fauxConfig(dir), { models: faux.models });
+  const api = await startApi(host, health, 0);
+  t.after(async () => { await api.close(); await host.close(); });
+  const base = `http://127.0.0.1:${api.port}`;
+  assert.equal(log.mock.calls[0]?.arguments[0], `Pages unavailable at ${db}:`);
+  assert.ok((await stat(db)).isDirectory());
+  assert.equal((await fetch(base + pagesPath)).status, 404);
+  const chat = await fetch(base);
+  assert.equal(chat.status, 200);
+  assert.doesNotMatch(await chat.text(), /href="\/pages"/);
+  assert.doesNotMatch(chat.headers.get("content-security-policy")!, /frame-src/);
+  assert.doesNotMatch(await (await fetch(base + "/app.js")).text(), /\/pages\/preview\.js/);
+  const { tools } = await faux.turn(host, "root");
+  assert.ok(!tools.some(tool => tool.name === publishPageTool));
 });

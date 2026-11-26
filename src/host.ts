@@ -48,7 +48,7 @@ export interface ModelStatus {
 
 export interface AgentHost {
   harness: Harness;
-  /** An instance feature, not a connected app. */
+  /** Instance-wide, absent only if Pages failed to open at startup. */
   pages?: Pages;
   app(id: string): OpenApp | undefined;
   appProblems(): Promise<string[]>;

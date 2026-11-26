@@ -37,7 +37,7 @@ no daemon and no service registration.
   last-known-good release for rollback.
   - `$ROOT/work/`: working directory of aipatty's own tools, for inspection and scratch, not PR work.
   - `$ROOT/runs/`: disposable workspaces for [`pi` runs](#pi-runs).
-  - `$ROOT/data/`: the conversation SQLite database, logs, `apps/<id>/` data, optional Pages data
+  - `$ROOT/data/`: the conversation SQLite database, logs, `apps/<id>/` data, and `pages.sqlite`
     (app and Pages data are not in the upgrade backup), and later MCP configuration and sign-ins.
   - `$ROOT/upgrade/`: the database backup of the last upgrade, its pending record, and the logs of the supervisor
     and of the servers it starts.
@@ -126,7 +126,7 @@ changing the setting. See [INSTALL.md](INSTALL.md) for the first pinned deploy a
 | `read`, `write`, `edit`, `bash`, `codemode`, `tool_search` | pi-durable built-ins, working in `work/`. |
 | `pi` | Runs one Pi session on a bounded coding task in a fresh clone and returns the result to the calling branch. At most one run per conversation branch; branches run independently. Inside the run Pi may delegate the work, and always delegates the review of a PR. |
 | `fork_branch`, `list_branches`, `read_branch`, `set_model` | Tree management, plus paging and text search over any branch. |
-| `publish_page` | With [Pages enabled](INSTALL.md#optional-pages), publish immutable sandboxed HTML from any branch. Organize or delete links in the instance-wide library, not in Git or the transcript. |
+| `publish_page` | Publish immutable sandboxed HTML from any branch without configuration. Organize or delete links in the instance-wide [Pages library](INSTALL.md#pages), not in Git or the transcript. |
 | `mcp_status`, `mcp_reload`, `mcp_sign_in` | Later: server state, re-reading `mcp.json`, and OAuth by link. |
 
 Pass relevant conversation context in the handoff. A branch-reading interface for Pi can come later if needed;
@@ -186,8 +186,8 @@ Deferred until something needs them: a read-only research mode and repos other t
   and you're at the bottom. It is not an interactive terminal. Add a Gmail switch when Gmail ships. The
   transcript is drawn by [the card pipeline](WEB-CARDS.md), an ordered list of pure steps that later features add to.
   A built-in step renders saved user and assistant prose as Markdown; live previews and tool output stay plain text,
-  except the results of a connected app's tools when its step asks for Markdown. When enabled, Pages uses a
-  dedicated sandboxed preview for successful `publish_page` results, not an app-provided card format.
+  except the results of a connected app's tools when its step asks for Markdown. Successful `publish_page`
+  results use a dedicated sandboxed preview, not an app-provided card format.
 - **CLI:** the same API from a terminal.
 - **Auth:** SSH or the tailnet's access policy. The server has no login of its own. HTTP and WebSocket requests
   must name the loopback listener or the single configured HTTPS origin, and any browser `Origin` must match.
