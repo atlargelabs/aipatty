@@ -55,7 +55,7 @@ the loaded entries. It is absent when that call is on an older page that is not 
 the same ID for two calls. This is the one place a card looks at another, and it only looks back.
 
 Every precard also has a `key` that identifies its card across runs, a `label` (the small heading, such as
-`user · 12`) and `text` (the body). Every settled precard starts with a **Fork here** button.
+`User · 12`) and `text` (the body). Every settled precard starts with a **Fork here** button.
 
 ## What a step can change
 
@@ -151,7 +151,7 @@ To add it:
 
 1. Put the step in [`src/web/steps.ts`](../src/web/steps.ts) and add it to `builtInSteps`, in the position it
    should run.
-2. Add the CSS for any class it uses to `pageCss` in [`src/page.ts`](../src/page.ts).
+2. Add the CSS for any class it uses to [`src/web/chat.css`](../src/web/chat.css).
 3. If it uses a new `format`, add the renderer to `formats` in `src/page.ts`. The page calls it with the card's
    body element and text whenever the format or text changes.
 4. Test it in [`test/cards.test.ts`](../test/cards.test.ts) with `derive(data, steps)`, which needs no browser.

@@ -1,5 +1,5 @@
 /**
- * The crude web page: branch list, transcript, input box, branch controls, model picker and cost. Served by the API
+ * The chat page: branch list, transcript, composer, branch controls, model picker and cost. Served by the API
  * with a strict CSP and same-origin scripts. The pipeline selects which cards use the built-in Markdown renderer.
  *
  * The transcript is drawn from the card pipeline in ./web/cards.ts (see docs/WEB-CARDS.md). This file is the
@@ -9,12 +9,13 @@ import { ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
 import { readFileSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 import { pagesPath, pagesPreviewScript } from "./pages/shared.ts";
+import { brandCredit, brandStylePath } from "./web/brand.ts";
 
 const markdownScriptPath = "/markdown-it.js";
 
 /** Browser modules by URL: our own with types removed, and the pinned parser's standalone ESM bundle. */
 export const pageModules: Readonly<Record<string, string>> = {
-  ...Object.fromEntries(["cards", "shared", "steps"].map(name => [
+  ...Object.fromEntries(["cards", "icons", "shared", "steps"].map(name => [
     `/web/${name}.ts`, stripTypeScriptTypes(readFileSync(new URL(`./web/${name}.ts`, import.meta.url), "utf8")),
   ])),
   [markdownScriptPath]: readFileSync(new URL(import.meta.resolve("markdown-it/browser")), "utf8"),
@@ -26,28 +27,36 @@ export const pageHtml = (pagesAvailable: boolean) => `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>aipatty</title>
+<link rel="stylesheet" href="${brandStylePath}">
 <link rel="stylesheet" href="/app.css">
 <script type="module" src="/app.js"></script>
 </head>
 <body>
-<header>
-  <button id="menu" type="button" aria-label="Branches">☰</button>
+<header class="masthead">
+  <a id="skip-to-chat" href="#input">Skip to message</a>
+  <button id="menu" type="button" aria-label="Branches" aria-expanded="false" aria-controls="branches">☰</button>
+  <div class="wordmark"><span class="product-name">Aipatty</span>${brandCredit}</div>
   <h1 id="title">aipatty</h1>
-  ${pagesAvailable ? `<a href="${pagesPath}">Pages</a>` : ""}
+  ${pagesAvailable ? `<a class="pages-link" href="${pagesPath}">Pages</a>` : ""}
   <span id="cost" title="This branch / all branches"></span>
 </header>
 <div id="layout">
   <nav id="branches" aria-label="Branches">
+    <h2 class="nav-heading">Branches</h2>
     <ul id="branch-list"></ul>
   </nav>
   <main>
     <div id="controls">
-      <label>Model <select id="model"></select></label>
-      <label>Thinking <select id="thinking"></select></label>
-      <button id="new" type="button">New</button>
-      <button id="rename" type="button">Rename</button>
-      <button id="archive" type="button" hidden>Archive</button>
-      <button id="search" type="button">Search</button>
+      <div class="picker-group">
+        <label>Model <select id="model"></select></label>
+        <label>Thinking <select id="thinking"></select></label>
+      </div>
+      <div class="branch-actions">
+        <button id="new" type="button">New</button>
+        <button id="rename" type="button">Rename</button>
+        <button id="archive" type="button" hidden>Archive</button>
+        <button id="search" type="button">Search</button>
+      </div>
     </div>
     <div id="notice" role="status" hidden></div>
     <div id="card-notice" role="status" hidden></div>
@@ -58,15 +67,15 @@ export const pageHtml = (pagesAvailable: boolean) => `<!doctype html>
       <div id="live"></div>
     </section>
     <form id="composer">
-      <textarea id="input" rows="3" placeholder="Message" required></textarea>
+      <textarea id="input" rows="3" placeholder="Message" aria-label="Message" required></textarea>
       <div id="actions">
-        <button id="send" type="submit">Send</button>
+        <button id="send" class="primary" type="submit">Send</button>
         <button id="abort" type="button">Abort</button>
       </div>
     </form>
   </main>
   <aside id="pi-run" aria-labelledby="pi-run-heading" hidden>
-    <div class="run-controls">
+    <div class="run-controls masthead">
       <h2 id="pi-run-heading">Pi run</h2>
       <button id="pi-run-jump" type="button" aria-controls="pi-run-view" hidden>Jump to latest</button>
       <button id="pi-run-close" type="button" aria-label="Close Pi run">Close</button>
@@ -82,87 +91,11 @@ export const pageHtml = (pagesAvailable: boolean) => `<!doctype html>
 </html>
 `;
 
-export const pageCss = `
-* { box-sizing: border-box; }
-body { margin: 0; font: 15px/1.45 system-ui, sans-serif; color: #1d1d1f; background: #fafafa; height: 100dvh; display: flex; flex-direction: column; }
-header { display: flex; align-items: center; gap: .6rem; padding: .5rem .8rem; background: #fff; border-bottom: 1px solid #ddd; }
-header h1 { font-size: 1rem; margin: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#cost { font-variant-numeric: tabular-nums; color: #555; }
-#menu { display: none; }
-#layout { flex: 1; display: flex; min-height: 0; }
-nav { width: 16rem; border-right: 1px solid #ddd; background: #fff; overflow-y: auto; }
-nav ul { list-style: none; margin: 0; padding: 0; }
-nav li { padding: .5rem .8rem; border-bottom: 1px solid #eee; cursor: pointer; }
-nav li.current { background: #e8f0fe; }
-nav li .meta { font-size: .8rem; color: #666; }
-nav li .busy { color: #0a7d32; }
-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-#controls { display: flex; flex-wrap: wrap; gap: .5rem; padding: .5rem .8rem; border-bottom: 1px solid #eee; align-items: center; }
-#controls select { max-width: 14rem; }
-#notice, #card-notice { padding: .4rem .8rem; background: #fff4e5; color: #8a4b00; white-space: pre-line; }
-#transcript { flex: 1; overflow-y: auto; padding: .8rem; }
-.entry { margin: 0 0 .8rem; padding: .5rem .7rem; border-radius: 8px; background: #fff; border: 1px solid #e4e4e4; white-space: pre-wrap; overflow-wrap: anywhere; }
-.entry.user { background: #eef5ff; border-color: #cfe0fb; }
-.entry:is(.toolCall, .toolResult, .liveTool) { font: 12px/1.4 ui-monospace, monospace; color: #444; background: #f4f4f4; max-height: 12rem; overflow: auto; }
-.entry.toolResult:has(> [data-format="page-preview"]) { max-height: none; font: inherit; }
-[data-format="page-preview"] .preview-controls { display: flex; flex-wrap: wrap; align-items: center; gap: .25rem .75rem; }
-[data-format="page-preview"] iframe { display: block; width: 100%; height: clamp(14rem, 48vh, 28rem); margin-top: .5rem; border: 1px solid #ddd; background: #fff; }
-.entry.inherited { opacity: .7; }
-.entry:is(.liveText, .liveTool) { border-style: dashed; }
-.entry.runFailure { background: #fff4e5; color: #8a4b00; }
-.card-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: .2rem .5rem; margin-bottom: .2rem; white-space: normal; font: .75rem/1.45 system-ui, sans-serif; }
-.card-head[hidden] { display: none; }
-.card-head .role { flex: 1; color: #777; }
-.card-head button { max-width: 100%; padding: .1rem .5rem; text-align: left; overflow-wrap: anywhere; }
-.card-head button[data-action="openPane"] { color: #17458a; }
-.card-body[data-format="markdown"] { display: flow-root; white-space: normal; }
-.card-body[data-format="markdown"] :where(p, ul, ol, blockquote, pre, h1, h2, h3, h4, h5, h6, .markdown-table) { margin: .55rem 0; }
-.card-body[data-format="markdown"] > :first-child { margin-top: 0; }
-.card-body[data-format="markdown"] > :last-child { margin-bottom: 0; }
-.card-body[data-format="markdown"] h1 { font-size: 1.35rem; }
-.card-body[data-format="markdown"] h2 { font-size: 1.2rem; }
-.card-body[data-format="markdown"] :is(h3, h4, h5, h6) { font-size: 1rem; }
-.card-body[data-format="markdown"] :is(ul, ol) { padding-inline-start: 1.5rem; }
-.card-body[data-format="markdown"] blockquote { border-inline-start: 3px solid #b9c2ce; padding-inline-start: .65rem; }
-.card-body[data-format="markdown"] code { font: .9em ui-monospace, monospace; background: #f0f0f0; border-radius: 4px; padding: .1em .25em; }
-.card-body[data-format="markdown"] pre { overflow-x: auto; white-space: pre; overflow-wrap: normal; background: #f0f0f0; border-radius: 4px; padding: .55rem; }
-.card-body[data-format="markdown"] pre code { padding: 0; background: none; }
-.markdown-table { overflow-x: auto; }
-.markdown-table table { width: 100%; border-collapse: collapse; }
-.markdown-table :is(th, td) { border: 1px solid #ddd; padding: .25rem .5rem; overflow-wrap: normal; text-align: left; }
-.markdown-table th { background: #f4f4f4; }
-.markdown-table .align-center { text-align: center; }
-.markdown-table .align-right { text-align: right; }
-#card-header:not([hidden]) { display: flex; flex-wrap: wrap; gap: .3rem 1rem; padding: .4rem .8rem; border-bottom: 1px solid #eee; background: #fff; }
-#composer { display: flex; gap: .5rem; padding: .6rem .8rem; border-top: 1px solid #ddd; background: #fff; }
-#composer textarea { flex: 1; min-width: 0; font: inherit; padding: .4rem; resize: vertical; }
-#actions { display: flex; flex-direction: column; gap: .4rem; }
-button { font: inherit; padding: .3rem .7rem; }
-#pi-run:not([hidden]) { display: flex; }
-#pi-run { flex: 0 0 clamp(18rem, 36vw, 35rem); min-width: 0; flex-direction: column; border-left: 1px solid #ddd; background: #fff; }
-.run-controls { display: flex; align-items: center; gap: .5rem; padding: .5rem .8rem; border-bottom: 1px solid #ddd; }
-.run-controls h2 { flex: 1; font-size: 1rem; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#pi-run-jump { white-space: nowrap; }
-.run-status { flex: none; height: calc(2.9em + .4rem); margin: 0; padding: .2rem .8rem; overflow: auto; overflow-wrap: anywhere; }
-#pi-run-view { overflow: auto; padding: .5rem .8rem; overflow-wrap: anywhere; }
-#pi-run-view h3 { font-size: .95rem; margin-bottom: .35rem; }
-#pi-run-view p { white-space: pre-wrap; }
-#pi-run-view pre { white-space: pre-wrap; background: #f4f4f4; padding: .5rem; font: 12px/1.45 ui-monospace, monospace; }
-#pi-run-view li { margin-bottom: .35rem; }
-@media (max-width: 900px) {
-  #pi-run { position: fixed; inset: 0; z-index: 3; border: 0; }
-}
-@media (max-width: 700px) {
-  /* Leave room for both labels and the Thinking picker. */
-  #controls #model { max-width: clamp(4rem, calc(100vw - 15rem), 9rem); }
-  #menu { display: inline-block; }
-  nav { position: fixed; top: 2.8rem; left: 0; bottom: 0; z-index: 2; display: none; box-shadow: 2px 0 8px #0003; }
-  nav.open { display: block; }
-}
-`;
+export const pageCss = readFileSync(new URL("./web/chat.css", import.meta.url), "utf8");
 
 export const pageJs = (appHostnames: readonly string[], pagesAvailable: boolean) => `import markdownit from ${JSON.stringify(markdownScriptPath)};
 import { derive, scopeAppStep } from "/web/cards.ts";
+import { drawButtonIcon } from "/web/icons.ts";
 import { piRunApiPath } from "/web/shared.ts";
 import { builtInSteps, runIdOf } from "/web/steps.ts";
 ${pagesAvailable ? `import { pagePreviews } from "${pagesPreviewScript}";` : ""}
@@ -458,16 +391,21 @@ function branchNode(id) {
   if (!node) {
     const li = document.createElement("li");
     li.dataset.branch = id;
-    const title = document.createElement("div");
-    const meta = document.createElement("div");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "branch-item";
+    const title = document.createElement("span");
+    title.className = "branch-name";
+    const meta = document.createElement("span");
     meta.className = "meta";
     const info = document.createElement("span");
     const busy = document.createElement("span");
     busy.className = "busy";
     busy.textContent = " · busy";
     meta.append(info, busy);
-    li.append(title, meta);
-    node = { li, title, info, busy };
+    button.append(title, meta);
+    li.append(button);
+    node = { li, button, title, info, busy };
     branchNodes.set(id, node);
   }
   return node;
@@ -482,7 +420,8 @@ function renderBranches() {
   }
   app.branches.forEach((branch, index) => {
     const node = branchNode(branch.id);
-    node.li.classList.toggle("current", branch.id === app.branch);
+    const selected = branch.id === app.branch;
+    node.button.ariaCurrent = selected ? "page" : null;
     setText(node.title, branch.title);
     const model = branch.model ? branch.model.modelId : "no model";
     setText(node.info, "#" + branch.id + " · " + model + " · " + money(branch.cost));
@@ -583,7 +522,8 @@ function buttonNode({ label, action }) {
   const button = document.createElement("button");
   button.type = "button";
   button.dataset.action = action.type;
-  button.textContent = label;
+  if (action.type === "fork") drawButtonIcon(button, "fork", label);
+  else button.textContent = label;
   button.addEventListener("click", guard(() => act(action, button)));
   return button;
 }
@@ -603,12 +543,15 @@ function linkNode({ label, href = "" }) {
 }
 
 function drawCard(node, precard) {
-  const classes = new Set(["entry", precard.kind, precard.message?.role, precard.inherited && "inherited", precard.style]);
+  const toolError = precard.kind === "toolResult" && precard.message.isError;
+  const classes = new Set(["entry", precard.kind, precard.message?.role, precard.inherited && "inherited", toolError && "tool-error", precard.style]);
   const className = [...classes].filter(Boolean).join(" ");
   if (node.className !== className) node.className = className;
   if (node.hidden !== precard.hidden) node.hidden = precard.hidden;
   const [head, body] = node.children;
-  setText(head.firstChild, precard.label);
+  const [role, inherited] = head.firstChild.children;
+  setText(role, precard.label);
+  inherited.hidden = !precard.inherited;
   const controls = JSON.stringify([precard.links, precard.buttons]);
   if (node.dataset.controls !== controls) {
     node.dataset.controls = controls;
@@ -640,8 +583,14 @@ function drawCards(container, precards) {
       node.dataset.key = precard.key;
       const head = document.createElement("div");
       head.className = "card-head";
-      const label = document.createElement("span");
-      label.className = "role";
+      const label = document.createElement("div");
+      label.className = "card-label";
+      const role = document.createElement("span");
+      role.className = "role";
+      const inherited = document.createElement("span");
+      inherited.className = "inherited-marker";
+      inherited.textContent = "Inherited";
+      label.append(role, inherited);
       head.append(label);
       const body = document.createElement("div");
       body.className = "card-body";
@@ -853,6 +802,11 @@ async function loadModels() {
   }));
 }
 
+$("skip-to-chat").addEventListener("click", event => {
+  event.preventDefault(); // The fragment names the selected branch.
+  $("input").focus();
+});
+
 let draftRevision = 0;
 $("input").addEventListener("input", () => { draftRevision++; });
 $("composer").addEventListener("submit", guard(async event => {
@@ -938,12 +892,31 @@ $("older").addEventListener("click", guard(async () => {
     if (revision === transcriptRevision) button.disabled = false;
   }
 }));
-$("menu").addEventListener("click", () => $("branches").classList.toggle("open"));
+const menu = $("menu");
+const branches = $("branches");
+function showBranches(open) {
+  branches.classList.toggle("open", open);
+  menu.ariaExpanded = String(open);
+}
+menu.addEventListener("click", () => {
+  const open = menu.ariaExpanded !== "true";
+  showBranches(open);
+  if (open) (branches.querySelector("[aria-current]") ?? branches.querySelector("button"))?.focus();
+});
+document.addEventListener("focusin", event => {
+  if (menu.ariaExpanded === "true" && event.target !== menu && !branches.contains(event.target)) showBranches(false);
+});
 $("branch-list").addEventListener("click", event => {
-  const li = event.target.closest("li");
-  if (!li) return;
-  selectBranch(Number(li.dataset.branch));
-  $("branches").classList.remove("open");
+  const item = event.target.closest(".branch-item");
+  if (!item) return;
+  selectBranch(Number(item.closest("li").dataset.branch));
+  showBranches(false);
+  if (menu.getClientRects().length) menu.focus();
+});
+document.addEventListener("keydown", event => {
+  if (event.key !== "Escape" || menu.ariaExpanded !== "true" || !menu.getClientRects().length || openedRun) return;
+  showBranches(false);
+  menu.focus();
 });
 
 guard(async () => {

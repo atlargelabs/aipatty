@@ -1,3 +1,5 @@
+import { drawButtonIcon } from "/web/icons.ts";
+
 const $ = id => document.getElementById(id);
 const form = $("set-form");
 const date = $("workout-date");
@@ -58,10 +60,12 @@ function node(tag, text) {
   if (text !== undefined) element.textContent = text;
   return element;
 }
-function button(label, action, click) {
-  const element = node("button", label);
+function iconButton(icon, label, action, click) {
+  const element = node("button");
   element.type = "button";
   element.dataset.action = action;
+  drawButtonIcon(element, icon, label);
+  if (icon === "trash") element.classList.add("danger");
   element.addEventListener("click", click);
   return element;
 }
@@ -235,23 +239,21 @@ function renderDraft() {
     content.className = "gym-inline";
     const actions = node("div");
     actions.className = "gym-actions";
-    const edit = button("Edit", "edit-set", () => {
+    const line = setLine(set);
+    const label = " set " + (i + 1) + ": " + line;
+    const edit = iconButton("edit", "Edit" + label, "edit-set", () => {
       if (pendingSet()) return;
       loadFields({ ...set, position: i });
       remember();
       exercise.focus();
       void previewLast();
     });
-    const remove = button("Remove", "remove-set", () => {
+    const remove = iconButton("trash", "Remove" + label, "remove-set", () => {
       sets.splice(i, 1);
       if (position === i) loadFields();
       else if (position !== null && position > i) position--;
       renderDraft();
     });
-    const line = setLine(set);
-    const label = " set " + (i + 1) + ": " + line;
-    edit.setAttribute("aria-label", "Edit" + label);
-    remove.setAttribute("aria-label", "Remove" + label);
     actions.append(edit, remove);
     content.append(node("span", line), actions);
     row.append(content);
@@ -384,14 +386,15 @@ function workoutCard(workout) {
   heading.className = "gym-inline";
   const actions = node("div");
   actions.className = "gym-actions";
-  const edit = button("Edit", "edit-workout", () => {
+  const label = " workout on " + workout.date;
+  const edit = iconButton("edit", "Edit" + label, "edit-workout", () => {
     if (busy || !mayDiscardDraft()) return;
     void run(async () => {
       begin({ ...await api("workouts/" + workout.id), editing: true });
       $("workout-heading").scrollIntoView({ block: "start" });
     });
   });
-  const remove = button("Delete", "delete-workout", () => {
+  const remove = iconButton("trash", "Delete" + label, "delete-workout", () => {
     if (busy || !confirm("Delete the workout on " + workout.date + "?")) return;
     void run(async () => {
       await api("workouts/" + workout.id, "DELETE");
@@ -403,7 +406,7 @@ function workoutCard(workout) {
   });
   const copyStatus = node("div");
   copyStatus.setAttribute("role", "status");
-  const copy = button("Copy", "copy-workout", async () => {
+  const copy = iconButton("copy", "Copy" + label, "copy-workout", async () => {
     const clipboard = navigator.clipboard;
     if (!clipboard?.writeText) {
       copyStatus.textContent = "Clipboard unavailable. Use a browser with clipboard access over HTTPS or localhost.";
@@ -418,9 +421,6 @@ function workoutCard(workout) {
       copyStatus.textContent = "Could not copy workout. Check clipboard permissions and try again.";
     }
   });
-  edit.setAttribute("aria-label", "Edit workout on " + workout.date);
-  copy.setAttribute("aria-label", "Copy workout on " + workout.date);
-  remove.setAttribute("aria-label", "Delete workout on " + workout.date);
   actions.append(edit, copy, remove);
   heading.append(node("h3", workout.date), actions);
   card.append(heading, copyStatus, setList(workout.sets));

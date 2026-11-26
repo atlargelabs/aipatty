@@ -140,6 +140,9 @@ ssh -N -L 8790:127.0.0.1:8790 macmini &
 node src/cli.ts health          # compare the commit with the expected release SHA
 ```
 
+Chat, Gym and the Pages library serve their bundled Source Code Pro fonts from the same listener. No system
+font installation or access to a font CDN is needed.
+
 ## Optional tailnet browser access
 
 Use [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve) for a private HTTPS bookmark on a

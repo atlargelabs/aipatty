@@ -1,3 +1,4 @@
+import { brandCredit, brandStylePath } from "../../web/brand.ts";
 import { durationUnits, loadUnits, maxAmount, maxExercise, maxReps, maxSets } from "./model.ts";
 
 const options = (units: readonly string[]) => units.map(unit => `<option>${unit}</option>`).join("");
@@ -7,21 +8,27 @@ export const phonePage = `<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Gym</title>
+  <title>Gym · Aipatty</title>
+  <link rel="stylesheet" href="${brandStylePath}">
   <link rel="stylesheet" href="/apps/gym/phone.css">
   <script type="module" src="/apps/gym/phone.js"></script>
 </head>
 <body>
-  <header><h1>Gym</h1><a id="chat-link" href="/" hidden>Back to chat</a></header>
+  <header class="masthead">
+    <div class="header-inner">
+      <div><h1 class="product-name">Gym</h1>${brandCredit}</div>
+      <a id="chat-link" href="/" hidden>Back to chat</a>
+    </div>
+  </header>
   <main>
-    <p id="overview-warning" role="status" hidden></p>
-    <section aria-labelledby="suggestion-heading">
+    <p id="overview-warning" class="banner" role="status" hidden></p>
+    <section class="suggestion" aria-labelledby="suggestion-heading">
       <h2 id="suggestion-heading">Suggested workout</h2>
       <p id="suggestion-note">Loading…</p>
       <ol id="suggestion-sets" class="gym-set-list" role="list" hidden></ol>
       <button id="start-suggestion" type="button" hidden>Start from this</button>
     </section>
-    <section aria-labelledby="workout-heading">
+    <section class="workout" aria-labelledby="workout-heading">
       <h2 id="workout-heading">Workouts</h2>
       <fieldset id="workout-editor" aria-labelledby="workout-heading" disabled>
         <label>Workout date <input id="workout-date" type="date" required></label>
@@ -37,13 +44,13 @@ export const phonePage = `<!doctype html>
           <div id="historical-reps" hidden>
             <label>Additional recorded reps <input id="extra-reps" type="number" inputmode="numeric" min="1" max="${maxReps}"></label>
           </div>
-          <div class="gym-actions"><button id="add-set" type="submit">Add set</button><button id="clear-set" type="button">Clear fields</button></div>
+          <div class="gym-actions"><button id="add-set" class="primary" type="submit">Add set</button><button id="clear-set" type="button">Clear fields</button></div>
         </form>
         <ol id="draft-sets" class="gym-set-list" role="list" aria-label="Workout sets"></ol>
-        <div class="gym-actions"><button id="save-workout" type="button">Save workout</button><button id="reset-workout" type="button" hidden>Discard draft</button></div>
+        <div class="gym-actions"><button id="save-workout" class="primary" type="button">Save workout</button><button id="reset-workout" type="button" hidden>Discard draft</button></div>
       </fieldset>
       <p id="status" role="status"></p>
-      <p id="draft-warning" role="status" hidden></p>
+      <p id="draft-warning" class="banner" role="status" hidden></p>
       <dialog id="new-exercise" aria-labelledby="new-exercise-heading">
         <h3 id="new-exercise-heading">Add new exercise</h3>
         <form id="new-exercise-form">
@@ -52,7 +59,7 @@ export const phonePage = `<!doctype html>
         </form>
       </dialog>
     </section>
-    <section aria-labelledby="recent-heading">
+    <section class="recent" aria-labelledby="recent-heading">
       <h2 id="recent-heading">Recent workouts</h2>
       <div id="recent-workouts">Loading…</div>
     </section>

@@ -114,14 +114,15 @@ its identity was remembered.
 ## Page
 
 Open `http://127.0.0.1:8790/` (or the port given with `--port`) for the branch list, transcript, input box, **New**,
-**Rename**, **Archive**, search, model and thinking pickers, and cost. Use **Fork here** on a message to fork at that
-entry. Archiving the selected branch returns the page to Main. In the message box, Enter sends on desktop and
+**Rename**, **Archive**, search, model and thinking pickers, and cost. Use the branching icon (**Fork here**) on a
+message to fork at that entry. Archiving the selected branch returns the page to Main. In the message box, Enter sends on desktop and
 inserts a newline when the primary pointer is coarse and cannot hover (touch-first).
 Shift+Enter inserts a newline in either case. Use the Send button or ⌘/Ctrl+Enter (without Shift or Alt) to send.
 
 The transcript shows a card for each message, and for an assistant message one for each run of text and each
-tool call, in the order they were written. Below the saved transcript, dashed cards show what is in progress: the
-answer being written and each tool call that has not finished. How the cards are made, and how to add to them, is
+tool call, in the order they were written. Labels and accents distinguish user, assistant, tool call and result
+cards, and inherited entries are marked. Below the saved transcript, dashed cards show what is in progress:
+the answer being written and each tool call that has not finished. How the cards are made, and how to add to them, is
 in [the card pipeline](docs/WEB-CARDS.md).
 
 Saved user and assistant prose renders as Markdown. Single newlines are preserved, and wide tables and code

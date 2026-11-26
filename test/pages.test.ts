@@ -48,6 +48,14 @@ test("Pages is available at startup in every branch, with durable immutable cont
   assert.match(chat.headers.get("content-security-policy")!, /frame-src 'self'/);
   assert.equal((await request(pagesPath)).status, 200);
   assert.equal((await request(pagesPreviewScript)).status, 200);
+  for (const weight of ["Regular", "Semibold"]) {
+    const font = await request(`/web/fonts/SourceCodePro-${weight}.ttf`);
+    assert.equal(font.status, 200);
+    assert.equal(font.headers.get("content-type"), "font/ttf");
+    assert.equal(font.headers.get("x-content-type-options"), "nosniff");
+    assert.equal(new DataView(await font.arrayBuffer()).getUint32(0), 0x00010000);
+  }
+  assert.equal((await request("/web/fonts/SourceCodePro-LICENSE.txt")).status, 404);
   const independent = String((await host.newBranch("Independent branch")).id);
   assert.deepEqual(await host.branchApps((await host.conversation(independent))!), []);
 
@@ -76,7 +84,7 @@ test("Pages is available at startup in every branch, with durable immutable cont
     for (const restriction of ["default-src 'none'", "base-uri 'none'", "form-action 'none'", "frame-ancestors 'self'"]) {
       assert.ok(csp.includes(restriction));
     }
-    assert.doesNotMatch(csp, /allow-same-origin|allow-forms|allow-popups|allow-top-navigation/);
+    assert.doesNotMatch(csp, /allow-same-origin|allow-forms|allow-popups|allow-top-navigation|font-src/);
     assert.equal((await request(path, { method: "HEAD" })).headers.get("content-length"), String(Buffer.byteLength(contents[index])));
     assert.equal((await request(path, { method: "POST" })).status, 405);
   }
@@ -88,7 +96,7 @@ test("Pages is available at startup in every branch, with durable immutable cont
 
   for (const path of [pagesPath, "/apps/gym/"]) {
     const response = await request(path);
-    assert.match(response.headers.get("content-security-policy")!, /frame-ancestors 'none'/);
+    assert.match(response.headers.get("content-security-policy")!, /frame-ancestors 'none'; font-src 'self'/);
     assert.doesNotMatch(response.headers.get("content-security-policy")!, /frame-src/);
   }
   assert.equal(await raw(pagePath(first.page.id), { Host: "mini.example.ts.net:8443", Origin: "https://mini.example.ts.net:8443" }), 200);

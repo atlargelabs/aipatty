@@ -116,8 +116,12 @@ async function openBrowser(t: TestContext, flags: string[] = []) {
     },
     viewport: (width: number, height: number) => send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false }),
     emulateTouch: () => send("Emulation.setTouchEmulationEnabled", { enabled: true }),
-    async key(key: "Enter" | "Escape", modifiers = 0) {
-      const params = { key, code: key, windowsVirtualKeyCode: key === "Enter" ? 13 : 27, modifiers };
+    async touch(x: number, y: number) {
+      await send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x, y }] });
+      await send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    },
+    async key(key: "Enter" | "Escape" | "Tab", modifiers = 0) {
+      const params = { key, code: key, windowsVirtualKeyCode: { Enter: 13, Escape: 27, Tab: 9 }[key], modifiers };
       await send("Input.dispatchKeyEvent", { type: "keyDown", ...params, ...(key === "Enter" && { text: "\r" }) });
       await send("Input.dispatchKeyEvent", { type: "keyUp", ...params });
     },
@@ -131,7 +135,7 @@ async function openBrowser(t: TestContext, flags: string[] = []) {
 interface Shown { title: string; current: string | null; hash: string; messages: string[] }
 const shown = `({
   title: document.getElementById("title").textContent,
-  current: document.querySelector("#branch-list li.current div")?.textContent ?? null,
+  current: document.querySelector("#branch-list [aria-current] .branch-name")?.textContent ?? null,
   hash: location.hash,
   messages: [...document.querySelectorAll("#entries .card-body")].map(body => body.innerText),
 })`;
@@ -166,9 +170,13 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
   await browser.navigate(`${base}/`);
   const main = await waitFor(browser, "the main branch", value => value.messages.length === 2);
   assert.deepEqual(main, { title: "Main", current: "Main", hash: "#1", messages: ["on main", "Faux reply: on main"] });
+  await browser.key("Tab");
+  assert.equal(await browser.evaluate("document.activeElement.id"), "skip-to-chat");
+  await browser.key("Enter");
+  assert.deepEqual(await browser.evaluate("[document.activeElement.id, location.hash]"), ["input", "#1"]);
 
-  const clickBranch = (title: string) => browser.evaluate(`[...document.querySelectorAll("#branch-list li")]
-    .find(li => li.querySelector("div").textContent === ${JSON.stringify(title)}).click()`);
+  const clickBranch = (title: string) => browser.evaluate(`[...document.querySelectorAll("#branch-list button")]
+    .find(button => button.querySelector(".branch-name").textContent === ${JSON.stringify(title)}).click()`);
   await clickBranch("Side");
   const onSide = await waitFor(browser, "the side branch after clicking it", value => value.messages.length === 4);
   assert.deepEqual(onSide, {
@@ -176,9 +184,14 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
     messages: ["on main", "Faux reply: on main", "only on side", "Faux reply: only on side"],
   });
 
-  await clickBranch("Main");
-  const back = await waitFor(browser, "the main branch after clicking it", value => value.title === "Main" && value.messages.length === 2);
+  await browser.viewport(390, 780);
+  await browser.emulateTouch();
+  await touchButton(browser, "#menu");
+  await until(() => browser.evaluate(`document.querySelector('#menu').ariaExpanded === "true"`));
+  await activate(browser, `li[data-branch="1"] button`);
+  const back = await waitFor(browser, "the main branch after keyboard selection", value => value.title === "Main" && value.messages.length === 2);
   assert.deepEqual(back.messages, ["on main", "Faux reply: on main"]);
+  assert.equal(await browser.evaluate(`document.activeElement.id + ':' + document.activeElement.ariaExpanded`), "menu:false");
 
   // Opening the page with a branch's fragment shows that branch. A fragment-only change would not reload the page.
   await browser.navigate("about:blank");
@@ -203,18 +216,28 @@ test("toolbar New starts blank, Fork here keeps history, and Archive works while
   const root = (await host.conversation("root"))!;
   await host.rename(root, "Home");
   await say(host, "root", "original message");
+  await root.commit(tx => tx.appendEntry(root.id, { kind: "test", model: [
+    { role: "user", content: "A later entry that should not appear in the fork.", timestamp: Date.now() },
+  ] }), ctx);
 
   const browser = await openBrowser(t);
   await browser.navigate(base);
-  const home = await waitFor(browser, "the renamed root", state => state.title === "Home" && state.messages.length === 2);
+  const home = await waitFor(browser, "the renamed root", state => state.title === "Home" && state.messages.length === 3);
   assert.equal(await browser.evaluate(`document.querySelector('#archive').hidden`), true);
   assert.ok(!(await browser.evaluate<string[]>(`[...document.querySelectorAll('#controls button')].map(b => b.textContent)`)).includes("Fork"));
   assert.equal(await browser.evaluate(`document.querySelector('#new').textContent`), "New");
-  const forkHere = `document.querySelector('#entries .assistant button[data-action=fork]')`;
-  assert.equal(await browser.evaluate(`${forkHere}.textContent`), "Fork here");
-  await browser.evaluate(`window.prompt = () => 'Main'; ${forkHere}.click()`);
-  const side = await waitFor(browser, "the fork with inherited messages", state => state.current === "Main" && state.messages.length === 2);
-  assert.deepEqual(side.messages, home.messages);
+  const forkHere = '#entries .assistant button[data-action="fork"]';
+  await assertIconButtons(browser, forkHere, ["Fork here"]);
+  await browser.evaluate(`window.prompt = () => 'Main'; document.querySelector('#entries .user button').focus()`);
+  await browser.key("Tab");
+  assert.equal(await browser.evaluate(`(() => {
+    const focused = document.activeElement;
+    return focused.matches(${JSON.stringify(forkHere)} + ':focus-visible') && getComputedStyle(focused).outlineStyle === 'solid';
+  })()`), true);
+  await browser.key("Enter");
+  const side = await waitFor(browser, "the fork at the selected entry", state => state.current === "Main" && state.messages.length === 2);
+  assert.deepEqual(side.messages, home.messages.slice(0, 2));
+  assert.equal(await browser.evaluate(`document.querySelectorAll('#entries .inherited-marker:not([hidden])').length`), 2);
   const id = side.hash.slice(1);
   const branch = (await host.conversation(id))!;
   const active = await host.submit(branch, { type: "input", content: "keep working" });
@@ -222,7 +245,7 @@ test("toolbar New starts blank, Fork here keeps history, and Archive works while
 
   await browser.evaluate(`window.prompt = () => 'Fresh'; document.querySelector('#new').click()`);
   const fresh = await waitFor(browser, "a blank branch", state => state.current === "Fresh" && state.messages.length === 0);
-  const item = `document.querySelector('li[data-branch="${id}"]')`;
+  const item = `document.querySelector('li[data-branch="${id}"] button')`;
   await browser.evaluate(`${item}.click()`);
   await until(() => browser.evaluate(`!document.querySelector('#abort').disabled && location.hash === '#${id}'`));
   assert.equal(await browser.evaluate(`document.querySelector('#archive').matches(':not([hidden]):enabled')`), true);
@@ -232,7 +255,7 @@ test("toolbar New starts blank, Fork here keeps history, and Archive works while
   `);
   assert.ok(confirmation.includes(`“Main” (#${id})`));
   assert.match(confirmation, /removed from the sidebar.*history and forks will be kept/);
-  await waitFor(browser, "back on Main", state => state.current === "Home" && state.hash === home.hash && state.messages.length === 2);
+  await waitFor(browser, "back on Main", state => state.current === "Home" && state.hash === home.hash && state.messages.length === 3);
   await until(() => browser.evaluate(`!${item}`));
   gate.resolve();
   assert.equal((await active.wait(ctx)).status, "done");
@@ -241,7 +264,7 @@ test("toolbar New starts blank, Fork here keeps history, and Archive works while
   await browser.navigate(`${base}/${side.hash}`);
   await waitFor(browser, "Main after opening an archived branch URL", state => state.current === "Home" && state.hash === home.hash);
   const freshId = fresh.hash.slice(1);
-  await browser.evaluate(`document.querySelector('li[data-branch="${freshId}"]').click()`);
+  await browser.evaluate(`document.querySelector('li[data-branch="${freshId}"] button').click()`);
   await waitFor(browser, "Fresh selected again", state => state.hash === fresh.hash);
   await browser.evaluate(`document.querySelector('#input').value = 'unsent draft'`);
   // Archiving in another client also falls back after the page's existing sidebar refresh.
@@ -252,17 +275,22 @@ test("toolbar New starts blank, Fork here keeps history, and Archive works while
   assert.deepEqual(browser.errors, []);
 });
 
-test("Model and Thinking share a toolbar row on phones with a long model ID", { skip: !chrome, timeout: 60_000 }, async t => {
+test("phone controls fit with long model and cost labels and leave room for chat in landscape", { skip: !chrome, timeout: 60_000 }, async t => {
   const host = await openHost(fauxConfig(await fixture(t)));
   const api = await startApi(host, health, 0);
   t.after(async () => { await api.close(); await host.close(); });
+  const side = await host.newBranch("Training");
+  await host.appCommand((await host.conversation(String(side.id)))!, { connect: true, args: ["gym"] });
 
   const browser = await openBrowser(t);
-  await browser.navigate(`http://127.0.0.1:${api.port}`);
-  await waitFor(browser, "the main branch", state => state.title === "Main");
+  await browser.navigate(`http://127.0.0.1:${api.port}/#${side.id}`);
+  await until(() => browser.evaluate(`!document.querySelector('#card-header').hidden`));
   // The short Faux option would fit even with the desktop cap.
-  await browser.evaluate(`document.querySelector('#model').add(new Option(
-    'an-especially-long-model-identifier-2026-11-26 (faux)', 'faux/long', false, true))`);
+  await browser.evaluate(`document.fonts.ready.then(() => {
+    document.querySelector('#model').add(new Option(
+      'an-especially-long-model-identifier-2026-11-26 (faux)', 'faux/long', false, true));
+    document.querySelector('#cost').textContent = '$129.77 / $1234.56';
+  })`);
 
   for (const width of [320, 375, 390]) {
     await browser.viewport(width, 600);
@@ -280,7 +308,26 @@ test("Model and Thinking share a toolbar row on phones with a long model ID", { 
     })()`);
     assert.deepEqual(layouts.map(([level]) => level), ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
     for (const [level, sameRow] of layouts) assert.ok(sameRow, `Thinking (${level}) should fit beside Model at ${width}px`);
+    assert.equal(await browser.evaluate(`(() => {
+      const box = selector => document.querySelector(selector).getBoundingClientRect();
+      const range = document.createRange();
+      range.selectNodeContents(document.querySelector('.brand-credit'));
+      return range.getBoundingClientRect().right <= box('.pages-link').left
+        && box('#title').right <= box('#cost').left
+        && document.documentElement.scrollWidth === innerWidth;
+    })()`), true, `branding, title and costs fit at ${width}px`);
   }
+
+  await browser.viewport(568, 320);
+  await browser.emulateTouch();
+  assert.equal(await browser.evaluate(`(() => {
+    const box = selector => document.querySelector(selector).getBoundingClientRect();
+    return box('#model').top === box('#archive').top && box('#archive').height >= 44 && box('#transcript').height >= 100;
+  })()`), true, "even with Gym linked, there is space to read in landscape");
+
+  await browser.viewport(844, 390);
+  assert.deepEqual(await browser.evaluate(`['#model', '#thinking'].map(selector => getComputedStyle(document.querySelector(selector)).fontSize)`),
+    ["16px", "16px"], "native pickers remain large enough to avoid iOS focus zoom above the drawer breakpoint");
 
   await browser.viewport(1000, 600);
   const modelWidthInRem = await browser.evaluate<number>(`document.querySelector('#model').getBoundingClientRect().width /
@@ -435,7 +482,7 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   await browser.viewport(1250, 850);
   const base = `http://127.0.0.1:${api.port}`;
   const html = await fetch(base);
-  assert.equal(html.headers.get("content-security-policy"), "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; frame-src 'self'");
+  assert.equal(html.headers.get("content-security-policy"), "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; font-src 'self'; frame-src 'self'");
   await browser.navigate(base);
   // The newest 50 entries: two of them are assistant messages that each made two calls, a card apiece.
   await waitFor(browser, "the cards of the 50 newest entries", state => state.messages.length === 52);
@@ -504,7 +551,7 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   await shows("Duplicate-ID archive");
 
   // A branch change closes the pane. A reload of the fork reads the original exchange, not the later reused ID.
-  await browser.evaluate(`document.querySelector('[data-branch="${side.id}"]').click()`);
+  await browser.evaluate(`document.querySelector('[data-branch="${side.id}"] button').click()`);
   await waitFor(browser, "the fork", state => state.current === "Forked history" && state.messages.length === 8);
   assert.equal(await browser.evaluate(`document.querySelector('#pi-run').hidden`), true);
   await browser.navigate("about:blank");
@@ -831,7 +878,7 @@ test("an older page is requested once and cannot overwrite a different branch", 
   `);
   await until(() => browser.evaluate("typeof window.releasePage === 'function'"));
   assert.equal(await browser.evaluate("window.olderRequests"), 1);
-  await browser.evaluate(`document.querySelector('li[data-branch="${side.id}"]').click()`);
+  await browser.evaluate(`document.querySelector('li[data-branch="${side.id}"] button').click()`);
   await waitFor(browser, "the side branch", state => state.current === "Side" && state.messages.length === 2);
   await browser.evaluate("window.releasePage(); new Promise(resolve => setTimeout(resolve, 0))");
   const state = await browser.evaluate<Shown>(shown);
@@ -861,8 +908,8 @@ test("a click on another branch lands while the current branch is streaming", { 
   // Press on the other branch, let stream frames arrive, then release: a person's click spans several frames.
   const point = await browser.evaluate<{ x: number; y: number }>(`(() => {
     window.kept = document.querySelector("#entries .entry");
-    const box = [...document.querySelectorAll("#branch-list li")]
-      .find(li => li.querySelector("div").textContent === "Side").getBoundingClientRect();
+    const box = [...document.querySelectorAll("#branch-list button")]
+      .find(button => button.querySelector(".branch-name").textContent === "Side").getBoundingClientRect();
     return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
   })()`);
   await browser.mouse("mousePressed", point.x, point.y);
@@ -877,6 +924,33 @@ test("a click on another branch lands while the current branch is streaming", { 
 });
 
 const click = (selector: string) => `document.querySelector(${JSON.stringify(selector)}).click()`;
+
+async function activate(browser: Awaited<ReturnType<typeof openBrowser>>, selector: string) {
+  const button = `document.querySelector(${JSON.stringify(selector)})`;
+  await browser.evaluate(`${button}.focus()`);
+  assert.equal(await browser.evaluate(`document.activeElement === ${button}`), true);
+  await browser.key("Enter");
+}
+
+async function touchButton(browser: Awaited<ReturnType<typeof openBrowser>>, selector: string) {
+  const { x, y, hit } = await browser.evaluate<{ x: number; y: number; hit: boolean }>(`(() => {
+    const button = document.querySelector(${JSON.stringify(selector)});
+    button.scrollIntoView({ block: "center" });
+    const { left, top, width, height } = button.getBoundingClientRect();
+    const x = left + width / 2, y = top + height / 2;
+    return { x, y, hit: button.contains(document.elementFromPoint(x, y)) };
+  })()`);
+  assert.ok(hit, `${selector} has an unobstructed touch target`);
+  await browser.touch(x, y);
+}
+
+async function assertIconButtons(browser: Awaited<ReturnType<typeof openBrowser>>, selector: string, names: string[]) {
+  const buttons = await browser.evaluate(`Array.from(document.querySelectorAll(${JSON.stringify(selector)}), button => [
+    button.type, button.ariaLabel, button.title, button.textContent,
+    !!button.querySelector('svg[aria-hidden="true"][focusable="false"] path[d]'),
+  ])`);
+  assert.deepEqual(buttons, names.map(name => ["button", name, name, "", true]));
+}
 
 async function compose(browser: Awaited<ReturnType<typeof openBrowser>>, content: string) {
   await until(() => browser.evaluate<boolean>("!document.querySelector('#send').disabled"));
@@ -1066,13 +1140,13 @@ test("app load and step failures fall back without leaking async results to anot
   await compose(browser, "/connect missing");
   await compose(browser, "/connect late");
   await until(() => browser.evaluate<boolean>("typeof globalThis.releaseFixture === 'function'"));
-  await browser.evaluate(click(`[data-branch='${root.id}']`));
+  await browser.evaluate(click(`[data-branch='${root.id}'] button`));
   await waitFor(browser, "the root", value => value.title === "Main");
   await browser.evaluate("globalThis.releaseFixture()");
   await say(host, "root", "**Normal chat after the import**");
   await waitFor(browser, "the ordinary response", value => value.messages.some(text => text.includes("Faux reply")));
   assert.deepEqual(await browser.evaluate("[document.querySelector('#card-header').hidden, document.querySelector('#card-notice').hidden, document.body.className]"), [true, true, ""]);
-  await browser.evaluate(click(`[data-branch='${side.id}']`));
+  await browser.evaluate(click(`[data-branch='${side.id}'] button`));
   const diagnostic = () => browser.evaluate<string>("document.querySelector('#card-notice').textContent");
   const problems = await until(diagnostic, text => text.includes("late/broken") && text.includes("missing"));
   assert.match(problems, /Could not load cards for app missing/);
@@ -1147,14 +1221,14 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
       assert.ok(Math.abs(gaps[i + 1] - gap) < 0.02, `${selector} gap after row ${i + 1}: expected ${gap} lines, got ${gaps[i + 1]}`);
     }
   };
-  const checkInlineActions = async (row: string, textSelector: string, minTarget = 32) => {
+  const checkInlineActions = async (row: string, textSelector: string) => {
     assert.equal(await browser.evaluate(`(() => {
       const row = document.querySelector(${JSON.stringify(row)});
       const text = row.querySelector(${JSON.stringify(textSelector)}).getBoundingClientRect();
       const buttons = [...row.querySelectorAll('button')].map(button => button.getBoundingClientRect());
       return buttons.every((box, i) => box.left >= (i ? buttons[i - 1].right : text.right)
         && box.top === buttons[0].top && text.top < box.bottom && text.bottom > box.top
-        && box.width >= ${minTarget} && box.height >= ${minTarget});
+        && box.width >= 44 && box.height >= 44);
     })()`), true, `${row} keeps all controls beside its text with room to tap`);
   };
   const assertNoHorizontalScroll = async (message: string) => {
@@ -1217,9 +1291,9 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await tap("#add-set");
   const newestFirst = [plankLine, "Squat · 4 reps · 62.5 kg", "Squat · 5 reps · 60 kg"];
   assert.deepEqual(await draftLines(), newestFirst);
-  assert.deepEqual(await matching("#draft-sets button", "ariaLabel"),
+  await assertIconButtons(browser, "#draft-sets button",
     newestFirst.flatMap((line, i) => ["Edit", "Remove"].map(action => `${action} set ${3 - i}: ${line}`)));
-  await tap('#draft-sets li:last-child [data-action="edit-set"]');
+  await activate(browser, '#draft-sets li:last-child [data-action="edit-set"]');
   assert.deepEqual(await values("exercise", "duration", "load"), ["name:Squat", "5", "60"]);
   await set({ duration: "6" });
   await tap("#add-set");
@@ -1248,9 +1322,9 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   assert.deepEqual(await matching(`${firstCard} ol > li`), entryLines);
   assert.deepEqual(await matching(`${firstCard} h3`), [first.date]);
   const workoutActions = ["Edit", "Copy", "Delete"].map(action => `${action} workout on ${first.date}`);
-  assert.deepEqual(await matching(`${firstCard} button`, "ariaLabel"), workoutActions);
+  await assertIconButtons(browser, `${firstCard} button`, workoutActions);
   assert.deepEqual(await matching(`${firstCard} > :has(> h3) button`, "ariaLabel"), workoutActions);
-  await checkInlineActions(firstCard, "h3", 44);
+  await checkInlineActions(firstCard, "h3");
   await assertNoHorizontalScroll("recent sets also fit on narrow phones");
   await browser.viewport(390, 780);
 
@@ -1355,6 +1429,7 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   assert.equal(await browser.evaluate("document.querySelectorAll('.toolResult a[href^=\"/apps/gym/\"]').length"), 2);
   assert.ok(await browser.evaluate<boolean>(`[...document.querySelectorAll('.toolCall .card-body')].some(el => el.textContent.includes(${JSON.stringify(JSON.stringify(sql))}))`));
   assert.ok(await browser.evaluate<boolean>(`[...document.querySelectorAll('.toolResult .card-body[data-format=text]')].some(el => el.textContent.includes('provide both load and its kg or lb unit'))`));
+  assert.match(await browser.evaluate<string>("document.querySelector('.toolResult.tool-error .role').textContent"), /^Tool error · /);
   const queryRows = await browser.evaluate<string[]>("[...document.querySelectorAll('.toolResult table:first-of-type td')].map(el => el.textContent)");
   assert.ok(queryRows.includes("62.5"));
   assert.equal((await overview()).workouts.length, 1, "even the successful suggestion did not log a workout");
@@ -1401,7 +1476,8 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await wait(`!!document.querySelector(${JSON.stringify(firstCard)})`);
   await tap(`${firstCard} [data-action='edit-workout']`);
   await wait(editingReady);
-  await tap('#draft-sets li:last-child [data-action="remove-set"]');
+  await touchButton(browser, '#draft-sets li:last-child [data-action="remove-set"]');
+  await wait("document.querySelectorAll('#draft-sets > li').length === 2");
   await checkSetList("#draft-sets", [0.5]);
   assert.deepEqual(await draftLines(), [entryLines[2], entryLines[1]]);
   await tap("#save-workout");
@@ -1420,7 +1496,8 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   faux.setResponses([fauxAssistantMessage(fauxToolCall("gym_query", { sql: check }), { stopReason: "toolUse" }), fauxAssistantMessage("Actual workout checked.")]);
   await compose(browser, "Read the saved workout.");
   await wait("[...document.querySelectorAll('.toolResult td')].some(el => el.textContent === '145')");
-  await tap(`[data-branch='${root.id}']`);
+  await tap("#menu");
+  await tap(`[data-branch='${root.id}'] button`);
   await waitFor(browser, "Main", value => value.title === "Main");
   assert.deepEqual(await browser.evaluate("[document.querySelector('#card-header').hidden, document.querySelectorAll('.toolResult table').length, document.body.className]"), [true, 0, ""]);
   assert.deepEqual(browser.errors, []);
@@ -1436,14 +1513,19 @@ test("Gym copies a recent workout as text without touching the draft", { skip: !
     { exercise: "Plank", duration: 15.5, durationUnit: "sec", load: 0, loadUnit: "kg", extraReps: 3 },
     { exercise: "Farmer\ncarry", duration: 20, durationUnit: "m", load: null, loadUnit: null, extraReps: null },
   ] };
-  const seeded = await fetch(page + "api/workouts/scratch", {
-    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(workout),
-  });
-  assert.equal(seeded.status, 200);
+  const other = { date: "2025-02-04", sets: [workout.sets[1]] };
+  for (const [id, body] of [["scratch", workout], ["other", other]] as const) {
+    const seeded = await fetch(page + "api/workouts/" + id, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    assert.equal(seeded.status, 200);
+  }
 
   const browser = await openBrowser(t);
+  await browser.viewport(1280, 820);
   await browser.navigate(page);
-  const copyButton = '#recent-workouts [data-action="copy-workout"]';
+  const card = 'article[data-workout-id="scratch"]';
+  const copyButton = `${card} [data-action="copy-workout"]`;
   await until(() => browser.evaluate(`!!document.querySelector(${JSON.stringify(copyButton)})`));
   await browser.evaluate(`
     const exercise = document.querySelector('#exercise');
@@ -1472,9 +1554,10 @@ test("Gym copies a recent workout as text without touching the draft", { skip: !
     document.querySelector('#duration').value, document.querySelector('#draft-sets li').textContent
   ]`);
   const before = await draft();
-  const status = () => browser.evaluate<string>(`document.querySelector('#recent-workouts [role="status"]').textContent`);
+  const status = () => browser.evaluate<string>(`document.querySelector('${card} [role="status"]').textContent`);
   const copy = () => browser.evaluate(click(copyButton));
-  await copy();
+  await assertIconButtons(browser, copyButton, ["Copy workout on 2025-02-03"]);
+  await activate(browser, copyButton);
   assert.equal(await browser.evaluate("window.copiedText"),
     "2025-02-03\n1. Squat · 6 reps · 62.5 kg\n2. Plank · 15.5 sec · 3 reps · 0 kg (bodyweight)\n3. Farmer carry · 20 m");
   assert.equal(await status(), "", "success must wait for the clipboard write");
@@ -1489,6 +1572,6 @@ test("Gym copies a recent workout as text without touching the draft", { skip: !
   assert.deepEqual(await draft(), before);
   assert.equal(await browser.evaluate("window.copyPrompts"), 0);
   const overview = await (await fetch(page + "api/overview")).json();
-  assert.deepEqual(overview.workouts, [{ id: "scratch", ...workout }]);
+  assert.deepEqual(overview.workouts, [{ id: "other", ...other }, { id: "scratch", ...workout }]);
   assert.deepEqual(browser.errors, []);
 });

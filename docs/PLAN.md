@@ -185,7 +185,8 @@ Deferred until needed: managed checkouts of repos other than aipatty.
 
 - **API:** bound to `127.0.0.1`, with no listen address to configure. List, create, fork and archive branches;
   send, steer, abort, set the model, stream live output, and check `/health` for the running commit.
-- **Page:** branch list, transcript, input box, New and Archive controls, per-message Fork, model picker, cost, and a read-only pane for the exact
+- **Page:** branch list, role-labeled transcript cards, input box, New and Archive controls, a per-message Fork
+  icon, model picker, cost, and a read-only pane for the exact
   Pi run behind a tool call. It shows archived results or automatically follows new output while the run is active
   and you're at the bottom. It is not an interactive terminal. Add a Gmail switch when Gmail ships. The
   transcript is drawn by [the card pipeline](WEB-CARDS.md), an ordered list of pure steps that later features add to.
