@@ -2,9 +2,13 @@ const $ = id => document.getElementById(id);
 const form = $("set-form");
 const date = $("workout-date");
 const exercise = $("exercise");
-const reps = $("reps");
-const amount = $("amount");
-const unit = $("unit");
+const duration = $("duration");
+const durationUnit = $("duration-unit");
+const load = $("load");
+const loadUnit = $("load-unit");
+const extraReps = $("extra-reps");
+const newExercise = $("new-exercise");
+const newName = $("new-exercise-name");
 const last = $("last-session");
 const recent = $("recent-workouts");
 const startSuggestion = $("start-suggestion");
@@ -17,9 +21,30 @@ if (/^[1-9]\d*$/.test(branch ?? "") && Number.isSafeInteger(Number(branch))) {
 }
 
 let id, sets, editing, position, setDirty, valuesDirty, dateDirty, unreadableDraft;
-let suggestion = null, knownExercises = new Set(), busy = false, lookup = 0, lookedUp, overviewRevision = 0;
+let selectedExercise, addedExercises, editingExtraReps;
+let suggestion = null, knownExercises = [], busy = false, lookup = 0, lookedUp, overviewRevision = 0;
 // Match the store's SQLite NOCASE, not Unicode case folding.
 const foldName = name => name.replace(/[A-Z]/g, letter => letter.toLowerCase());
+const addNew = "add-new";
+const optionValue = name => name ? "name:" + name : "";
+
+function exerciseChoices() {
+  const choices = new Map();
+  for (const name of [...knownExercises, ...sets.map(set => set.exercise), ...(suggestion?.sets ?? []).map(set => set.exercise), ...addedExercises]) {
+    const key = foldName(name);
+    if (!choices.has(key)) choices.set(key, name);
+  }
+  return choices;
+}
+function renderExercisePicker() {
+  const choices = exerciseChoices();
+  // Keep the selected spelling when editing a historical set, without showing a second option.
+  if (selectedExercise) choices.set(foldName(selectedExercise), selectedExercise);
+  const placeholder = new Option("Choose an exercise", "");
+  placeholder.disabled = true;
+  exercise.replaceChildren(placeholder, ...[...choices.values()].map(name => new Option(name, optionValue(name))), new Option("Add new", addNew));
+  exercise.value = optionValue(selectedExercise);
+}
 
 function today() {
   const now = new Date();
@@ -41,7 +66,9 @@ function button(label, action, click) {
   return element;
 }
 function setLine(set) {
-  return set.exercise + " · " + (set.reps == null ? "" : set.reps + " reps · ") + set.amount + " " + set.unit;
+  return set.exercise + " · " + set.duration + " " + set.durationUnit
+    + (set.extraReps == null ? "" : " · " + set.extraReps + " reps")
+    + (set.load == null ? "" : " · " + set.load + " " + set.loadUnit + (set.load === 0 ? " (bodyweight)" : ""));
 }
 function say(text) { $("status").textContent = text; }
 function warning(id, text = "") {
@@ -59,7 +86,7 @@ async function api(path, method = "GET", body) {
 }
 
 function hasDraft() {
-  return editing || sets.length > 0 || dateDirty || setDirty || position !== null;
+  return editing || sets.length > 0 || addedExercises.length > 0 || dateDirty || setDirty || position !== null;
 }
 function updateDefaultDate() {
   if (!hasDraft()) date.value = today();
@@ -75,14 +102,27 @@ function remember() {
   try {
     if (!dirty) localStorage.removeItem(draftKey);
     else localStorage.setItem(draftKey, JSON.stringify({
-      id, date: date.value, dateDirty, sets, editing,
-      fields: { exercise: exercise.value, reps: reps.value, amount: amount.value, unit: unit.value, position, setDirty, valuesDirty },
+      id, date: date.value, dateDirty, sets, editing, addedExercises,
+      fields: { exercise: selectedExercise, duration: duration.value, durationUnit: durationUnit.value,
+        load: load.value, loadUnit: loadUnit.value, extraReps: editingExtraReps ? extraReps.value : null, position, setDirty, valuesDirty },
     }));
     warning("draft-warning");
   } catch {
     warning("draft-warning", dirty ? "This browser could not autosave the draft. Save the workout before leaving Gym."
       : "This browser could not clear the draft. A previously saved draft may reappear on reload.");
   }
+}
+// Older browser drafts used the same weight-or-time split as the old database, but editor fields are strings.
+function upgradeDraftSet(set) {
+  if (!set || "duration" in set) return set;
+  const { reps, amount, unit, ...rest } = set;
+  if (unit === "sec" || unit === "min") {
+    return { ...rest, duration: amount, durationUnit: unit, load: null, loadUnit: null, extraReps: reps === "" ? null : reps ?? null };
+  }
+  if (unit === "kg" || unit === "lb") {
+    return { ...rest, duration: reps, durationUnit: "reps", load: amount, loadUnit: unit, extraReps: null };
+  }
+  return set;
 }
 function restoreEditor() {
   let raw;
@@ -95,26 +135,42 @@ function restoreEditor() {
   if (raw !== null) {
     try {
       const draft = JSON.parse(raw);
-      if (typeof draft?.id !== "string" || !draft.id || typeof draft.date !== "string" || !Array.isArray(draft.sets)
-        || !draft.sets.every(set => typeof set?.exercise === "string" && typeof set.amount === "number" && typeof set.unit === "string")) {
+      if (typeof draft?.id !== "string" || !draft.id || typeof draft.date !== "string" || !Array.isArray(draft.sets)) {
         throw new Error("Unrecognized draft");
       }
+      draft.sets = draft.sets.map(upgradeDraftSet);
+      if (!draft.sets.every(set => typeof set?.exercise === "string" && typeof set.duration === "number" && typeof set.durationUnit === "string")
+        || (draft.addedExercises !== undefined && (!Array.isArray(draft.addedExercises) || !draft.addedExercises.every(name => typeof name === "string")))) {
+        throw new Error("Unrecognized draft");
+      }
+      const fields = draft.fields;
+      if (fields != null && (typeof fields !== "object" || Array.isArray(fields)
+        || (fields.exercise != null && typeof fields.exercise !== "string"))) {
+        throw new Error("Unrecognized draft fields");
+      }
+      draft.fields = upgradeDraftSet(fields);
       saved = draft;
     } catch { unreadableDraft = true; }
   }
   begin(saved);
 }
-function timed() { return unit.value === "sec" || unit.value === "min"; }
 function syncFields() {
-  reps.required = !timed();
-  $("amount-label").textContent = timed() ? "Time" : "Weight";
+  const count = durationUnit.value === "reps";
+  duration.min = count ? "1" : "0";
+  duration.max = count ? duration.dataset.maxCount : duration.dataset.maxMeasurement;
+  duration.step = count ? "1" : "any";
+  duration.inputMode = count ? "numeric" : "decimal";
+  $("historical-reps").hidden = extraReps.disabled = count || !editingExtraReps;
   $("add-set").textContent = position === null ? "Add set" : "Update set";
   $("clear-set").textContent = position === null ? "Clear fields" : "Cancel set edit";
 }
-function fillFields(set) {
-  reps.value = set.reps ?? "";
-  amount.value = set.amount;
-  unit.value = set.unit;
+function fillFields(set, defaultLoadUnit = "kg") {
+  duration.value = set.duration ?? "";
+  durationUnit.value = set.durationUnit ?? "reps";
+  load.value = set.load ?? "";
+  loadUnit.value = set.loadUnit ?? defaultLoadUnit;
+  extraReps.value = set.extraReps ?? "";
+  editingExtraReps = set.extraReps != null;
   syncFields();
 }
 function hideLast() {
@@ -124,22 +180,25 @@ function hideLast() {
 }
 function loadFields(fields) {
   hideLast();
-  exercise.value = fields?.exercise ?? "";
+  selectedExercise = fields?.exercise?.trim() ?? "";
   position = fields?.position ?? null;
   setDirty = !!fields?.setDirty;
   valuesDirty = !!fields?.valuesDirty;
-  fillFields(fields ?? { reps: "", amount: "", unit: "kg" });
+  fillFields(fields ?? {});
+  renderExercisePicker();
 }
 function begin(draft) {
+  if (newExercise.open) newExercise.close();
   id = draft?.id ?? newId();
   date.value = draft?.date ?? today();
   dateDirty = draft?.dateDirty ?? false;
   sets = draft ? [...draft.sets] : [];
+  addedExercises = draft?.addedExercises ?? [];
   editing = !!draft?.editing;
   $("workout-heading").textContent = editing ? "Edit workout" : "Log workout";
   loadFields(draft?.fields);
   renderDraft();
-  if (exercise.value) void previewLast();
+  if (selectedExercise) void previewLast();
 }
 function mayDiscardDraft() {
   return !hasDraft() || confirm("Discard your unsaved workout changes?");
@@ -150,6 +209,7 @@ function pendingSet() {
   return true;
 }
 function renderDraft() {
+  renderExercisePicker();
   $("draft-sets").replaceChildren(...sets.map((set, i) => {
     const row = node("li", setLine(set));
     const actions = node("div");
@@ -159,6 +219,7 @@ function renderDraft() {
       loadFields({ ...set, position: i });
       remember();
       exercise.focus();
+      void previewLast();
     });
     const remove = button("Remove", "remove-set", () => {
       sets.splice(i, 1);
@@ -175,7 +236,7 @@ function renderDraft() {
   remember();
 }
 async function previewLast() {
-  const name = exercise.value.trim();
+  const name = selectedExercise;
   if (!name || name === lookedUp) return;
   lookedUp = name;
   const call = ++lookup;
@@ -188,8 +249,8 @@ async function previewLast() {
       const list = node("ol");
       list.append(...session.sets.map(set => node("li", setLine(set))));
       last.replaceChildren(node("strong", "Last time · " + session.date), list);
-      if (position === null && !valuesDirty && reps.value === "" && amount.value === "") {
-        fillFields(session.sets[0]);
+      if (position === null && !valuesDirty && duration.value === "" && load.value === "") {
+        fillFields(session.sets[0], loadUnit.value);
         remember();
       }
     }
@@ -200,34 +261,68 @@ async function previewLast() {
   last.hidden = false;
 }
 
-form.addEventListener("input", event => {
-  updateDefaultDate();
-  setDirty = true;
-  if (event.target === exercise) {
+function selectExercise(name, isNew = false) {
+  if (name !== selectedExercise) {
+    updateDefaultDate();
+    if (isNew) addedExercises.push(name);
+    selectedExercise = name;
+    setDirty = true;
     hideLast();
-    if (position === null && !valuesDirty) reps.value = amount.value = "";
-    if (knownExercises.has(foldName(exercise.value.trim()))) void previewLast();
-  } else {
-    valuesDirty = true;
+    if (position === null && !valuesDirty) fillFields({}, loadUnit.value);
+    void previewLast();
   }
+  renderExercisePicker();
+  remember();
+}
+exercise.addEventListener("change", () => {
+  if (exercise.value !== addNew) {
+    selectExercise(exercise.value.slice("name:".length));
+    return;
+  }
+  // Opening or cancelling the dialog doesn't change the selection or the draft.
+  exercise.value = optionValue(selectedExercise);
+  newName.value = "";
+  newName.setCustomValidity("");
+  newExercise.showModal();
+});
+newName.addEventListener("input", () => newName.setCustomValidity(""));
+$("cancel-exercise").addEventListener("click", () => newExercise.close());
+$("new-exercise-form").addEventListener("submit", event => {
+  event.preventDefault();
+  const name = newName.value.trim();
+  if (!name || name.length > newName.maxLength) {
+    newName.setCustomValidity("Enter an exercise name (1–" + newName.maxLength + " characters).");
+    newName.reportValidity();
+    return;
+  }
+  const key = foldName(name);
+  const existing = foldName(selectedExercise) === key ? selectedExercise : exerciseChoices().get(key);
+  newExercise.close();
+  selectExercise(existing ?? name, !existing);
+});
+form.addEventListener("input", () => {
+  updateDefaultDate();
+  setDirty = valuesDirty = true;
   syncFields();
   remember();
 });
-exercise.addEventListener("change", () => void previewLast());
 date.addEventListener("input", () => { dateDirty = true; remember(); });
 $("clear-set").addEventListener("click", () => { loadFields(); remember(); say(""); });
 form.addEventListener("submit", event => {
   event.preventDefault();
-  const name = exercise.value.trim();
-  if (!name) { say("Enter an exercise name."); exercise.focus(); return; }
-  if (timed() && amount.valueAsNumber === 0) { say("Enter a time greater than zero."); amount.focus(); return; }
+  if (!selectedExercise) { say("Choose or add an exercise."); exercise.focus(); return; }
+  if (duration.valueAsNumber <= 0) { say("Enter a duration greater than zero."); duration.focus(); return; }
   if (position === null && sets.length === maxSets) { say("A workout can have up to " + maxSets + " sets."); return; }
-  const set = { exercise: name, reps: reps.value === "" ? null : reps.valueAsNumber, amount: amount.valueAsNumber, unit: unit.value };
+  const set = { exercise: selectedExercise, duration: duration.valueAsNumber, durationUnit: durationUnit.value,
+    load: load.value === "" ? null : load.valueAsNumber, loadUnit: load.value === "" ? null : loadUnit.value,
+    extraReps: extraReps.disabled || extraReps.value === "" ? null : extraReps.valueAsNumber };
   const added = position === null;
   if (added) sets.push(set);
   else sets[position] = set;
   position = null;
   setDirty = valuesDirty = false;
+  extraReps.value = set.extraReps ?? "";
+  editingExtraReps = set.extraReps !== null;
   // Keep the fields so an identical next set takes one tap. Save uses the list, not these fields.
   syncFields();
   renderDraft();
@@ -248,9 +343,9 @@ async function refresh() {
   try {
     const overview = await api("overview");
     if (revision !== overviewRevision) return;
-    knownExercises = new Set(overview.exercises.map(foldName));
-    $("exercises").replaceChildren(...overview.exercises.map(name => new Option(name, name)));
+    knownExercises = overview.exercises;
     suggestion = overview.suggestion;
+    renderExercisePicker();
     $("suggestion-note").textContent = suggestion ? (suggestion.note || "Saved on " + suggestion.created + ".") : "No suggestion saved yet.";
     $("suggestion-sets").replaceChildren(...(suggestion?.sets ?? []).map(set => node("li", setLine(set))));
     $("suggestion-sets").hidden = startSuggestion.hidden = !suggestion;

@@ -22,26 +22,36 @@ branch still remembers the connection.
 
 ## Data
 
-`data/apps/gym/gym.sqlite`, opened with `node:sqlite` and created with `CREATE TABLE IF NOT EXISTS` at open.
+`data/apps/gym/gym.sqlite`, opened with `node:sqlite` and initialized on first use.
 
 | Table | Columns |
 | --- | --- |
 | `workouts` | `id`, `date` (`YYYY-MM-DD`) |
-| `sets` | `workout_id`, `position`, `exercise`, `reps`, `amount`, `unit` (`kg`, `lb`, `sec` or `min`) |
+| `sets` | `workout_id`, `position`, `exercise`, `duration`, `duration_unit` (`reps`, `m`, `sec`, `min`), `load`, `load_unit` (`kg` or `lb`), `extra_reps` |
 | `suggestion` | one row: `created` date, `note` text, `sets` as JSON in the shape of a workout's sets |
 
-`reps` is optional, so a timed set such as a 60-second plank needs only an amount and a unit. There is no list
-of exercises: names from the log are compared using SQLite `NOCASE` (ASCII case folding).
+Duration is independent of load. `reps` requires a positive whole count; `m` (metres), `sec` and `min` accept
+positive fractional values. `NULL` load and unit mean no weight entered; an explicit zero with a unit means
+bodyweight. `extra_reps` retains any additional rep count that was logged on a historical timed set.
+
+At open, Gym upgrades the previous `reps`/`amount`/`unit` schema and saved suggestion in one transaction.
+Weighted sets keep their rep count and weight, including zero; timed sets keep their time and any extra reps,
+with no weight inferred. The old release cannot read the upgraded Gym database; see [Backup](#not-handled-as-decisions)
+if keeping a pre-upgrade copy for rollback. No separate exercise catalog is stored: names from the log are
+compared using SQLite `NOCASE` (ASCII case folding).
 
 ## The page
 
 `/apps/gym/`, built for the phone.
 
-- **Log:** choose the date (today by default), type or pick an exercise, and add sets one at a time with reps and
-  a weight or a time. **Save workout** writes the whole workout.
-- **Completion:** the exercise field offers every name already in the log.
-- **Last time:** picking an exercise shows its sets from the most recent workout that had it, and fills the
-  first set from them. Most sets repeat the last session, and this is what makes logging quick.
+- **Log:** choose the date (today by default), pick an exercise, and add sets one at a time. Duration starts in
+  `reps`; change the unit for distance or time. Enter a weight in `kg` or `lb` if useful (e.g. 15 sec at 60 kg).
+  **Save workout** writes the whole workout.
+- **Exercise picker:** names come from the log, current workout and suggestion. **Add new** lets you use a
+  name in this draft, reusing a matching name without regard to case. Cancel leaves your selection unchanged.
+  New names become available to later workouts once logged.
+- **Last time:** picking a known exercise shows the most recent matching sets and pre-fills the first set when
+  the measurement fields are untouched. After adding a set, its fields stay filled for one-tap repeats.
 - **Suggestion:** when there is one, the page shows its note and sets, and **Start from this** loads the sets
   as the draft to correct and save.
 - **Draft:** an unsaved workout is kept in this browser's `localStorage` and normally survives reload or a
@@ -54,6 +64,11 @@ The page's API is `GET /apps/gym/api/overview` (recent workouts, exercise names,
 `GET /apps/gym/api/last?exercise=<name>` (`{ date, sets }` from the newest matching workout across the whole log,
 or `null`), and `GET`, `PUT` and `DELETE` on `/apps/gym/api/workouts/<id>`. `PUT` sends `{ date, sets }` with an
 ID the page made up, as a transactional upsert, so a retried save does not make a second workout.
+Each set is `{ exercise, duration, durationUnit, load, loadUnit, extraReps }`. On input, `durationUnit` can be
+omitted for `reps`; `load` and `loadUnit` must be supplied together or left absent/null. `extraReps` is optional
+and normally omitted. For example, `{ "exercise": "Carry", "duration": 20, "durationUnit": "m", "load": 60,
+"loadUnit": "kg" }` records both measurements. The old input format is not accepted; reload a tab left open
+before the upgrade. Previously autosaved browser drafts are converted on restore.
 
 ## The tools
 
@@ -64,8 +79,8 @@ ID the page made up, as a transactional upsert, so a retried save does not make 
 
 - **Searching** is `gym_query`. SQL covers "when did I last squat", "bench progress this year" and "volume per
   week" without a tool for each.
-- **Suggesting** is the model's job, done from the instructions and what it queried. The tool exists only to
-  put the result on the phone page, where the workout happens.
+- **Suggesting** is the model's job, done from the instructions and what it queried. The tool takes the same
+  set shape as the phone API and only puts the result on the phone page, where the workout happens.
 - **Only the page writes workouts.** The model has no tool to log, edit or delete one. That removes the risk of
   a proposal being logged as done, and two writers editing one workout.
 - **The instructions** give the schema, say to compare exercise names without case and not to mix units, and

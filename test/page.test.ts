@@ -899,11 +899,19 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   const set = (values: Record<string, string>) => browser.evaluate(`for (const [id, value] of Object.entries(${JSON.stringify(values)})) {
     const field = document.getElementById(id);
     field.value = value;
-    field.dispatchEvent(new Event('input', { bubbles: true }));
+    field.dispatchEvent(new Event(id === 'exercise' ? 'change' : 'input', { bubbles: true }));
   }`);
+  const values = (...ids: string[]) => browser.evaluate<string[]>(`${JSON.stringify(ids)}.map(id => document.getElementById(id).value)`);
+  const names = () => browser.evaluate<string[]>("[...document.querySelectorAll('#exercise option')].map(option => option.textContent)");
+  const newExercise = async (name: string) => {
+    await set({ exercise: "add-new" });
+    await set({ "new-exercise-name": name });
+    await tap("#confirm-exercise");
+    await wait("!document.querySelector('#new-exercise').open");
+  };
   const status = (text: string) => wait(`document.querySelector('#status').textContent.includes(${JSON.stringify(text)})`);
   const overview = async () => (await fetch(`${base}/apps/gym/api/overview`)).json() as Promise<{
-    workouts: { id: string; sets: { exercise: string; reps: number | null; amount: number; unit: string }[] }[];
+    workouts: { id: string; sets: { exercise: string; duration: number; durationUnit: string; load: number | null; loadUnit: string | null }[] }[];
     suggestion: { note: string } | null;
   }>;
 
@@ -917,42 +925,87 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   assert.equal(await browser.evaluate("document.querySelector('#chat-link').getAttribute('href')"), `/#${side.id}`);
   assert.equal(await browser.evaluate(`document.querySelector('#workout-date').value === new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10)`), true);
   assert.equal(await browser.evaluate("document.documentElement.scrollWidth === innerWidth"), true, "phone does not scroll horizontally");
-  await set({ exercise: "Squat", reps: "5", amount: "60" });
+  assert.deepEqual(await names(), ["Choose an exercise", "Add new"]);
+  assert.deepEqual(await browser.evaluate("[...document.querySelectorAll('#duration-unit option')].map(option => option.value)"), ["reps", "m", "sec", "min"]);
+  await set({ exercise: "add-new" });
+  await set({ "new-exercise-name": "   " });
+  await tap("#confirm-exercise");
+  assert.equal(await browser.evaluate("document.querySelector('#new-exercise').open"), true, "blank names are rejected");
+  await set({ "new-exercise-name": "Cancelled" });
+  await tap("#cancel-exercise");
+  assert.deepEqual(await names(), ["Choose an exercise", "Add new"]);
+  assert.equal(await browser.evaluate("localStorage.getItem('gym-draft')"), null);
+
+  await newExercise("  Squat  ");
+  await tap("#clear-set");
+  assert.ok((await names()).includes("Squat"), "a confirmed name stays selectable before any set is logged");
+  await set({ exercise: "name:Squat", duration: "5.5", load: "60" });
+  assert.deepEqual(await values("duration-unit", "load-unit"), ["reps", "kg"]);
   await tap("#add-set");
-  await set({ reps: "4", amount: "62.5" });
+  assert.equal(await browser.evaluate("document.querySelectorAll('#draft-sets li').length"), 0);
+  await set({ duration: "5" });
   await tap("#add-set");
-  await set({ exercise: "Plank", unit: "sec", reps: "", amount: "45" });
+  await set({ duration: "4", load: "62.5" });
+  await tap("#add-set");
+  await newExercise("Plank");
+  await set({ "duration-unit": "sec", duration: "15.5", load: "60" });
   assert.equal((await overview()).workouts.length, 0, "draft changes don't write the log");
   await browser.navigate(`${base}/#${side.id}`);
   await browser.navigate(base + gym);
   await wait("document.querySelector('#workout-editor')?.disabled === false");
-  assert.deepEqual(await browser.evaluate("[document.querySelectorAll('#draft-sets li').length, document.querySelector('#exercise').value, document.querySelector('#amount').value]"), [2, "Plank", "45"]);
+  assert.equal(await browser.evaluate("document.querySelectorAll('#draft-sets li').length"), 2);
+  assert.deepEqual(await values("exercise", "duration", "duration-unit", "load", "load-unit"), ["name:Plank", "15.5", "sec", "60", "kg"]);
   await tap("#add-set");
   await tap("#save-workout");
   await status("Workout saved");
   const [first] = (await overview()).workouts;
-  assert.deepEqual(first.sets.map(set => [set.exercise, set.reps, set.amount, set.unit]), [["Squat", 5, 60, "kg"], ["Squat", 4, 62.5, "kg"], ["Plank", null, 45, "sec"]]);
+  assert.deepEqual(first.sets.map(set => [set.exercise, set.duration, set.durationUnit, set.load, set.loadUnit]),
+    [["Squat", 5, "reps", 60, "kg"], ["Squat", 4, "reps", 62.5, "kg"], ["Plank", 15.5, "sec", 60, "kg"]]);
   assert.equal(await browser.evaluate("localStorage.getItem('gym-draft')"), null);
-  await wait("document.querySelectorAll('#exercises option').length === 2");
-  assert.deepEqual(await browser.evaluate("[...document.querySelectorAll('#exercises option')].map(option => option.value)"), ["Plank", "Squat"]);
-  await set({ exercise: "sQuAt" });
+  await wait("document.querySelectorAll('#exercise option').length === 4");
+  assert.deepEqual(await names(), ["Choose an exercise", "Plank", "Squat", "Add new"]);
+  await newExercise("sQuAt");
   await wait("document.querySelectorAll('#last-session li').length === 2");
-  assert.deepEqual(await browser.evaluate("['reps', 'amount', 'unit'].map(id => document.getElementById(id).value)"), ["5", "60", "kg"]);
+  assert.deepEqual(await values("exercise", "duration", "duration-unit", "load", "load-unit"), ["name:Squat", "5", "reps", "60", "kg"]);
+  assert.deepEqual(await names(), ["Choose an exercise", "Plank", "Squat", "Add new"]);
+  await set({ exercise: "name:Plank" });
+  await wait("document.querySelectorAll('#last-session li').length === 1");
+  assert.deepEqual(await values("duration", "duration-unit", "load", "load-unit"), ["15.5", "sec", "60", "kg"]);
+  await set({ exercise: "add-new" });
+  await set({ "new-exercise-name": "Never added" });
+  await tap("#cancel-exercise");
+  assert.deepEqual(await values("exercise", "duration", "load"), ["name:Plank", "15.5", "60"]);
   await browser.evaluate("window.confirm = () => true");
   await tap("#reset-workout");
   assert.equal(await browser.evaluate("localStorage.getItem('gym-draft')"), null);
 
-  // A previous visit restored by history must not offer a stale copy if a newer visit saved or discarded it.
-  await set({ exercise: "Deadlift", reps: "3", amount: "90" });
+  // An old browser draft can still be edited, including a timed set's additional reps and original name casing.
   const fromHistory = "window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }))";
+  const legacySet = { exercise: "SQUAT", reps: 3, amount: 1.25, unit: "min" };
+  const legacyDraft = { id: "old-draft", date: "2025-01-01", sets: [legacySet],
+    fields: { ...legacySet, reps: "3", amount: "1.5", position: 0, setDirty: true, valuesDirty: true } };
+  await browser.evaluate(`localStorage.setItem('gym-draft', JSON.stringify(${JSON.stringify(legacyDraft)})); ${fromHistory}`);
+  assert.deepEqual(await values("exercise", "duration", "duration-unit", "load", "extra-reps"), ["name:SQUAT", "1.5", "min", "", "3"]);
+  assert.deepEqual(await names(), ["Choose an exercise", "Plank", "SQUAT", "Add new"]);
+  await set({ "extra-reps": "" });
+  await browser.evaluate(fromHistory);
+  assert.equal(await browser.evaluate("document.querySelector('#historical-reps').hidden"), false, "an empty extra rep field stays editable");
+  await set({ "extra-reps": "4" });
+  await tap("#add-set");
+  assert.match(await browser.evaluate<string>("document.querySelector('#draft-sets li').textContent"), /SQUAT · 1\.5 min · 4 reps/);
+
+  // A previous visit restored by history must not offer a stale copy if a newer visit saved or discarded it.
   await browser.evaluate(`localStorage.removeItem('gym-draft'); ${fromHistory}`);
   await wait("!document.querySelector('#workout-editor').disabled");
   assert.equal(await browser.evaluate("document.querySelector('#exercise').value"), "");
-  await browser.evaluate(`localStorage.setItem('gym-draft', '{corrupt'); ${fromHistory}`);
-  await wait("!document.querySelector('#workout-editor').disabled && !document.querySelector('#draft-warning').hidden");
-  assert.equal(await browser.evaluate("localStorage.getItem('gym-draft')"), "{corrupt");
-  await tap("#reset-workout");
-  assert.equal(await browser.evaluate("localStorage.getItem('gym-draft')"), null);
+  const malformed = JSON.stringify({ ...legacyDraft, fields: { exercise: 123 } });
+  for (const raw of ["{corrupt", malformed]) {
+    await browser.evaluate(`localStorage.setItem('gym-draft', ${JSON.stringify(raw)}); ${fromHistory}`);
+    await wait("!document.querySelector('#workout-editor').disabled && !document.querySelector('#draft-warning').hidden");
+    assert.equal(await browser.evaluate("localStorage.getItem('gym-draft')"), raw);
+    await tap("#reset-workout");
+    assert.equal(await browser.evaluate("localStorage.getItem('gym-draft')"), null);
+  }
 
   // Foreground refresh is bounded and doesn't lock local logging. A failed autosave isn't masked by Set added.
   const foreground = "document.dispatchEvent(new Event('visibilitychange'))";
@@ -967,9 +1020,12 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
     ${foreground}
   `);
   await wait("typeof window.releaseOverview === 'function'");
-  await set({ exercise: "Deadlift", reps: "3", amount: "90" });
+  await newExercise("Deadlift");
+  await set({ duration: "3", load: "90", "load-unit": "lb" });
   await tap("#add-set");
   await status("Set added");
+  await newExercise("Calf raise");
+  assert.deepEqual(await values("duration", "duration-unit", "load", "load-unit"), ["", "reps", "", "lb"], "changing exercises keeps the weight unit");
   assert.match(await browser.evaluate<string>("document.querySelector('#draft-warning').innerText"), /could not autosave/);
   await browser.evaluate("Storage.prototype.setItem = window.saveDraftItem; window.fetch = window.realGymFetch; window.releaseOverview()");
   await tap("#reset-workout");
@@ -988,14 +1044,15 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await tap("#chat-link");
   await waitFor(browser, "back in Training", value => value.title === "Training");
 
-  const sql = "SELECT exercise, reps, amount, unit FROM sets WHERE exercise = 'squat' ORDER BY position";
-  const suggested = [{ exercise: "Squat", reps: 5, amount: 65, unit: "kg" }, { exercise: "Plank", reps: null, amount: 1, unit: "min" }];
+  const sql = "SELECT exercise, duration, duration_unit, load, load_unit FROM sets WHERE exercise = 'squat' ORDER BY position";
+  const suggested = [{ exercise: "Squat", duration: 5, durationUnit: "reps", load: 65, loadUnit: "kg" },
+    { exercise: "Farmer carry", duration: 20, durationUnit: "m", load: 60, loadUnit: "kg" }];
   faux.setResponses([request => {
     assert.deepEqual(getCurrentTools(request.messages).map(tool => tool.name).filter(name => name.startsWith("gym_")), ["gym_query", "gym_suggest_workout"]);
     return fauxAssistantMessage(fauxToolCall("gym_query", { sql }, { id: "gym-read" }), { stopReason: "toolUse" });
   }, fauxAssistantMessage([
-    fauxToolCall("gym_suggest_workout", { note: "Start light, then hold a plank.", sets: suggested }, { id: "gym-suggestion" }),
-    fauxToolCall("gym_suggest_workout", { note: "invalid", sets: [{ ...suggested[1], amount: 0 }] }, { id: "gym-error" }),
+    fauxToolCall("gym_suggest_workout", { note: "Start light, then carry.", sets: suggested }, { id: "gym-suggestion" }),
+    fauxToolCall("gym_suggest_workout", { note: "invalid", sets: [{ ...suggested[1], loadUnit: null }] }, { id: "gym-error" }),
   ], { stopReason: "toolUse" }), fauxAssistantMessage("**Next workout** is on your phone.")]);
   await compose(browser, "Show my squats and suggest the next workout.");
   await wait("document.querySelector('#entries .prose strong')?.textContent === 'Next workout'");
@@ -1003,27 +1060,31 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   assert.equal(await browser.evaluate("document.querySelectorAll('.toolCall[hidden]').length"), 0);
   assert.equal(await browser.evaluate("document.querySelectorAll('.toolResult a[href^=\"/apps/gym/\"]').length"), 2);
   assert.ok(await browser.evaluate<boolean>(`[...document.querySelectorAll('.toolCall .card-body')].some(el => el.textContent.includes(${JSON.stringify(JSON.stringify(sql))}))`));
-  assert.ok(await browser.evaluate<boolean>(`[...document.querySelectorAll('.toolResult .card-body[data-format=text]')].some(el => el.textContent.includes('enter a time greater than zero'))`));
+  assert.ok(await browser.evaluate<boolean>(`[...document.querySelectorAll('.toolResult .card-body[data-format=text]')].some(el => el.textContent.includes('provide both load and its kg or lb unit'))`));
   const queryRows = await browser.evaluate<string[]>("[...document.querySelectorAll('.toolResult table:first-of-type td')].map(el => el.textContent)");
   assert.ok(queryRows.includes("62.5"));
   assert.equal((await overview()).workouts.length, 1, "even the successful suggestion did not log a workout");
 
   await tap("#card-header a");
   await wait("document.querySelector('#start-suggestion')?.hidden === false && !document.querySelector('#workout-editor').disabled");
-  assert.equal(await browser.evaluate("document.querySelector('#suggestion-note').textContent"), "Start light, then hold a plank.");
+  assert.equal(await browser.evaluate("document.querySelector('#suggestion-note').textContent"), "Start light, then carry.");
+  assert.ok((await names()).includes("Farmer carry"));
   await tap("#start-suggestion");
   assert.equal(await browser.evaluate("document.querySelectorAll('#draft-sets li').length"), 2);
   assert.equal((await overview()).workouts.length, 1);
   await tap('#draft-sets [data-action="edit-set"]');
-  await set({ amount: "145", unit: "lb" });
+  await set({ load: "145", "load-unit": "lb" });
   await tap("#add-set");
   await tap('#draft-sets li:nth-child(2) [data-action="edit-set"]');
-  await set({ amount: "1.5" });
+  assert.deepEqual(await values("exercise", "duration", "duration-unit", "load", "load-unit"), ["name:Farmer carry", "20", "m", "60", "kg"]);
+  await set({ duration: "20.25" });
   await tap("#add-set");
+  await tap("#add-set"); // Repeat without re-entering either measurement.
   await tap("#save-workout");
   await status("Workout saved");
   const next = (await overview()).workouts.find(workout => workout.id !== first.id)!;
-  assert.deepEqual(next.sets.map(set => [set.amount, set.unit]), [[145, "lb"], [1.5, "min"]]);
+  assert.deepEqual(next.sets.map(set => [set.duration, set.durationUnit, set.load, set.loadUnit]),
+    [[5, "reps", 145, "lb"], [20.25, "m", 60, "kg"], [20.25, "m", 60, "kg"]]);
 
   await tap(`[data-workout-id='${first.id}'] [data-action='edit-workout']`);
   await wait("document.querySelector('#workout-heading').textContent === 'Edit workout'");
@@ -1040,7 +1101,7 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await tap("#chat-link");
   await waitFor(browser, "Training again", value => value.title === "Training");
   await wait("!document.querySelector('#card-header').hidden");
-  const check = "SELECT amount, unit FROM sets ORDER BY position";
+  const check = "SELECT duration, duration_unit, load, load_unit FROM sets ORDER BY position";
   faux.setResponses([fauxAssistantMessage(fauxToolCall("gym_query", { sql: check }), { stopReason: "toolUse" }), fauxAssistantMessage("Actual workout checked.")]);
   await compose(browser, "Read the saved workout.");
   await wait("[...document.querySelectorAll('.toolResult td')].some(el => el.textContent === '145')");

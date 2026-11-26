@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { exerciseName, readId, readSuggestion, readWorkout, units, type GymSet, type Suggestion, type Workout } from "./model.ts";
+import { durationUnits, exerciseName, loadUnits, readId, readSuggestion, readWorkout, type GymSet, type Suggestion, type Workout } from "./model.ts";
 
 const recentLimit = 20;
 const schema = `
@@ -9,16 +9,6 @@ const schema = `
     date TEXT NOT NULL
   ) STRICT;
   CREATE INDEX IF NOT EXISTS workouts_date ON workouts(date DESC);
-  CREATE TABLE IF NOT EXISTS sets (
-    workout_id TEXT NOT NULL REFERENCES workouts(id) ON DELETE CASCADE,
-    position INTEGER NOT NULL,
-    exercise TEXT NOT NULL COLLATE NOCASE,
-    reps INTEGER,
-    amount REAL NOT NULL,
-    unit TEXT NOT NULL CHECK (unit IN (${units.map(unit => "'" + unit + "'").join(", ")})),
-    PRIMARY KEY (workout_id, position)
-  ) STRICT;
-  CREATE INDEX IF NOT EXISTS sets_exercise ON sets(exercise);
   CREATE TABLE IF NOT EXISTS suggestion (
     created TEXT NOT NULL,
     note TEXT NOT NULL,
@@ -27,20 +17,77 @@ const schema = `
   ) STRICT;
 `;
 
+const sqlUnits = (units: readonly string[]) => units.map(unit => "'" + unit + "'").join(", ");
+const setsTable = (table: "sets" | "sets_new") => `
+  CREATE TABLE ${table} (
+    workout_id TEXT NOT NULL REFERENCES workouts(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    exercise TEXT NOT NULL COLLATE NOCASE,
+    duration REAL NOT NULL CHECK (duration > 0),
+    duration_unit TEXT NOT NULL CHECK (duration_unit IN (${sqlUnits(durationUnits)})),
+    load REAL CHECK (load >= 0),
+    load_unit TEXT CHECK (load_unit IN (${sqlUnits(loadUnits)})),
+    extra_reps INTEGER,
+    CHECK ((load IS NULL) = (load_unit IS NULL)),
+    PRIMARY KEY (workout_id, position)
+  ) STRICT;
+`;
+const setFields = "exercise, duration, duration_unit AS durationUnit, load, load_unit AS loadUnit, extra_reps AS extraReps";
+
+type LegacySet = { exercise: string; reps?: number | null; amount: number; unit: "kg" | "lb" | "sec" | "min" };
+
+function migrateSets(db: DatabaseSync) {
+  const columns = db.prepare("PRAGMA table_info(sets)").all();
+  if (!columns.length) db.exec(setsTable("sets"));
+  if (!columns.some(column => column.name === "reps")) return;
+
+  // A v1 amount is either weight or time, never both. Keep missing weights NULL and keep explicit zero weights.
+  db.exec("BEGIN");
+  try {
+    db.exec(setsTable("sets_new") + `
+      INSERT INTO sets_new (workout_id, position, exercise, duration, duration_unit, load, load_unit, extra_reps)
+      SELECT workout_id, position, exercise,
+        CASE WHEN unit IN ('kg', 'lb') THEN reps ELSE amount END,
+        CASE WHEN unit IN ('kg', 'lb') THEN 'reps' ELSE unit END,
+        CASE WHEN unit IN ('kg', 'lb') THEN amount END,
+        CASE WHEN unit IN ('kg', 'lb') THEN unit END,
+        CASE WHEN unit IN ('sec', 'min') THEN reps END
+      FROM sets;
+      DROP TABLE sets;
+      ALTER TABLE sets_new RENAME TO sets;
+    `);
+    const row = db.prepare("SELECT sets FROM suggestion").get() as { sets: string } | undefined;
+    if (row) {
+      const sets = (JSON.parse(row.sets) as LegacySet[]).map(({ exercise, reps, amount, unit }) =>
+        unit === "kg" || unit === "lb"
+          ? { exercise, duration: reps, durationUnit: "reps", load: amount, loadUnit: unit, extraReps: null }
+          : { exercise, duration: amount, durationUnit: unit, load: null, loadUnit: null, extraReps: reps ?? null });
+      db.prepare("UPDATE suggestion SET sets = ?").run(JSON.stringify(sets));
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    if (db.isTransaction) db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
 export function openGymStore(dataDir: string) {
   const path = join(dataDir, "gym.sqlite");
   const db = new DatabaseSync(path);
   try {
     db.exec(schema);
+    migrateSets(db);
+    db.exec("CREATE INDEX IF NOT EXISTS sets_exercise ON sets(exercise)");
     const putWorkout = db.prepare(`
       INSERT INTO workouts(id, date) VALUES (?, ?)
       ON CONFLICT(id) DO UPDATE SET date = excluded.date
     `);
-    const putSet = db.prepare("INSERT INTO sets(workout_id, position, exercise, reps, amount, unit) VALUES (?, ?, ?, ?, ?, ?)");
+    const putSet = db.prepare(`INSERT INTO sets(workout_id, position, exercise, duration, duration_unit, load, load_unit, extra_reps)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
     const clearSets = db.prepare("DELETE FROM sets WHERE workout_id = ?");
     const deleteWorkout = db.prepare("DELETE FROM workouts WHERE id = ?");
     const getWorkout = db.prepare("SELECT id, date FROM workouts WHERE id = ?");
-    const getSets = db.prepare("SELECT exercise, reps, amount, unit FROM sets WHERE workout_id = ? ORDER BY position");
+    const getSets = db.prepare(`SELECT ${setFields} FROM sets WHERE workout_id = ? ORDER BY position`);
     const recent = db.prepare("SELECT id, date FROM workouts ORDER BY date DESC, rowid DESC LIMIT ?");
     const exercises = db.prepare("SELECT DISTINCT exercise FROM sets ORDER BY exercise");
     const lastWorkout = db.prepare(`
@@ -48,7 +95,7 @@ export function openGymStore(dataDir: string) {
       ORDER BY date DESC, rowid DESC LIMIT 1
     `);
     const lastSets = db.prepare(`
-      SELECT exercise, reps, amount, unit FROM sets WHERE workout_id = ? AND exercise = ? ORDER BY position
+      SELECT ${setFields} FROM sets WHERE workout_id = ? AND exercise = ? ORDER BY position
     `);
     const getSuggestion = db.prepare("SELECT created, note, sets FROM suggestion");
     const putSuggestion = db.prepare("INSERT OR REPLACE INTO suggestion(rowid, created, note, sets) VALUES (1, ?, ?, ?)");
@@ -83,8 +130,8 @@ export function openGymStore(dataDir: string) {
         try {
           putWorkout.run(id, date);
           clearSets.run(id);
-          sets.forEach(({ exercise, reps, amount, unit }, position) => {
-            putSet.run(id, position, exercise, reps, amount, unit);
+          sets.forEach(({ exercise, duration, durationUnit, load, loadUnit, extraReps }, position) => {
+            putSet.run(id, position, exercise, duration, durationUnit, load, loadUnit, extraReps);
           });
           db.exec("COMMIT");
         } catch (error) {
