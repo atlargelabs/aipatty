@@ -1,4 +1,6 @@
 import { BACKGROUND_CONTEXT as ctx, withCancel } from "@earendil-works/chord/context";
+import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+import { UsageDoc } from "@earendil-works/pi-durable";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { stripTypeScriptTypes } from "node:module";
@@ -9,15 +11,18 @@ import type { BranchInfo } from "../src/branches.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
 import { pageModules } from "../src/page.ts";
 import { messageText, type ConversationPage } from "../src/protocol.ts";
+import { selfCheck } from "../src/upgrade.ts";
+import { fixtureApp } from "./fixtures/app.ts";
 import { checkout, fauxConfig, fixture, realConfig, until } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
 const exec = promisify(execFile);
 
-async function server(t: TestContext, dir?: string) {
-  const host = await openHost(fauxConfig(dir ?? await fixture(t)));
+async function server(t: TestContext, dir?: string, options?: Parameters<typeof openHost>[1]) {
+  const host = await openHost(fauxConfig(dir ?? await fixture(t)), options);
   const api = await startApi(host, health, 0);
-  t.after(async () => { await api.close(); await host.harness.close(ctx); });
+  const close = async () => { await api.close(); await host.close(); };
+  t.after(close);
   const base = `http://127.0.0.1:${api.port}`;
   const call = async <T = unknown>(path: string, method = "GET", body?: unknown): Promise<{ status: number; body: T }> => {
     const response = await fetch(base + path, {
@@ -25,7 +30,7 @@ async function server(t: TestContext, dir?: string) {
     });
     return { status: response.status, body: await response.json() as T };
   };
-  return { host, base, call };
+  return { host, base, call, close };
 }
 
 /** Send and wait for the answer. */
@@ -40,7 +45,7 @@ async function texts(host: AgentHost, id: string): Promise<string[]> {
   return items.toReversed().flatMap(entry => (entry.model ?? []).map(messageText).filter(Boolean));
 }
 
-test("a fork shares history to the fork point, then diverges, and every branch stays listed", async t => {
+test("a fork shares history to the fork point, then diverges", async t => {
   const { host, call } = await server(t);
   await say(host, "root", "one");
   await say(host, "root", "two");
@@ -77,6 +82,104 @@ test("a fork shares history to the fork point, then diverges, and every branch s
   assert.equal((await call("/api/conversations/root/fork", "POST", { title: "bad\u0007" })).status, 400);
   assert.equal((await call("/api/conversations/root/fork", "POST", { title: "Missing", at: 99_999 })).status, 400);
   assert.equal((await call("/api/conversations/999/fork", "POST", { title: "x" })).status, 404);
+});
+
+test("POST /api/branches starts blank with server defaults, unlike a fork", async t => {
+  const { host, call } = await server(t, undefined, { apps: [fixtureApp("alpha")] });
+  await say(host, "root", "not inherited");
+  const root = (await host.conversation("root"))!;
+  await call("/api/conversations/root/messages", "POST", { content: "/connect alpha" });
+  const savedModel = { provider: "missing", modelId: "not-the-default" };
+  await root.configure({ model: savedModel, thinkingLevel: "low" }, ctx);
+
+  const fork = (await call<BranchInfo>("/api/conversations/root/fork", "POST", { title: "Same title" })).body;
+  assert.equal(fork.parent?.id, root.id);
+  assert.equal(fork.thinking, "low");
+  assert.deepEqual(fork.model, savedModel);
+  assert.deepEqual(await host.branchApps((await host.conversation(String(fork.id)))!), ["alpha"]);
+  assert.deepEqual(await texts(host, String(fork.id)), ["not inherited", "Faux reply: not inherited"]);
+
+  const created = await call<BranchInfo>("/api/branches", "POST", { title: "  Same   title  " });
+  assert.equal(created.status, 201);
+  const fresh = created.body;
+  assert.equal(fresh.title, fork.title);
+  assert.notEqual(fresh.id, fork.id);
+  assert.equal(fresh.parent, null);
+  assert.equal(fresh.thinking, "high");
+  assert.deepEqual(fresh.model, { provider: "faux", modelId: "faux-1" });
+  assert.deepEqual(await host.branchApps((await host.conversation(String(fresh.id)))!), []);
+  const page = await call<ConversationPage>(`/api/conversations/${fresh.id}`);
+  assert.deepEqual(page.body.entries, []);
+  for (const title of [undefined, 42, "  ", "x".repeat(101)]) {
+    assert.equal((await call("/api/branches", "POST", { title })).status, 400);
+  }
+});
+
+test("archive hides a branch durably without touching history, spend, or parked and queued work", { timeout: 20_000 }, async t => {
+  const dir = await fixture(t);
+  const parked = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  t.after(() => release.resolve());
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage("prefix answer"), async () => {
+    parked.resolve();
+    await release.promise;
+    return fauxAssistantMessage("finished parked work");
+  }, fauxAssistantMessage("finished queued work")]);
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const { host, call, close } = await server(t, dir, { models });
+  await say(host, "root", "prefix");
+  const root = (await host.conversation("root"))!;
+  const { id } = await host.fork(root, { title: "Hide this branch" });
+  const branch = (await host.conversation(String(id)))!;
+  const child = await host.fork(branch, { title: "Still listed" });
+  const archive = `/api/conversations/${id}/archive`;
+  await branch.commit(async tx => {
+    (await tx.doc(UsageDoc, branch.id)).models.test = {
+      ...fauxAssistantMessage("").usage, cost: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, total: 1 },
+    };
+  }, ctx);
+  assert.equal((await host.branches()).totalCost, 1);
+
+  const active = await host.submit(branch, { type: "input", content: "park this work" });
+  await parked.promise;
+  const queued = await host.submit(branch, { type: "input", content: "queued work" });
+  // New is also independent of a busy branch with history.
+  const fresh = await call<BranchInfo>("/api/branches", "POST", { title: "While busy" });
+  assert.equal(fresh.status, 201);
+  assert.equal(fresh.body.parent, null);
+  assert.deepEqual((await call<ConversationPage>(`/api/conversations/${fresh.body.id}`)).body.entries, []);
+  assert.equal((await call(archive)).status, 405);
+  assert.equal((await call(archive, "POST")).status, 200);
+  assert.equal((await call(archive, "POST")).status, 200);
+  assert.equal((await call(`/api/conversations/${root.id}/archive`, "POST")).status, 400);
+  assert.equal((await call<ConversationPage>(`/api/conversations/${id}`)).body.busy, true);
+  await assert.rejects(host.reserveUpgrade(), /Wait for every branch/);
+  const listed = await call<{ branches: BranchInfo[]; totalCost: number }>("/api/branches");
+  assert.deepEqual(listed.body.branches.map(branch => branch.id), [root.id, child.id, fresh.body.id]);
+  assert.equal(listed.body.totalCost, 1);
+
+  release.resolve();
+  for (const work of [active, queued]) assert.equal((await work.wait(ctx)).status, "done");
+  const after = (await call<BranchInfo>(`/api/conversations/${id}/fork`, "POST", { title: "Fork after archive", at: child.parent!.at })).body;
+  assert.deepEqual(after.parent, child.parent);
+  await close();
+
+  const reopened = await server(t, dir);
+  const listing = await reopened.host.branches();
+  assert.deepEqual(listing.branches.map(branch => branch.id), [root.id, child.id, fresh.body.id, after.id]);
+  assert.equal(listing.totalCost, 1);
+  const saved = await reopened.call<ConversationPage & { branch: BranchInfo }>(`/api/conversations/${id}`);
+  assert.equal(saved.status, 200);
+  assert.equal(saved.body.branch.title, "Hide this branch");
+  assert.deepEqual(await texts(reopened.host, String(id)), [
+    "prefix", "prefix answer", "park this work", "finished parked work", "queued work", "finished queued work",
+  ]);
+  for (const fork of [child, after]) assert.deepEqual(await texts(reopened.host, String(fork.id)), ["prefix", "prefix answer"]);
+  const open = t.mock.method(reopened.host, "conversation");
+  await selfCheck(reopened.host, fauxConfig(dir));
+  assert.ok(open.mock.calls.some(call => call.arguments[0] === String(id)), "startup still checks archived branches");
 });
 
 test("HTTP and read_branch page the same fork history without gaps or duplicates", { timeout: 30_000 }, async t => {

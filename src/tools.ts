@@ -64,7 +64,7 @@ export function treeExtension(getHost: () => AgentHost) {
 
   const listBranches = defineTool({
     name: "list_branches",
-    description: "List every conversation branch: ID, title, model, own cost, where it was forked from, and whether it is busy.",
+    description: "List unarchived conversation branches: ID, title, model, own cost, where each was forked from, and whether it is busy.",
     parameters: obj({}),
     replay: "safe",
     async execute(_args, api, context) {

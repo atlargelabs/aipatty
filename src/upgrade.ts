@@ -73,7 +73,7 @@ export async function selfCheck(agent: AgentHost, config: Config): Promise<strin
   // Scheduling runs and the root's saved model is in the catalog.
   await check("Model", () => agent.assertAvailable());
   await check("Conversations", async () => {
-    const { branches } = await agent.branches();
+    const { branches } = await agent.branches({ includeArchived: true });
     for (const { id } of branches) {
       const branch = await agent.conversation(String(id));
       if (!branch) throw new Error(`Branch ${id} cannot be opened`);

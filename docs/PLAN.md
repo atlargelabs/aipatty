@@ -14,7 +14,7 @@ conversation.
 | Upgrade | Explicit, never automatic: Steve sends `/upgrade`. If rollback also fails, Steve uses SSH or remote desktop. |
 | GitHub identity | The `pattycaik` account with write access, behind a ruleset on `main`. Other repos only when Steve directs it. |
 | Coding | Aipatty has pi-durable's built-in tools for inspection, scratch work and `gh`. Work intended for a PR goes to its own pinned Pi CLI in a disposable workspace, with the `delegates` and `pi-review` extensions installed. Pi can write the change directly or through a delegate. Every PR is reviewed by a `crmanager` delegate, and Pi keeps fixing until no important finding remains. |
-| Tree | Branches are independent workstreams. Steve and aipatty can both fork. All branches stay listed. No automatic report-back. |
+| Tree | Branches are independent workstreams. Steve can start blank branches and both Steve and aipatty can fork. Steve can archive non-root branches to hide them from listings without deleting history or stopping work. No automatic report-back. |
 | Models | Default `openai/gpt-6.2-sol`, on the `openai` provider with the OpenAI subscription, for aipatty's conversations and for Pi runs. Per-branch model, set by Steve or by aipatty. Spark later. Claude through the `pi` CLI only, for now. |
 | Cost | Shown per branch and in total as `$<branch> / $<total>`. No spend limit. |
 | macOS account | An existing standard service user `aipatty`; manual app installation needs no macOS administrator access. Steve retains administrator access for separate machine provisioning. |
@@ -178,9 +178,9 @@ Deferred until something needs them: a read-only research mode and repos other t
 
 ## Remote access
 
-- **API:** bound to `127.0.0.1`, with no listen address to configure. List branches, send, steer, abort, fork, set
-  the model, stream live output, and `/health` with the running commit.
-- **Page:** branch list, transcript, input box, fork button, model picker, cost, and a read-only pane for the exact
+- **API:** bound to `127.0.0.1`, with no listen address to configure. List, create, fork and archive branches;
+  send, steer, abort, set the model, stream live output, and check `/health` for the running commit.
+- **Page:** branch list, transcript, input box, New and Archive controls, per-message Fork, model picker, cost, and a read-only pane for the exact
   Pi run behind a tool call. It shows archived results or automatically follows new output while the run is active
   and you're at the bottom. It is not an interactive terminal. Add a Gmail switch when Gmail ships. The
   transcript is drawn by [the card pipeline](WEB-CARDS.md), an ordered list of pure steps that later features add to.
