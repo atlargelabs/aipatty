@@ -38,7 +38,8 @@ body > .masthead {
 }
 .branch-item.is-busy .branch-name { color: var(--phosphor); }
 .branch-item:not([aria-current]):hover { background: #293e32; }
-#branches .branch-item[aria-current] { background: #304538; border-inline-start-color: var(--phosphor); }
+#branches .branch-item[aria-current] { background: #304538; border-inline-start-color: var(--cyan); }
+#branches .branch-item.is-busy[aria-current] { border-inline-start-color: var(--phosphor); }
 #branches .branch-item[aria-current]:hover { background: #395444; }
 main {
   --chat-gutter: max(16px, (100% - 56rem) / 2);
@@ -112,6 +113,8 @@ main {
 #composer textarea { flex: 1; min-width: 0; padding: 8px; font-size: 1rem; resize: vertical; }
 #actions { display: flex; flex-direction: column; gap: 4px; }
 #actions button { min-height: 36px; }
+#send { background: var(--cyan); }
+#send:enabled:hover { background: color-mix(in srgb, var(--cyan) 92%, var(--pine)); }
 #pi-run:not([hidden]) { display: flex; }
 #pi-run { flex: 0 0 clamp(18rem, 36vw, 35rem); min-width: 0; flex-direction: column; border-left: 1px solid var(--line); background: var(--paper); }
 .run-controls { display: flex; align-items: center; gap: 8px; padding: 8px 12px; }

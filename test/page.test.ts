@@ -263,18 +263,21 @@ test("toolbar New starts blank, Fork here keeps history, and Archive works while
       edge: style.borderInlineStartColor };
   })()`);
   const chalk = "rgb(242, 246, 241)";
+  const cyan = "rgb(115, 216, 232)";
   const phosphor = "rgb(184, 237, 138)";
-  const idle = { text: "Main", tooltip: "", label: null, current: "page", nameColor: chalk, buttonColor: chalk, edge: phosphor };
+  const idle = { text: "Main", tooltip: "", label: null, current: "page", nameColor: chalk, buttonColor: chalk, edge: cyan };
   assert.deepEqual(await row(), idle);
+  assert.equal(await browser.evaluate(`getComputedStyle(document.querySelector('#send')).backgroundColor`), cyan);
 
   const first = await host.submit(branch, { type: "input", content: "start working" });
   await until(() => browser.evaluate(`!document.querySelector('#abort').disabled`));
-  const running = { ...idle, label: "Main, busy", nameColor: idle.edge };
+  const running = { ...idle, label: "Main, busy", nameColor: phosphor, edge: phosphor };
   assert.deepEqual(await row(), running);
 
   await browser.evaluate(`window.prompt = () => 'Fresh'; document.querySelector('#new').click()`);
   const fresh = await waitFor(browser, "a blank branch", state => state.current === "Fresh" && state.messages.length === 0);
   assert.deepEqual(await row(), { ...running, current: null, edge: "rgba(0, 0, 0, 0)" });
+  assert.equal(await browser.evaluate(`getComputedStyle(document.querySelector('#branch-list [aria-current]')).borderInlineStartColor`), cyan);
   await browser.evaluate(`${item}.click()`);
   await until(() => browser.evaluate(`!document.querySelector('#abort').disabled && location.hash === '#${id}'`));
 
