@@ -67,10 +67,8 @@ export interface AgentHost {
    */
   setModel(model: ModelRef & { thinkingLevel?: ModelThinkingLevel }, conversation?: Conversation, context?: Context): Promise<void>;
   setThinking(level: string, conversation?: Conversation, context?: Context): Promise<void>;
-  /** Unarchived branches, oldest first, and the spend of the whole session. */
-  branches(): Promise<{ branches: BranchInfo[]; totalCost: number }>;
-  /** All ownerless branch records, including archived ones, for startup checks. */
-  branchRecords(): Promise<ConversationRecord[]>;
+  /** Oldest first, with whole-session spend. Only startup checks include archived branches. */
+  branches(options?: { includeArchived?: boolean }): Promise<{ branches: BranchInfo[]; totalCost: number }>;
   branch(conversation: Conversation): Promise<BranchInfo>;
   newBranch(title: unknown): Promise<BranchInfo>;
   archive(conversation: Conversation): Promise<void>;
@@ -496,12 +494,11 @@ async function openOwnedHost(config: Config, { apps: modules = connectedApps, mo
           await target.configure({ thinkingLevel }, ctx);
         }, context));
       },
-      branchRecords,
-      async branches() {
+      async branches({ includeArchived = false } = {}) {
         const records = await branchRecords();
         const branches = await Promise.all(records.map(async record => {
           const doc = await harness.snapshot(BranchDoc, record.id, ctx);
-          if (doc?.archived) return undefined;
+          if (!includeArchived && doc?.archived) return undefined;
           return branchInfo((await harness.conversation(record.id, ctx))!, record, doc?.title);
         }));
         return { branches: branches.filter(branch => branch !== undefined), totalCost: await totalCost() };

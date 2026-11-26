@@ -788,7 +788,7 @@ async function refreshBranches() {
   branchListApplied = request;
   app.branches = branches;
   app.totalCost = totalCost;
-  if (app.branch !== null && !current()) await selectBranch(rootId);
+  if (app.branch !== null && !current()) await leaveArchivedBranch();
   else renderBranches();
 }
 
@@ -806,6 +806,11 @@ async function selectBranch(id) {
   render();
   renderBranches();
   connect(id);
+}
+
+async function leaveArchivedBranch() {
+  await selectBranch(rootId);
+  if ($("input").value.trim()) notice("Branch archived. Your draft was kept; sending it now goes to the root branch.");
 }
 
 async function forkAt(at) {
@@ -878,7 +883,7 @@ $("archive").addEventListener("click", guard(async () => {
   const { id, title } = branch;
   if (!confirm("Archive “" + title + "” (#" + id + ")? It will be removed from the sidebar, but its history and forks will be kept.")) return;
   await api("/api/conversations/" + id + "/archive", { method: "POST" });
-  if (app.branch === id) await selectBranch(rootId);
+  if (app.branch === id) await leaveArchivedBranch();
   await refreshBranches();
 }));
 $("search").addEventListener("click", guard(async () => {

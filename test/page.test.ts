@@ -233,9 +233,12 @@ test("toolbar New starts blank, Fork here keeps history, and Archive works while
   const freshId = fresh.hash.slice(1);
   await browser.evaluate(`document.querySelector('li[data-branch="${freshId}"]').click()`);
   await waitFor(browser, "Fresh selected again", state => state.hash === fresh.hash);
+  await browser.evaluate(`document.querySelector('#input').value = 'unsent draft'`);
   // Archiving in another client also falls back after the page's existing sidebar refresh.
   assert.equal((await fetch(`${base}/api/conversations/${freshId}/archive`, { method: "POST" })).status, 200);
   await until(() => browser.evaluate(`location.hash === '${home.hash}'`), Boolean, 15_000);
+  assert.equal(await browser.evaluate(`document.querySelector('#input').value`), "unsent draft");
+  assert.match(await browser.evaluate<string>(`document.querySelector('#notice:not([hidden])').textContent`), /draft was kept.*root branch/);
   assert.deepEqual(browser.errors, []);
 });
 
