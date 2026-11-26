@@ -248,6 +248,22 @@ can retain the workout instructions without the tools. This does not delete the 
 branches when running a release with Gym again. Automatic `/upgrade` rollback restores its prior conversation
 database and needs no such step.
 
+## Pages
+
+Pages is available in every branch without setup or `/connect`. Open **Pages** in chat or visit `/pages` on the
+same hostname and port as chat. At startup the server opens or creates `pages.sqlite` in its data directory
+(`$ROOT/data` in a normal managed install, `$ROOT/faux` in Faux mode, or the directory passed as `--data-dir`).
+If the database cannot be opened, chat still runs; check server output for the Pages startup error.
+
+`pages.sqlite` stays outside the release and survives ordinary restarts and upgrades. The upgrade backup does
+**not** include it. To back it up, stop the server and copy the file to a private location after the process
+exits. The library holds up to 128 pages of at most 256 KiB each and 32 sections including Unsorted. The
+instance's existing SSH/tailnet access governs the library and direct page URLs; there is no separate login,
+publish listener, proxy or server-side page runtime.
+
+The trial `/pages/ai-patty-usage` Tailscale mount is not a managed page and is not imported. Leave its routing
+and files as they are; any import is a separate operator follow-up.
+
 ## Upgrade
 
 With the server started as in [Start](#start), from a release that has the command, ask for an upgrade in any
@@ -276,7 +292,7 @@ Everything the upgrade keeps is in `$ROOT/upgrade/`:
 | --- | --- |
 | `upgrade.log` | What the supervisor did, with times. |
 | `server.log` | The output of the servers the supervisor started. |
-| `backup.sqlite` | The conversation database as the old release left it at the last switch (not app data). Replaced by the next upgrade. |
+| `backup.sqlite` | The conversation database as the old release left it at the last switch (not app or Pages data). Replaced by the next upgrade. |
 | `pending.json` | Present only between the switch and the new release passing its health check. |
 | `result.json` | An outcome waiting for a running server to post it. |
 

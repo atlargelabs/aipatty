@@ -9,6 +9,8 @@ import { LOOPBACK } from "./config.ts";
 import type { AgentHost } from "./host.ts";
 import { HttpError, jsonBody, pageHeaders, requireMethod, sendJson } from "./http.ts";
 import { pageCss, pageHtml, pageJs, pageModules } from "./page.ts";
+import { isPagesPath } from "./pages/index.ts";
+import { pagesLibraryApi } from "./pages/shared.ts";
 import { appCommand, appEntryKind, messageText, piRunApiPath, piRunId, shutdownHeader, streamState, streamUpdate, upgradeCommand, type StreamFrame } from "./protocol.ts";
 import { transcriptPage } from "./transcript.ts";
 
@@ -89,6 +91,17 @@ async function handleHttp(
   tailscale?: URL, shutdown?: (res: ServerResponse) => void, upgrade?: (conversation: Conversation) => Promise<void>,
 ) {
   const { pathname, searchParams } = requestUrl(req, tailscale);
+  const rawPath = req.url!.split("?", 1)[0];
+  if (isPagesPath(pathname) || isPagesPath(rawPath)) {
+    if (rawPath !== pathname) throw new HttpError(404, "Not found");
+    if (!agent.pages) {
+      // An open chat tab must not mistake a storage outage for an empty library.
+      if (pathname === pagesLibraryApi && req.method === "GET") throw new HttpError(503, "Pages unavailable");
+      throw new HttpError(404, "Not found");
+    }
+    await agent.pages.handle(req, res, pathname);
+    return;
+  }
   if (pathname === "/api/shutdown" && shutdown) {
     requireMethod(req, res, "POST");
     const marker = req.headersDistinct[shutdownHeader];
@@ -113,8 +126,9 @@ async function handleHttp(
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
       ...pageHeaders,
+      ...(agent.pages && { "Content-Security-Policy": `${pageHeaders["Content-Security-Policy"]}; frame-src 'self'` }),
     });
-    res.end(pageHtml);
+    res.end(pageHtml(!!agent.pages));
     return;
   }
   const appRoute = /^\/apps\/([^/]+)(\/.*)?$/.exec(pathname);
@@ -136,7 +150,7 @@ async function handleHttp(
     return;
   }
   // Only the modules listed in `pageModules` are served, looked up by name: no path from the request reaches a file.
-  const script = pathname === "/app.js" ? pageJs(tailscale ? [...loopbackNames, tailscale.hostname] : loopbackNames)
+  const script = pathname === "/app.js" ? pageJs(tailscale ? [...loopbackNames, tailscale.hostname] : loopbackNames, !!agent.pages)
     : Object.hasOwn(pageModules, pathname) ? pageModules[pathname] : undefined;
   if (script !== undefined || pathname === "/app.css") {
     requireMethod(req, res, "GET");

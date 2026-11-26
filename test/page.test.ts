@@ -1,5 +1,5 @@
 import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
-import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, getCurrentTools } from "@earendil-works/pi-ai";
+import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, getCurrentTools, type JsonObject } from "@earendil-works/pi-ai";
 import { LiveDoc, type Tx } from "@earendil-works/pi-durable";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -11,8 +11,10 @@ import { test, type TestContext } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { startApi } from "../src/api.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
+import { pagePath, pagesLibraryApi, pagesPath, publishPageTool } from "../src/pages/shared.ts";
 import { piRunApiPath, upgradeEntryKind, type PiRunSnapshot } from "../src/protocol.ts";
 import { fixtureApp } from "./fixtures/app.ts";
+import { fauxPages, pagesBrowserFixture } from "./fixtures/pages.ts";
 import { archivedPiRun, checkout, fauxConfig, fixture, realConfig, until } from "./helpers.ts";
 
 const health = { ok: true as const, commit: "test", startedAt: "now", version: "0" };
@@ -63,6 +65,7 @@ async function openBrowser(t: TestContext, flags: string[] = []) {
   let nextId = 0;
   const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   const errors: string[] = [];
+  const requested: string[] = [];
   const loaded = new Set<string>();
   socket.onmessage = event => {
     const message = JSON.parse(String(event.data));
@@ -71,6 +74,8 @@ async function openBrowser(t: TestContext, flags: string[] = []) {
       pending.delete(message.id);
       if (message.error) waiter?.reject(new Error(message.error.message));
       else waiter?.resolve(message.result);
+    } else if (message.method === "Network.requestWillBeSent") {
+      requested.push(message.params.request.url);
     } else if (message.method === "Page.lifecycleEvent" && message.params.name === "load") {
       loaded.add(message.params.loaderId);
     } else if (message.method === "Runtime.exceptionThrown") {
@@ -98,6 +103,11 @@ async function openBrowser(t: TestContext, flags: string[] = []) {
   return {
     errors,
     evaluate,
+    async watchRequests() { await send("Network.enable"); return requested; },
+    async onNewDocument(source: string) {
+      const { identifier } = await send("Page.addScriptToEvaluateOnNewDocument", { source }) as { identifier: string };
+      return () => send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+    },
     async navigate(url: string) {
       const { loaderId, errorText } = await send("Page.navigate", { url }) as { loaderId?: string; errorText?: string };
       if (errorText) throw new Error(`Could not navigate to ${url}: ${errorText}`);
@@ -425,7 +435,7 @@ test("Pi calls open the exact archive across pages and forks, without rebuilding
   await browser.viewport(1250, 850);
   const base = `http://127.0.0.1:${api.port}`;
   const html = await fetch(base);
-  assert.equal(html.headers.get("content-security-policy"), "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
+  assert.equal(html.headers.get("content-security-policy"), "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; frame-src 'self'");
   await browser.navigate(base);
   // The newest 50 entries: two of them are assistant messages that each made two calls, a card apiece.
   await waitFor(browser, "the cards of the 50 newest entries", state => state.messages.length === 52);
@@ -872,6 +882,165 @@ async function compose(browser: Awaited<ReturnType<typeof openBrowser>>, content
   await until(() => browser.evaluate<boolean>("!document.querySelector('#send').disabled"));
   await browser.evaluate(`document.querySelector('#input').value = ${JSON.stringify(content)}; document.querySelector('#composer').requestSubmit()`);
 }
+
+test("Pages previews and direct views are sandboxed; the library moves and deletes links without running them", { skip: !chrome, timeout: 60_000 }, async t => {
+  const dir = await fixture(t);
+  const web = join(dir, "formatter.ts");
+  await writeFile(web, `export const steps = [{ name: 'format', card: () => ({ format: 'page-preview', style: 'format-probe' }) }];`);
+  const faux = fauxPages();
+  const host = await openHost(fauxConfig(dir), { models: faux.models, apps: [fixtureApp("formatter", { web: pathToFileURL(web) })] });
+  let api = await startApi(host, health, 0);
+  t.after(async () => { await api.close(); await host.close(); });
+  const base = `http://127.0.0.1:${api.port}`;
+  const root = (await host.conversation("root"))!;
+  await host.harness.commit(async tx => {
+    // Force an older page that a reconnect's initial transcript window will drop.
+    for (let i = 0; i < 55; i++) {
+      await tx.appendEntry(root.id, { kind: "test", model: [fauxAssistantMessage(`Earlier Pages history ${i}`)] });
+    }
+  }, ctx);
+  const safeBranch = await host.newBranch("Empty sandbox probe");
+  const fixtureSite = await pagesBrowserFixture(t, safeBranch.id);
+  const title = "Static <em>as text</em>";
+  const { page: staticPage } = await faux.publish(host, "root", { title, html: fixtureSite.html("static") });
+  const { page: jsPage } = await faux.publish(host, "root", { title: "Interactive", html: fixtureSite.html("interactive"), interactive: true });
+  const htmlPath = pagePath(staticPage.id);
+  const jsPath = pagePath(jsPage.id);
+  await host.appCommand(root, { connect: true, args: ["formatter"] });
+  await host.harness.commit(async tx => {
+    const result = (toolName: string, details: JsonObject, text: string, isError = false) => ({
+      role: "toolResult" as const, toolName, details, toolCallId: text, isError, timestamp: 0,
+      content: [{ type: "text" as const, text }],
+    });
+    await tx.appendEntry(root.id, { kind: "test", model: [
+      fauxAssistantMessage(`<iframe src="${jsPath}"></iframe> ${JSON.stringify(jsPage)}`),
+      result("formatter_probe", { ...jsPage, mode: "static" }, "Other tool has valid-looking page details"),
+      result(publishPageTool, jsPage, "Failed publish with valid-looking details", true),
+      result(publishPageTool, { title, src: jsPath }, "Publish with invalid details"),
+    ] });
+  }, ctx);
+
+  const browser = await openBrowser(t);
+  const requested = await browser.watchRequests();
+  const wait = (expression: string) => until(() => browser.evaluate<boolean>(expression));
+  const tap = (selector: string) => browser.evaluate(click(selector));
+  const preview = '[data-format="page-preview"]';
+  const staticFrame = `${preview} iframe[src="${htmlPath}"]`;
+  const jsFrame = `${preview} iframe[src="${jsPath}"]`;
+  const noScripts = () => assert.ok(!fixtureSite.requests.some(path => path.endsWith("-script.svg")));
+  const intact = async () => assert.ok((await host.branches()).branches.some(branch => branch.id === safeBranch.id));
+  const checkReport = (embedded: boolean, index: number) => assert.deepEqual(fixtureSite.reports[index], {
+    origin: "null", embedded, parentBlocked: embedded ? true : null, cookiesBlocked: true, workerBlocked: true,
+    apiBlocked: true, noCorsReadBlocked: true, wsBlocked: true, external: "Fixture data",
+  });
+
+  const stopSeeding = await browser.onNewDocument(`window.originalFetch = fetch;
+    window.fetch = (url, ...args) => url !== '${pagesLibraryApi}' ? originalFetch(url, ...args)
+      : new Promise(resolve => { window.releaseMetadata = () => resolve(originalFetch(url, ...args)); });`);
+  const atBottom = `(() => { const box = document.querySelector('#transcript');
+    return box.scrollHeight - box.scrollTop - box.clientHeight < 40; })()`;
+  await browser.navigate(base);
+  await stopSeeding();
+  await wait(`typeof window.releaseMetadata === 'function'`);
+  assert.equal(await browser.evaluate(atBottom), true);
+  await browser.evaluate(`window.fetch = originalFetch; window.releaseMetadata(); undefined`);
+  await wait(`document.querySelector('${staticFrame}') !== null && document.querySelector('${preview} button') !== null
+    && document.querySelector('.format-probe') !== null`);
+  assert.equal(await browser.evaluate(atBottom), true, "expanding a preview preserves the bottom of the transcript");
+  await browser.evaluate(`document.querySelector('${staticFrame}').scrollIntoView()`);
+  await until(() => fixtureSite.requests.includes("/static-render.svg"));
+  assert.deepEqual(await browser.evaluate(`[
+    document.querySelector('${staticFrame}').getAttribute('sandbox'),
+    document.querySelector('${staticFrame}').contentDocument === null,
+    document.querySelector('header a[href="/pages"]').textContent,
+    ...[...document.querySelectorAll('${preview} a')].map(a => [a.textContent, a.getAttribute('href')]),
+  ]`), ["", true, "Pages", ["Open full page", htmlPath], ["Open full page", jsPath]]);
+  assert.equal(await browser.evaluate(`document.querySelectorAll('iframe').length`), 1);
+  assert.equal(await browser.evaluate(`document.querySelectorAll('${preview}').length`), 2);
+  assert.equal(await browser.evaluate(`document.querySelector('.format-probe .card-body').textContent`), "Other tool has valid-looking page details");
+  assert.ok(!requested.includes(base + jsPath), "the interactive document is not requested before consent");
+  assert.ok(!fixtureSite.requests.includes("/interactive-render.svg"));
+  noScripts();
+
+  await tap(`${preview} button`);
+  await until(() => fixtureSite.reports.length === 1).catch(error => {
+    throw new Error(`No inline probe report: ${JSON.stringify({ fixture: fixtureSite.requests, requested, errors: browser.errors })}`, { cause: error });
+  });
+  checkReport(true, 0);
+  await intact();
+  assert.equal(await browser.evaluate(`document.querySelector('${jsFrame}').getAttribute('sandbox')`), "allow-scripts");
+  await browser.evaluate(`window.keptPage = document.querySelector('${jsFrame}')`);
+  await faux.turn(host, "root");
+  await wait(`document.querySelector('#entries .entry:last-child .card-body')?.textContent.trim() === 'Faux Pages turn finished.'`);
+  assert.equal(await browser.evaluate(`window.keptPage === document.querySelector('${jsFrame}')`), true);
+  await browser.evaluate(`window.originalFetch = fetch;
+    window.fetch = (url, ...args) => url === '${pagesLibraryApi}' ? Promise.resolve(new Response(null, { status: 503 })) : originalFetch(url, ...args);
+    window.dispatchEvent(new Event('focus'))`);
+  await wait(`document.querySelector('#entries').textContent.includes('Could not check page availability.')`);
+  assert.equal(await browser.evaluate(`window.keptPage === document.querySelector('${jsFrame}')`), true);
+  await browser.evaluate(`window.fetch = originalFetch; window.dispatchEvent(new Event('focus'))`);
+  await wait(`!document.querySelector('#entries').textContent.includes('Could not check page availability.')`);
+
+  const earlier = `document.querySelector('#entries').textContent.includes('Earlier Pages history 0')`;
+  assert.equal(await browser.evaluate(earlier), false);
+  await tap("#older");
+  await wait(earlier);
+  await browser.evaluate("window.keptBrowsingContext = window.keptPage.contentWindow");
+  const port = api.port;
+  await api.close();
+  api = await startApi(host, health, port);
+  await wait(`!(${earlier})`);
+  assert.equal(await browser.evaluate(`window.keptBrowsingContext === document.querySelector('${jsFrame}').contentWindow`), true,
+    "trimming older history preserves the running browsing context, not just the iframe node");
+
+  // These are top-level navigations: there is no iframe attribute supplying the isolation.
+  await browser.navigate(base + htmlPath);
+  assert.deepEqual(await browser.evaluate(`[self.origin, document.querySelector('h1').textContent,
+    document.querySelector('#api-image').naturalWidth]`), ["null", "Published static fixture", 0]);
+  await tap("#probe-form");
+  assert.ok(!fixtureSite.requests.includes("/static-script.svg"));
+  await browser.navigate(base + jsPath);
+  await until(() => fixtureSite.reports.length === 2);
+  checkReport(false, 1);
+  await intact();
+
+  const beforeLibrary = requested.filter(url => url === base + jsPath || url === base + htmlPath).length;
+  await browser.navigate(base + pagesPath);
+  await wait("document.querySelectorAll('#sections li').length === 2");
+  assert.deepEqual(await browser.evaluate(`[
+    document.querySelector('#sections h2').textContent, document.querySelector('#sections a').textContent,
+    document.querySelectorAll('#sections em, iframe').length,
+  ]`), ["Unsorted", title, 0]);
+  await browser.evaluate(`window.originalFetch = fetch;
+    window.fetch = (...args) => new Promise(resolve => { window.saveLibrary = () => resolve(originalFetch(...args)); });
+    document.querySelector('#new-section input').value = 'Reports <b>as text</b>';
+    document.querySelector('#new-section').requestSubmit()`);
+  assert.deepEqual(await browser.evaluate(`[document.querySelector('#new-section').inert, document.querySelector('#sections').inert,
+    document.querySelector('#status').textContent]`), [true, true, "Saving…"]);
+  await browser.evaluate("window.fetch = originalFetch; window.saveLibrary(); undefined");
+  await wait("document.querySelectorAll('#sections section').length === 2 && !document.querySelector('#sections').inert");
+  assert.equal(await browser.evaluate("document.querySelector('#sections section:last-child h2').textContent"), "Reports <b>as text</b>");
+  for (const [index, path] of [htmlPath, jsPath].entries()) {
+    await browser.evaluate(`{
+      const select = document.querySelector('a[href="${path}"]').closest('li').querySelector('select');
+      select.selectedIndex = 1; select.dispatchEvent(new Event('change'));
+    }`);
+    await wait(`document.querySelectorAll('#sections section:last-child li').length === ${index + 1}`);
+  }
+  await tap('button[aria-label="Move Interactive up"]');
+  await wait(`document.querySelector('#sections section:last-child a').getAttribute('href') === '${jsPath}'`);
+  await browser.evaluate(`window.confirm = message => { window.confirmation = message; return true; };`);
+  await tap('button[aria-label="Delete Interactive"]');
+  await wait(`!document.querySelector('#sections a[href="${jsPath}"]')`);
+  assert.match(await browser.evaluate<string>("window.confirmation"), /Delete “Interactive”.*history will be kept/i);
+  assert.equal(requested.filter(url => url === base + jsPath || url === base + htmlPath).length, beforeLibrary, "the trusted library requests no published HTML");
+
+  await browser.navigate(base);
+  await wait(`document.querySelector('#entries').textContent.includes('Page no longer available.')`);
+  assert.equal(await browser.evaluate(`document.querySelector('${jsFrame}') === null && !document.querySelector('${preview} button')`), true);
+  assert.equal(fixtureSite.reports.length, 2);
+  await intact();
+});
 
 test("app load and step failures fall back without leaking async results to another branch", { skip: !chrome, timeout: 60_000 }, async t => {
   const dir = await fixture(t);

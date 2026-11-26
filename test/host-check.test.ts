@@ -36,7 +36,8 @@ test("HTTP and WS require a loopback name and the listener port, and a same-orig
     // The far end of an SSH forward must use the same port number.
     assert.equal(await probe({ Host: "localhost:1" }), 403);
     assert.equal(await probe({ Host: "localhost" }), 403);
-    // A cross-site request, and one from another origin on this machine.
+    // A sandboxed Pages document, a cross-site request, and another origin on this machine.
+    assert.equal(await probe({ Host: base, Origin: "null" }), 403);
     assert.equal(await probe({ Host: base, Origin: "http://other.test" }), 403);
     assert.equal(await probe({ Host: name, Origin: `http://${base}` }), 403);
     assert.equal(await probe({ Host: base, Origin: `https://${base}` }), 403);

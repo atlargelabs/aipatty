@@ -10,6 +10,7 @@ import { startApi } from "../src/api.ts";
 import type { BranchInfo } from "../src/branches.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
 import { pageModules } from "../src/page.ts";
+import { pagesPath, pagesPreviewScript } from "../src/pages/shared.ts";
 import { messageText, type ConversationPage } from "../src/protocol.ts";
 import { selfCheck } from "../src/upgrade.ts";
 import { fixtureApp } from "./fixtures/app.ts";
@@ -481,7 +482,7 @@ test("the web page is served with a strict policy and its script and style", asy
   assert.match(page.headers.get("content-security-policy")!, /default-src 'none'; script-src 'self'/);
   assert.match(await page.text(), /<script type="module" src="\/app\.js"><\/script>/);
   // Every script must parse, and import only scripts that are served: either failure would leave the page blank.
-  const scripts = ["/app.js", ...Object.keys(pageModules)];
+  const scripts = ["/app.js", ...Object.keys(pageModules), pagesPreviewScript, `${pagesPath}/shared.ts`];
   for (const path of scripts) {
     const script = await fetch(base + path);
     assert.equal(script.status, 200, path);
