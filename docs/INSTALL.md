@@ -248,6 +248,24 @@ can retain the workout instructions without the tools. This does not delete the 
 branches when running a release with Gym again. Automatic `/upgrade` rollback restores its prior conversation
 database and needs no such step.
 
+## Optional Pages
+
+Pages is off by default, and is not a `/connect` app. On a release that includes it, create an empty
+`pages.enabled` file in the server's data directory and restart the server when idle. In a normal managed
+install that is `touch "$ROOT/data/pages.enabled"` (use `$ROOT/faux` in Faux mode, or the directory passed as
+`--data-dir` if overridden). Open **Pages** in chat or visit `/pages` on the same hostname and port as chat.
+If the marker exists but the link is missing after restart, check server output for a Pages startup error.
+Remove the marker and restart to turn off the tool, routes and link without deleting the library.
+
+The marker plus `pages.sqlite` stay outside the release and survive ordinary restarts and upgrades. The
+upgrade backup does **not** include them. To back them up, stop the server and copy both files to a private
+location after the process exits. The library holds up to 128 pages of at most 256 KiB each and 32 sections
+including Unsorted. The instance's existing SSH/tailnet access governs the library and direct page URLs;
+there is no separate login, publish listener, proxy or server-side page runtime.
+
+The trial `/pages/ai-patty-usage` Tailscale mount is not a managed page and is not imported by enabling Pages.
+Leave its routing and files as they are; any import is a separate operator follow-up.
+
 ## Upgrade
 
 With the server started as in [Start](#start), from a release that has the command, ask for an upgrade in any
@@ -276,7 +294,7 @@ Everything the upgrade keeps is in `$ROOT/upgrade/`:
 | --- | --- |
 | `upgrade.log` | What the supervisor did, with times. |
 | `server.log` | The output of the servers the supervisor started. |
-| `backup.sqlite` | The conversation database as the old release left it at the last switch (not app data). Replaced by the next upgrade. |
+| `backup.sqlite` | The conversation database as the old release left it at the last switch (not app or Pages data). Replaced by the next upgrade. |
 | `pending.json` | Present only between the switch and the new release passing its health check. |
 | `result.json` | An outcome waiting for a running server to post it. |
 

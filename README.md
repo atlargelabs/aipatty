@@ -267,6 +267,20 @@ not an access-control boundary. The Gym database is separate from the conversati
 upgrade backup. A restart that changes a branch's app configuration can stop its interrupted turn with a
 notice to resend.
 
+## Pages (optional)
+
+[Enable Pages once for the instance](docs/INSTALL.md#optional-pages), then ask aipatty in any branch to publish
+standalone HTML. Each publish makes a new `/pages/<id>/` link, even if the title is the same. Publishing needs
+no new port or restart. The **Pages** link in chat opens a library: new links go to **Unsorted**, and you can
+create named sections, move or reorder links, and confirm deletion there. The library never runs page code.
+
+Static pages preview in chat automatically. JavaScript pages require **Run inline** or **Open full page**.
+Both views sandbox the page away from chat, its storage, and its API. Use inline styles and, when requested,
+inline JavaScript. External requests come from your browser: APIs must accept an opaque (`null`) origin and
+satisfy browser CORS and mixed-content rules. This is browser isolation, not a network firewall; do not bundle
+credentials or data you would not send to an external site. Deletion removes the page and link, not old chat
+records, which may still contain its source.
+
 ## Upgrade
 
 In a [service install](#configure), typing `/upgrade` in a branch on the page, or running the CLI's `upgrade`,

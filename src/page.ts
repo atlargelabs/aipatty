@@ -8,6 +8,7 @@
 import { ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
 import { readFileSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
+import { pagesPath, pagesPreviewScript } from "./pages/shared.ts";
 
 const markdownScriptPath = "/markdown-it.js";
 
@@ -19,7 +20,7 @@ export const pageModules: Readonly<Record<string, string>> = {
   [markdownScriptPath]: readFileSync(new URL(import.meta.resolve("markdown-it/browser")), "utf8"),
 };
 
-export const pageHtml = `<!doctype html>
+export const pageHtml = (pagesEnabled: boolean) => `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -32,6 +33,7 @@ export const pageHtml = `<!doctype html>
 <header>
   <button id="menu" type="button" aria-label="Branches">☰</button>
   <h1 id="title">aipatty</h1>
+  ${pagesEnabled ? `<a href="${pagesPath}">Pages</a>` : ""}
   <span id="cost" title="This branch / all branches"></span>
 </header>
 <div id="layout">
@@ -102,6 +104,9 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .entry { margin: 0 0 .8rem; padding: .5rem .7rem; border-radius: 8px; background: #fff; border: 1px solid #e4e4e4; white-space: pre-wrap; overflow-wrap: anywhere; }
 .entry.user { background: #eef5ff; border-color: #cfe0fb; }
 .entry:is(.toolCall, .toolResult, .liveTool) { font: 12px/1.4 ui-monospace, monospace; color: #444; background: #f4f4f4; max-height: 12rem; overflow: auto; }
+.entry.toolResult:has(> [data-format="page-preview"]) { max-height: none; font: inherit; }
+[data-format="page-preview"] .preview-controls { display: flex; flex-wrap: wrap; align-items: center; gap: .25rem .75rem; }
+[data-format="page-preview"] iframe { display: block; width: 100%; height: clamp(14rem, 48vh, 28rem); margin-top: .5rem; border: 1px solid #ddd; background: #fff; }
 .entry.inherited { opacity: .7; }
 .entry:is(.liveText, .liveTool) { border-style: dashed; }
 .entry.runFailure { background: #fff4e5; color: #8a4b00; }
@@ -156,10 +161,11 @@ button { font: inherit; padding: .3rem .7rem; }
 }
 `;
 
-export const pageJs = (appHostnames: readonly string[]) => `import markdownit from ${JSON.stringify(markdownScriptPath)};
+export const pageJs = (appHostnames: readonly string[], pagesEnabled: boolean) => `import markdownit from ${JSON.stringify(markdownScriptPath)};
 import { derive, scopeAppStep } from "/web/cards.ts";
 import { piRunApiPath } from "/web/shared.ts";
 import { builtInSteps, runIdOf } from "/web/steps.ts";
+${pagesEnabled ? `import { drawPagePreview } from "${pagesPreviewScript}";` : ""}
 
 const $ = id => document.getElementById(id);
 const rootId = ${ROOT_CONVERSATION_ID};
@@ -609,6 +615,7 @@ function drawCard(node, precard) {
     head.replaceChildren(head.firstChild, ...precard.links.map(linkNode), ...precard.buttons.map(buttonNode));
   }
   head.hidden = !precard.label && !precard.links.length && !precard.buttons.length;
+  ${pagesEnabled ? "if (drawPagePreview(body, precard)) return;" : ""}
   const format = Object.hasOwn(formats, precard.format) ? precard.format : "text";
   if (body.dataset.format !== format || bodyText.get(body) !== precard.text) {
     formats[format](body, precard.text);
