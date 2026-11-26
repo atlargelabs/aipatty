@@ -971,6 +971,12 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
         && text.top < edit.bottom && text.bottom > edit.top;
     })()`), true, `${row} keeps both controls beside its text`);
   };
+  const assertNoHorizontalScroll = async (message: string) => {
+    // Unlike innerWidth, clientWidth excludes any space used by a vertical scrollbar.
+    const [contentWidth, viewportWidth] = await browser.evaluate<[number, number]>(
+      "[document.documentElement.scrollWidth, document.documentElement.clientWidth]");
+    assert.equal(contentWidth, viewportWidth, message);
+  };
   const overview = async () => (await fetch(`${base}/apps/gym/api/overview`)).json() as Promise<{
     workouts: { id: string; date: string; sets: { exercise: string; duration: number; durationUnit: string; load: number | null; loadUnit: string | null }[] }[];
     suggestion: { note: string } | null;
@@ -985,7 +991,7 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await wait("document.querySelector('#workout-editor')?.disabled === false");
   assert.equal(await browser.evaluate("document.querySelector('#chat-link').getAttribute('href')"), `/#${side.id}`);
   assert.equal(await browser.evaluate(`document.querySelector('#workout-date').value === new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10)`), true);
-  assert.equal(await browser.evaluate("document.documentElement.scrollWidth === innerWidth"), true, "phone does not scroll horizontally");
+  await assertNoHorizontalScroll("phone does not scroll horizontally");
   assert.deepEqual(await names(), ["Choose an exercise", "Add new"]);
   assert.deepEqual(await browser.evaluate("[...document.querySelectorAll('#duration-unit option')].map(option => option.value)"), ["reps", "m", "sec", "min"]);
   await set({ exercise: "add-new" });
@@ -1037,7 +1043,7 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
     range.selectNodeContents(document.querySelector('#draft-sets li:first-child span'));
     return range.getClientRects().length > 1;
   })()`), true, "long set text wraps");
-  assert.equal(await browser.evaluate("document.documentElement.scrollWidth === innerWidth"), true, "long sets fit on narrow phones");
+  await assertNoHorizontalScroll("long sets fit on narrow phones");
 
   await tap("#save-workout");
   await status("Workout saved");
@@ -1054,7 +1060,7 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   assert.deepEqual(await matching(`${firstCard} button`, "ariaLabel"), workoutActions);
   assert.deepEqual(await matching(`${firstCard} > :has(> h3) button`, "ariaLabel"), workoutActions);
   await checkInlineActions(firstCard, "h3");
-  assert.equal(await browser.evaluate("document.documentElement.scrollWidth === innerWidth"), true, "recent sets also fit on narrow phones");
+  await assertNoHorizontalScroll("recent sets also fit on narrow phones");
   await browser.viewport(390, 780);
 
   assert.deepEqual(await names(), ["Choose an exercise", plank, "Squat", "Add new"]);
