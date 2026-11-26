@@ -148,6 +148,8 @@ button { font: inherit; padding: .3rem .7rem; }
   #pi-run { position: fixed; inset: 0; z-index: 3; border: 0; }
 }
 @media (max-width: 700px) {
+  /* Leave room for both labels and the Thinking picker. */
+  #controls #model { max-width: clamp(4rem, calc(100vw - 15rem), 9rem); }
   #menu { display: inline-block; }
   nav { position: fixed; top: 2.8rem; left: 0; bottom: 0; z-index: 2; display: none; box-shadow: 2px 0 8px #0003; }
   nav.open { display: block; }

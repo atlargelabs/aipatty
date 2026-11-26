@@ -242,6 +242,42 @@ test("toolbar New starts blank, Fork here keeps history, and Archive works while
   assert.deepEqual(browser.errors, []);
 });
 
+test("Model and Thinking share a toolbar row on phones with a long model ID", { skip: !chrome, timeout: 60_000 }, async t => {
+  const host = await openHost(fauxConfig(await fixture(t)));
+  const api = await startApi(host, health, 0);
+  t.after(async () => { await api.close(); await host.close(); });
+
+  const browser = await openBrowser(t);
+  await browser.navigate(`http://127.0.0.1:${api.port}`);
+  await waitFor(browser, "the main branch", state => state.title === "Main");
+  // The short Faux option would fit even with the desktop cap.
+  await browser.evaluate(`document.querySelector('#model').add(new Option(
+    'an-especially-long-model-identifier-2026-11-26 (faux)', 'faux/long', false, true))`);
+
+  for (const width of [320, 375, 390]) {
+    await browser.viewport(width, 600);
+    const layouts = await browser.evaluate<[string, boolean][]>(`(() => {
+      const model = document.querySelector('#model');
+      const thinking = document.querySelector('#thinking');
+      model.value = 'faux/long';
+      return [...thinking.options].map(({ value }) => {
+        thinking.value = value;
+        const modelBox = model.getBoundingClientRect();
+        const thinkingBox = thinking.getBoundingClientRect();
+        const sameRow = modelBox.right < thinkingBox.left && modelBox.top < thinkingBox.bottom && thinkingBox.top < modelBox.bottom;
+        return [value, sameRow];
+      });
+    })()`);
+    assert.deepEqual(layouts.map(([level]) => level), ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+    for (const [level, sameRow] of layouts) assert.ok(sameRow, `Thinking (${level}) should fit beside Model at ${width}px`);
+  }
+
+  await browser.viewport(1000, 600);
+  const modelWidthInRem = await browser.evaluate<number>(`document.querySelector('#model').getBoundingClientRect().width /
+    parseFloat(getComputedStyle(document.documentElement).fontSize)`);
+  assert.equal(modelWidthInRem, 14);
+});
+
 test("saved prose renders Markdown on narrow screens and survives live updates", { skip: !chrome, timeout: 60_000 }, async t => {
   const host = await openHost(fauxConfig(await fixture(t)));
   const serve = "https://operator.example.invalid";
