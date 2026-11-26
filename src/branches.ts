@@ -4,7 +4,7 @@ import { defineDoc, type ModelRef } from "@earendil-works/pi-durable";
 export const thinkingLevels: readonly ModelThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /** aipatty's own per-branch state. A fork's `init` writes its title and copies its parent's app list. */
-export const BranchDoc = defineDoc<{ title: string; apps: string[] }>({
+export const BranchDoc = defineDoc<{ title: string; apps: string[]; archived?: boolean }>({
   kind: "aipatty.branch",
   version: 1,
   scope: "conversation",

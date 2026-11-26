@@ -9,10 +9,11 @@ the `pi` tool, which hands coding work to a pinned Pi CLI. Installing it on the 
 
 ## Branches
 
-The root conversation ("Main") and every branch forked from it are independent workstreams. A fork shares its
-parent's history up to the fork point, starts with the parent's model and thinking level, and then continues on its
-own. Nothing reports back between branches, and every branch stays listed. Each branch has a title, its own model and
-thinking level, and its own cost; the page and the CLI show it as `$<branch> / $<total>`.
+Each branch is an independent workstream. **New** starts a blank branch with the server defaults; a fork shares its
+parent's history up to the fork point, starts with the parent's model and thinking level, and then continues on its own.
+Nothing reports back between branches. **Archive** hides a branch from listings without deleting its history or forks,
+interrupting its work, or changing total spend. Archived branches remain accessible by ID. The root ("Main") cannot
+be archived. Each branch has its own title, model, thinking level and cost; the page and CLI show `$<branch> / $<total>`.
 
 The model gets four tools for the tree: `list_branches`, `read_branch` (paging and case-insensitive text search over
 any branch), `fork_branch` (optionally with a first message the new branch starts on), and `set_model`. A branch it
@@ -102,9 +103,10 @@ its identity was remembered.
 
 ## Page
 
-Open `http://127.0.0.1:8790/` (or the port given with `--port`) for the branch list, transcript, input box, fork (of the whole branch, or
-at a completed exchange with "Fork here"), rename, search, model and thinking pickers, and cost. In the message box,
-Enter sends on desktop and inserts a newline when the primary pointer is coarse and cannot hover (touch-first).
+Open `http://127.0.0.1:8790/` (or the port given with `--port`) for the branch list, transcript, input box, **New**,
+**Rename**, **Archive**, search, model and thinking pickers, and cost. Use **Fork here** on a message to fork at that
+entry. Archiving the selected branch returns the page to Main. In the message box, Enter sends on desktop and
+inserts a newline when the primary pointer is coarse and cannot hover (touch-first).
 Shift+Enter inserts a newline in either case. Use the Send button or ⌘/Ctrl+Enter (without Shift or Alt) to send.
 
 The transcript shows a card for each message, and for an assistant message one for each run of text and each
@@ -255,7 +257,7 @@ process to exit before starting another one on the same data directory.
 
 ## Connected apps: Gym
 
-Fork a training branch and send `/connect gym` while idle. Tap **Log workout** above the transcript to log
+Use **New** to start a training branch and send `/connect gym` while idle. Tap **Log workout** above the transcript to log
 sets on your phone. Ask the coach about your history or for a suggestion, then use **Start from this** on the
 Gym page to make a draft. Only saving on the page logs a workout. `/connect` lists app status and
 `/disconnect gym` removes coaching from the branch without deleting the log.
@@ -306,12 +308,17 @@ loopback; access to the HTTPS URL is controlled by your tailnet policy. Do not u
 - `POST /api/shutdown` (no body needed): requires the `X-Aipatty-Shutdown: 1` header so ordinary browser forms
   cannot trigger it. No CORS is enabled. Returns `202 { "status": "shutdown-requested" }` before stopping the
   server; it does not wait for cleanup. The same Host and Origin rules below apply.
-- `GET /api/branches`: `{ branches: [{ id, title, parent, model, modelStatus, thinking, busy, cost }], totalCost }`
+- `GET /api/branches`: `{ branches: [{ id, title, parent, model, modelStatus, thinking, busy, cost }], totalCost }`;
+  omits archived branches, but includes their spend in `totalCost`
+- `POST /api/branches` with `{ title }` (1 to 100 characters; duplicates allowed): `201` with a blank branch
+  (`parent: null`) using the server defaults
 - `PUT /api/model` and `PUT /api/thinking`: the root's, as below
 - `GET /api/conversations/:id` (`root` is the root conversation; `?limit=` and `?before=` page backwards); also
   carries `branch` and `totalCost`
 - `POST /api/conversations/:id/fork` with `{ title, at? }`: a new branch from `:id`'s history through entry `at`
   (default its newest); inherits its current apps and returns the branch
+- `POST /api/conversations/:id/archive` (no body): hide a branch from listings; returns `200 { "ok": true }`
+  even if already archived, or `400` for the root. By-ID access is unchanged.
 - `PUT /api/conversations/:id/title` with `{ title }` (1 to 100 characters)
 - `PUT /api/conversations/:id/model` with `{ modelId, provider? }`; 409 while the branch has active work
 - `PUT /api/conversations/:id/thinking` with `{ level }`

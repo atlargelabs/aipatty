@@ -229,7 +229,7 @@ or send the server `SIGTERM`. These all use the same cleanup; see [CLI shutdown 
 ## Gym pilot
 
 No new service, credentials or settings are needed. Once the running release includes Gym, open the usual chat
-page on the phone, create a training branch, and send `/connect gym`. Follow the [Gym quickstart](GYM-APP.md)
+page on the phone, tap **New** to create a training branch, and send `/connect gym`. Follow the [Gym quickstart](GYM-APP.md)
 for logging and coaching, then use it for two real workouts before deciding what to change.
 
 Check `/connect` or `aipatty health` (`appProblems`) if Gym is missing. The diagnostic names the app data path;
@@ -242,7 +242,8 @@ exit, and copy `gym.sqlite` to a private backup location. App pages use the chat
 not separate authentication: only let people you trust with the workout log reach aipatty.
 
 Before a manual downgrade to a release without connected apps **keeping the current conversation database**,
-use `/disconnect gym` on each connected branch while still running this release. Otherwise the old release
+use `/disconnect gym` on each connected branch while still running this release. For an archived branch, send it
+with `aipatty --branch <id> send '/disconnect gym'`. Otherwise the old release
 can retain the workout instructions without the tools. This does not delete the Gym log. Reconnect the
 branches when running a release with Gym again. Automatic `/upgrade` rollback restores its prior conversation
 database and needs no such step.

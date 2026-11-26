@@ -177,6 +177,62 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
   assert.deepEqual(browser.errors, []);
 });
 
+test("toolbar New starts blank, Fork here keeps history, and Archive works while busy", { skip: !chrome, timeout: 60_000 }, async t => {
+  const faux = fauxProvider();
+  const gate = Promise.withResolvers<void>();
+  faux.setResponses([fauxAssistantMessage("original answer"), async () => {
+    await gate.promise;
+    return fauxAssistantMessage("finished while archived");
+  }]);
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const host = await openHost(fauxConfig(await fixture(t)), { models });
+  const api = await startApi(host, health, 0);
+  t.after(async () => { gate.resolve(); await api.close(); await host.close(); });
+  const base = `http://127.0.0.1:${api.port}`;
+  const root = (await host.conversation("root"))!;
+  await host.rename(root, "Home");
+  await say(host, "root", "original message");
+
+  const browser = await openBrowser(t);
+  await browser.navigate(base);
+  const home = await waitFor(browser, "the renamed root", state => state.title === "Home" && state.messages.length === 2);
+  assert.equal(await browser.evaluate(`document.querySelector('#archive').hidden`), true);
+  assert.ok(!(await browser.evaluate<string[]>(`[...document.querySelectorAll('#controls button')].map(b => b.textContent)`)).includes("Fork"));
+  assert.equal(await browser.evaluate(`document.querySelector('#new').textContent`), "New");
+  const forkHere = `document.querySelector('#entries .assistant button[data-action=fork]')`;
+  assert.equal(await browser.evaluate(`${forkHere}.textContent`), "Fork here");
+  await browser.evaluate(`window.prompt = () => 'Main'; ${forkHere}.click()`);
+  const side = await waitFor(browser, "the fork with inherited messages", state => state.current === "Main" && state.messages.length === 2);
+  assert.deepEqual(side.messages, home.messages);
+  const id = side.hash.slice(1);
+  const branch = (await host.conversation(id))!;
+  const active = await host.submit(branch, { type: "input", content: "keep working" });
+  await until(() => browser.evaluate(`!document.querySelector('#abort').disabled`));
+
+  await browser.evaluate(`window.prompt = () => 'Fresh'; document.querySelector('#new').click()`);
+  await waitFor(browser, "a blank branch", state => state.current === "Fresh" && state.messages.length === 0);
+  const item = `document.querySelector('li[data-branch="${id}"]')`;
+  await browser.evaluate(`${item}.click()`);
+  await until(() => browser.evaluate(`!document.querySelector('#abort').disabled && location.hash === '#${id}'`));
+  assert.equal(await browser.evaluate(`document.querySelector('#archive').matches(':not([hidden]):enabled')`), true);
+  const confirmation = await browser.evaluate<string>(`
+    window.confirm = text => { window.confirmation = text; return true; };
+    document.querySelector('#archive').click(); window.confirmation;
+  `);
+  assert.ok(confirmation.includes(`“Main” (#${id})`));
+  assert.match(confirmation, /removed from the sidebar.*history and forks will be kept/);
+  await waitFor(browser, "back on Main", state => state.current === "Home" && state.hash === home.hash && state.messages.length === 2);
+  await until(() => browser.evaluate(`!${item}`));
+  gate.resolve();
+  assert.equal((await active.wait(ctx)).status, "done");
+
+  await browser.navigate("about:blank");
+  await browser.navigate(`${base}/${side.hash}`);
+  await waitFor(browser, "Main after opening an archived branch URL", state => state.current === "Home" && state.hash === home.hash);
+  assert.deepEqual(browser.errors, []);
+});
+
 test("saved prose renders Markdown on narrow screens and survives live updates", { skip: !chrome, timeout: 60_000 }, async t => {
   const host = await openHost(fauxConfig(await fixture(t)));
   const serve = "https://operator.example.invalid";

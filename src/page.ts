@@ -1,10 +1,11 @@
 /**
- * The crude web page: branch list, transcript, input box, fork, rename, model picker and cost. Served by the API
+ * The crude web page: branch list, transcript, input box, branch controls, model picker and cost. Served by the API
  * with a strict CSP and same-origin scripts. The pipeline selects which cards use the built-in Markdown renderer.
  *
  * The transcript is drawn from the card pipeline in ./web/cards.ts (see docs/WEB-CARDS.md). This file is the
  * shell around it and the code that puts its cards on screen.
  */
+import { ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
 import { readFileSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 
@@ -41,8 +42,9 @@ export const pageHtml = `<!doctype html>
     <div id="controls">
       <label>Model <select id="model"></select></label>
       <label>Thinking <select id="thinking"></select></label>
-      <button id="fork" type="button">Fork</button>
+      <button id="new" type="button">New</button>
       <button id="rename" type="button">Rename</button>
+      <button id="archive" type="button" hidden>Archive</button>
       <button id="search" type="button">Search</button>
     </div>
     <div id="notice" role="status" hidden></div>
@@ -158,6 +160,7 @@ import { piRunApiPath } from "/web/shared.ts";
 import { builtInSteps, runIdOf } from "/web/steps.ts";
 
 const $ = id => document.getElementById(id);
+const rootId = ${ROOT_CONVERSATION_ID};
 const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 // What the page holds: the agent data of the selected branch (entries, live), and what the reader has done to the
 // view (the pane they opened and the button that opened it).
@@ -479,6 +482,7 @@ function renderBranches() {
     if (list.children[index] !== node.li) list.insertBefore(node.li, list.children[index] || null);
   });
   const branch = current();
+  $("archive").hidden = !branch || branch.id === rootId;
   if (!branch) return;
   setText($("title"), branch.title);
   document.title = branch.title + " · aipatty";
@@ -847,12 +851,27 @@ $("input").addEventListener("keydown", event => {
   if (!event.repeat) $("composer").requestSubmit();
 });
 $("abort").addEventListener("click", guard(() => act({ type: "abort" })));
-$("fork").addEventListener("click", guard(() => forkAt()));
+$("new").addEventListener("click", guard(async () => {
+  const title = prompt("Title for the new branch");
+  if (!title) return;
+  const created = await api("/api/branches", { method: "POST", body: { title } });
+  await refreshBranches();
+  await selectBranch(created.id);
+}));
 $("rename").addEventListener("click", guard(async () => {
   const branch = current();
   const title = prompt("Branch title", branch ? branch.title : "");
   if (!title) return;
   await api("/api/conversations/" + app.branch + "/title", { method: "PUT", body: { title } });
+  await refreshBranches();
+}));
+$("archive").addEventListener("click", guard(async () => {
+  const branch = current();
+  if (!branch || branch.id === rootId) return;
+  const { id, title } = branch;
+  if (!confirm("Archive “" + title + "” (#" + id + ")? It will be removed from the sidebar, but its history and forks will be kept.")) return;
+  await api("/api/conversations/" + id + "/archive", { method: "POST" });
+  if (app.branch === id) await selectBranch(rootId);
   await refreshBranches();
 }));
 $("search").addEventListener("click", guard(async () => {
@@ -903,7 +922,7 @@ guard(async () => {
   await loadModels();
   await refreshBranches();
   const wanted = Number(location.hash.slice(1));
-  await selectBranch(app.branches.some(branch => branch.id === wanted) ? wanted : app.branches[0].id);
+  await selectBranch(app.branches.some(branch => branch.id === wanted) ? wanted : rootId);
   setInterval(() => { refreshBranches().catch(() => {}); }, 10000);
 })();
 `;

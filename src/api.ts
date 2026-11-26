@@ -149,8 +149,13 @@ async function handleHttp(
     return;
   }
   if (pathname === "/api/branches") {
-    requireMethod(req, res, "GET");
-    sendJson(res, 200, await agent.branches());
+    requireMethod(req, res, "GET", "POST");
+    if (req.method === "POST") {
+      const { title } = await jsonBody(req);
+      sendJson(res, 201, await agent.newBranch(title));
+    } else {
+      sendJson(res, 200, await agent.branches());
+    }
     return;
   }
   if (pathname.startsWith(piRunApiPath)) {
@@ -170,7 +175,7 @@ async function handleHttp(
     sendJson(res, 200, await agent.modelStatus(root));
     return;
   }
-  const route = /^\/api\/conversations\/([^/]+)(?:\/(messages|abort|fork|title|model|thinking|search))?$/.exec(pathname);
+  const route = /^\/api\/conversations\/([^/]+)(?:\/(messages|abort|fork|archive|title|model|thinking|search))?$/.exec(pathname);
   if (!route) throw new HttpError(404, "Not found");
   const [, id, action] = route;
   const method = !action || action === "search" ? "GET"
@@ -206,6 +211,9 @@ async function handleHttp(
       throw new HttpError(400, "at must be an entry ID");
     }
     sendJson(res, 201, await agent.fork(conversation, { title, at }));
+  } else if (action === "archive") {
+    await agent.archive(conversation);
+    sendJson(res, 200, { ok: true });
   } else if (action === "title") {
     const { title } = await jsonBody(req);
     if (typeof title !== "string") throw new HttpError(400, "Expected title");

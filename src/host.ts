@@ -34,7 +34,7 @@ interface HostOptions {
   models?: Models;
 }
 
-/** What a new root conversation starts with. Afterwards `model set` and `thinking set` change the saved values. */
+/** Defaults for the root and new independent branches. `model set` and `thinking set` change saved values. */
 const newRoot = { model: { provider: "openai", modelId: "gpt-6.2-sol" }, thinkingLevel: "high" } as const;
 const fauxModel = { provider: "faux", modelId: "faux-1" };
 const searchScanPage = 200;
@@ -67,9 +67,11 @@ export interface AgentHost {
    */
   setModel(model: ModelRef & { thinkingLevel?: ModelThinkingLevel }, conversation?: Conversation, context?: Context): Promise<void>;
   setThinking(level: string, conversation?: Conversation, context?: Context): Promise<void>;
-  /** Every branch, oldest first, and the spend of the whole session. */
+  /** Unarchived branches, oldest first, and the spend of the whole session. */
   branches(): Promise<{ branches: BranchInfo[]; totalCost: number }>;
   branch(conversation: Conversation): Promise<BranchInfo>;
+  newBranch(title: unknown): Promise<BranchInfo>;
+  archive(conversation: Conversation): Promise<void>;
   /**
    * Start a branch from `from`'s history through entry `at`, with `from`'s current model and thinking level. Without
    * `at`, the history through its newest entry, or through the newest one below `before`. No such entry starts an
@@ -224,7 +226,8 @@ async function openOwnedHost(config: Config, { apps: modules = connectedApps, mo
   const closed = harness.closed.then(closeResources);
   void closed.catch(error => console.error("Host cleanup failed:", error));
   try {
-    const root = await harness.root(ctx, { agent: config.faux ? { ...newRoot, model: fauxModel } : newRoot });
+    const initialAgent = config.faux ? { ...newRoot, model: fauxModel } : newRoot;
+    const root = await harness.root(ctx, { agent: initialAgent });
     const branchRecords = async () => {
       const records: ConversationRecord[] = [];
       let cursor: Cursor | undefined;
@@ -362,15 +365,13 @@ async function openOwnedHost(config: Config, { apps: modules = connectedApps, mo
       if (!record || record.owner) return undefined;
       return harness.conversation(number as ConversationId, ctx);
     };
-    const branch = async (target: Conversation): Promise<BranchInfo> => {
-      const record = await harness.commit(tx => tx.conversation(target.id), ctx);
-      const [doc, live, usage, model] = await Promise.all([
-        harness.snapshot(BranchDoc, target.id, ctx), harness.snapshot(LiveDoc, target.id, ctx),
-        harness.snapshot(UsageDoc, target.id, ctx), status(target),
+    const branchInfo = async (target: Conversation, record: ConversationRecord | undefined, title: string | undefined): Promise<BranchInfo> => {
+      const [live, usage, model] = await Promise.all([
+        harness.snapshot(LiveDoc, target.id, ctx), harness.snapshot(UsageDoc, target.id, ctx), status(target),
       ]);
       return {
         id: target.id,
-        title: doc?.title || (target.id === ROOT_CONVERSATION_ID ? ROOT_TITLE : `Branch ${target.id}`),
+        title: title || (target.id === ROOT_CONVERSATION_ID ? ROOT_TITLE : `Branch ${target.id}`),
         parent: record?.parent ? { id: record.parent.conversationId, at: record.parent.at } : null,
         model: model.model,
         modelStatus: model.modelStatus,
@@ -378,6 +379,12 @@ async function openOwnedHost(config: Config, { apps: modules = connectedApps, mo
         busy: live?.run !== undefined,
         cost: usage ? usageCost(usage as UsageState) : 0,
       };
+    };
+    const branch = async (target: Conversation): Promise<BranchInfo> => {
+      const [record, doc] = await Promise.all([
+        harness.commit(tx => tx.conversation(target.id), ctx), harness.snapshot(BranchDoc, target.id, ctx),
+      ]);
+      return branchInfo(target, record, doc?.title);
     };
     const totalCost = async () => usageCost(await harness.usage(ctx));
 
@@ -489,10 +496,27 @@ async function openOwnedHost(config: Config, { apps: modules = connectedApps, mo
       },
       async branches() {
         const records = await branchRecords();
-        const branches = await Promise.all(records.map(async record => branch((await harness.conversation(record.id, ctx))!)));
-        return { branches, totalCost: await totalCost() };
+        const branches = await Promise.all(records.map(async record => {
+          const doc = await harness.snapshot(BranchDoc, record.id, ctx);
+          if (doc?.archived) return undefined;
+          return branchInfo((await harness.conversation(record.id, ctx))!, record, doc?.title);
+        }));
+        return { branches: branches.filter(branch => branch !== undefined), totalCost: await totalCost() };
       },
       branch,
+      async newBranch(title) {
+        const name = validTitle(title);
+        if (!name) throw new HttpError(400, "Expected a title of 1 to 100 characters");
+        const created = await harness.createConversation({
+          ownership: { kind: "ownerless" }, agent: initialAgent,
+          init: async (tx, id) => { (await tx.doc(BranchDoc, id)).title = name; },
+        }, ctx);
+        return branch(created);
+      },
+      async archive(target) {
+        if (target.id === ROOT_CONVERSATION_ID) throw new HttpError(400, "The root branch cannot be archived");
+        await target.commit(async tx => { (await tx.doc(BranchDoc, target.id)).archived = true; }, ctx);
+      },
       async fork(from, { title, at, before }, context = ctx) {
         context.abortSignal?.throwIfAborted();
         const name = validTitle(title);

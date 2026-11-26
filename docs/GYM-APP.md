@@ -8,7 +8,7 @@ can read the log and suggest the next workout.
 On a running release that includes Gym, there is no setup beyond reaching the normal chat page. For a phone,
 use [Tailscale Serve](INSTALL.md#optional-tailnet-browser-access) or the same tunnel you use for chat.
 
-1. Fork a branch named **Training** and send `/connect gym` while it is idle. `/connect` lists the available
+1. Use **New** to start a branch named **Training** and send `/connect gym` while it is idle. `/connect` lists the available
    apps and the branch's connections. A fork of **Training** inherits Gym; the root stays ordinary chat.
 2. Tap **Log workout** above the transcript, or bookmark `/apps/gym/` on that origin. Pick an exercise, use
    **Add set** for each set, then **Save workout**. The page remembers unfinished drafts in that browser.
