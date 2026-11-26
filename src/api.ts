@@ -10,6 +10,7 @@ import type { AgentHost } from "./host.ts";
 import { HttpError, jsonBody, pageHeaders, requireMethod, sendJson } from "./http.ts";
 import { pageCss, pageHtml, pageJs, pageModules } from "./page.ts";
 import { isPagesPath } from "./pages/index.ts";
+import { pagesLibraryApi } from "./pages/shared.ts";
 import { appCommand, appEntryKind, messageText, piRunApiPath, piRunId, shutdownHeader, streamState, streamUpdate, upgradeCommand, type StreamFrame } from "./protocol.ts";
 import { transcriptPage } from "./transcript.ts";
 
@@ -92,7 +93,12 @@ async function handleHttp(
   const { pathname, searchParams } = requestUrl(req, tailscale);
   const rawPath = req.url!.split("?", 1)[0];
   if (isPagesPath(pathname) || isPagesPath(rawPath)) {
-    if (!agent.pages || rawPath !== pathname) throw new HttpError(404, "Not found");
+    if (rawPath !== pathname) throw new HttpError(404, "Not found");
+    if (!agent.pages) {
+      // An open chat tab must not mistake a storage outage for an empty library.
+      if (pathname === pagesLibraryApi && req.method === "GET") throw new HttpError(503, "Pages unavailable");
+      throw new HttpError(404, "Not found");
+    }
     await agent.pages.handle(req, res, pathname);
     return;
   }

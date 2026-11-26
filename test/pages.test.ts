@@ -141,6 +141,8 @@ test("an unopenable Pages database leaves chat running", async t => {
   assert.equal(log.mock.calls[0]?.arguments[0], `Pages unavailable at ${db}:`);
   assert.ok((await stat(db)).isDirectory());
   assert.equal((await fetch(base + pagesPath)).status, 404);
+  assert.equal((await fetch(base + pagesLibraryApi)).status, 503);
+  assert.equal((await fetch(base + pagesLibraryApi, { headers: { Origin: "null" } })).status, 403);
   const chat = await fetch(base);
   assert.equal(chat.status, 200);
   assert.doesNotMatch(await chat.text(), /href="\/pages"/);

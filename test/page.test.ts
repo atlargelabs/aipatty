@@ -974,7 +974,7 @@ test("Pages previews and direct views are sandboxed; the library moves and delet
   await wait(`document.querySelector('#entries .entry:last-child .card-body')?.textContent.trim() === 'Faux Pages turn finished.'`);
   assert.equal(await browser.evaluate(`window.keptPage === document.querySelector('${jsFrame}')`), true);
   await browser.evaluate(`window.originalFetch = fetch;
-    window.fetch = (url, ...args) => url === '${pagesLibraryApi}' ? Promise.reject(new Error('Offline')) : originalFetch(url, ...args);
+    window.fetch = (url, ...args) => url === '${pagesLibraryApi}' ? Promise.resolve(new Response(null, { status: 503 })) : originalFetch(url, ...args);
     window.dispatchEvent(new Event('focus'))`);
   await wait(`document.querySelector('#entries').textContent.includes('Could not check page availability.')`);
   assert.equal(await browser.evaluate(`window.keptPage === document.querySelector('${jsFrame}')`), true);
