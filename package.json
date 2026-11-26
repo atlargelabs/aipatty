@@ -30,5 +30,11 @@
       "puppeteer": "npm:puppeteer-core@25.18.1"
     }
   },
-  "devDependencies": { "@types/node": "^25.0.0", "@types/proper-lockfile": "^4.1.4", "@types/ws": "^8.18.1", "typescript": "^5.9.3" }
+  "devDependencies": {
+    "@types/node": "^25.0.0",
+    "@types/proper-lockfile": "^4.1.4",
+    "@types/ws": "^8.18.1",
+    "playwright": "1.65.1",
+    "typescript": "^5.9.3"
+  }
 }

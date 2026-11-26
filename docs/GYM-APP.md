@@ -117,5 +117,6 @@ was logged, and a second app looks easy to write against the seam. Otherwise fix
 - **Two devices editing at once.** A save replaces the whole workout, so the last one wins.
 - **Backup.** The log and current suggestion are not in the upgrade backup. To keep a separate copy, stop the
   server and copy `data/apps/gym/gym.sqlite`; see [the operator runbook](INSTALL.md#gym-pilot).
-- **Not now:** a multi-week programme, exercise metadata such as muscle groups, charts, rest timers, body weight
-  and import or export.
+- **No import or export UI or API.** For the one-time history migration, see the
+  [operator runbook](INSTALL.md#one-time-gym-history-import): it drives the phone page's normal Save action.
+- **Not now:** a multi-week programme, exercise metadata such as muscle groups, charts, rest timers and body weight.

@@ -248,6 +248,35 @@ can retain the workout instructions without the tools. This does not delete the 
 branches when running a release with Gym again. Automatic `/upgrade` rollback restores its prior conversation
 database and needs no such step.
 
+### One-time Gym history import
+
+Use a separate repo checkout with Node 26 or newer and the usual SSH tunnel to the target aipatty. Keep the
+prepared JSON outside the checkout. First preview it; before using `--save`, check the origin and counts and
+back up Gym as described above.
+
+```sh
+npm ci --ignore-scripts
+node tools/import-gym-history.ts --origin http://127.0.0.1:8790 /path/to/history.json
+
+# Install the Chromium build pinned by this checkout's Playwright (needed only for saving).
+./node_modules/.bin/playwright install chromium --only-shell
+node tools/import-gym-history.ts --origin http://127.0.0.1:8790 --save /path/to/history.json
+```
+
+Use the local port of your tunnel. The file is an array of `{ id, date, sets }` workouts (see the
+[Gym set format](GYM-APP.md#the-page)); keep IDs stable and unique. Dates are real `YYYY-MM-DD` dates. The
+utility checks the whole file and target IDs before any save, then opens `/apps/gym/` in an isolated,
+non-persistent browser and clicks **Save workout** for each new draft, in file order. It does not use your
+normal browser profile or change suggestions. It reads back each save and checks the date, ID and sets in order.
+
+Do not edit workouts or run another import while saving: the page uses an upsert, so the final GET check and
+click are not atomic. On failure, earlier saves remain, and the last click might have reached the server even
+if verification failed. Correct the problem, preview the same file again, then rerun with `--save`. Identical
+workouts are skipped; a differing existing ID stops the run. Inspect and reconcile that ID before retrying;
+the utility will neither overwrite it nor roll back previous saves.
+
+For a synthetic scratch-server check after installing Chromium, run `node --test test/gym-import.browser.ts`.
+
 ## Upgrade
 
 With the server started as in [Start](#start), from a release that has the command, ask for an upgrade in any
