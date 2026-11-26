@@ -778,11 +778,18 @@ function connect(id) {
   });
 }
 
+let branchListRequest = 0;
+let branchListApplied = 0;
 async function refreshBranches() {
+  const request = ++branchListRequest;
   const { branches, totalCost } = await api("/api/branches");
+  // A poll started before a branch change can return after the new list.
+  if (request < branchListApplied) return;
+  branchListApplied = request;
   app.branches = branches;
   app.totalCost = totalCost;
-  renderBranches();
+  if (app.branch !== null && !current()) await selectBranch(rootId);
+  else renderBranches();
 }
 
 async function selectBranch(id) {

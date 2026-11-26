@@ -11,6 +11,7 @@ import type { BranchInfo } from "../src/branches.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
 import { pageModules } from "../src/page.ts";
 import { messageText, type ConversationPage } from "../src/protocol.ts";
+import { selfCheck } from "../src/upgrade.ts";
 import { fixtureApp } from "./fixtures/app.ts";
 import { checkout, fauxConfig, fixture, realConfig, until } from "./helpers.ts";
 
@@ -176,6 +177,9 @@ test("archive hides a branch durably without touching history, spend, or parked 
     "prefix", "prefix answer", "park this work", "finished parked work", "queued work", "finished queued work",
   ]);
   for (const fork of [child, after]) assert.deepEqual(await texts(reopened.host, String(fork.id)), ["prefix", "prefix answer"]);
+  const open = t.mock.method(reopened.host, "conversation");
+  await selfCheck(reopened.host, fauxConfig(dir));
+  assert.ok(open.mock.calls.some(call => call.arguments[0] === String(id)), "startup still checks archived branches");
 });
 
 test("HTTP and read_branch page the same fork history without gaps or duplicates", { timeout: 30_000 }, async t => {

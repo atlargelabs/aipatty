@@ -211,7 +211,7 @@ test("toolbar New starts blank, Fork here keeps history, and Archive works while
   await until(() => browser.evaluate(`!document.querySelector('#abort').disabled`));
 
   await browser.evaluate(`window.prompt = () => 'Fresh'; document.querySelector('#new').click()`);
-  await waitFor(browser, "a blank branch", state => state.current === "Fresh" && state.messages.length === 0);
+  const fresh = await waitFor(browser, "a blank branch", state => state.current === "Fresh" && state.messages.length === 0);
   const item = `document.querySelector('li[data-branch="${id}"]')`;
   await browser.evaluate(`${item}.click()`);
   await until(() => browser.evaluate(`!document.querySelector('#abort').disabled && location.hash === '#${id}'`));
@@ -230,6 +230,12 @@ test("toolbar New starts blank, Fork here keeps history, and Archive works while
   await browser.navigate("about:blank");
   await browser.navigate(`${base}/${side.hash}`);
   await waitFor(browser, "Main after opening an archived branch URL", state => state.current === "Home" && state.hash === home.hash);
+  const freshId = fresh.hash.slice(1);
+  await browser.evaluate(`document.querySelector('li[data-branch="${freshId}"]').click()`);
+  await waitFor(browser, "Fresh selected again", state => state.hash === fresh.hash);
+  // Archiving in another client also falls back after the page's existing sidebar refresh.
+  assert.equal((await fetch(`${base}/api/conversations/${freshId}/archive`, { method: "POST" })).status, 200);
+  await until(() => browser.evaluate(`location.hash === '${home.hash}'`), Boolean, 15_000);
   assert.deepEqual(browser.errors, []);
 });
 

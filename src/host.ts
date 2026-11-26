@@ -69,6 +69,8 @@ export interface AgentHost {
   setThinking(level: string, conversation?: Conversation, context?: Context): Promise<void>;
   /** Unarchived branches, oldest first, and the spend of the whole session. */
   branches(): Promise<{ branches: BranchInfo[]; totalCost: number }>;
+  /** All ownerless branch records, including archived ones, for startup checks. */
+  branchRecords(): Promise<ConversationRecord[]>;
   branch(conversation: Conversation): Promise<BranchInfo>;
   newBranch(title: unknown): Promise<BranchInfo>;
   archive(conversation: Conversation): Promise<void>;
@@ -494,6 +496,7 @@ async function openOwnedHost(config: Config, { apps: modules = connectedApps, mo
           await target.configure({ thinkingLevel }, ctx);
         }, context));
       },
+      branchRecords,
       async branches() {
         const records = await branchRecords();
         const branches = await Promise.all(records.map(async record => {
