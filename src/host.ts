@@ -20,6 +20,7 @@ import type { Config } from "./config.ts";
 import { HttpError } from "./http.ts";
 import { ownDataDir } from "./ownership.ts";
 import { openModels } from "./models.ts";
+import { openPages, type Pages } from "./pages/index.ts";
 import { openPiRuns, type PiRuns } from "./pi-run.ts";
 import { piExtension } from "./pi-tool.ts";
 import { appEntryKind, connectCommand, disconnectCommand, failureText, messageText, usageCost, type AppCommand } from "./protocol.ts";
@@ -47,6 +48,8 @@ export interface ModelStatus {
 
 export interface AgentHost {
   harness: Harness;
+  /** Instance-wide, absent only if Pages failed to open at startup. */
+  pages?: Pages;
   app(id: string): OpenApp | undefined;
   appProblems(): Promise<string[]>;
   branchApps(conversation: Conversation): Promise<string[]>;
@@ -173,6 +176,8 @@ async function openOwnedHost(config: Config, { apps: modules = connectedApps, mo
     if (!host) throw new Error("aipatty is still starting");
     return host;
   }));
+  const pages = openPages(config.dataDir);
+  if (pages) registry.install(pages.extension);
   // An implicit default selects *every* installed extension, even on old conversations.
   const extensions = registry.snapshot().installed();
   const apps = new Map<string, { title: string; instructions: string; opened: OpenApp; extension: Extension }>();
@@ -214,7 +219,7 @@ async function openOwnedHost(config: Config, { apps: modules = connectedApps, mo
   }
   const closeResources = async () => {
     for (const [id, { opened }] of apps) closeApp(id, opened);
-    await sandbox.close();
+    try { pages?.close(); } finally { await sandbox.close(); }
   };
   const harness = await Harness.open(storage, {
     models,
@@ -391,6 +396,7 @@ async function openOwnedHost(config: Config, { apps: modules = connectedApps, mo
     host = {
       harness,
       runs,
+      pages,
       app: id => apps.get(id)?.opened,
       async appProblems() {
         const attached = await Promise.all((await branchRecords()).map(({ id }) => markers(id)));

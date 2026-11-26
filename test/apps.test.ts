@@ -8,6 +8,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { startApi } from "../src/api.ts";
 import { openHost } from "../src/host.ts";
+import { pageHeaders } from "../src/http.ts";
+import { publishPageTool } from "../src/pages/shared.ts";
 import { appEntryKind, messageText } from "../src/protocol.ts";
 import { fixtureApp } from "./fixtures/app.ts";
 import { connect, fauxConfig, fixture, until } from "./helpers.ts";
@@ -57,7 +59,7 @@ test("apps opt branches into tools, discovery and instructions, including forks 
     const instructions = [...text.matchAll(/Instruction for fixture (\w+)\./g)].map(match => match[1]);
     assert.deepEqual(instructions, expected);
     const names = getCurrentTools(request.messages).map(tool => tool.name);
-    for (const builtIn of ["bash", "pi", "codemode", "tool_search"]) assert.ok(names.includes(builtIn), builtIn);
+    for (const builtIn of ["bash", "pi", "codemode", "tool_search", publishPageTool]) assert.ok(names.includes(builtIn), builtIn);
     assert.deepEqual(names.filter(name => name.endsWith("_probe")), expected.map(id => id + "_probe"));
     return names;
   };
@@ -169,7 +171,7 @@ test("only valid namespaced apps open; app requests keep the host trust and erro
   assert.deepEqual(await response.json(), { id: "good", dataDir });
   assert.equal((await stat(dataDir)).mode & 0o777, 0o700);
   assert.equal(response.headers.get("cache-control"), "no-store");
-  assert.equal(response.headers.get("content-security-policy"), (await fetch(base)).headers.get("content-security-policy"));
+  assert.equal(response.headers.get("content-security-policy"), pageHeaders["Content-Security-Policy"]);
   assert.equal((await fetch(route, { headers: { Origin: "https://outside.example" } })).status, 403);
   const rejectedHost = await new Promise<number | undefined>((resolve, reject) => {
     get(route, { headers: { Host: `outside.example:${api.port}` } }, res => { res.resume(); resolve(res.statusCode); }).on("error", reject);
