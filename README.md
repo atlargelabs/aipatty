@@ -264,8 +264,8 @@ Gym page to make a draft. Only saving on the page logs a workout. `/connect` lis
 
 See the [Gym quickstart and trial](docs/GYM-APP.md) and [app API](docs/CONNECTED-APPS.md). Apps are trusted code,
 not an access-control boundary. The Gym database is separate from the conversation database and is not in the
-upgrade backup. A restart that changes a branch's app configuration can stop its interrupted turn with a
-notice to resend.
+upgrade backup. For a one-time history migration, see the [operator import runbook](docs/INSTALL.md#one-time-gym-history-import).
+A restart that changes a branch's app configuration can stop its interrupted turn with a notice to resend.
 
 ## Upgrade
 
