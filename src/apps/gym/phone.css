@@ -19,9 +19,10 @@ button:disabled { cursor: default; opacity: .6; }
 #historical-reps { margin-bottom: .75rem; }
 #new-exercise { width: min(26rem, calc(100% - 2rem)); padding: 1rem; border: 1px solid GrayText; border-radius: .4rem; }
 #new-exercise .gym-actions { margin-top: .75rem; }
-ol { margin-block: .6rem; padding-inline-start: 1.6rem; }
-li { margin-bottom: .4rem; overflow-wrap: anywhere; }
-/* Keep native list markers on the li, with wrapping text and buttons in separate columns. */
+/* Keep role="list" on these markerless lists for Safari accessibility. */
+.gym-set-list { list-style: none; margin-block: .6rem; padding-inline-start: 0; }
+.gym-set-list > li { overflow-wrap: anywhere; }
+.gym-set-list > li.exercise-break { margin-block-start: .5lh; }
 .gym-inline { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: .5rem; }
 .gym-inline > h3 { margin: 0; }
 .gym-inline > .gym-actions { flex-wrap: nowrap; gap: .35rem; }
