@@ -396,12 +396,9 @@ function branchNode(id) {
     button.className = "branch-item";
     const title = document.createElement("span");
     title.className = "branch-name";
-    const busy = document.createElement("span");
-    busy.className = "busy";
-    busy.textContent = "busy";
-    button.append(title, busy);
+    button.append(title);
     li.append(button);
-    node = { li, button, title, busy };
+    node = { li, button, title };
     branchNodes.set(id, node);
   }
   return node;
@@ -419,7 +416,9 @@ function renderBranches() {
     const selected = branch.id === app.branch;
     node.button.ariaCurrent = selected ? "page" : null;
     setText(node.title, branch.title);
-    node.busy.hidden = !branch.busy;
+    node.button.classList.toggle("is-busy", branch.busy);
+    const label = branch.busy ? branch.title + ", busy" : null;
+    if (node.button.ariaLabel !== label) node.button.ariaLabel = label;
     if (list.children[index] !== node.li) list.insertBefore(node.li, list.children[index] || null);
   });
   const branch = current();

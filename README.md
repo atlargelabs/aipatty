@@ -115,7 +115,8 @@ its identity was remembered.
 
 Open `http://127.0.0.1:8790/` (or the port given with `--port`) for the branch list, transcript, input box, **New**,
 **Rename**, **Archive**, search, model and thinking pickers, and cost. Use the branching icon (**Fork here**) on a
-message to fork at that entry. Archiving the selected branch returns the page to Main. In the message box, Enter sends on desktop and
+message to fork at that entry. A green left edge marks the selected branch, and a green branch name marks a
+running branch. Archiving the selected branch returns the page to Main. In the message box, Enter sends on desktop and
 inserts a newline when the primary pointer is coarse and cannot hover (touch-first).
 Shift+Enter inserts a newline in either case. Use the Send button or ⌘/Ctrl+Enter (without Shift or Alt) to send.
 

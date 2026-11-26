@@ -212,8 +212,12 @@ test("clicking a branch in the page's list switches to it, and back", { skip: ch
 
 test("toolbar New starts blank, Fork here keeps history, and Archive works while busy", { skip: !chrome, timeout: 60_000 }, async t => {
   const faux = fauxProvider();
+  const settle = Promise.withResolvers<void>();
   const gate = Promise.withResolvers<void>();
   faux.setResponses([fauxAssistantMessage("original answer"), async () => {
+    await settle.promise;
+    return fauxAssistantMessage("finished before archiving");
+  }, async () => {
     await gate.promise;
     return fauxAssistantMessage("finished while archived");
   }]);
@@ -221,7 +225,7 @@ test("toolbar New starts blank, Fork here keeps history, and Archive works while
   models.setProvider(faux.provider);
   const host = await openHost(fauxConfig(await fixture(t)), { models });
   const api = await startApi(host, health, 0);
-  t.after(async () => { gate.resolve(); await api.close(); await host.close(); });
+  t.after(async () => { settle.resolve(); gate.resolve(); await api.close(); await host.close(); });
   const base = `http://127.0.0.1:${api.port}`;
   const root = (await host.conversation("root"))!;
   await host.rename(root, "Home");
@@ -250,15 +254,37 @@ test("toolbar New starts blank, Fork here keeps history, and Archive works while
   assert.equal(await browser.evaluate(`document.querySelectorAll('#entries .inherited-marker:not([hidden])').length`), 2);
   const id = side.hash.slice(1);
   const branch = (await host.conversation(id))!;
-  const active = await host.submit(branch, { type: "input", content: "keep working" });
+  const item = `document.querySelector('li[data-branch="${id}"] button')`;
+  const row = () => browser.evaluate(`(() => {
+    const button = ${item};
+    const style = getComputedStyle(button);
+    return { text: button.innerText, tooltip: button.title, label: button.ariaLabel, current: button.ariaCurrent,
+      nameColor: getComputedStyle(button.querySelector('.branch-name')).color, buttonColor: style.color,
+      edge: style.borderInlineStartColor };
+  })()`);
+  const chalk = "rgb(242, 246, 241)";
+  const phosphor = "rgb(184, 237, 138)";
+  const idle = { text: "Main", tooltip: "", label: null, current: "page", nameColor: chalk, buttonColor: chalk, edge: phosphor };
+  assert.deepEqual(await row(), idle);
+
+  const first = await host.submit(branch, { type: "input", content: "start working" });
   await until(() => browser.evaluate(`!document.querySelector('#abort').disabled`));
+  const running = { ...idle, label: "Main, busy", nameColor: idle.edge };
+  assert.deepEqual(await row(), running);
 
   await browser.evaluate(`window.prompt = () => 'Fresh'; document.querySelector('#new').click()`);
   const fresh = await waitFor(browser, "a blank branch", state => state.current === "Fresh" && state.messages.length === 0);
-  const item = `document.querySelector('li[data-branch="${id}"] button')`;
-  assert.equal(await browser.evaluate(`${item}.innerText`), "Main\nbusy");
+  assert.deepEqual(await row(), { ...running, current: null, edge: "rgba(0, 0, 0, 0)" });
   await browser.evaluate(`${item}.click()`);
   await until(() => browser.evaluate(`!document.querySelector('#abort').disabled && location.hash === '#${id}'`));
+
+  settle.resolve();
+  assert.equal((await first.wait(ctx)).status, "done");
+  await until(() => browser.evaluate(`document.querySelector('#abort').disabled && ${item}.ariaLabel === null`));
+  assert.deepEqual(await row(), idle);
+
+  const active = await host.submit(branch, { type: "input", content: "keep working" });
+  await until(() => browser.evaluate(`!document.querySelector('#abort').disabled`));
   assert.equal(await browser.evaluate(`document.querySelector('#archive').matches(':not([hidden]):enabled')`), true);
   const confirmation = await browser.evaluate<string>(`
     window.confirm = text => { window.confirmation = text; return true; };
@@ -399,6 +425,16 @@ test("saved prose renders Markdown on narrow screens and survives live updates",
   await browser.viewport(390, 600);
   await browser.navigate(base);
   await waitFor(browser, "the saved cards", state => state.messages.length === 5);
+  assert.deepEqual(await browser.evaluate(`['.prose.assistant', '.toolResult', '.prose.user', '.toolCall'].map(role => {
+    const card = document.querySelector('#entries .entry' + role);
+    const style = getComputedStyle(card);
+    return [style.borderInlineStartColor, getComputedStyle(card.querySelector('.role')).backgroundColor, style.backgroundColor];
+  })`), [
+    ["rgb(184, 237, 138)", "rgb(184, 237, 138)", "rgb(236, 245, 229)"], // Phosphor
+    ["rgb(227, 165, 184)", "rgb(227, 165, 184)", "rgb(250, 237, 241)"], // Dusty Rose
+    ["rgb(115, 216, 232)", "rgb(115, 216, 232)", "rgb(232, 245, 246)"], // Cyan
+    ["rgb(181, 164, 227)", "rgb(181, 164, 227)", "rgb(243, 238, 249)"], // Violet
+  ]);
   for (const role of ["user", "assistant"]) {
     const rendered = await browser.evaluate(`(() => {
       const body = document.querySelector('#entries .${role}.prose .card-body');
@@ -453,8 +489,10 @@ test("saved prose renders Markdown on narrow screens and survives live updates",
   await until(() => browser.evaluate(`!!document.querySelector('#live .liveText')`));
   assert.deepEqual(await browser.evaluate(`(() => {
     const live = document.querySelector('#live .liveText .card-body');
-    return [live.textContent, live.childElementCount, window.savedLink.isConnected];
-  })()`), ['**Writing\n→ bash {"command":"partial"}', 0, true]);
+    const style = getComputedStyle(live.parentElement);
+    return [live.textContent, live.childElementCount, window.savedLink.isConnected,
+      style.borderInlineStartStyle, style.borderInlineStartColor, style.backgroundColor];
+  })()`), ['**Writing\n→ bash {"command":"partial"}', 0, true, "dashed", "rgb(115, 216, 232)", "rgb(252, 253, 250)"]);
   assert.deepEqual(browser.errors, []);
 });
 

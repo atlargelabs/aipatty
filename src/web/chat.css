@@ -36,7 +36,7 @@ body > .masthead {
   border: 1px solid transparent;
   border-inline-start-width: 4px;
 }
-.branch-item .busy:not([hidden]) { display: block; font-size: .75rem; color: var(--phosphor); font-weight: 600; }
+.branch-item.is-busy .branch-name { color: var(--phosphor); }
 .branch-item:not([aria-current]):hover { background: #293e32; }
 #branches .branch-item[aria-current] { background: #304538; border-inline-start-color: var(--phosphor); }
 #branches .branch-item[aria-current]:hover { background: #395444; }
@@ -69,9 +69,9 @@ main {
   overflow-wrap: anywhere;
 }
 .entry.prose.user { --accent: var(--cyan); --fill: #e8f5f6; }
-.entry.prose.assistant { --accent: var(--chalk); }
+.entry.prose.assistant { --accent: var(--phosphor); --fill: #ecf5e5; }
 .entry.toolCall, .entry.liveTool { --accent: var(--violet); --fill: #f3eef9; }
-.entry.toolResult { --accent: var(--phosphor); --fill: #ecf5e5; }
+.entry.toolResult { --accent: #e3a5b8; --fill: #faedf1; }
 .entry:is(.toolCall, .toolResult, .liveTool) { font-size: .8125rem; max-height: 12rem; overflow: auto; }
 .entry:is(.system, .notice) { --fill: var(--quiet); }
 .entry:is(.runFailure, .tool-error) { --accent: var(--danger); --fill: var(--danger-fill); }
