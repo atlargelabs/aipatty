@@ -24,9 +24,10 @@ export function piExtension(getRuns: () => PiRuns) {
     name: "pi",
     description: "Run one Pi coding session on a bounded task in a fresh clone of atlargelabs/aipatty, aipatty's own repository, and wait "
       + "for its result. Use it for every change that should become a PR: Pi opens an issue, a task branch and a PR, runs the "
-      + "checks, and has a crmanager delegate review the final commit. Only Steve merges. At most one run per conversation "
-      + "branch (including cleanup); other branches run independently. Every run starts fresh and sees nothing of this conversation or of earlier "
-      + "runs, so put all the context it needs in `task`: the goal, the relevant decisions, and what done means. "
+      + "checks, and has a crmanager delegate review the final commit. Only Steve merges. Only one Pi run can be active per "
+      + "conversation branch at a time, including cleanup. After the run finishes and cleanup completes, you can run Pi again "
+      + "on the same branch. Other branches can run independently. Every run starts fresh and sees nothing of this conversation "
+      + "or of earlier runs, so put all the context it needs in `task`: the goal, the relevant decisions, and what done means. "
       + "The result reports the PR and its head commit as confirmed with GitHub, and whether the last review covered "
       + "that commit; a result that says NOT REVIEWED or lists problems is not finished work. The run's cost is charged to this branch.",
     parameters: obj({

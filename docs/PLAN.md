@@ -124,7 +124,7 @@ changing the setting. See [INSTALL.md](INSTALL.md) for the first pinned deploy a
 | Tool | What it does |
 | --- | --- |
 | `read`, `write`, `edit`, `bash`, `codemode`, `tool_search` | pi-durable built-ins, working in `work/`. |
-| `pi` | Runs one Pi session on a bounded coding task in a fresh clone and returns the result to the calling branch. At most one run per conversation branch; branches run independently. Inside the run Pi may delegate the work, and always delegates the review of a PR. |
+| `pi` | Runs one Pi session on a bounded coding task in a fresh clone and returns the result to the calling branch. One active run at a time per conversation branch, including cleanup; branches run independently. Inside the run Pi may delegate the work, and always delegates the review of a PR. |
 | `fork_branch`, `list_branches`, `read_branch`, `set_model` | Tree management, plus paging and text search over any branch. |
 | `mcp_status`, `mcp_reload`, `mcp_sign_in` | Later: server state, re-reading `mcp.json`, and OAuth by link. |
 

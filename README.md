@@ -33,9 +33,9 @@ have the permissions of the user the server runs as.
 Work meant for a PR goes through the `pi` tool. Each call runs one session of the Pi CLI pinned in `package.json`,
 in a fresh clone of `atlargelabs/aipatty` under the runs directory, and waits for it.
 
-- **One per conversation branch.** A second call in the same branch is refused during startup, execution and
-  cleanup. Different branches start and finish independently in separate clones; there is no global run cap
-  or coordination of work in GitHub.
+- **One active run per conversation branch.** A second call in the same branch is refused during startup, execution
+  and cleanup. Once cleanup completes, the same branch can start another run. Different branches start and finish
+  independently in separate clones; there is no global run cap or coordination of work in GitHub.
 - **Launch.** The CLI runs in one-shot JSON mode with no session. It explicitly loads the release's pinned
   `delegates`, `just-web-fetch` (managed `web_fetch`) and `pi-web-search` (`web_search`, plus `url_context` on
   supported models). The default stays `openai/gpt-6.2-sol`. An explicit `model: "claude-code/<model-id>"`
