@@ -90,17 +90,17 @@ mode. This is a workflow rule, not a sandbox or a change to the service account'
   Preserve the records and workspaces as evidence. A later cleanup may add spend to `result.json`; if the
   call's result was already committed in its branch, that spend is not charged there again.
 
-A run needs `git`, `gh`, a GitHub login for the account running the server, and the Pi sign-in. For a PR run,
-`delegates.reviewExtension` in the selected Pi directory's `settings.json` must be an absolute path to the
-running release's `node_modules/@earendil-works/pi-review/review.ts`. The host checks it before cloning; a
-missing path or an older or shared copy is refused. Only the `crmanager` job loads pi-review. Non-PR runs do
-not require this setting. See [the runbook](docs/INSTALL.md) for the exact path and rollout steps.
+A run needs local `git` and sign-in for its Pi model. Checkout-based runs also need GitHub read access via
+SSH; PR runs need `gh` and a GitHub login with write access. Scratch runs need neither `gh` nor GitHub access
+for setup. For a PR run, `delegates.reviewExtension` in the selected Pi directory's `settings.json` must be an
+absolute path to the running release's `node_modules/@earendil-works/pi-review/review.ts`. The host checks it
+before cloning; a missing path or an older or shared copy is refused. Only the `crmanager` job loads pi-review.
+Non-PR runs do not require this setting. See [the runbook](docs/INSTALL.md) for the exact path and rollout steps.
 
-Web and Claude Code extensions are for the top-level coding run only, not conversations, delegates, or the
-reviewer. Fetch needs operator-installed Chrome/Chromium, trafilatura, and a filtering egress proxy; managed
-runs do not load fetch hooks.
-Search needs a provider/account with native search and can incur separate usage. Claude Code needs its own CLI
-and service-account subscription login. See [optional coding extensions](docs/INSTALL.md#optional-coding-extensions)
+The managed web and Claude Code extensions are loaded for the top-level Pi run, not for conversations or the
+reviewer. Delegates do not inherit the top-level web tools. Fetch needs operator-installed Chrome/Chromium,
+trafilatura, and a filtering egress proxy; managed runs do not load fetch hooks. Search needs a provider/account
+with native search and can incur separate usage. Claude Code needs its own CLI and service-account subscription login. See [optional coding extensions](docs/INSTALL.md#optional-coding-extensions)
 for prerequisites, configuration, and data/usage boundaries.
 
 A run's processes are identified by a remembered PID and start time or by a marker in their environment.

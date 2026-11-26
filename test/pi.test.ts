@@ -846,13 +846,16 @@ test("the pi tool returns the outcome to the calling branch and charges the run 
   // No-PR investigation still clones by default, and supports a selected base without any GitHub confirmation.
   const ghCalls = join(config.dataDir, "fake-gh-calls.txt");
   await rm(ghCalls);
-  await exec("git", ["tag", "fixture-base"], { cwd: config.pi.repoUrl });
-  await scenario(config, [assistant(report({ pr: null, issue: null })), settled]);
+  const git = (...args: string[]) => exec("git", ["-c", "user.name=test", "-c", "user.email=test@example.invalid", ...args], { cwd: config.pi.repoUrl });
+  const baseSha = (await git("rev-parse", "HEAD")).stdout.trim();
+  await git("tag", "fixture-base");
+  await git("commit", "--quiet", "--allow-empty", "-m", "advance default branch past fixture-base");
+  await scenario(config, [assistant(report({ pr: null, issue: null })), settled], { expectedHead: baseSha });
   await send('call pi {"task":"Investigate the repo.","pr":false,"base":"fixture-base"}');
   assert.match(await lastText(host), /Pi run \S+: completed/);
   const investigation = (await launches(config)).at(-1)!;
   assert.equal(investigation.cwd.endsWith("/repo"), true);
-  assert.match(investigation.prompt, /checked out here at `fixture-base` \([0-9a-f]{40}\)/);
+  assert.ok(investigation.prompt.includes(`checked out here at \`fixture-base\` (${baseSha}).`));
   const rules = await readFile(investigation.argv[investigation.argv.indexOf("--append-system-prompt") + 1], "utf8");
   assert.match(rules, /Publish nothing\.[^]*edit and run code in the disposable checkout/);
   assert.doesNotMatch(rules, /checks the links against GitHub|survive.*through the PR/);

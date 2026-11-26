@@ -9,7 +9,7 @@ import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import type { Config } from "./config.ts";
 import { stageDelegates } from "./pi-delegates.ts";
-import { instructions, taskPrompt, type PromptInput } from "./pi-prompt.ts";
+import { instructions, maxSummary, taskPrompt, type PromptInput } from "./pi-prompt.ts";
 import { addUsage, githubLink, readReport, RunTrace, usageKey, type JobUsage, type Review } from "./pi-trace.ts";
 import { readPiRunSnapshot, runLogParts } from "./pi-run-view.ts";
 import { runStatuses, type PiRunSnapshot, type RunStatus } from "./protocol.ts";
@@ -113,7 +113,6 @@ interface JobManifest {
   workspace?: { source?: string };
 }
 
-const maxSummary = 6_000;
 const maxItems = 20;
 const maxItem = 600;
 const defaultPollMs = 2_000;

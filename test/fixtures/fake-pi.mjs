@@ -1,6 +1,7 @@
 // A stand-in for the Pi CLI in one-shot JSON mode. Plays a branch's `fake-scenario-<branch>.json` or the common
 // `fake-scenario.json` in the agent directory, and records how it was launched in `fake-launches.jsonl` there.
-import { spawn } from "node:child_process";
+import assert from "node:assert/strict";
+import { execFileSync, spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -11,6 +12,9 @@ for await (const chunk of process.stdin) prompt += chunk;
 const branch = /requested from aipatty's conversation branch (\d+)/.exec(prompt)?.[1];
 const branchScenario = join(agentDir, `fake-scenario-${branch}.json`);
 const scenario = JSON.parse(readFileSync(existsSync(branchScenario) ? branchScenario : join(agentDir, "fake-scenario.json"), "utf8"));
+if (scenario.expectedHead !== undefined) {
+  assert.equal(execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(), scenario.expectedHead);
+}
 const sessionId = scenario.sessionId ?? `fake-session-${process.env.PATTY_RUN_ID}`;
 if (scenario.ignoreTerm) process.on("SIGTERM", () => {});
 appendFileSync(join(agentDir, "fake-launches.jsonl"), JSON.stringify({
