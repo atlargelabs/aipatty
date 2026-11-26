@@ -962,14 +962,15 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
         [...list.children].every(li => getComputedStyle(li).display === 'list-item' && !li.hasAttribute('value'))];
     })()`), ["OL", reversed, start, "decimal", true], `${selector} uses native list numbering`);
   };
-  const checkInlineActions = async (row: string, textSelector: string) => {
+  const checkInlineActions = async (row: string, textSelector: string, minTarget = 32) => {
     assert.equal(await browser.evaluate(`(() => {
       const row = document.querySelector(${JSON.stringify(row)});
       const text = row.querySelector(${JSON.stringify(textSelector)}).getBoundingClientRect();
-      const [edit, remove] = [...row.querySelectorAll('button')].map(button => button.getBoundingClientRect());
-      return text.right <= edit.left && edit.right <= remove.left && edit.top === remove.top
-        && text.top < edit.bottom && text.bottom > edit.top;
-    })()`), true, `${row} keeps both controls beside its text`);
+      const buttons = [...row.querySelectorAll('button')].map(button => button.getBoundingClientRect());
+      return buttons.every((box, i) => box.left >= (i ? buttons[i - 1].right : text.right)
+        && box.top === buttons[0].top && text.top < box.bottom && text.bottom > box.top
+        && box.width >= ${minTarget} && box.height >= ${minTarget});
+    })()`), true, `${row} keeps all controls beside its text with room to tap`);
   };
   const assertNoHorizontalScroll = async (message: string) => {
     // Unlike innerWidth, clientWidth excludes any space used by a vertical scrollbar.
@@ -1056,10 +1057,10 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await numbered(`${firstCard} ol`);
   assert.deepEqual(await matching(`${firstCard} ol > li`), entryLines);
   assert.deepEqual(await matching(`${firstCard} h3`), [first.date]);
-  const workoutActions = ["Edit workout on " + first.date, "Delete workout on " + first.date];
+  const workoutActions = ["Edit", "Copy", "Delete"].map(action => `${action} workout on ${first.date}`);
   assert.deepEqual(await matching(`${firstCard} button`, "ariaLabel"), workoutActions);
   assert.deepEqual(await matching(`${firstCard} > :has(> h3) button`, "ariaLabel"), workoutActions);
-  await checkInlineActions(firstCard, "h3");
+  await checkInlineActions(firstCard, "h3", 44);
   await assertNoHorizontalScroll("recent sets also fit on narrow phones");
   await browser.viewport(390, 780);
 
@@ -1214,5 +1215,72 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await tap(`[data-branch='${root.id}']`);
   await waitFor(browser, "Main", value => value.title === "Main");
   assert.deepEqual(await browser.evaluate("[document.querySelector('#card-header').hidden, document.querySelectorAll('.toolResult table').length, document.body.className]"), [true, 0, ""]);
+  assert.deepEqual(browser.errors, []);
+});
+
+test("Gym copies a recent workout as text without touching the draft", { skip: !chrome, timeout: 60_000 }, async t => {
+  const host = await openHost(fauxConfig(await fixture(t)));
+  const api = await startApi(host, health, 0);
+  t.after(async () => { await api.close(); await host.close(); });
+  const page = `http://127.0.0.1:${api.port}/apps/gym/`;
+  const workout = { date: "2025-02-03", sets: [
+    { exercise: "Squat", duration: 6, durationUnit: "reps", load: 62.5, loadUnit: "kg", extraReps: null },
+    { exercise: "Plank", duration: 15.5, durationUnit: "sec", load: 0, loadUnit: "kg", extraReps: 3 },
+    { exercise: "Farmer\ncarry", duration: 20, durationUnit: "m", load: null, loadUnit: null, extraReps: null },
+  ] };
+  const seeded = await fetch(page + "api/workouts/scratch", {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(workout),
+  });
+  assert.equal(seeded.status, 200);
+
+  const browser = await openBrowser(t);
+  await browser.navigate(page);
+  const copyButton = '#recent-workouts [data-action="copy-workout"]';
+  await until(() => browser.evaluate(`!!document.querySelector(${JSON.stringify(copyButton)})`));
+  await browser.evaluate(`
+    const exercise = document.querySelector('#exercise');
+    exercise.value = 'name:Squat';
+    exercise.dispatchEvent(new Event('change'));
+    window.copyPrompts = 0;
+    window.confirm = () => { window.copyPrompts++; return false; };
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+      writeText(text) {
+        window.copiedText = text;
+        return new Promise((resolve, reject) => { window.finishCopy = resolve; window.denyCopy = reject; });
+      }
+    } });
+  `);
+  await until(() => browser.evaluate("document.querySelector('#duration').value === '6'"));
+  await browser.evaluate(`
+    document.querySelector('#add-set').click();
+    for (const [id, value] of [['workout-date', '2025-02-04'], ['duration', '9']]) {
+      const input = document.getElementById(id);
+      input.value = value;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+  `);
+  const draft = () => browser.evaluate(`[
+    localStorage.getItem('gym-draft'), document.querySelector('#workout-date').value,
+    document.querySelector('#duration').value, document.querySelector('#draft-sets li').textContent
+  ]`);
+  const before = await draft();
+  const status = () => browser.evaluate<string>(`document.querySelector('#recent-workouts [role="status"]').textContent`);
+  const copy = () => browser.evaluate(click(copyButton));
+  await copy();
+  assert.equal(await browser.evaluate("window.copiedText"),
+    "2025-02-03\n1. Squat · 6 reps · 62.5 kg\n2. Plank · 15.5 sec · 3 reps · 0 kg (bodyweight)\n3. Farmer carry · 20 m");
+  assert.equal(await status(), "", "success must wait for the clipboard write");
+  await browser.evaluate("window.finishCopy()");
+  await until(status, text => text === "Workout copied to clipboard.");
+  await copy();
+  await browser.evaluate("window.denyCopy(new DOMException('Clipboard denied', 'NotAllowedError'))");
+  await until(status, text => text.startsWith("Could not copy workout."));
+  await browser.evaluate("Object.defineProperty(navigator, 'clipboard', { value: undefined })");
+  await copy();
+  assert.match(await status(), /^Clipboard unavailable\./);
+  assert.deepEqual(await draft(), before);
+  assert.equal(await browser.evaluate("window.copyPrompts"), 0);
+  const overview = await (await fetch(page + "api/overview")).json();
+  assert.deepEqual(overview.workouts, [{ id: "scratch", ...workout }]);
   assert.deepEqual(browser.errors, []);
 });

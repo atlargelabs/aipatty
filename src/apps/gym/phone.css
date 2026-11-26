@@ -26,6 +26,7 @@ li { margin-bottom: .4rem; overflow-wrap: anywhere; }
 .gym-inline > h3 { margin: 0; }
 .gym-inline > .gym-actions { flex-wrap: nowrap; gap: .35rem; }
 .gym-inline button { min-height: 32px; padding: .2rem .5rem; font-size: .875rem; }
+#recent-workouts .gym-actions button { min-width: 44px; min-height: 44px; }
 article { padding: .75rem 0; border-top: 1px solid GrayText; overflow-wrap: anywhere; }
 #last-session { margin-top: .5rem; }
 #status { font-weight: 600; }

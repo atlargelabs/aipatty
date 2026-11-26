@@ -388,11 +388,29 @@ function workoutCard(workout) {
       void refresh();
     });
   });
+  const copyStatus = node("div");
+  copyStatus.setAttribute("role", "status");
+  const copy = button("Copy", "copy-workout", async () => {
+    const clipboard = navigator.clipboard;
+    if (!clipboard?.writeText) {
+      copyStatus.textContent = "Clipboard unavailable. Use a browser with clipboard access over HTTPS or localhost.";
+      return;
+    }
+    copyStatus.textContent = "";
+    try {
+      const lines = workout.sets.map((set, i) => `${i + 1}. ${setLine(set).replace(/[\r\n\u2028\u2029]+/g, " ")}`);
+      await clipboard.writeText([workout.date, ...lines].join("\n"));
+      copyStatus.textContent = "Workout copied to clipboard.";
+    } catch {
+      copyStatus.textContent = "Could not copy workout. Check clipboard permissions and try again.";
+    }
+  });
   edit.setAttribute("aria-label", "Edit workout on " + workout.date);
+  copy.setAttribute("aria-label", "Copy workout on " + workout.date);
   remove.setAttribute("aria-label", "Delete workout on " + workout.date);
-  actions.append(edit, remove);
+  actions.append(edit, copy, remove);
   heading.append(node("h3", workout.date), actions);
-  card.append(heading, setList(workout.sets));
+  card.append(heading, copyStatus, setList(workout.sets));
   return card;
 }
 startSuggestion.addEventListener("click", () => {
