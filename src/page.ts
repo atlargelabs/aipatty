@@ -793,6 +793,7 @@ async function refreshBranches() {
 }
 
 async function selectBranch(id) {
+  notice("");
   // Reset even if the next branch has the same app list: its stream supplies the authoritative selection.
   appKey = null;
   setAppSteps([]);
