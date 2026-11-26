@@ -274,7 +274,6 @@ from a release that predates `/upgrade`, which is one more manual deploy. See
    mode, hooks, or more repos only when needed.
 6. **Gym pilot:** the [connected-app seam](CONNECTED-APPS.md) and [Gym](GYM-APP.md) are implemented and tested
    with temporary data and Faux. Steve's trial is two real workouts on a phone before expanding the experiment.
-   The [one-time history import](INSTALL.md#one-time-gym-history-import) uses the existing phone page, not a new API or UI.
 
 ## Setup responsibilities
 
