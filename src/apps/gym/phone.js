@@ -70,6 +70,11 @@ function setLine(set) {
     + (set.extraReps == null ? "" : " · " + set.extraReps + " reps")
     + (set.load == null ? "" : " · " + set.load + " " + set.loadUnit + (set.load === 0 ? " (bodyweight)" : ""));
 }
+function setList(sets) {
+  const list = node("ol");
+  list.append(...sets.map(set => node("li", setLine(set))));
+  return list;
+}
 function say(text) { $("status").textContent = text; }
 function warning(id, text = "") {
   $(id).textContent = text;
@@ -210,8 +215,13 @@ function pendingSet() {
 }
 function renderDraft() {
   renderExercisePicker();
-  $("draft-sets").replaceChildren(...sets.map((set, i) => {
-    const row = node("li", setLine(set));
+  const list = $("draft-sets");
+  list.start = sets.length;
+  // Reverse the rendered rows only; their controls use the original array indexes.
+  list.replaceChildren(...sets.map((set, i) => {
+    const row = node("li");
+    const content = node("div");
+    content.className = "gym-inline";
     const actions = node("div");
     actions.className = "gym-actions";
     const edit = button("Edit", "edit-set", () => {
@@ -230,9 +240,10 @@ function renderDraft() {
     edit.setAttribute("aria-label", "Edit set " + (i + 1));
     remove.setAttribute("aria-label", "Remove set " + (i + 1));
     actions.append(edit, remove);
-    row.append(actions);
+    content.append(node("span", setLine(set)), actions);
+    row.append(content);
     return row;
-  }));
+  }).reverse());
   remember();
 }
 async function previewLast() {
@@ -246,9 +257,7 @@ async function previewLast() {
     if (!session) {
       last.textContent = "No previous sets for " + name + ".";
     } else {
-      const list = node("ol");
-      list.append(...session.sets.map(set => node("li", setLine(set))));
-      last.replaceChildren(node("strong", "Last time · " + session.date), list);
+      last.replaceChildren(node("strong", "Last time · " + session.date), setList(session.sets));
       if (position === null && !valuesDirty && duration.value === "" && load.value === "") {
         fillFields(session.sets[0], loadUnit.value);
         remember();
@@ -358,30 +367,32 @@ async function refresh() {
 function workoutCard(workout) {
   const card = node("article");
   card.dataset.workoutId = workout.id;
+  const heading = node("div");
+  heading.className = "gym-inline";
   const actions = node("div");
   actions.className = "gym-actions";
-  actions.append(
-    button("Edit", "edit-workout", () => {
-      if (busy || !mayDiscardDraft()) return;
-      void run(async () => {
-        begin({ ...await api("workouts/" + workout.id), editing: true });
-        $("workout-heading").scrollIntoView({ block: "start" });
-      });
-    }),
-    button("Delete", "delete-workout", () => {
-      if (busy || !confirm("Delete the workout on " + workout.date + "?")) return;
-      void run(async () => {
-        await api("workouts/" + workout.id, "DELETE");
-        if (editing && id === workout.id) begin();
-        card.remove();
-        say("Workout deleted.");
-        void refresh();
-      });
-    }),
-  );
-  const names = [...new Set(workout.sets.map(set => set.exercise))];
-  card.append(node("h3", workout.date + " · " + workout.sets.length + (workout.sets.length === 1 ? " set" : " sets")),
-    node("p", names.slice(0, 3).join(", ") + (names.length > 3 ? ", …" : "")), actions);
+  const edit = button("Edit", "edit-workout", () => {
+    if (busy || !mayDiscardDraft()) return;
+    void run(async () => {
+      begin({ ...await api("workouts/" + workout.id), editing: true });
+      $("workout-heading").scrollIntoView({ block: "start" });
+    });
+  });
+  const remove = button("Delete", "delete-workout", () => {
+    if (busy || !confirm("Delete the workout on " + workout.date + "?")) return;
+    void run(async () => {
+      await api("workouts/" + workout.id, "DELETE");
+      if (editing && id === workout.id) begin();
+      card.remove();
+      say("Workout deleted.");
+      void refresh();
+    });
+  });
+  edit.setAttribute("aria-label", "Edit workout on " + workout.date);
+  remove.setAttribute("aria-label", "Delete workout on " + workout.date);
+  actions.append(edit, remove);
+  heading.append(node("h3", workout.date), actions);
+  card.append(heading, setList(workout.sets));
   return card;
 }
 startSuggestion.addEventListener("click", () => {
