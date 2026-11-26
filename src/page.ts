@@ -9,7 +9,7 @@ import { ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
 import { readFileSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 import { pagesPath, pagesPreviewScript } from "./pages/shared.ts";
-import { brandCredit, brandStylePath } from "./web/brand.ts";
+import { brandStylePath } from "./web/brand.ts";
 
 const markdownScriptPath = "/markdown-it.js";
 
@@ -35,7 +35,7 @@ export const pageHtml = (pagesAvailable: boolean) => `<!doctype html>
 <header class="masthead">
   <a id="skip-to-chat" href="#input">Skip to message</a>
   <button id="menu" type="button" aria-label="Branches" aria-expanded="false" aria-controls="branches">☰</button>
-  <div class="wordmark"><span class="product-name">Aipatty</span>${brandCredit}</div>
+  <span class="wordmark product-name">aipatty</span>
   <h1 id="title">aipatty</h1>
   ${pagesAvailable ? `<a class="pages-link" href="${pagesPath}">Pages</a>` : ""}
   <span id="cost" title="This branch / all branches"></span>

@@ -275,6 +275,16 @@ test("toolbar New starts blank, Fork here keeps history, and Archive works while
   assert.deepEqual(browser.errors, []);
 });
 
+async function assertBranding(browser: Awaited<ReturnType<typeof openBrowser>>, name: string, title: string) {
+  const [productName, documentTitle, header] = await browser.evaluate<[string, string, string]>(`[
+    document.querySelector('header .product-name').textContent, document.title,
+    document.querySelector('header').textContent,
+  ]`);
+  assert.equal(productName, name);
+  assert.equal(documentTitle, title);
+  assert.doesNotMatch(header, /@tLarge Labs/i);
+}
+
 test("phone controls fit with long model and cost labels and leave room for chat in landscape", { skip: !chrome, timeout: 60_000 }, async t => {
   const host = await openHost(fauxConfig(await fixture(t)));
   const api = await startApi(host, health, 0);
@@ -311,12 +321,13 @@ test("phone controls fit with long model and cost labels and leave room for chat
     assert.equal(await browser.evaluate(`(() => {
       const box = selector => document.querySelector(selector).getBoundingClientRect();
       const range = document.createRange();
-      range.selectNodeContents(document.querySelector('.brand-credit'));
+      range.selectNodeContents(document.querySelector('.wordmark'));
       return range.getBoundingClientRect().right <= box('.pages-link').left
         && box('#title').right <= box('#cost').left
         && document.documentElement.scrollWidth === innerWidth;
     })()`), true, `branding, title and costs fit at ${width}px`);
   }
+  await assertBranding(browser, "aipatty", "Training · aipatty");
 
   await browser.viewport(568, 320);
   await browser.emulateTouch();
@@ -1080,6 +1091,7 @@ test("Pages previews and direct views are sandboxed; the library moves and delet
 
   const beforeLibrary = requested.filter(url => url === base + jsPath || url === base + htmlPath).length;
   await browser.navigate(base + pagesPath);
+  await assertBranding(browser, "Pages", "Pages · aipatty");
   await wait("document.querySelectorAll('#sections li').length === 2");
   assert.deepEqual(await browser.evaluate(`[
     document.querySelector('#sections h2').textContent, document.querySelector('#sections a').textContent,
@@ -1251,6 +1263,7 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   assert.match((await waitFor(browser, "connect notice", value => value.messages.some(text => text.includes("Connected this branch")))).messages.join(), /Connected this branch to Gym/);
   await tap("#card-header a");
   await wait("document.querySelector('#workout-editor')?.disabled === false");
+  await assertBranding(browser, "Gym", "Gym · aipatty");
   await heading("Workouts");
   assert.equal(await browser.evaluate("document.querySelector('#chat-link').getAttribute('href')"), `/#${side.id}`);
   assert.equal(await browser.evaluate(`document.querySelector('#workout-date').value === new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10)`), true);

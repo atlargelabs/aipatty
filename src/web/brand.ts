@@ -14,5 +14,3 @@ export const brandHeaders = {
   ...pageHeaders,
   "Content-Security-Policy": `${pageHeaders["Content-Security-Policy"]}; font-src 'self'`,
 };
-
-export const brandCredit = '<small class="brand-credit">by <span role="img" aria-label="atLarge Labs"><b>@</b>tLarge Labs</span></small>';
