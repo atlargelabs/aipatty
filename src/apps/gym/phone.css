@@ -15,7 +15,10 @@ input, select { min-width: 0; width: 100%; background: Canvas; }
 button { cursor: pointer; background: ButtonFace; }
 button:disabled { cursor: default; opacity: .6; }
 #add-set, #save-workout { background: Highlight; color: HighlightText; }
-.gym-set-inputs { display: grid; grid-template-columns: 1fr 1.2fr .9fr; gap: .5rem; margin: .75rem 0; }
+.gym-set-inputs { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: .5rem; margin: .75rem 0; }
+#historical-reps { margin-bottom: .75rem; }
+#new-exercise { width: min(26rem, calc(100% - 2rem)); padding: 1rem; border: 1px solid GrayText; border-radius: .4rem; }
+#new-exercise .gym-actions { margin-top: .75rem; }
 ol { margin-block: .6rem; padding-inline-start: 1.6rem; }
 li { margin-bottom: .4rem; overflow-wrap: anywhere; }
 #draft-sets li > .gym-actions { margin-top: .3rem; }
