@@ -12,7 +12,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { startApi } from "../src/api.ts";
 import { openHost, type AgentHost } from "../src/host.ts";
 import { pagesEnableFile } from "../src/pages/index.ts";
-import { pagePath, pagesPath, publishPageTool } from "../src/pages/shared.ts";
+import { pagePath, pagesLibraryApi, pagesPath, publishPageTool } from "../src/pages/shared.ts";
 import { piRunApiPath, upgradeEntryKind, type PiRunSnapshot } from "../src/protocol.ts";
 import { fixtureApp } from "./fixtures/app.ts";
 import { fauxPages, pagesBrowserFixture } from "./fixtures/pages.ts";
@@ -955,6 +955,13 @@ test("Pages previews and direct views are sandboxed; the library moves and delet
   await faux.turn(host, "root");
   await wait(`document.querySelector('#entries .entry:last-child .card-body')?.textContent.trim() === 'Faux Pages turn finished.'`);
   assert.equal(await browser.evaluate(`window.keptPage === document.querySelector('${jsFrame}')`), true);
+  await browser.evaluate(`window.originalFetch = fetch;
+    window.fetch = (url, ...args) => url === '${pagesLibraryApi}' ? Promise.reject(new Error('Offline')) : originalFetch(url, ...args);
+    window.dispatchEvent(new Event('focus'))`);
+  await wait(`document.querySelector('#entries').textContent.includes('Could not check page availability.')`);
+  assert.equal(await browser.evaluate(`window.keptPage === document.querySelector('${jsFrame}')`), true);
+  await browser.evaluate(`window.fetch = originalFetch; window.dispatchEvent(new Event('focus'))`);
+  await wait(`!document.querySelector('#entries').textContent.includes('Could not check page availability.')`);
 
   // These are top-level navigations: there is no iframe attribute supplying the isolation.
   await browser.navigate(base + htmlPath);
@@ -974,8 +981,14 @@ test("Pages previews and direct views are sandboxed; the library moves and delet
     document.querySelector('#sections h2').textContent, document.querySelector('#sections a').textContent,
     document.querySelectorAll('#sections em, iframe').length,
   ]`), ["Unsorted", title, 0]);
-  await browser.evaluate("document.querySelector('#new-section input').value = 'Reports <b>as text</b>'; document.querySelector('#new-section').requestSubmit()");
-  await wait("document.querySelectorAll('#sections section').length === 2");
+  await browser.evaluate(`window.originalFetch = fetch;
+    window.fetch = (...args) => new Promise(resolve => { window.saveLibrary = () => resolve(originalFetch(...args)); });
+    document.querySelector('#new-section input').value = 'Reports <b>as text</b>';
+    document.querySelector('#new-section').requestSubmit()`);
+  assert.deepEqual(await browser.evaluate(`[document.querySelector('#new-section').inert, document.querySelector('#sections').inert,
+    document.querySelector('#status').textContent]`), [true, true, "Saving…"]);
+  await browser.evaluate("window.fetch = originalFetch; window.saveLibrary(); undefined");
+  await wait("document.querySelectorAll('#sections section').length === 2 && !document.querySelector('#sections').inert");
   assert.equal(await browser.evaluate("document.querySelector('#sections section:last-child h2').textContent"), "Reports <b>as text</b>");
   for (const [index, path] of [htmlPath, jsPath].entries()) {
     await browser.evaluate(`{

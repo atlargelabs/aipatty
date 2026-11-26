@@ -1,11 +1,12 @@
 import type { Precard } from "../web/cards.ts";
 import { pagePath, pagesLibraryApi, publishPageTool, readPageDetails, type PageDetails, type PageSection } from "./shared.ts";
 
-type Availability = "checking" | "available" | "missing" | "unknown";
+type Availability = "available" | "missing";
 interface Preview {
   page: PageDetails;
-  status: Availability;
+  status?: Availability;
   controls: HTMLElement;
+  message: HTMLElement;
   body: HTMLElement;
 }
 
@@ -22,13 +23,17 @@ function mountFrame(preview: Preview) {
   body.append(frame);
 }
 
-function update(preview: Preview, status: Availability) {
-  if (preview.status === status) return;
+function update(preview: Preview, status?: Availability) {
+  const { body, controls, message, page } = preview;
+  // A failed lookup is not a deletion: keep an already-running frame and its local state.
+  const text = (status ?? preview.status) === "missing" ? "Page no longer available."
+    : status === undefined ? "Could not check page availability." : "";
+  if (message.textContent !== text) message.textContent = text;
+  if (status === undefined || preview.status === status) return;
   preview.status = status;
-  const { body, controls, page } = preview;
-  body.querySelector("iframe")?.remove();
-  if (status !== "available") {
-    controls.textContent = status === "missing" ? "Page no longer available." : "Could not check page availability.";
+  if (status === "missing") {
+    body.querySelector("iframe")?.remove();
+    controls.replaceChildren();
     return;
   }
   const open = document.createElement("a");
@@ -64,14 +69,16 @@ function checkPreviews() {
     let ids: Set<string> | undefined;
     try {
       const response = await fetch(pagesLibraryApi);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const { sections } = await response.json() as { sections: PageSection[] };
-      ids = new Set(sections.flatMap(section => section.pages.map(page => page.id)));
+      if (response.status === 404) ids = new Set(); // The new server no longer has Pages enabled.
+      else if (response.ok) {
+        const { sections } = await response.json() as { sections: PageSection[] };
+        ids = new Set(sections.flatMap(section => section.pages.map(page => page.id)));
+      }
     } catch { /* Keep the title readable if the library cannot be reached. */ }
     if (current !== revision) return;
     for (const body of shown) {
       const preview = previews.get(body);
-      if (preview && body.isConnected) update(preview, !ids ? "unknown" : ids.has(preview.page.id) ? "available" : "missing");
+      if (preview && body.isConnected) update(preview, ids && (ids.has(preview.page.id) ? "available" : "missing"));
     }
   });
 }
@@ -90,10 +97,12 @@ export function drawPagePreview(body: HTMLElement, precard: Precard): boolean {
   heading.textContent = `${page.title} · ${page.mode === "static" ? "Static HTML" : "JavaScript"}`;
   const controls = document.createElement("div");
   controls.className = "preview-controls";
-  controls.textContent = "Checking page…";
+  const message = document.createElement("div");
+  message.setAttribute("role", "status");
+  message.textContent = "Checking page…";
   body.dataset.format = "page-preview";
-  body.replaceChildren(heading, controls);
-  previews.set(body, { page, status: "checking", controls, body });
+  body.replaceChildren(heading, controls, message);
+  previews.set(body, { page, controls, message, body });
   checkPreviews();
   return true;
 }

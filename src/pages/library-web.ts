@@ -65,7 +65,8 @@ function draw() {
 
 async function update(method: "GET" | "POST" | "DELETE", body?: object): Promise<boolean> {
   if (busy) return false;
-  busy = true;
+  busy = form.inert = list.inert = true;
+  status.textContent = method === "GET" ? "Loading library…" : "Saving…";
   try {
     const response = await fetch(pagesLibraryApi, {
       method, ...(body && { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
@@ -80,7 +81,7 @@ async function update(method: "GET" | "POST" | "DELETE", body?: object): Promise
     status.textContent = error instanceof Error ? error.message : String(error);
     return false;
   } finally {
-    busy = false;
+    busy = form.inert = list.inert = false;
   }
 }
 
