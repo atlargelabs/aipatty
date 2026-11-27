@@ -1264,7 +1264,12 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   const status = (text: string) => wait(`document.querySelector('#status').textContent.includes(${JSON.stringify(text)})`);
   const matching = (selector: string, property = "textContent") => browser.evaluate<string[]>(
     `[...document.querySelectorAll(${JSON.stringify(selector)})].map(el => el[${JSON.stringify(property)}])`);
-  const draftLines = () => matching("#draft-sets > li span");
+  const groupedRows = (selector: string) => browser.evaluate<[string | null, string][]>(
+    `[...document.querySelectorAll(${JSON.stringify(selector + " > li")})].map(row => [
+      row.querySelector('${selector === "#draft-sets" ? "h3" : "h4"}.gym-exercise-heading')?.textContent ?? null,
+      row.querySelector('.gym-measurement').textContent
+    ])`);
+  const draftRows = () => groupedRows("#draft-sets");
   const checkSetList = async (selector: string, expectedGaps: number[]) => {
     const { markerless, gaps, trailing } = await browser.evaluate<{ markerless: boolean; gaps: number[]; trailing: number }>(`(() => {
       const list = document.querySelector(${JSON.stringify(selector)});
@@ -1345,8 +1350,9 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await tap("#add-set");
   await set({ duration: "4", load: "62.5" });
   await tap("#add-set");
-  const plank = "Plank" + "x".repeat(75); // A long unbroken name must wrap without moving the buttons below it.
-  const plankLine = plank + " · 15.5 sec · 60 kg";
+  const plank = "Plank" + "x".repeat(75); // A long unbroken heading must wrap on a narrow phone.
+  const plankLine = " · 15.5 sec · 60 kg";
+  const secondSquat = " · 4 reps · 62.5 kg";
   await newExercise(plank);
   await set({ "duration-unit": "sec", duration: "15.5", load: "60" });
   assert.equal((await overview()).workouts.length, 0, "draft changes don't write the log");
@@ -1357,25 +1363,28 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   assert.equal(await browser.evaluate("document.querySelectorAll('#draft-sets li').length"), 2);
   assert.deepEqual(await values("exercise", "duration", "duration-unit", "load", "load-unit"), ["name:" + plank, "15.5", "sec", "60", "kg"]);
   await tap("#add-set");
-  const newestFirst = [plankLine, "Squat · 4 reps · 62.5 kg", "Squat · 5 reps · 60 kg"];
-  assert.deepEqual(await draftLines(), newestFirst);
+  assert.deepEqual(await draftRows(), [[plank, plankLine], ["Squat", secondSquat], [null, " · 5 reps · 60 kg"]]);
   await assertIconButtons(browser, "#draft-sets button",
-    newestFirst.flatMap((line, i) => ["Edit", "Remove"].map(action => `${action} set ${3 - i}: ${line}`)));
+    [plank + plankLine, "Squat" + secondSquat, "Squat · 5 reps · 60 kg"]
+      .flatMap((line, i) => ["Edit", "Remove"].map(action => `${action} set ${3 - i}: ${line}`)));
   await activate(browser, '#draft-sets li:last-child [data-action="edit-set"]');
   assert.deepEqual(await values("exercise", "duration", "load"), ["name:Squat", "5", "60"]);
   await set({ duration: "6" });
   await tap("#add-set");
-  const entryLines = ["Squat · 6 reps · 60 kg", "Squat · 4 reps · 62.5 kg", plankLine];
-  assert.deepEqual(await draftLines(), [entryLines[2], entryLines[1], entryLines[0]], "editing does not move a set");
+  const firstSquat = " · 6 reps · 60 kg";
+  assert.deepEqual(await draftRows(), [[plank, plankLine], ["Squat", secondSquat], [null, firstSquat]], "editing does not move a set");
   assert.deepEqual(await browser.evaluate("JSON.parse(localStorage.getItem('gym-draft')).sets.map(set => set.duration)"), [6, 4, 15.5]);
   await browser.viewport(320, 780);
   await checkSetList("#draft-sets", [0.5, 0]);
-  await checkInlineActions("#draft-sets > li:first-child", "span");
+  await checkInlineActions("#draft-sets > li:first-child", ".gym-measurement");
   assert.equal(await browser.evaluate(`(() => {
+    const row = document.querySelector('#draft-sets > li:first-child');
+    const heading = row.querySelector('.gym-exercise-heading');
     const range = document.createRange();
-    range.selectNodeContents(document.querySelector('#draft-sets li:first-child span'));
-    return range.getClientRects().length > 1;
-  })()`), true, "long set text wraps");
+    range.selectNodeContents(heading);
+    return range.getClientRects().length > 1
+      && heading.getBoundingClientRect().bottom <= row.querySelector('.gym-measurement').getBoundingClientRect().top;
+  })()`), true, "a long exercise heading wraps above the measurement line");
   await assertNoHorizontalScroll("long sets fit on narrow phones");
 
   await tap("#save-workout");
@@ -1387,7 +1396,7 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   const firstCard = `[data-workout-id='${first.id}']`;
   await wait(`!!document.querySelector(${JSON.stringify(firstCard)})`);
   await checkSetList(`${firstCard} ol`, [0, 0.5]);
-  assert.deepEqual(await matching(`${firstCard} ol > li`), entryLines);
+  assert.deepEqual(await groupedRows(`${firstCard} ol`), [["Squat", firstSquat], [null, secondSquat], [plank, plankLine]]);
   assert.deepEqual(await matching(`${firstCard} h3`), [first.date]);
   const workoutActions = ["Edit", "Copy", "Delete"].map(action => `${action} workout on ${first.date}`);
   await assertIconButtons(browser, `${firstCard} button`, workoutActions);
@@ -1400,7 +1409,7 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await newExercise("sQuAt");
   await wait("document.querySelectorAll('#last-session li').length === 2");
   await checkSetList("#last-session ol", [0]);
-  assert.deepEqual(await matching("#last-session ol > li"), entryLines.slice(0, 2));
+  assert.deepEqual(await groupedRows("#last-session ol"), [["Squat", firstSquat], [null, secondSquat]]);
   assert.deepEqual(await values("exercise", "duration", "duration-unit", "load", "load-unit"), ["name:Squat", "6", "reps", "60", "kg"]);
   assert.deepEqual(await names(), ["Choose an exercise", plank, "Squat", "Add new"]);
   await set({ exercise: "name:" + plank });
@@ -1427,7 +1436,7 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   assert.equal(await browser.evaluate("document.querySelector('#historical-reps').hidden"), false, "an empty extra rep field stays editable");
   await set({ "extra-reps": "4" });
   await tap("#add-set");
-  assert.match(await browser.evaluate<string>("document.querySelector('#draft-sets li').textContent"), /SQUAT · 1\.5 min · 4 reps/);
+  assert.deepEqual(await draftRows(), [["SQUAT", " · 1.5 min · 4 reps"]]);
 
   // A previous visit restored by history must not offer a stale copy if a newer visit saved or discarded it.
   await browser.evaluate(`localStorage.removeItem('gym-draft'); ${fromHistory}`);
@@ -1510,7 +1519,9 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   assert.deepEqual(await matching("#suggestion-sets > li"), suggestedLines);
   await checkSetList("#suggestion-sets", [0, 0.5, 0.5]);
   await tap("#start-suggestion");
-  assert.deepEqual(await draftLines(), suggestedLines.toReversed());
+  assert.deepEqual(await draftRows(), [
+    ["Squat", " · 3 reps · 55 kg"], ["Farmer carry", " · 20 m · 60 kg"], ["sQuAt", " · 4 reps · 60 kg"], [null, " · 5 reps · 65 kg"],
+  ]);
   await checkSetList("#draft-sets", [0.5, 0.5, 0]);
   assert.equal((await overview()).workouts.length, 1);
   await tap('#draft-sets li:last-child [data-action="edit-set"]');
@@ -1531,6 +1542,10 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await wait("document.querySelectorAll('#recent-workouts article').length === 2");
   assert.deepEqual(await browser.evaluate("[...document.querySelectorAll('#recent-workouts article')].map(card => card.dataset.workoutId)"),
     [first.id, next.id]);
+  assert.deepEqual(await groupedRows(`[data-workout-id='${next.id}'] ol`), [
+    ["Squat", " · 5 reps · 145 lb"], [null, " · 4 reps · 60 kg"], ["Farmer carry", " · 20.25 m · 60 kg"],
+    ["Squat", " · 3 reps · 55 kg"], ["Farmer carry", " · 20.25 m · 60 kg"],
+  ]);
   await tap(`${firstCard} [data-action='edit-workout']`);
   const editingReady = "document.querySelector('#workout-heading').textContent === 'Edit workout' && !document.querySelector('#workout-editor').disabled";
   await wait(editingReady);
@@ -1547,7 +1562,7 @@ test("Gym phone logging and a Faux coaching turn share the same actual workouts"
   await touchButton(browser, '#draft-sets li:last-child [data-action="remove-set"]');
   await wait("document.querySelectorAll('#draft-sets > li').length === 2");
   await checkSetList("#draft-sets", [0.5]);
-  assert.deepEqual(await draftLines(), [entryLines[2], entryLines[1]]);
+  assert.deepEqual(await draftRows(), [[plank, plankLine], ["Squat", secondSquat]]);
   await tap("#save-workout");
   await status("Workout saved");
   await heading("Workouts");
@@ -1578,10 +1593,12 @@ test("Gym copies a recent workout as text without touching the draft", { skip: !
   const page = `http://127.0.0.1:${api.port}/apps/gym/`;
   const workout = { date: "2025-02-03", sets: [
     { exercise: "Squat", duration: 6, durationUnit: "reps", load: 62.5, loadUnit: "kg", extraReps: null },
+    { exercise: "sQuAt", duration: 4, durationUnit: "reps", load: 155, loadUnit: "lb", extraReps: null },
     { exercise: "Plank", duration: 15.5, durationUnit: "sec", load: 0, loadUnit: "kg", extraReps: 3 },
-    { exercise: "Farmer\ncarry", duration: 20, durationUnit: "m", load: null, loadUnit: null, extraReps: null },
+    { exercise: "Squat", duration: 3, durationUnit: "reps", load: 70, loadUnit: "kg", extraReps: null },
+    { exercise: "Farmer\r\n\u2028\u2029carry", duration: 20, durationUnit: "m", load: null, loadUnit: null, extraReps: null },
   ] };
-  const other = { date: "2025-02-04", sets: [workout.sets[1]] };
+  const other = { date: "2025-02-04", sets: [workout.sets[2]] };
   for (const [id, body] of [["scratch", workout], ["other", other]] as const) {
     const seeded = await fetch(page + "api/workouts/" + id, {
       method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
@@ -1627,7 +1644,8 @@ test("Gym copies a recent workout as text without touching the draft", { skip: !
   await assertIconButtons(browser, copyButton, ["Copy workout on 2025-02-03"]);
   await activate(browser, copyButton);
   assert.equal(await browser.evaluate("window.copiedText"),
-    "2025-02-03\n1. Squat · 6 reps · 62.5 kg\n2. Plank · 15.5 sec · 3 reps · 0 kg (bodyweight)\n3. Farmer carry · 20 m");
+    "2025-02-03\nSquat\n · 6 reps · 62.5 kg\n · 4 reps · 155 lb\n\nPlank\n · 15.5 sec · 3 reps · 0 kg (bodyweight)"
+    + "\n\nSquat\n · 3 reps · 70 kg\n\nFarmer carry\n · 20 m");
   assert.equal(await status(), "", "success must wait for the clipboard write");
   await browser.evaluate("window.finishCopy()");
   await until(status, text => text === "Workout copied to clipboard.");

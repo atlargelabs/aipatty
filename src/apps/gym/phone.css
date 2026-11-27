@@ -20,7 +20,7 @@ section {
 .workout { border-block-start: 4px solid var(--cyan); }
 .recent { border-block-start: 4px solid var(--sage); }
 h2 { margin: 0 0 12px; font-size: 1.125rem; }
-h3 { margin: 0; font-size: 1rem; }
+h3, .gym-exercise-heading { margin: 0; font-size: 1rem; }
 p { margin: 0 0 12px; }
 .gym-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
@@ -38,6 +38,7 @@ input, select { min-width: 0; width: 100%; color: var(--pine); font-size: 1rem; 
 .gym-set-list { list-style: none; margin: 8px 0 12px; padding-inline-start: 0; }
 .gym-set-list > li { overflow-wrap: anywhere; }
 .gym-set-list > li.exercise-break { margin-block-start: .5lh; }
+.gym-measurement { white-space: pre-wrap; }
 .gym-inline { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; }
 .gym-inline > .gym-actions { flex-wrap: nowrap; gap: 4px; }
 #draft-sets:empty { display: none; }

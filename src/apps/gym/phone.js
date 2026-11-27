@@ -69,26 +69,41 @@ function iconButton(icon, label, action, click) {
   element.addEventListener("click", click);
   return element;
 }
-function setLine(set) {
-  return set.exercise + " · " + set.duration + " " + set.durationUnit
+function measurementLine(set) {
+  return " · " + set.duration + " " + set.durationUnit
     + (set.extraReps == null ? "" : " · " + set.extraReps + " reps")
     + (set.load == null ? "" : " · " + set.load + " " + set.loadUnit + (set.load === 0 ? " (bodyweight)" : ""));
 }
+const setLine = set => set.exercise + measurementLine(set);
+const startsExerciseBlock = (sets, i) => i === 0 || foldName(sets[i - 1].exercise) !== foldName(sets[i].exercise);
+
 function renderSets(list, sets, renderRow = set => node("li", setLine(set))) {
-  let previous;
   list.replaceChildren(...sets.map((set, i) => {
-    const row = renderRow(set, i);
-    const name = foldName(set.exercise);
-    if (i > 0 && name !== previous) row.classList.add("exercise-break");
-    previous = name;
+    const startsBlock = startsExerciseBlock(sets, i);
+    const row = renderRow(set, i, startsBlock);
+    if (i > 0 && startsBlock) row.classList.add("exercise-break");
     return row;
   }));
+}
+function renderGroupedSets(list, sets, headingTag, withActions = line => line) {
+  renderSets(list, sets, (set, i, startsBlock) => {
+    const row = node("li");
+    if (startsBlock) {
+      const heading = node(headingTag, set.exercise);
+      heading.className = "gym-exercise-heading";
+      row.append(heading);
+    }
+    const line = node("div", measurementLine(set));
+    line.className = "gym-measurement";
+    row.append(withActions(line, set, i));
+    return row;
+  });
 }
 function setList(sets) {
   const list = node("ol");
   list.className = "gym-set-list";
   list.setAttribute("role", "list");
-  renderSets(list, sets);
+  renderGroupedSets(list, sets, "h4");
   return list;
 }
 function say(text) { $("status").textContent = text; }
@@ -232,15 +247,13 @@ function pendingSet() {
 function renderDraft() {
   renderExercisePicker();
   // Reverse the display only; row controls still target the original array indexes.
-  renderSets($("draft-sets"), sets.toReversed(), (set, index) => {
+  renderGroupedSets($("draft-sets"), sets.toReversed(), "h3", (line, set, index) => {
     const i = sets.length - 1 - index;
-    const row = node("li");
     const content = node("div");
     content.className = "gym-inline";
     const actions = node("div");
     actions.className = "gym-actions";
-    const line = setLine(set);
-    const label = " set " + (i + 1) + ": " + line;
+    const label = " set " + (i + 1) + ": " + setLine(set);
     const edit = iconButton("edit", "Edit" + label, "edit-set", () => {
       if (pendingSet()) return;
       loadFields({ ...set, position: i });
@@ -255,9 +268,8 @@ function renderDraft() {
       renderDraft();
     });
     actions.append(edit, remove);
-    content.append(node("span", line), actions);
-    row.append(content);
-    return row;
+    content.append(line, actions);
+    return content;
   });
   remember();
 }
@@ -272,7 +284,7 @@ async function previewLast() {
     if (!session) {
       last.textContent = "No previous sets for " + name + ".";
     } else {
-      last.replaceChildren(node("strong", "Last time · " + session.date), setList(session.sets));
+      last.replaceChildren(node("h3", "Last time · " + session.date), setList(session.sets));
       if (position === null && !valuesDirty && duration.value === "" && load.value === "") {
         fillFields(session.sets[0], loadUnit.value);
         remember();
@@ -414,8 +426,15 @@ function workoutCard(workout) {
     }
     copyStatus.textContent = "";
     try {
-      const lines = workout.sets.map((set, i) => `${i + 1}. ${setLine(set).replace(/[\r\n\u2028\u2029]+/g, " ")}`);
-      await clipboard.writeText([workout.date, ...lines].join("\n"));
+      const lines = [workout.date];
+      workout.sets.forEach((set, i) => {
+        if (startsExerciseBlock(workout.sets, i)) {
+          if (i > 0) lines.push("");
+          lines.push(set.exercise.replace(/[\r\n\u2028\u2029]+/g, " "));
+        }
+        lines.push(measurementLine(set));
+      });
+      await clipboard.writeText(lines.join("\n"));
       copyStatus.textContent = "Workout copied to clipboard.";
     } catch {
       copyStatus.textContent = "Could not copy workout. Check clipboard permissions and try again.";
