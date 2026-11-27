@@ -70,14 +70,13 @@ main {
   overflow-wrap: anywhere;
 }
 .entry.prose.user { --accent: var(--cyan); --fill: #e8f5f6; }
-.entry.prose.assistant { --accent: var(--phosphor); --fill: #ecf5e5; }
+.entry.prose.assistant, .entry.liveText { --accent: var(--phosphor); --fill: #ecf5e5; }
 .entry.toolCall, .entry.liveTool { --accent: var(--violet); --fill: #f3eef9; }
 .entry.toolResult { --accent: #e3a5b8; --fill: #faedf1; }
 .entry:is(.toolCall, .toolResult, .liveTool) { font-size: .8125rem; max-height: 12rem; overflow: auto; }
 .entry:is(.system, .notice) { --fill: var(--quiet); }
 .entry:is(.runFailure, .tool-error) { --accent: var(--danger); --fill: var(--danger-fill); }
 .entry:is(.liveText, .liveTool) { border-style: dashed; }
-.entry.liveText { --accent: var(--cyan); }
 .entry.toolResult:has(> [data-format="page-preview"]) { max-height: none; font: inherit; }
 [data-format="page-preview"] .preview-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
 [data-format="page-preview"] iframe { display: block; width: 100%; height: clamp(14rem, 48vh, 28rem); margin-top: 8px; border: 1px solid var(--line); background: #fff; }
