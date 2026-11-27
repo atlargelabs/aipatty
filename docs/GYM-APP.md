@@ -42,8 +42,9 @@ compared using SQLite `NOCASE` (ASCII case folding).
 
 ## The page
 
-`/apps/gym/`, built for the phone and usable beside chat on a desktop. Set lists have no visible numbers and leave
-a small gap when the exercise changes.
+`/apps/gym/`, built for the phone and usable beside chat on a desktop. Last time, the draft and recent workouts
+show one heading per consecutive block of the same exercise and one measurement line per set. Set lists have no
+visible numbers and leave a small gap when the exercise changes.
 
 - **Workouts:** choose the date (today by default), pick an exercise, and add sets one at a time. Duration starts in
   `reps`; change the unit for distance or time. Enter a weight in `kg` or `lb` if useful (e.g. 15 sec at 60 kg).
@@ -60,9 +61,9 @@ a small gap when the exercise changes.
   phone. Saving or discarding clears it. If autosave fails, the page warns that recent edits may only be in
   memory. Slow workout-history requests do not stop you entering sets.
 - **Recent workouts:** the newest 20 with their full set lists in entry order. Use the pencil to edit a workout,
-  the overlapping squares to copy it, or the trash can to delete it. **Copy workout** puts the date and numbered
-  sets on the clipboard as plain text without changing your draft. It needs browser clipboard access (typically
-  HTTPS or localhost).
+  the overlapping squares to copy it, or the trash can to delete it. **Copy workout** puts the date followed by
+  the same set layout on the clipboard as plain text, with a blank line between exercise blocks. It does not
+  change your draft and needs browser clipboard access (typically HTTPS or localhost).
 - **Back to chat:** shown when the page was opened from a branch.
 
 The page's API is `GET /apps/gym/api/overview` (recent workouts, exercise names, the suggestion),
