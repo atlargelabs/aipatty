@@ -492,10 +492,17 @@ test("saved prose renders Markdown on narrow screens and survives live updates",
   await until(() => browser.evaluate(`!!document.querySelector('#live .liveText')`));
   assert.deepEqual(await browser.evaluate(`(() => {
     const live = document.querySelector('#live .liveText .card-body');
-    const style = getComputedStyle(live.parentElement);
-    return [live.textContent, live.childElementCount, window.savedLink.isConnected,
-      style.borderInlineStartStyle, style.borderInlineStartColor, style.backgroundColor];
-  })()`), ['**Writing\n→ bash {"command":"partial"}', 0, true, "dashed", "rgb(115, 216, 232)", "rgb(252, 253, 250)"]);
+    return [live.textContent, live.childElementCount, window.savedLink.isConnected];
+  })()`), ['**Writing\n→ bash {"command":"partial"}', 0, true]);
+  const [[liveBorder, ...liveColors], [savedBorder, ...savedColors]] = await browser.evaluate<[string[], string[]]>(`
+    ['#live .entry.liveText', '#entries .entry.prose.assistant'].map(selector => {
+      const card = document.querySelector(selector);
+      const style = getComputedStyle(card);
+      return [style.borderInlineStartStyle, style.borderInlineStartColor,
+        getComputedStyle(card.querySelector('.role')).backgroundColor, style.backgroundColor];
+    })`);
+  assert.deepEqual(liveColors, savedColors);
+  assert.deepEqual([liveBorder, savedBorder], ["dashed", "solid"]);
   assert.deepEqual(browser.errors, []);
 });
 
