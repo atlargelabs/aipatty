@@ -11,11 +11,13 @@ function displayOpener(src: string, start: number, end: number): string | undefi
 }
 
 /** Find the first unescaped closer. Leave Markdown's code spans and link label boundaries to its own rules. */
-function findClose(src: string, start: number, end: number, close: string, inline = false, inLabel = false): number {
+function findClose(
+  src: string, start: number, end: number, close: string, mode: "block" | "display" | "inline" = "block", inLabel = false,
+): number {
   let brackets = 0;
   for (let pos = start; pos < end; pos++) {
     const ch = src[pos];
-    if (inline && (ch === "\n" || ch === "`")) break;
+    if ((mode === "inline" && ch === "\n") || (mode !== "block" && ch === "`")) break;
     if (pos + close.length <= end && src.startsWith(close, pos)) return pos;
     if (ch === "\\" && src[pos + 1] !== "\n") pos++;
     else if (inLabel && ch === "[") brackets++;
@@ -33,15 +35,15 @@ function inlineMath(state: StateInline, silent: boolean): boolean {
   const from = pos + open.length;
   if (open === "$" && /\s/.test(src[from] ?? "")) return false;
   const close = closing[open];
-  const end = findClose(src, from, Math.min(posMax, from + maxMathLength + close.length), close, true, silent);
+  const end = findClose(src, from, Math.min(posMax, from + maxMathLength + close.length), close, display ? "display" : "inline", silent);
   if (end < 0) return false;
   const after = end + close.length;
   const tex = src.slice(from, end);
   if (!tex.trim() || (src[end] === "$" && src[after] === "$")) return false;
   if (open === "$") {
     const next = src[after] ?? "";
-    // Leave prices and ranges alone, including a price followed by emphasized math: $5 and **$x$**.
-    if (/\s$/.test(tex) || /\d/.test(next) || (/^\d[\d.,]*\s/.test(tex) && /[\p{L}\\{]/u.test(next))) return false;
+    // Leave prices and ranges alone. After a price, **$x$** starts fresh math rather than ending it.
+    if (/\s$/.test(tex) || /\d/.test(next) || (/^\d[\d.,]*[^\d.,]/.test(tex) && /[\p{L}\\{]/u.test(next))) return false;
   }
   if (!silent) {
     const token = state.push(display ? "math_display" : "math_inline", "", 0);
@@ -83,7 +85,8 @@ function blockMath(state: StateBlock, startLine: number, endLine: number, silent
 /** Add math to the built-in Markdown renderer, not to raw text, code, or custom card renderers. */
 export function mathMarkdown(markdown: MarkdownIt, render: typeof renderTex): (body: HTMLElement, text: string) => void {
   markdown.inline.ruler.before("escape", "math", inlineMath);
-  markdown.block.ruler.before("table", "math", blockMath, { alt: ["paragraph"] });
+  // Don't interrupt paragraphs here: a display delimiter might be inside a multiline code span.
+  markdown.block.ruler.before("table", "math", blockMath);
   const escape = markdown.utils.escapeHtml;
   const placeholder = (tag: string, mode: string): RendererRule => (tokens, index) => {
     const { content, markup } = tokens[index];

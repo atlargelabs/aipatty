@@ -128,10 +128,10 @@ the answer being written and each tool call that has not finished. How the cards
 in [the card pipeline](docs/WEB-CARDS.md).
 
 Saved user and assistant prose renders as Markdown. Use `\(...\)` or `$...$` for inline math, and `\[...\]`
-or `$$...$$` for display math. For multiline display, put the delimiters on their own lines. To show
-literal delimiters, use a code span or escape each `$` or `\`. Single newlines in prose are preserved, and wide
-display equations, tables, and code blocks scroll horizontally. Links must be absolute HTTP(S) URLs outside
-aipatty's hosts and open in a new tab. Raw HTML is
+or `$$...$$` for display math. For multiline display, put the delimiters on their own lines and separate the
+block from surrounding prose with blank lines. To show literal delimiters, use a code span or escape each
+`$` or `\`. Single newlines in prose are preserved, and wide display equations, tables, and code blocks scroll
+horizontally. Links must be absolute HTTP(S) URLs outside aipatty's hosts and open in a new tab. Raw HTML is
 shown as text, and images are not loaded. Live previews (including partial tool arguments), tool cards, system
 messages, notices, and the Pi run pane stay plain text. A [connected app](docs/CONNECTED-APPS.md) can have its
 own tools' results rendered as Markdown, as Gym does.
