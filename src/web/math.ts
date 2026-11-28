@@ -1,4 +1,4 @@
-import type { render as renderTex } from "katex";
+import type katexApi from "katex";
 import type { MarkdownIt, RendererRule, StateBlock, StateInline } from "markdown-it";
 
 const closing: Readonly<Record<string, string>> = { "\\(": "\\)", "\\[": "\\]", "$": "$", "$$": "$$" };
@@ -42,8 +42,10 @@ function inlineMath(state: StateInline, silent: boolean): boolean {
   if (!tex.trim() || (src[end] === "$" && src[after] === "$")) return false;
   if (open === "$") {
     const next = src[after] ?? "";
-    // Leave prices and ranges alone. After a price, **$x$** starts fresh math rather than ending it.
-    if (/\s$/.test(tex) || /\d/.test(next) || (/^\d[\d.,]*[^\d.,]/.test(tex) && /[\p{L}\\{]/u.test(next))) return false;
+    // Leave prices and ranges alone. A dollar just inside opening emphasis can start a new formula
+    // (e.g. $5; **$(x+1)^2$**), regardless of the first character of that formula.
+    const startsEmphasizedMath = next && !/\s/.test(next) && /\s(?:\*{1,3}|_{1,3}|~~)$/.test(tex);
+    if (/\s$/.test(tex) || /\d/.test(next) || startsEmphasizedMath) return false;
   }
   if (!silent) {
     const token = state.push(display ? "math_display" : "math_inline", "", 0);
@@ -83,7 +85,7 @@ function blockMath(state: StateBlock, startLine: number, endLine: number, silent
 }
 
 /** Add math to the built-in Markdown renderer, not to raw text, code, or custom card renderers. */
-export function mathMarkdown(markdown: MarkdownIt, render: typeof renderTex): (body: HTMLElement, text: string) => void {
+export function mathMarkdown(markdown: MarkdownIt, katex: Pick<typeof katexApi, "render" | "ParseError">): (body: HTMLElement, text: string) => void {
   markdown.inline.ruler.before("escape", "math", inlineMath);
   // Don't interrupt paragraphs here: a display delimiter might be inside a multiline code span.
   markdown.block.ruler.before("table", "math", blockMath);
@@ -104,9 +106,11 @@ export function mathMarkdown(markdown: MarkdownIt, render: typeof renderTex): (b
       const literal = node.textContent;
       try {
         // KaTeX's DOM renderer sets layout styles via CSSOM; renderToString would produce CSP-blocked inline styles.
-        render(tex, node, { displayMode: node.classList.contains("math-display"), trust: false, throwOnError: true, maxSize: 20 });
-      } catch {
+        katex.render(tex, node, { displayMode: node.classList.contains("math-display"), trust: false, throwOnError: true, maxSize: 20 });
+      } catch (error) {
+        // Keep the rest of the transcript readable even on an unexpected renderer failure.
         node.textContent = literal;
+        if (!(error instanceof katex.ParseError)) console.error("KaTeX could not render chat math:", error);
       }
     }
   };

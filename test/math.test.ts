@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { ParseError } from "katex";
 import markdownit from "markdown-it";
 import { mathMarkdown } from "../src/web/math.ts";
 
 const markdown = markdownit({ html: false, breaks: true });
-mathMarkdown(markdown, () => assert.fail("the parser must not run KaTeX"));
+mathMarkdown(markdown, { render: () => assert.fail("the parser must not run KaTeX"), ParseError });
 
 function formulas(source: string): [string, string][] {
   return markdown.parse(source, {}).flatMap(token => token.children ?? [token])
@@ -38,8 +39,8 @@ test("Markdown math leaves currency, escapes, code and incomplete delimiters alo
   ].join("\n");
   assert.deepEqual(formulas(literal), []);
   assert.ok(markdown.render(literal).includes("<code>before $$x$$ after</code>"));
-  const mixed = "[Price $5](https://example.org/)$x$. Lunch cost $10; **$y$** is the tip.";
-  assert.deepEqual(formulas(mixed), [["math_inline", "x"], ["math_inline", "y"]]);
+  const mixed = "[Price $5](https://example.org/)$x$. Lunch cost $10; **$(y+1)^2$** is the adjustment.";
+  assert.deepEqual(formulas(mixed), [["math_inline", "x"], ["math_inline", "(y+1)^2"]]);
   assert.match(markdown.render(mixed), /<a href="https:\/\/example\.org\/">Price \$5<\/a>/);
   assert.match(markdown.render(mixed), /Lunch cost \$10; <strong><span class="math-inline"/);
 });

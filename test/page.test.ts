@@ -517,9 +517,11 @@ test("saved chat math uses local KaTeX under the chat CSP", { skip: !chrome, tim
   const fraction = String.raw`\frac{x_1}{2}`;
   const aligned = String.raw`\begin{aligned}a &= b \\ c &= d\end{aligned}`;
   const wide = Array(65).fill("x_1").join(" + ");
+  const wideInline = String.raw`\frac{${"x".repeat(120)}}{2}`;
   const source = [
     `Inline \\(${fraction}\\) and $x^2$.`, `\\[${fraction}\\]`, "$$", aligned, "$$", "",
-    `$$${wide}$$`, "", literal, "", "`" + code + "`", "", "```tex", code, "```", "", invalid, "",
+    `$$${wide}$$`, "", `Wide inline $${wideInline}$.`, "", literal, "", "`" + code + "`", "",
+    "```tex", code, "```", "", invalid, "",
     String.raw`\(\href{https://example.org/math-probe}{x}\) \(\includegraphics{/math-probe}\) \(\htmlClass{injected}{x}\)`,
   ].join("\n");
   const root = (await host.conversation("root"))!;
@@ -534,17 +536,19 @@ test("saved chat math uses local KaTeX under the chat CSP", { skip: !chrome, tim
   await waitFor(browser, "the saved math card", state => state.messages.length === 1);
   const rendered = await browser.evaluate(`(async () => {
     const body = document.querySelector('#entries .assistant .card-body');
-    const math = [...body.querySelectorAll('math')].slice(0, 5);
+    const math = [...body.querySelectorAll('math')].slice(0, 6);
     const line = body.querySelector('.frac-line');
     const wide = body.querySelectorAll('.math-display')[2];
+    const wideInline = body.querySelectorAll('.math-inline')[2];
     const transcript = document.querySelector('#transcript');
-    wide.scrollLeft = 80;
     await document.fonts.ready;
+    wide.scrollLeft = 80;
+    wideInline.scrollLeft = 80;
     return {
       formulas: math.map(node => [node.getAttribute('display'), node.querySelector('annotation').textContent.trim()]),
       styled: getComputedStyle(line).display === 'inline-block' && parseFloat(getComputedStyle(line).borderBottomWidth) > 0,
       localFont: [...document.fonts].some(face => face.family.startsWith('KaTeX_') && face.status === 'loaded'),
-      scrolls: wide.scrollLeft > 0 && transcript.scrollWidth === transcript.clientWidth,
+      scrolls: wide.scrollLeft > 0 && wideInline.scrollLeft > 0 && transcript.scrollWidth === transcript.clientWidth,
       code: [...body.querySelectorAll('code')].map(node => node.textContent.trim()),
       price: [...body.querySelectorAll('p')].find(node => node.textContent.startsWith('Literal:')).textContent,
       invalid: [...body.querySelectorAll('p')].some(node => node.textContent === ${JSON.stringify(invalid)}),
@@ -553,7 +557,7 @@ test("saved chat math uses local KaTeX under the chat CSP", { skip: !chrome, tim
     };
   })()`);
   assert.deepEqual(rendered, {
-    formulas: [[null, fraction], [null, "x^2"], ["block", fraction], ["block", aligned], ["block", wide]],
+    formulas: [[null, fraction], [null, "x^2"], ["block", fraction], ["block", aligned], ["block", wide], [null, wideInline]],
     styled: true, localFont: true, scrolls: true, code: [code, code], price: String.raw`Literal: $5 or $10; $x$; \(x\).`,
     invalid: true, unsafe: false, violations: [],
   });

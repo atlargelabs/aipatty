@@ -107,6 +107,7 @@ main {
 .markdown-table th { background: var(--quiet); }
 .markdown-table .align-center { text-align: center; }
 .markdown-table .align-right { text-align: right; }
+.math-inline { display: inline-block; max-width: 100%; overflow-x: auto; vertical-align: middle; }
 .math-display { display: block; overflow-x: auto; white-space: pre-wrap; }
 .math-display > .katex-display { width: max-content; min-width: 100%; margin: 0; }
 #card-header:not([hidden]) { display: flex; flex-wrap: wrap; gap: 4px 16px; border-bottom: 1px solid var(--line); }

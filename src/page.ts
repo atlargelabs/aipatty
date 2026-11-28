@@ -504,7 +504,7 @@ markdown.renderer.rules.td_open = renderTableCell;
 const bodyText = new WeakMap();
 const formats = {
   text(body, text) { body.textContent = text; },
-  markdown: mathMarkdown(markdown, katex.render),
+  markdown: mathMarkdown(markdown, katex),
 };
 
 function sendMessage(branch, content) {
