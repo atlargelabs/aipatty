@@ -479,8 +479,12 @@ test("the web page is served with a strict policy and its script and style", asy
   const page = await fetch(base + "/");
   assert.equal(page.status, 200);
   assert.match(page.headers.get("content-type")!, /text\/html/);
-  assert.match(page.headers.get("content-security-policy")!, /default-src 'none'; script-src 'self'/);
-  assert.match(await page.text(), /<script type="module" src="\/app\.js"><\/script>/);
+  const policy = page.headers.get("content-security-policy")!;
+  assert.match(policy, /default-src 'none'; script-src 'self'; style-src 'self';/);
+  assert.doesNotMatch(policy, /unsafe-inline|unsafe-eval|style-src-attr/);
+  const html = await page.text();
+  assert.match(html, /<script type="module" src="\/app\.js"><\/script>/);
+  assert.match(html, /<link rel="stylesheet" href="\/katex\/katex\.css">/);
   // Every script must parse, and import only scripts that are served: either failure would leave the page blank.
   const scripts = ["/app.js", ...Object.keys(pageModules), pagesPreviewScript, `${pagesPath}/shared.ts`];
   for (const path of scripts) {
@@ -498,6 +502,28 @@ test("the web page is served with a strict policy and its script and style", asy
   assert.equal((await fetch(base + "/markdown-it.js.map")).status, 404);
   assert.equal((await fetch(base + "/app.css")).status, 200);
   assert.equal((await fetch(base + "/", { method: "POST" })).status, 405);
+});
+
+test("KaTeX only serves the stylesheet and fonts it references alongside its script", async t => {
+  const { base } = await server(t);
+  const cssUrl = base + "/katex/katex.css";
+  const css = await fetch(cssUrl);
+  assert.equal(css.status, 200);
+  assert.match(css.headers.get("content-type")!, /^text\/css/);
+  assert.equal(css.headers.get("x-content-type-options"), "nosniff");
+  const fontRefs = new Set(Array.from((await css.text()).matchAll(/url\(([^)]+)\)/g), match => match[1]));
+  assert.ok(fontRefs.size > 0);
+  for (const ref of fontRefs) {
+    assert.match(ref, /^fonts\/KaTeX_[\w-]+\.(?:woff2?|ttf)$/);
+    const font = await fetch(new URL(ref, cssUrl));
+    assert.equal(font.status, 200, ref);
+    assert.equal(font.headers.get("content-type"), `font/${ref.split(".").at(-1)}`, ref);
+    assert.equal(font.headers.get("x-content-type-options"), "nosniff", ref);
+    assert.ok((await font.arrayBuffer()).byteLength > 0, ref);
+  }
+  for (const path of ["/katex/katex.mjs", "/katex/package.json", "/katex/contrib/auto-render.js", "/katex/fonts/not-a-font.woff2"]) {
+    assert.equal((await fetch(base + path)).status, 404, path);
+  }
 });
 
 test("a task-owned conversation is not a branch, and an unknown ID is 404", async t => {

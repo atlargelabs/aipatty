@@ -169,7 +169,9 @@ Every branch runs these, in this order:
   the run starts and when the result's card replaces the live one.
 - **`markdown`** sets the format on saved user and assistant prose. Tables scroll horizontally when too wide,
   and column alignment uses CSS classes rather than inline styles. The renderer turns off raw HTML and images
-  and allows only absolute HTTP(S) links outside aipatty's hosts. All other cards stay plain text.
+  and allows only absolute HTTP(S) links outside aipatty's hosts. Math is parsed outside code and rendered by
+  local KaTeX with trust disabled. KaTeX's DOM renderer applies layout via CSSOM without relaxing the chat CSP;
+  rejected formulas show as text. All other cards stay plain text.
 
 ## Connected app steps
 

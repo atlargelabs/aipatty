@@ -190,9 +190,9 @@ Deferred until needed: managed checkouts of repos other than aipatty.
   Pi run behind a tool call. It shows archived results or automatically follows new output while the run is active
   and you're at the bottom. It is not an interactive terminal. Add a Gmail switch when Gmail ships. The
   transcript is drawn by [the card pipeline](WEB-CARDS.md), an ordered list of pure steps that later features add to.
-  A built-in step renders saved user and assistant prose as Markdown; live previews and tool output stay plain text,
-  except the results of a connected app's tools when its step asks for Markdown. Successful `publish_page`
-  results use a dedicated sandboxed preview, not an app-provided card format.
+  A built-in step renders saved user and assistant prose as Markdown with locally served KaTeX for math.
+  Live previews and tool output stay plain text, except when a connected app's step asks for Markdown.
+  Successful `publish_page` results use a dedicated sandboxed preview, not an app-provided card format.
 - **CLI:** the same API from a terminal.
 - **Auth:** SSH or the tailnet's access policy. The server has no login of its own. HTTP and WebSocket requests
   must name the loopback listener or the single configured HTTPS origin, and any browser `Origin` must match.

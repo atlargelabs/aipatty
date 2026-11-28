@@ -176,8 +176,8 @@ phone or laptop. No Caddy or change to the listener is needed. The CLI still use
 4. With Tailscale on, open the printed URL on your phone or laptop. Check `/health` at the same URL and compare
    its commit to the expected release, then send a message and check that the reply updates live. A `502`
    usually means aipatty isn't running on the port named in `tailscale serve status`; a `403` from aipatty
-   means the startup URL is missing or doesn't match the browser's URL. Saved messages render Markdown using
-   the parser bundled with the release; this needs no CDN or extra browser setup.
+   means the startup URL is missing or doesn't match the browser's URL. Saved messages render Markdown and
+   math using locally served Markdown-it and KaTeX assets; this needs no CDN or extra browser setup.
 
 To remove the default HTTPS route, run `tailscale serve --https=443 off` on the mini. Drop
 `--tailscale-origin` the next time you start aipatty. The SSH forward is unaffected.

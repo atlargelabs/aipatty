@@ -12,13 +12,29 @@ import { pagesPath, pagesPreviewScript } from "./pages/shared.ts";
 import { brandStylePath } from "./web/brand.ts";
 
 const markdownScriptPath = "/markdown-it.js";
+const katexScriptPath = "/katex/katex.js";
+const katexStylePath = "/katex/katex.css";
+const katexStyleFile = new URL(import.meta.resolve("katex/dist/katex.min.css"));
+const katexCss = readFileSync(katexStyleFile, "utf8");
+const cssType = "text/css; charset=utf-8";
+// Only the pinned stylesheet's font URLs are served, relative to the stylesheet on disk and in the browser.
+const katexFonts = new Set(Array.from(katexCss.matchAll(/url\((fonts\/KaTeX_[\w-]+\.(?:woff2?|ttf))\)/g), match => match[1]));
+type PageAsset = { body: string | Buffer; type: string };
+export const pageAssets: ReadonlyMap<string, PageAsset> = new Map<string, PageAsset>([
+  ["/app.css", { body: readFileSync(new URL("./web/chat.css", import.meta.url), "utf8"), type: cssType }],
+  [katexStylePath, { body: katexCss, type: cssType }],
+  ...Array.from(katexFonts, name => [
+    `/katex/${name}`, { body: readFileSync(new URL(name, katexStyleFile)), type: `font/${name.split(".").at(-1)}` },
+  ] as const),
+]);
 
-/** Browser modules by URL: our own with types removed, and the pinned parser's standalone ESM bundle. */
+/** Browser modules by URL: our own with types removed, plus pinned standalone ESM bundles. */
 export const pageModules: Readonly<Record<string, string>> = {
-  ...Object.fromEntries(["cards", "icons", "shared", "steps"].map(name => [
+  ...Object.fromEntries(["cards", "icons", "math", "shared", "steps"].map(name => [
     `/web/${name}.ts`, stripTypeScriptTypes(readFileSync(new URL(`./web/${name}.ts`, import.meta.url), "utf8")),
   ])),
   [markdownScriptPath]: readFileSync(new URL(import.meta.resolve("markdown-it/browser")), "utf8"),
+  [katexScriptPath]: readFileSync(new URL(import.meta.resolve("katex")), "utf8"),
 };
 
 export const pageHtml = (pagesAvailable: boolean) => `<!doctype html>
@@ -28,6 +44,7 @@ export const pageHtml = (pagesAvailable: boolean) => `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>aipatty</title>
 <link rel="stylesheet" href="${brandStylePath}">
+<link rel="stylesheet" href="${katexStylePath}">
 <link rel="stylesheet" href="/app.css">
 <script type="module" src="/app.js"></script>
 </head>
@@ -91,11 +108,11 @@ export const pageHtml = (pagesAvailable: boolean) => `<!doctype html>
 </html>
 `;
 
-export const pageCss = readFileSync(new URL("./web/chat.css", import.meta.url), "utf8");
-
 export const pageJs = (appHostnames: readonly string[], pagesAvailable: boolean) => `import markdownit from ${JSON.stringify(markdownScriptPath)};
+import katex from ${JSON.stringify(katexScriptPath)};
 import { derive, scopeAppStep } from "/web/cards.ts";
 import { drawButtonIcon } from "/web/icons.ts";
+import { mathMarkdown } from "/web/math.ts";
 import { piRunApiPath } from "/web/shared.ts";
 import { builtInSteps, runIdOf } from "/web/steps.ts";
 ${pagesAvailable ? `import { pagePreviews } from "${pagesPreviewScript}";` : ""}
@@ -445,7 +462,7 @@ function renderBranches() {
  * touched, for the same reason as the branch list above.
  */
 
-// No raw HTML or plugins.
+// Saved messages are untrusted; raw HTML is never allowed.
 const markdown = markdownit({ html: false, breaks: true });
 const appHostnames = ${JSON.stringify(appHostnames.map(host => host.replace(/\.$/, "")))};
 markdown.validateLink = href => {
@@ -487,7 +504,7 @@ markdown.renderer.rules.td_open = renderTableCell;
 const bodyText = new WeakMap();
 const formats = {
   text(body, text) { body.textContent = text; },
-  markdown(body, text) { body.innerHTML = markdown.render(text); },
+  markdown: mathMarkdown(markdown, katex),
 };
 
 function sendMessage(branch, content) {
