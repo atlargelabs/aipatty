@@ -26,9 +26,15 @@ function findClose(
   return -1;
 }
 
+function escapedAt(src: string, pos: number): boolean {
+  let first = pos;
+  while (src[first - 1] === "\\") first--;
+  return (pos - first) % 2 === 1;
+}
+
 function inlineMath(state: StateInline, silent: boolean): boolean {
   const { src, pos, posMax } = state;
-  if (src[pos] === "$" && src[pos - 1] === "$") return false;
+  if (src[pos] === "$" && src[pos - 1] === "$" && !escapedAt(src, pos - 1)) return false;
   const display = displayOpener(src, pos, posMax);
   const open = display ?? (src.startsWith("\\(", pos) ? "\\(" : src[pos] === "$" && src[pos + 1] !== "$" ? "$" : undefined);
   if (!open) return false;
@@ -42,10 +48,14 @@ function inlineMath(state: StateInline, silent: boolean): boolean {
   if (!tex.trim() || (src[end] === "$" && src[after] === "$")) return false;
   if (open === "$") {
     const next = src[after] ?? "";
-    // Leave prices and ranges alone. A dollar just inside opening emphasis can start a new formula
-    // (e.g. $5; **$(x+1)^2$**), regardless of the first character of that formula.
-    const startsEmphasizedMath = next && !/\s/.test(next) && /\s(?:\*{1,3}|_{1,3}|~~)$/.test(tex);
-    if (/\s$/.test(tex) || /\d/.test(next) || startsEmphasizedMath) return false;
+    if (/\s$/.test(tex) || /\d/.test(next)) return false;
+    // A price is a provisional opener. Prefer Markdown structure when pairing it would consume
+    // a link destination or the opener of an emphasized formula, e.g. $5; **$(x+1)^2$**.
+    if (/^\d/.test(tex)) {
+      const link = /\]\(|\]\[|<[a-z][\w.+-]*:/i.test(tex);
+      const emphasized = next && !/\s/.test(next) && /\s(?:\*{1,3}|_{1,3}|~~)$/.test(tex);
+      if (link || emphasized) return false;
+    }
   }
   if (!silent) {
     const token = state.push(display ? "math_display" : "math_inline", "", 0);

@@ -39,8 +39,14 @@ test("Markdown math leaves currency, escapes, code and incomplete delimiters alo
   ].join("\n");
   assert.deepEqual(formulas(literal), []);
   assert.ok(markdown.render(literal).includes("<code>before $$x$$ after</code>"));
-  const mixed = "[Price $5](https://example.org/)$x$. Lunch cost $10; **$(y+1)^2$** is the adjustment.";
-  assert.deepEqual(formulas(mixed), [["math_inline", "x"], ["math_inline", "(y+1)^2"]]);
-  assert.match(markdown.render(mixed), /<a href="https:\/\/example\.org\/">Price \$5<\/a>/);
-  assert.match(markdown.render(mixed), /Lunch cost \$10; <strong><span class="math-inline"/);
+  const mixed = [
+    "[Price $5](https://example.org/)$x$. Lunch cost $10; **$(y+1)^2$** is the adjustment.",
+    String.raw`Price: \$$p$.`, "Costs $5; see [details](https://example.org/?currency=$USD).",
+  ].join("\n");
+  assert.deepEqual(formulas(mixed), [["math_inline", "x"], ["math_inline", "(y+1)^2"], ["math_inline", "p"]]);
+  const html = markdown.render(mixed);
+  assert.ok(html.includes('<a href="https://example.org/">Price $5</a>'));
+  assert.ok(html.includes('Lunch cost $10; <strong><span class="math-inline"'));
+  assert.ok(html.includes('Price: $<span class="math-inline"'));
+  assert.ok(html.includes('Costs $5; see <a href="https://example.org/?currency=$USD">details</a>'));
 });
