@@ -18,27 +18,31 @@ test("Markdown math recognizes opaque expressions in both delimiter styles", () 
     "\\[", String.raw`\sum_{i=0}^{n} i`, "\\]", "After the equation.", "",
     "$$", String.raw`\begin{aligned} a &= b \\`, "", String.raw`c &= d \end{aligned}`, "$$", "",
     "> \\[", "> a+b", "> \\]", "", "- $$x$$", "",
-    "[Formula $a[b]$](https://example.org/)",
+    "[Formula $a[b]$](https://example.org/) and $2 A[i][j] + 1$",
   ].join("\n");
   assert.deepEqual(formulas(source), [
     ["math_inline", "x_1 < y^2"], ["math_inline", String.raw`\text{cost \$5}`],
     ["math_display", "\n" + String.raw`\sum_{i=0}^{n} i` + "\n"],
     ["math_block", "\n" + String.raw`\begin{aligned} a &= b \\` + "\n\n" + String.raw`c &= d \end{aligned}` + "\n"],
-    ["math_block", "\na+b\n"], ["math_block", "x"], ["math_inline", "a[b]"],
+    ["math_block", "\na+b\n"], ["math_display", "x"], ["math_inline", "a[b]"], ["math_inline", "2 A[i][j] + 1"],
   ]);
 });
 
 test("Markdown math leaves currency, escapes, code and incomplete delimiters alone", () => {
   const literal = [
     String.raw`\$x\$ and \\(x\\) and \\[x\\]`,
-    "Costs $5, or $10-$20 per person.",
+    "Costs $5, or $10-$20 per person. Sale prices: $.50-$.75.",
     "Costs $5 and `echo $`.",
     "`\\(x\\) \\[x\\] $x$ $$x$$`", "", "`before", "$$x$$", "after`", "",
     "```tex", "$$", "x^2", "$$", "```", "",
-    "    $$x$$", "", "$$", "```", "$$", "```", "", "Unfinished $x and \\(y.",
+    "    $$x$$", "", "$$ is the shell PID. For example:", "", "    echo $$", "",
+    "$$", "```", "$$", "```", "", "Unfinished $x and \\(y.",
   ].join("\n");
   assert.deepEqual(formulas(literal), []);
-  assert.ok(markdown.render(literal).includes("<code>before $$x$$ after</code>"));
+  const literalHtml = markdown.render(literal);
+  assert.ok(literalHtml.includes("<code>before $$x$$ after</code>"));
+  assert.ok(literalHtml.includes("<pre><code>echo $$\n</code></pre>"));
+  assert.ok(literalHtml.includes("Sale prices: $.50-$.75."));
   const mixed = [
     "[Price $5](https://example.org/)$x$. Lunch cost $10; **$(y+1)^2$** is the adjustment.",
     String.raw`Price: \$$p$.`, "Costs $5; see [details](https://example.org/?currency=$USD).",

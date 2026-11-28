@@ -3,6 +3,7 @@ import type { MarkdownIt, RendererRule, StateBlock, StateInline } from "markdown
 
 const closing: Readonly<Record<string, string>> = { "\\(": "\\)", "\\[": "\\]", "$": "$", "$$": "$$" };
 const maxMathLength = 4096;
+const amount = /^(?:\d+(?:[.,]\d+)*|\.\d+)/;
 
 function displayOpener(src: string, start: number, end: number): string | undefined {
   if (start + 2 > end) return;
@@ -12,12 +13,12 @@ function displayOpener(src: string, start: number, end: number): string | undefi
 
 /** Find the first unescaped closer. Leave Markdown's code spans and link label boundaries to its own rules. */
 function findClose(
-  src: string, start: number, end: number, close: string, mode: "block" | "display" | "inline" = "block", inLabel = false,
+  src: string, start: number, end: number, close: string, multiline: boolean, inLabel: boolean,
 ): number {
   let brackets = 0;
   for (let pos = start; pos < end; pos++) {
     const ch = src[pos];
-    if ((mode === "inline" && ch === "\n") || (mode !== "block" && ch === "`")) break;
+    if ((!multiline && ch === "\n") || ch === "`") break;
     if (pos + close.length <= end && src.startsWith(close, pos)) return pos;
     if (ch === "\\" && src[pos + 1] !== "\n") pos++;
     else if (inLabel && ch === "[") brackets++;
@@ -41,19 +42,20 @@ function inlineMath(state: StateInline, silent: boolean): boolean {
   const from = pos + open.length;
   if (open === "$" && /\s/.test(src[from] ?? "")) return false;
   const close = closing[open];
-  const end = findClose(src, from, Math.min(posMax, from + maxMathLength + close.length), close, display ? "display" : "inline", silent);
+  const end = findClose(src, from, Math.min(posMax, from + maxMathLength + close.length), close, !!display, silent);
   if (end < 0) return false;
   const after = end + close.length;
   const tex = src.slice(from, end);
   if (!tex.trim() || (src[end] === "$" && src[after] === "$")) return false;
   if (open === "$") {
-    const next = src[after] ?? "";
-    if (/\s$/.test(tex) || /\d/.test(next)) return false;
-    // A price is a provisional opener. Prefer Markdown structure when pairing it would consume
-    // a link destination or the opener of an emphasized formula, e.g. $5; **$(x+1)^2$**.
-    if (/^\d/.test(tex)) {
-      const link = /\]\(|\]\[|<[a-z][\w.+-]*:/i.test(tex);
-      const emphasized = next && !/\s/.test(next) && /\s(?:\*{1,3}|_{1,3}|~~)$/.test(tex);
+    const next = src.slice(after, after + 2);
+    if (/\s$/.test(tex) || amount.test(next)) return false;
+    // A leading amount with prose punctuation is a provisional opener. Don't let it consume
+    // an HTTP(S) link or the opener of emphasized math, e.g. $5; **$(x+1)^2$**.
+    const price = tex.match(amount)?.[0];
+    if (price && /[\s.,;:!?%/]/.test(tex[price.length] ?? "")) {
+      const link = /(?:\]\(\s*<?|<)https?:\/\//i.test(tex);
+      const emphasized = /^\S/.test(next) && /\s(?:\*{1,3}|_{1,3}|~~)$/.test(tex);
       if (link || emphasized) return false;
     }
   }
@@ -70,17 +72,17 @@ function blockMath(state: StateBlock, startLine: number, endLine: number, silent
   const { src, bMarks, tShift, eMarks, sCount, blkIndent } = state;
   const start = bMarks[startLine] + tShift[startLine];
   const open = displayOpener(src, start, eMarks[startLine]);
-  if (!open || sCount[startLine] - blkIndent >= 4) return false;
+  // Blocks can span blank lines. Require standalone delimiters so that prose mentioning $$
+  // cannot reach across a blank line into a code block. Compact display math is handled inline.
+  if (!open || sCount[startLine] - blkIndent >= 4 || src.slice(start + open.length, eMarks[startLine]).trim()) return false;
   const close = closing[open];
-  for (let line = startLine; line < endLine; line++) {
+  for (let line = startLine + 1; line < endLine; line++) {
     const first = bMarks[line] + tShift[line];
     const last = eMarks[line];
     if (last - start > maxMathLength + open.length + close.length) return false;
-    if (line > startLine && first < last && (sCount[line] < blkIndent || /^(?:```|~~~)/.test(src.slice(first, first + 3)))) return false;
-    const end = findClose(src, line === startLine ? start + open.length : first, last, close);
-    if (end < 0) continue;
-    if (src.slice(end + close.length, last).trim()) return false;
-    const tex = state.getLines(startLine, line + 1, blkIndent, false).trim().slice(open.length, -close.length);
+    if (first < last && (sCount[line] < blkIndent || /^(?:```|~~~)/.test(src.slice(first, first + 3)))) return false;
+    if (sCount[line] - blkIndent >= 4 || src.slice(first, last).trimEnd() !== close) continue;
+    const tex = "\n" + state.getLines(startLine + 1, line, blkIndent, true);
     if (!tex.trim()) return false;
     if (!silent) {
       const token = state.push("math_block", "", 0);
