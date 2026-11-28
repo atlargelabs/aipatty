@@ -90,7 +90,7 @@ main {
 .card-head .icon-button { width: 36px; height: 36px; }
 .card-head button[data-action="openPane"] { color: var(--link); }
 .card-body[data-format="markdown"] { display: flow-root; white-space: normal; }
-.card-body[data-format="markdown"] :where(p, ul, ol, blockquote, pre, h1, h2, h3, h4, h5, h6, .markdown-table) { margin: 8px 0; }
+.card-body[data-format="markdown"] :where(p, ul, ol, blockquote, pre, h1, h2, h3, h4, h5, h6, .markdown-table, .math-display) { margin: 8px 0; }
 .card-body[data-format="markdown"] > :first-child { margin-top: 0; }
 .card-body[data-format="markdown"] > :last-child { margin-bottom: 0; }
 .card-body[data-format="markdown"] h1 { font-size: 1.35rem; }
@@ -107,6 +107,8 @@ main {
 .markdown-table th { background: var(--quiet); }
 .markdown-table .align-center { text-align: center; }
 .markdown-table .align-right { text-align: right; }
+.math-display { display: block; overflow-x: auto; white-space: pre-wrap; }
+.math-display > .katex-display { width: max-content; min-width: 100%; margin: 0; }
 #card-header:not([hidden]) { display: flex; flex-wrap: wrap; gap: 4px 16px; border-bottom: 1px solid var(--line); }
 #composer { display: flex; gap: 8px; border-top: 1px solid var(--line); }
 #composer textarea { flex: 1; min-width: 0; padding: 8px; font-size: 1rem; resize: vertical; }

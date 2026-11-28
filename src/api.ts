@@ -8,7 +8,7 @@ import WebSocket, { WebSocketServer } from "ws";
 import { LOOPBACK } from "./config.ts";
 import type { AgentHost } from "./host.ts";
 import { HttpError, jsonBody, pageHeaders, requireMethod, sendJson } from "./http.ts";
-import { pageCss, pageHtml, pageJs, pageModules } from "./page.ts";
+import { pageAssets, pageHtml, pageJs, pageModules } from "./page.ts";
 import { isPagesPath } from "./pages/index.ts";
 import { pagesLibraryApi } from "./pages/shared.ts";
 import { appCommand, appEntryKind, messageText, piRunApiPath, piRunId, shutdownHeader, streamState, streamUpdate, upgradeCommand, type StreamFrame } from "./protocol.ts";
@@ -151,7 +151,7 @@ async function handleHttp(
     return;
   }
   // The UI assets are served from explicit lists: no path from the request reaches a file.
-  const asset = brandAssets.get(pathname);
+  const asset = brandAssets.get(pathname) ?? pageAssets.get(pathname);
   if (asset) {
     requireMethod(req, res, "GET");
     res.writeHead(200, { "Content-Type": asset.type, "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
@@ -160,14 +160,14 @@ async function handleHttp(
   }
   const script = pathname === "/app.js" ? pageJs(tailscale ? [...loopbackNames, tailscale.hostname] : loopbackNames, !!agent.pages)
     : Object.hasOwn(pageModules, pathname) ? pageModules[pathname] : undefined;
-  if (script !== undefined || pathname === "/app.css") {
+  if (script !== undefined) {
     requireMethod(req, res, "GET");
     res.writeHead(200, {
-      "Content-Type": script !== undefined ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8",
+      "Content-Type": "text/javascript; charset=utf-8",
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
     });
-    res.end(script ?? pageCss);
+    res.end(script);
     return;
   }
   if (pathname === "/api/branches") {

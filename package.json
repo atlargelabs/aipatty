@@ -16,6 +16,7 @@
     "@earendil-works/pi-review": "git+https://github.com/earendil-works/pi-review.git#f1de050504936046c0f85b21fec0e0a93ef394eb",
     "@earendil-works/pi-schema": "1.6.0",
     "just-web-fetch": "git+https://github.com/stephenchestnut/just-web-fetch.git#a933b90b8af36c98f9cc45aa748cddb7f1bbb525",
+    "katex": "0.19.1",
     "markdown-it": "15.0.3",
     "pi-delegates": "git+https://github.com/stephenchestnut/delegates.git#a66e6d83dcc0cf534802a59f76aa03d088446efd",
     "pi-web-search": "1.7.0",

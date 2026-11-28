@@ -127,11 +127,14 @@ cards, and inherited entries are marked. Below the saved transcript, dashed card
 the answer being written and each tool call that has not finished. How the cards are made, and how to add to them, is
 in [the card pipeline](docs/WEB-CARDS.md).
 
-Saved user and assistant prose renders as Markdown. Single newlines are preserved, and wide tables and code
-blocks scroll horizontally. Links must be absolute HTTP(S) URLs outside aipatty's hosts and open in a new tab.
-Raw HTML is shown as text, and images are not loaded. Live previews (including partial tool arguments), tool
-cards, system messages, notices, and the Pi run pane stay plain text. A [connected app](docs/CONNECTED-APPS.md)
-can have its own tools' results rendered as Markdown, as Gym does.
+Saved user and assistant prose renders as Markdown. Use `\(...\)` or `$...$` for inline math, and `\[...\]`
+or `$$...$$` for display math. For multiline display, put the delimiters on their own lines. To show
+literal delimiters, use a code span or escape each `$` or `\`. Single newlines in prose are preserved, and wide
+display equations, tables, and code blocks scroll horizontally. Links must be absolute HTTP(S) URLs outside
+aipatty's hosts and open in a new tab. Raw HTML is
+shown as text, and images are not loaded. Live previews (including partial tool arguments), tool cards, system
+messages, notices, and the Pi run pane stay plain text. A [connected app](docs/CONNECTED-APPS.md) can have its
+own tools' results rendered as Markdown, as Gym does.
 
 Use **Open Pi run** on a `pi` call's result, or on its dashed card while it runs, to inspect that run beside the
 conversation. On a narrow screen it uses the full screen; Close or Esc goes back to the same place in chat. Inherited calls open the original run.
@@ -321,7 +324,7 @@ loopback; access to the HTTPS URL is controlled by your tailnet policy. Do not u
 
 ## API
 
-- `GET /` the page (and `/app.js`, `/app.css`, `/markdown-it.js`, and the modules of `src/web/` as `/web/<name>.ts`)
+- `GET /` the page (and `/app.js`, `/app.css`, `/markdown-it.js`, the chat modules under `/web/`, and KaTeX assets under `/katex/`)
 - `GET /health` (includes the process ID, the root's saved model, its catalog availability, the thinking level,
   and `problems`: what the startup health check found, empty when healthy). Optional apps report separately
   in `appProblems` when unavailable; they do not fail the core health check.

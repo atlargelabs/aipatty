@@ -506,6 +506,62 @@ test("saved prose renders Markdown on narrow screens and survives live updates",
   assert.deepEqual(browser.errors, []);
 });
 
+test("saved chat math uses local KaTeX under the chat CSP", { skip: !chrome, timeout: 60_000 }, async t => {
+  const host = await openHost(fauxConfig(await fixture(t)));
+  const api = await startApi(host, health, 0);
+  t.after(async () => { await api.close(); await host.close(); });
+  const base = `http://127.0.0.1:${api.port}`;
+  const invalid = String.raw`\(\notACommand <img src="/math-probe" onerror="window.bad=true">\)`;
+  const literal = String.raw`Literal: $5 or $10; \$x\$; \\(x\\).`;
+  const code = String.raw`\(x\) \[x\] $x$ $$x$$`;
+  const fraction = String.raw`\frac{x_1}{2}`;
+  const aligned = String.raw`\begin{aligned}a &= b \\ c &= d\end{aligned}`;
+  const wide = Array(65).fill("x_1").join(" + ");
+  const source = [
+    `Inline \\(${fraction}\\) and $x^2$.`, `\\[${fraction}\\]`, "$$", aligned, "$$", "",
+    `$$${wide}$$`, "", literal, "", "`" + code + "`", "", "```tex", code, "```", "", invalid, "",
+    String.raw`\(\href{https://example.org/math-probe}{x}\) \(\includegraphics{/math-probe}\) \(\htmlClass{injected}{x}\)`,
+  ].join("\n");
+  const root = (await host.conversation("root"))!;
+  await root.commit(tx => tx.appendEntry(root.id, { kind: "test", model: [fauxAssistantMessage(source)] }), ctx);
+
+  const browser = await openBrowser(t);
+  const requested = await browser.watchRequests();
+  await browser.onNewDocument(`window.cspViolations = [];
+    document.addEventListener('securitypolicyviolation', event => cspViolations.push(event.violatedDirective));`);
+  await browser.viewport(390, 600);
+  await browser.navigate(base);
+  await waitFor(browser, "the saved math card", state => state.messages.length === 1);
+  const rendered = await browser.evaluate(`(async () => {
+    const body = document.querySelector('#entries .assistant .card-body');
+    const math = [...body.querySelectorAll('math')].slice(0, 5);
+    const line = body.querySelector('.frac-line');
+    const wide = body.querySelectorAll('.math-display')[2];
+    const transcript = document.querySelector('#transcript');
+    wide.scrollLeft = 80;
+    await document.fonts.ready;
+    return {
+      formulas: math.map(node => [node.getAttribute('display'), node.querySelector('annotation').textContent.trim()]),
+      styled: getComputedStyle(line).display === 'inline-block' && parseFloat(getComputedStyle(line).borderBottomWidth) > 0,
+      localFont: [...document.fonts].some(face => face.family.startsWith('KaTeX_') && face.status === 'loaded'),
+      scrolls: wide.scrollLeft > 0 && transcript.scrollWidth === transcript.clientWidth,
+      code: [...body.querySelectorAll('code')].map(node => node.textContent.trim()),
+      price: [...body.querySelectorAll('p')].find(node => node.textContent.startsWith('Literal:')).textContent,
+      invalid: [...body.querySelectorAll('p')].some(node => node.textContent === ${JSON.stringify(invalid)}),
+      unsafe: !!body.querySelector('a, img, script, [href], [src], [onerror], .injected'),
+      violations: window.cspViolations,
+    };
+  })()`);
+  assert.deepEqual(rendered, {
+    formulas: [[null, fraction], [null, "x^2"], ["block", fraction], ["block", aligned], ["block", wide]],
+    styled: true, localFont: true, scrolls: true, code: [code, code], price: String.raw`Literal: $5 or $10; $x$; \(x\).`,
+    invalid: true, unsafe: false, violations: [],
+  });
+  assert.ok(requested.some(url => url.startsWith(`${base}/katex/fonts/`) && url.endsWith(".woff2")), requested.join("\n"));
+  assert.ok(requested.every(url => url.startsWith(base + "/") && !url.endsWith("/math-probe")), requested.join("\n"));
+  assert.deepEqual(browser.errors, []);
+});
+
 test("Pi calls open the exact archive across pages and forks, without rebuilding the chat", { skip: !chrome, timeout: 60_000 }, async t => {
   const dir = await fixture(t);
   const host = await openHost(fauxConfig(dir));
