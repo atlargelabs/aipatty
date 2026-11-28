@@ -130,8 +130,8 @@ in [the card pipeline](docs/WEB-CARDS.md).
 Saved user and assistant prose renders as Markdown. Use `\(...\)` or `$...$` for inline math, and `\[...\]`
 or `$$...$$` for display math. For multiline display, put the delimiters on their own lines and separate the
 block from surrounding prose with blank lines. To show literal delimiters, use a code span or escape each
-`$` or `\`. If a dollar amount is ambiguous, prefer `\(...\)` for the adjacent formula. Single newlines in prose
-are preserved, and wide equations, tables, and code blocks scroll
+`$` or `\`. Dollar math gives Markdown links and code spans precedence; if a formula is ambiguous, prefer
+`\(...\)`. Single newlines in prose are preserved, and wide equations, tables, and code blocks scroll
 horizontally. Links must be absolute HTTP(S) URLs outside aipatty's hosts and open in a new tab. Raw HTML is
 shown as text, and images are not loaded. Live previews (including partial tool arguments), tool cards, system
 messages, notices, and the Pi run pane stay plain text. A [connected app](docs/CONNECTED-APPS.md) can have its
