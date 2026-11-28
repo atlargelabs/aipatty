@@ -18,16 +18,19 @@ test("Markdown math recognizes opaque expressions in both delimiter styles", () 
     "\\[", String.raw`\sum_{i=0}^{n} i`, "\\]", "After the equation.", "",
     "$$", String.raw`\begin{aligned} a &= b \\`, "", String.raw`c &= d \end{aligned}`, "$$", "",
     "> \\[", "> a+b", "> \\]", "", "- $$x$$", "",
-    "[Formula $a[b]$](https://example.org/) and $2 A[i][j] + 1$", "", "\\(\\verb|`|\\) and `code`",
+    "[Formula $a[b]$](https://example.org/) and $2 A[i][j] + 1$", "", "\\(\\verb|`|\\) and `code`", "",
+    String.raw`[See \(x\in(0,1]\)](https://example.org/)`,
   ].join("\n");
   assert.deepEqual(formulas(source), [
     ["math_inline", "x_1 < y^2"], ["math_inline", String.raw`\text{cost \$5}`],
     ["math_display", "\n" + String.raw`\sum_{i=0}^{n} i` + "\n"],
     ["math_block", "\n" + String.raw`\begin{aligned} a &= b \\` + "\n\n" + String.raw`c &= d \end{aligned}` + "\n"],
     ["math_block", "\na+b\n"], ["math_display", "x"], ["math_inline", "a[b]"], ["math_inline", "2 A[i][j] + 1"],
-    ["math_inline", "\\verb|`|"],
+    ["math_inline", "\\verb|`|"], ["math_inline", String.raw`x\in(0,1]`],
   ]);
-  assert.ok(markdown.render(source).includes("and <code>code</code>"));
+  const html = markdown.render(source);
+  assert.ok(html.includes("and <code>code</code>"));
+  assert.ok(html.includes('<a href="https://example.org/">See <span class="math-inline"'));
 });
 
 test("Markdown math leaves currency, escapes, code and incomplete delimiters alone", () => {
@@ -49,6 +52,7 @@ test("Markdown math leaves currency, escapes, code and incomplete delimiters alo
     "[Price $5](https://example.org/)$x$. Lunch cost $10; **$(y+1)^2$** is the adjustment.",
     String.raw`Price: \$$p$.`, "**$5**; see [details](https://example.org/?currency=$USD).",
     "**$5**; see [US$ exchange rates](https://example.org/).",
+    "Shell PID is $$; see [Bash $$ docs](https://example.org/).",
   ].join("\n");
   assert.deepEqual(formulas(mixed), [["math_inline", "x"], ["math_inline", "(y+1)^2"], ["math_inline", "p"]]);
   const html = markdown.render(mixed);
@@ -57,4 +61,5 @@ test("Markdown math leaves currency, escapes, code and incomplete delimiters alo
   assert.ok(html.includes('Price: $<span class="math-inline"'));
   assert.ok(html.includes('<strong>$5</strong>; see <a href="https://example.org/?currency=$USD">details</a>'));
   assert.ok(html.includes('<strong>$5</strong>; see <a href="https://example.org/">US$ exchange rates</a>'));
+  assert.ok(html.includes('Shell PID is $$; see <a href="https://example.org/">Bash $$ docs</a>'));
 });

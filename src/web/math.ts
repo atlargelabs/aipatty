@@ -24,22 +24,23 @@ function findClose(state: StateInline, start: number, open: string, multiline: b
   const { src, posMax } = state;
   const close = closing[open];
   const end = Math.min(posMax, start + maxMathLength + close.length);
+  const dollar = open[0] === "$";
   let brackets = 0;
   for (let pos = start; pos < end; pos++) {
     const ch = src[pos];
     if (!multiline && ch === "\n") break;
     if (pos + close.length <= end && src.startsWith(close, pos)) return pos;
-    if (open[0] === "$" && ch === "`") {
+    if (dollar && ch === "`") {
       let runEnd = pos + 1;
       while (runEnd < posMax && src[runEnd] === "`") runEnd++;
       if (skipInlineAt(state, pos) > runEnd) break;
       pos = runEnd - 1;
-    } else if (open === "$" && !inLabel && (ch === "[" || ch === "<") && skipInlineAt(state, pos) > pos + 1) {
+    } else if (dollar && !inLabel && (ch === "[" || ch === "<") && skipInlineAt(state, pos) > pos + 1) {
       // A link or autolink is opaque. Avoid probing for nested links during label lookahead.
       break;
     } else if (ch === "\\" && src[pos + 1] !== "\n") pos++;
-    else if (inLabel && ch === "[") brackets++;
-    else if (inLabel && ch === "]" && brackets-- === 0) break;
+    else if (dollar && inLabel && ch === "[") brackets++;
+    else if (dollar && inLabel && ch === "]" && brackets-- === 0) break;
   }
   return -1;
 }
