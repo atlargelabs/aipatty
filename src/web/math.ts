@@ -3,7 +3,6 @@ import type { MarkdownIt, RendererRule, StateBlock, StateInline } from "markdown
 
 const closing: Readonly<Record<string, string>> = { "\\(": "\\)", "\\[": "\\]", "$": "$", "$$": "$$" };
 const maxMathLength = 4096;
-const amount = /^(?:\d+(?:[.,]\d+)*|\.\d+)/;
 
 function displayOpener(src: string, start: number, end: number): string | undefined {
   if (start + 2 > end) return;
@@ -13,14 +12,25 @@ function displayOpener(src: string, start: number, end: number): string | undefi
 
 /** Find the first unescaped closer. Leave Markdown's code spans and link label boundaries to its own rules. */
 function findClose(
-  src: string, start: number, end: number, close: string, multiline: boolean, inLabel: boolean,
+  state: StateInline, start: number, end: number, close: string, multiline: boolean, inLabel: boolean,
 ): number {
+  const { src, pos: opener, posMax } = state;
   let brackets = 0;
   for (let pos = start; pos < end; pos++) {
     const ch = src[pos];
-    if ((!multiline && ch === "\n") || ch === "`") break;
+    if (!multiline && ch === "\n") break;
     if (pos + close.length <= end && src.startsWith(close, pos)) return pos;
-    if (ch === "\\" && src[pos + 1] !== "\n") pos++;
+    if (ch === "`") {
+      let runEnd = pos + 1;
+      while (runEnd < posMax && src[runEnd] === "`") runEnd++;
+      // Let the Markdown tokenizer distinguish a code span from literal backticks in TeX.
+      state.pos = pos;
+      state.md.inline.skipToken(state);
+      const isCode = state.pos > runEnd;
+      state.pos = opener;
+      if (isCode) break;
+      pos = runEnd - 1;
+    } else if (ch === "\\" && src[pos + 1] !== "\n") pos++;
     else if (inLabel && ch === "[") brackets++;
     else if (inLabel && ch === "]" && brackets-- === 0) break;
   }
@@ -42,22 +52,19 @@ function inlineMath(state: StateInline, silent: boolean): boolean {
   const from = pos + open.length;
   if (open === "$" && /\s/.test(src[from] ?? "")) return false;
   const close = closing[open];
-  const end = findClose(src, from, Math.min(posMax, from + maxMathLength + close.length), close, !!display, silent);
+  const end = findClose(state, from, Math.min(posMax, from + maxMathLength + close.length), close, !!display, silent);
   if (end < 0) return false;
   const after = end + close.length;
   const tex = src.slice(from, end);
   if (!tex.trim() || (src[end] === "$" && src[after] === "$")) return false;
   if (open === "$") {
     const next = src.slice(after, after + 2);
-    if (/\s$/.test(tex) || amount.test(next)) return false;
-    // A leading amount with prose punctuation is a provisional opener. Don't let it consume
-    // an HTTP(S) link or the opener of emphasized math, e.g. $5; **$(x+1)^2$**.
-    const price = tex.match(amount)?.[0];
-    if (price && /[\s.,;:!?%/]/.test(tex[price.length] ?? "")) {
-      const link = /(?:\]\(\s*<?|<)https?:\/\//i.test(tex);
-      const emphasized = /^\S/.test(next) && /\s(?:\*{1,3}|_{1,3}|~~)$/.test(tex);
-      if (link || emphasized) return false;
-    }
+    if (/\s$/.test(tex) || /^(?:\d|\.\d)/.test(next)) return false;
+    // Dollar openers are ambiguous. Prefer Markdown links and new emphasized formulas over a
+    // candidate that would swallow that markup, no matter how a preceding price is formatted.
+    const link = /(?:\]\(\s*<?|<)https?:\/\//i.test(tex);
+    const emphasized = /^\S/.test(next) && /\s(?:\*{1,3}|_{1,3}|~~)$/.test(tex);
+    if (link || emphasized) return false;
   }
   if (!silent) {
     const token = state.push(display ? "math_display" : "math_inline", "", 0);
